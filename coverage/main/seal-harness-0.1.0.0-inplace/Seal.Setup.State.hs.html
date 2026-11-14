@@ -1,0 +1,364 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The first-run setup state: what the wizard must show, computed from files
+<span class="lineno">    3 </span>-- on disk plus the live vault handle.
+<span class="lineno">    4 </span>--
+<span class="lineno">    5 </span>-- == Two rules this module exists to enforce
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- 1. /Never/ treat @vsLocked@ as a readiness signal on its own. A
+<span class="lineno">    8 </span>--    @per_access@ vault never populates the in-memory cache (every read goes
+<span class="lineno">    9 </span>--    to disk), so a perfectly working vault reports @vsLocked = True@
+<span class="lineno">   10 </span>--    forever. Only @startup@ mode can be genuinely locked in-process, and
+<span class="lineno">   11 </span>--    @reopen@ (which calls @vhUnlock@) is the in-product fix.
+<span class="lineno">   12 </span>-- 2. /Never/ decrypt while merely rendering the wizard. For a YubiKey vault,
+<span class="lineno">   13 </span>--    probing credentials means a physical touch, so the provider step is
+<span class="lineno">   14 </span>--    config-only there (§5.2); the explicit Test button is where a touch is
+<span class="lineno">   15 </span>--    allowed to happen.
+<span class="lineno">   16 </span>--
+<span class="lineno">   17 </span>-- Every 'SetupStep' detail is path-free: tilde form at most, no absolute path,
+<span class="lineno">   18 </span>-- no secret, no credential value. This module imports no vault read function
+<span class="lineno">   19 </span>-- beyond 'VaultStatus' — it cannot leak vault contents because it cannot read
+<span class="lineno">   20 </span>-- them.
+<span class="lineno">   21 </span>module Seal.Setup.State
+<span class="lineno">   22 </span>  ( StepStatus (..)
+<span class="lineno">   23 </span>  , SetupStep (..)
+<span class="lineno">   24 </span>  , ProviderCard (..)
+<span class="lineno">   25 </span>  , SetupState (..)
+<span class="lineno">   26 </span>  , SetupInputs (..)
+<span class="lineno">   27 </span>  , emptySetupInputs
+<span class="lineno">   28 </span>  , deriveSetupState
+<span class="lineno">   29 </span>  ) where
+<span class="lineno">   30 </span>
+<span class="lineno">   31 </span>import Data.List (stripPrefix)
+<span class="lineno">   32 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   33 </span>import Data.Maybe (fromMaybe, isJust, isNothing)
+<span class="lineno">   34 </span>import Data.Set (Set)
+<span class="lineno">   35 </span>import Data.Set qualified as Set
+<span class="lineno">   36 </span>import Data.Text (Text)
+<span class="lineno">   37 </span>import Data.Text qualified as T
+<span class="lineno">   38 </span>import System.FilePath (takeDirectory, takeFileName)
+<span class="lineno">   39 </span>
+<span class="lineno">   40 </span>import Seal.Config.File
+<span class="lineno">   41 </span>  ( RuntimeConfig (..), defaultRuntimeConfig, providerDefaultModel, providerModels )
+<span class="lineno">   42 </span>import Seal.Config.Paths (SealPaths (..), vaultFilePath)
+<span class="lineno">   43 </span>import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig)
+<span class="lineno">   44 </span>import Seal.Core.Types (ModelId (..))
+<span class="lineno">   45 </span>import Seal.Providers.Registry
+<span class="lineno">   46 </span>  ( KnownProvider (..), knownProviders, providerLabel
+<span class="lineno">   47 </span>  , configuredCustomProviderNames, resolveDefaultModelForName )
+<span class="lineno">   48 </span>import Seal.Security.Vault (VaultHandle (vhStatus), VaultStatus (..))
+<span class="lineno">   49 </span>
+<span class="lineno">   50 </span>-- | The three states a wizard row can be in. There is deliberately no
+<span class="lineno">   51 </span>-- @StepSkipped@: the gate is blocking (operator decision), so &quot;done&quot; and
+<span class="lineno">   52 </span>-- &quot;not done&quot; are the only outcomes a required step can have.
+<span class="lineno">   53 </span>data StepStatus = StepReady | StepPending | StepBlocked
+<span class="lineno">   54 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   55 </span>
+<span class="lineno">   56 </span>data SetupStep = SetupStep
+<span class="lineno">   57 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">stId</span></span></span>       :: Text
+<span class="lineno">   58 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">stRequired</span></span></span> :: Bool
+<span class="lineno">   59 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">stStatus</span></span></span>   :: StepStatus
+<span class="lineno">   60 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">stDetail</span></span></span>   :: Maybe Text
+<span class="lineno">   61 </span>    -- ^ Path-free: tilde form at most. Never a secret or a credential value.
+<span class="lineno">   62 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">stActions</span></span></span>  :: [Text]
+<span class="lineno">   63 </span>    -- ^ @create@ | @resume@ | @reopen@ | @recheck@ | @configure@.
+<span class="lineno">   64 </span>    -- @configure@ renders no action-bar button (the provider step has its own
+<span class="lineno">   65 </span>    -- inline form); the rest map to buttons.
+<span class="lineno">   66 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>-- | One row of the provider step's list. Carried on 'SetupState' so the
+<span class="lineno">   69 </span>-- provider step renders without a second call to @GET \/api\/providers\/all@
+<span class="lineno">   70 </span>-- (which decrypts once per provider name).
+<span class="lineno">   71 </span>data ProviderCard = ProviderCard
+<span class="lineno">   72 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">pcId</span></span></span>           :: Text
+<span class="lineno">   73 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pcLabel</span></span></span>        :: Text
+<span class="lineno">   74 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pcConfigured</span></span></span>   :: Bool
+<span class="lineno">   75 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pcIsDefault</span></span></span>    :: Bool
+<span class="lineno">   76 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pcDefaultModel</span></span></span> :: Maybe Text
+<span class="lineno">   77 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pcModels</span></span></span>      :: [Text]
+<span class="lineno">   78 </span>    -- ^ The operator's frequently-used models for this provider. Offered as
+<span class="lineno">   79 </span>    -- suggestions by the new-tab model combobox.
+<span class="lineno">   80 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pcRequiresBaseUrl</span></span></span> :: Bool
+<span class="lineno">   81 </span>    -- ^ True for providers with no built-in endpoint (the generic
+<span class="lineno">   82 </span>    -- OpenAI-compatible option): the wizard must collect the URL, and the
+<span class="lineno">   83 </span>    -- backend refuses to use the provider without one. Server-driven so the
+<span class="lineno">   84 </span>    -- wizard never has to know which provider is which.
+<span class="lineno">   85 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pcRequiresName</span></span></span> :: Bool
+<span class="lineno">   86 </span>    -- ^ True for the generic OpenAI-compatible option: each instance needs its
+<span class="lineno">   87 </span>    -- own unique name, which becomes the config key and the vault-key stem.
+<span class="lineno">   88 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   89 </span>
+<span class="lineno">   90 </span>data SetupState = SetupState
+<span class="lineno">   91 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">ssRequiredComplete</span></span></span> :: Bool
+<span class="lineno">   92 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ssSteps</span></span></span>            :: [SetupStep]
+<span class="lineno">   93 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ssProviders</span></span></span>        :: [ProviderCard]
+<span class="lineno">   94 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   95 </span>
+<span class="lineno">   96 </span>-- | Everything 'deriveSetupState' needs, as values.
+<span class="lineno">   97 </span>--
+<span class="lineno">   98 </span>-- The two @stat@ results ('siVaultFileExists', 'siIdentityReadable') are
+<span class="lineno">   99 </span>-- inputs rather than seams, so classification is testable without a
+<span class="lineno">  100 </span>-- filesystem; the caller does the two @stat@ calls against 'siPaths'.
+<span class="lineno">  101 </span>data SetupInputs = SetupInputs
+<span class="lineno">  102 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">siPaths</span></span></span>              :: SealPaths
+<span class="lineno">  103 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">siRuntime</span></span></span>            :: RuntimeConfig
+<span class="lineno">  104 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">siSecurity</span></span></span>           :: SecurityConfig
+<span class="lineno">  105 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">siSecurityProblem</span></span></span>    :: Maybe Text
+<span class="lineno">  106 </span>    -- ^ 'Just' a summary when @security.toml@ exists but does not parse.
+<span class="lineno">  107 </span>    -- 'Nothing' when it parsed (or was absent, in which case 'siSecurity' is
+<span class="lineno">  108 </span>    -- 'defaultSecurityConfig').
+<span class="lineno">  109 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">siHandle</span></span></span>             :: Maybe VaultHandle
+<span class="lineno">  110 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">siVaultFileExists</span></span></span>    :: Bool
+<span class="lineno">  111 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">siIdentityReadable</span></span></span>   :: Maybe Bool
+<span class="lineno">  112 </span>    -- ^ 'Nothing' = no identity recorded; @Just False@ = recorded but not a
+<span class="lineno">  113 </span>    -- readable regular file.
+<span class="lineno">  114 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">siHome</span></span></span>               :: FilePath
+<span class="lineno">  115 </span>    -- ^ The user's home directory, the base for the tilde form a detail may
+<span class="lineno">  116 </span>    -- show. 'emptySetupInputs' guesses it as the seal home's parent, which is
+<span class="lineno">  117 </span>    -- exactly right for the default @~/.seal@ layout; the handler can override
+<span class="lineno">  118 </span>    -- it with the real home directory.
+<span class="lineno">  119 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">siConfiguredProviders</span></span></span> :: IO [KnownProvider]
+<span class="lineno">  120 </span>    -- ^ The @adProviders@ seam. Never invoked for a YubiKey vault.
+<span class="lineno">  121 </span>  }
+<span class="lineno">  122 </span>
+<span class="lineno">  123 </span>-- | An &quot;empty install&quot;: no config files on disk, no handle, no vault, no
+<span class="lineno">  124 </span>-- provider probing. The base a handler overrides field by field.
+<span class="lineno">  125 </span>emptySetupInputs :: SealPaths -&gt; SetupInputs
+<span class="lineno">  126 </span><span class="decl"><span class="istickedoff">emptySetupInputs paths = SetupInputs</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="istickedoff">{ siPaths = paths</span>
+<span class="lineno">  128 </span><span class="spaces">  </span><span class="istickedoff">, siRuntime = defaultRuntimeConfig</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="istickedoff">, siSecurity = defaultSecurityConfig</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">, siSecurityProblem = Nothing</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">, siHandle = Nothing</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">, siVaultFileExists = False</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="istickedoff">, siIdentityReadable = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  134 </span><span class="spaces">  </span><span class="istickedoff">, siConfiguredProviders = pure []</span>
+<span class="lineno">  135 </span><span class="spaces">  </span><span class="istickedoff">, siHome = takeDirectory (spHome paths)</span>
+<span class="lineno">  136 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  137 </span>
+<span class="lineno">  138 </span>-- | The whole state. 'ssSteps' order is the wizard's order: vault first.
+<span class="lineno">  139 </span>deriveSetupState :: SetupInputs -&gt; IO SetupState
+<span class="lineno">  140 </span><span class="decl"><span class="istickedoff">deriveSetupState inputs = do</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">vault &lt;- classifyVault inputs</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">configured &lt;- configuredProviderIds inputs</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">let provider = classifyProvider inputs configured</span>
+<span class="lineno">  144 </span><span class="spaces">      </span><span class="istickedoff">steps = [vault, provider]</span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="istickedoff">pure SetupState</span>
+<span class="lineno">  146 </span><span class="spaces">    </span><span class="istickedoff">{ ssRequiredComplete = all isSatisfied steps</span>
+<span class="lineno">  147 </span><span class="spaces">    </span><span class="istickedoff">, ssSteps = steps</span>
+<span class="lineno">  148 </span><span class="spaces">    </span><span class="istickedoff">, ssProviders = providerCards inputs configured</span>
+<span class="lineno">  149 </span><span class="spaces">    </span><span class="istickedoff">}</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  151 </span><span class="spaces">    </span><span class="istickedoff">-- A future non-required step (chat channels) must not be able to block the</span>
+<span class="lineno">  152 </span><span class="spaces">    </span><span class="istickedoff">-- gate by accident: only required steps constrain completion.</span>
+<span class="lineno">  153 </span><span class="spaces">    </span><span class="istickedoff">isSatisfied step = not (stRequired step) || stStatus step == StepReady</span></span>
+<span class="lineno">  154 </span>
+<span class="lineno">  155 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  156 </span>-- Vault step (design §5.1, ordered by terminality)
+<span class="lineno">  157 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  158 </span>
+<span class="lineno">  159 </span>classifyVault :: SetupInputs -&gt; IO SetupStep
+<span class="lineno">  160 </span><span class="decl"><span class="istickedoff">classifyVault inputs</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="istickedoff">-- V0: the file exists but does not decode. Never attempt a write; the</span>
+<span class="lineno">  162 </span><span class="spaces">  </span><span class="istickedoff">-- runtime case is &quot;boot refused, then a later edit broke it&quot;.</span>
+<span class="lineno">  163 </span><span class="spaces">  </span><span class="istickedoff">| Just summary &lt;- siSecurityProblem inputs =</span>
+<span class="lineno">  164 </span><span class="spaces">      </span><span class="istickedoff">pure (blockedVault</span>
+<span class="lineno">  165 </span><span class="spaces">        </span><span class="istickedoff">(&quot;security.toml could not be parsed (&quot; &lt;&gt; summary</span>
+<span class="lineno">  166 </span><span class="spaces">          </span><span class="istickedoff">&lt;&gt; &quot;). Fix or restore it, then Re-check.&quot;)</span>
+<span class="lineno">  167 </span><span class="spaces">        </span><span class="istickedoff">[&quot;recheck&quot;])</span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="istickedoff">-- V1: an orphan vault file. Precedes the identity check on purpose: when</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="istickedoff">-- both are wrong the operator must attach a key first, and the reverse order</span>
+<span class="lineno">  170 </span><span class="spaces">  </span><span class="istickedoff">-- would give advice that cannot fix the blocker.</span>
+<span class="lineno">  171 </span><span class="spaces">  </span><span class="istickedoff">| siVaultFileExists inputs, isNothing recipient =</span>
+<span class="lineno">  172 </span><span class="spaces">      </span><span class="istickedoff">pure (blockedVault (orphanDetail inputs) [&quot;recheck&quot;])</span>
+<span class="lineno">  173 </span><span class="spaces">  </span><span class="istickedoff">-- V2: the recorded identity cannot be read.</span>
+<span class="lineno">  174 </span><span class="spaces">  </span><span class="istickedoff">| isJust recipient, Just False &lt;- siIdentityReadable inputs =</span>
+<span class="lineno">  175 </span><span class="spaces">      </span><span class="istickedoff">pure (blockedVault (identityDetail inputs) [&quot;recheck&quot;])</span>
+<span class="lineno">  176 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = do</span>
+<span class="lineno">  177 </span><span class="spaces">      </span><span class="istickedoff">locked &lt;- handleLocked (siHandle inputs)</span>
+<span class="lineno">  178 </span><span class="spaces">      </span><span class="istickedoff">pure (classifyWith locked)</span>
+<span class="lineno">  179 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  180 </span><span class="spaces">    </span><span class="istickedoff">security = siSecurity inputs</span>
+<span class="lineno">  181 </span><span class="spaces">    </span><span class="istickedoff">recipient = scVaultRecipient security</span>
+<span class="lineno">  182 </span><span class="spaces">    </span><span class="istickedoff">startupMode = scVaultUnlock security == Just &quot;startup&quot;</span>
+<span class="lineno">  183 </span><span class="spaces">    </span><span class="istickedoff">hasHandle = isJust (siHandle inputs)</span>
+<span class="lineno">  184 </span><span class="spaces">    </span><span class="istickedoff">vaultExists = siVaultFileExists inputs</span>
+<span class="lineno">  185 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  186 </span><span class="spaces">    </span><span class="istickedoff">classifyWith locked</span>
+<span class="lineno">  187 </span><span class="spaces">      </span><span class="istickedoff">-- V3: startup mode, handle present, genuinely locked.</span>
+<span class="lineno">  188 </span><span class="spaces">      </span><span class="istickedoff">| hasHandle, startupMode, <span class="tickonlytrue">locked</span> =</span>
+<span class="lineno">  189 </span><span class="spaces">          </span><span class="istickedoff">blockedVault</span>
+<span class="lineno">  190 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">&quot;The vault is locked (mode: `startup`). Reopen it here, or run \</span></span>
+<span class="lineno">  191 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">\`/vault unlock` in `seal tui`.&quot;</span></span>
+<span class="lineno">  192 </span><span class="spaces">            </span><span class="istickedoff">[&quot;reopen&quot;, &quot;recheck&quot;]</span>
+<span class="lineno">  193 </span><span class="spaces">      </span><span class="istickedoff">-- V4: configured on disk but no handle in this process.</span>
+<span class="lineno">  194 </span><span class="spaces">      </span><span class="istickedoff">| isJust recipient, vaultExists, not hasHandle =</span>
+<span class="lineno">  195 </span><span class="spaces">          </span><span class="istickedoff">blockedVault <span class="nottickedoff">&quot;The vault is configured but not open in this process.&quot;</span> [&quot;reopen&quot;]</span>
+<span class="lineno">  196 </span><span class="spaces">      </span><span class="istickedoff">-- V5: key recorded, no vault file — one click from done.</span>
+<span class="lineno">  197 </span><span class="spaces">      </span><span class="istickedoff">| isJust recipient, not vaultExists =</span>
+<span class="lineno">  198 </span><span class="spaces">          </span><span class="istickedoff">pendingVault <span class="nottickedoff">&quot;Finish creating the vault (a key is already recorded).&quot;</span> [&quot;resume&quot;]</span>
+<span class="lineno">  199 </span><span class="spaces">      </span><span class="istickedoff">-- V6: open, on disk, identity readable, and not genuinely locked.</span>
+<span class="lineno">  200 </span><span class="spaces">      </span><span class="istickedoff">| hasHandle, vaultExists, <span class="tickonlytrue">not (startupMode &amp;&amp; <span class="nottickedoff">locked</span>)</span> =</span>
+<span class="lineno">  201 </span><span class="spaces">          </span><span class="istickedoff">readyVault (&quot;Key type: `&quot; &lt;&gt; fromMaybe <span class="nottickedoff">&quot;unknown&quot;</span> (scVaultKeyType security) &lt;&gt; &quot;`.&quot;)</span>
+<span class="lineno">  202 </span><span class="spaces">      </span><span class="istickedoff">-- Nothing recorded, no vault file: the clean first run.</span>
+<span class="lineno">  203 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> =</span>
+<span class="lineno">  204 </span><span class="spaces">          </span><span class="istickedoff">pendingVault &quot;Create an encrypted vault for API keys and tokens.&quot; [&quot;create&quot;]</span></span>
+<span class="lineno">  205 </span>
+<span class="lineno">  206 </span>handleLocked :: Maybe VaultHandle -&gt; IO Bool
+<span class="lineno">  207 </span><span class="decl"><span class="istickedoff">handleLocked Nothing = pure <span class="nottickedoff">False</span></span>
+<span class="lineno">  208 </span><span class="spaces"></span><span class="istickedoff">handleLocked (Just handle) = vsLocked &lt;$&gt; vhStatus handle</span></span>
+<span class="lineno">  209 </span>
+<span class="lineno">  210 </span>orphanDetail :: SetupInputs -&gt; Text
+<span class="lineno">  211 </span><span class="decl"><span class="istickedoff">orphanDetail inputs =</span>
+<span class="lineno">  212 </span><span class="spaces">  </span><span class="istickedoff">&quot;A vault file exists at &quot; &lt;&gt; displayPath inputs (configuredVaultPath inputs)</span>
+<span class="lineno">  213 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; &quot; but no key is recorded. Run `seal tui`, then `/vault setup` to attach \</span>
+<span class="lineno">  214 </span><span class="spaces">       </span><span class="istickedoff">\a key, then Re-check.&quot;</span></span>
+<span class="lineno">  215 </span>
+<span class="lineno">  216 </span>identityDetail :: SetupInputs -&gt; Text
+<span class="lineno">  217 </span><span class="decl"><span class="istickedoff">identityDetail inputs =</span>
+<span class="lineno">  218 </span><span class="spaces">  </span><span class="istickedoff">&quot;security.toml names `&quot; &lt;&gt; identityBasename inputs &lt;&gt; &quot;`, which cannot be \</span>
+<span class="lineno">  219 </span><span class="spaces">  </span><span class="istickedoff">\read. Fix ~/.seal/security.toml or re-run `/vault setup` in `seal tui`, \</span>
+<span class="lineno">  220 </span><span class="spaces">  </span><span class="istickedoff">\then Re-check.&quot;</span></span>
+<span class="lineno">  221 </span>
+<span class="lineno">  222 </span>identityBasename :: SetupInputs -&gt; Text
+<span class="lineno">  223 </span><span class="decl"><span class="istickedoff">identityBasename inputs = case scVaultIdentity (siSecurity inputs) of</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">&quot;the identity file&quot;</span></span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="istickedoff">Just raw -&gt; T.pack (takeFileName (T.unpack raw))</span></span>
+<span class="lineno">  226 </span>
+<span class="lineno">  227 </span>configuredVaultPath :: SetupInputs -&gt; FilePath
+<span class="lineno">  228 </span><span class="decl"><span class="istickedoff">configuredVaultPath inputs =</span>
+<span class="lineno">  229 </span><span class="spaces">  </span><span class="istickedoff">maybe (vaultFilePath (siPaths inputs)) <span class="nottickedoff">T.unpack</span> (scVaultPath (siSecurity inputs))</span></span>
+<span class="lineno">  230 </span>
+<span class="lineno">  231 </span>-- | Render a path for a detail. Tilde form when it is under the user's home
+<span class="lineno">  232 </span>-- (@~/.seal/config/vault/vault.age@); otherwise the file name alone. A detail
+<span class="lineno">  233 </span>-- must never carry an absolute path (design §5.1), so an unusual @SEAL_HOME@
+<span class="lineno">  234 </span>-- loses the location rather than disclosing it.
+<span class="lineno">  235 </span>displayPath :: SetupInputs -&gt; FilePath -&gt; Text
+<span class="lineno">  236 </span><span class="decl"><span class="istickedoff">displayPath inputs path = case stripPrefix (siHome inputs &lt;&gt; &quot;/&quot;) path of</span>
+<span class="lineno">  237 </span><span class="spaces">  </span><span class="istickedoff">Just rest -&gt; &quot;~/&quot; &lt;&gt; T.pack rest</span>
+<span class="lineno">  238 </span><span class="spaces">  </span><span class="istickedoff">Nothing   -&gt; <span class="nottickedoff">T.pack (takeFileName path)</span></span></span>
+<span class="lineno">  239 </span>
+<span class="lineno">  240 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  241 </span>-- Provider step (design §5.2)
+<span class="lineno">  242 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  243 </span>
+<span class="lineno">  244 </span>-- | Which provider ids count as configured. For a YubiKey vault this is
+<span class="lineno">  245 </span>-- config-only (@[providers.*]@ sections), because asking the vault would
+<span class="lineno">  246 </span>-- decrypt — and a decrypt on a YubiKey identity means a physical touch.
+<span class="lineno">  247 </span>configuredProviderIds :: SetupInputs -&gt; IO (Set Text)
+<span class="lineno">  248 </span><span class="decl"><span class="istickedoff">configuredProviderIds inputs</span>
+<span class="lineno">  249 </span><span class="spaces">  </span><span class="istickedoff">| isYubiKeyVault inputs =</span>
+<span class="lineno">  250 </span><span class="spaces">      </span><span class="istickedoff">pure (Set.fromList (Map.keys (rcProviders (siRuntime inputs))))</span>
+<span class="lineno">  251 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = do</span>
+<span class="lineno">  252 </span><span class="spaces">      </span><span class="istickedoff">builtins &lt;- map providerLabel &lt;$&gt; siConfiguredProviders inputs</span>
+<span class="lineno">  253 </span><span class="spaces">      </span><span class="istickedoff">customs &lt;- configuredCustomProviderNames <span class="nottickedoff">(siHandle inputs)</span> (siRuntime inputs)</span>
+<span class="lineno">  254 </span><span class="spaces">      </span><span class="istickedoff">pure (Set.fromList (builtins &lt;&gt; customs))</span></span>
+<span class="lineno">  255 </span>
+<span class="lineno">  256 </span>classifyProvider :: SetupInputs -&gt; Set Text -&gt; SetupStep
+<span class="lineno">  257 </span><span class="decl"><span class="istickedoff">classifyProvider inputs configured =</span>
+<span class="lineno">  258 </span><span class="spaces">  </span><span class="istickedoff">case rcDefaultProvider (siRuntime inputs) of</span>
+<span class="lineno">  259 </span><span class="spaces">    </span><span class="istickedoff">Just label</span>
+<span class="lineno">  260 </span><span class="spaces">      </span><span class="istickedoff">-- P1</span>
+<span class="lineno">  261 </span><span class="spaces">      </span><span class="istickedoff">| isYubiKeyVault inputs || Set.member label configured -&gt;</span>
+<span class="lineno">  262 </span><span class="spaces">          </span><span class="istickedoff">readyProvider (label &lt;&gt; &quot; · &quot; &lt;&gt; modelFor inputs label)</span>
+<span class="lineno">  263 </span><span class="spaces">      </span><span class="istickedoff">-- P2</span>
+<span class="lineno">  264 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt;</span>
+<span class="lineno">  265 </span><span class="spaces">          </span><span class="istickedoff">pendingProvider (&quot;Add credentials for &quot; &lt;&gt; label &lt;&gt; &quot;.&quot;) <span class="nottickedoff">[&quot;configure&quot;]</span></span>
+<span class="lineno">  266 </span><span class="spaces">    </span><span class="istickedoff">Nothing</span>
+<span class="lineno">  267 </span><span class="spaces">      </span><span class="istickedoff">-- P3</span>
+<span class="lineno">  268 </span><span class="spaces">      </span><span class="istickedoff">| not (Set.null configured) -&gt;</span>
+<span class="lineno">  269 </span><span class="spaces">          </span><span class="istickedoff">pendingProvider &quot;Choose which provider new sessions should use.&quot; <span class="nottickedoff">[&quot;configure&quot;]</span></span>
+<span class="lineno">  270 </span><span class="spaces">      </span><span class="istickedoff">-- P4</span>
+<span class="lineno">  271 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt;</span>
+<span class="lineno">  272 </span><span class="spaces">          </span><span class="istickedoff">pendingProvider</span>
+<span class="lineno">  273 </span><span class="spaces">            </span><span class="istickedoff">&quot;Add an LLM provider: anthropic, openrouter, ollama, or an \</span>
+<span class="lineno">  274 </span><span class="spaces">            </span><span class="istickedoff">\OpenAI-compatible endpoint.&quot;</span>
+<span class="lineno">  275 </span><span class="spaces">            </span><span class="istickedoff">[&quot;configure&quot;]</span></span>
+<span class="lineno">  276 </span>
+<span class="lineno">  277 </span>-- | The model a session would actually use: the global default, else the
+<span class="lineno">  278 </span>-- provider's configured default, else the provider's hardcoded default. A
+<span class="lineno">  279 </span>-- custom OpenAI-compatible instance falls back to that implementation's
+<span class="lineno">  280 </span>-- default.
+<span class="lineno">  281 </span>modelFor :: SetupInputs -&gt; Text -&gt; Text
+<span class="lineno">  282 </span><span class="decl"><span class="istickedoff">modelFor inputs label =</span>
+<span class="lineno">  283 </span><span class="spaces">  </span><span class="istickedoff">case rcDefaultModel (siRuntime inputs) of</span>
+<span class="lineno">  284 </span><span class="spaces">    </span><span class="istickedoff">Just m -&gt; <span class="nottickedoff">m</span></span>
+<span class="lineno">  285 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt;</span>
+<span class="lineno">  286 </span><span class="spaces">      </span><span class="istickedoff">let ModelId m = resolveDefaultModelForName (siRuntime inputs) label</span>
+<span class="lineno">  287 </span><span class="spaces">      </span><span class="istickedoff">in m</span></span>
+<span class="lineno">  288 </span>
+<span class="lineno">  289 </span>providerCards :: SetupInputs -&gt; Set Text -&gt; [ProviderCard]
+<span class="lineno">  290 </span><span class="decl"><span class="istickedoff">providerCards inputs configured =</span>
+<span class="lineno">  291 </span><span class="spaces">  </span><span class="istickedoff">[ ProviderCard</span>
+<span class="lineno">  292 </span><span class="spaces">      </span><span class="istickedoff">{ pcId = providerLabel known</span>
+<span class="lineno">  293 </span><span class="spaces">      </span><span class="istickedoff">, pcLabel = providerDisplayName known</span>
+<span class="lineno">  294 </span><span class="spaces">      </span><span class="istickedoff">, pcConfigured = Set.member (providerLabel known) configured</span>
+<span class="lineno">  295 </span><span class="spaces">      </span><span class="istickedoff">, pcIsDefault = rcDefaultProvider (siRuntime inputs) == Just <span class="nottickedoff">(providerLabel known)</span></span>
+<span class="lineno">  296 </span><span class="spaces">      </span><span class="istickedoff">, pcDefaultModel = providerDefaultModel (siRuntime inputs) (providerLabel known)</span>
+<span class="lineno">  297 </span><span class="spaces">      </span><span class="istickedoff">, pcModels = providerModels (siRuntime inputs) (providerLabel known)</span>
+<span class="lineno">  298 </span><span class="spaces">      </span><span class="istickedoff">, pcRequiresBaseUrl = case known of</span>
+<span class="lineno">  299 </span><span class="spaces">          </span><span class="istickedoff">OpenAICompatibleProvider -&gt; True</span>
+<span class="lineno">  300 </span><span class="spaces">          </span><span class="istickedoff">_ -&gt; False</span>
+<span class="lineno">  301 </span><span class="spaces">      </span><span class="istickedoff">, pcRequiresName = case known of</span>
+<span class="lineno">  302 </span><span class="spaces">          </span><span class="istickedoff">OpenAICompatibleProvider -&gt; True</span>
+<span class="lineno">  303 </span><span class="spaces">          </span><span class="istickedoff">_ -&gt; False</span>
+<span class="lineno">  304 </span><span class="spaces">      </span><span class="istickedoff">}</span>
+<span class="lineno">  305 </span><span class="spaces">  </span><span class="istickedoff">| known &lt;- knownProviders</span>
+<span class="lineno">  306 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">  307 </span>
+<span class="lineno">  308 </span>-- | The card's display name. Branding is explicit rather than derived: a
+<span class="lineno">  309 </span>-- mechanical capitalise turns @openrouter@ into &quot;Openrouter&quot;.
+<span class="lineno">  310 </span>providerDisplayName :: KnownProvider -&gt; Text
+<span class="lineno">  311 </span><span class="decl"><span class="istickedoff">providerDisplayName known = case known of</span>
+<span class="lineno">  312 </span><span class="spaces">  </span><span class="istickedoff">AnthropicProvider  -&gt; &quot;Anthropic&quot;</span>
+<span class="lineno">  313 </span><span class="spaces">  </span><span class="istickedoff">OllamaProvider     -&gt; &quot;Ollama&quot;</span>
+<span class="lineno">  314 </span><span class="spaces">  </span><span class="istickedoff">OpenRouterProvider -&gt; &quot;OpenRouter&quot;</span>
+<span class="lineno">  315 </span><span class="spaces">  </span><span class="istickedoff">OpenAICompatibleProvider -&gt; &quot;OpenAI-compatible&quot;</span></span>
+<span class="lineno">  316 </span>
+<span class="lineno">  317 </span>isYubiKeyVault :: SetupInputs -&gt; Bool
+<span class="lineno">  318 </span><span class="decl"><span class="istickedoff">isYubiKeyVault inputs = scVaultKeyType (siSecurity inputs) == Just &quot;yubikey&quot;</span></span>
+<span class="lineno">  319 </span>
+<span class="lineno">  320 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  321 </span>-- Constructors
+<span class="lineno">  322 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  323 </span>
+<span class="lineno">  324 </span>vaultStepId, providerStepId :: Text
+<span class="lineno">  325 </span><span class="decl"><span class="istickedoff">vaultStepId = &quot;vault&quot;</span></span>
+<span class="lineno">  326 </span><span class="decl"><span class="istickedoff">providerStepId = &quot;provider&quot;</span></span>
+<span class="lineno">  327 </span>
+<span class="lineno">  328 </span>readyVault :: Text -&gt; SetupStep
+<span class="lineno">  329 </span><span class="decl"><span class="istickedoff">readyVault detail = SetupStep vaultStepId True StepReady (Just detail) <span class="nottickedoff">[]</span></span></span>
+<span class="lineno">  330 </span>
+<span class="lineno">  331 </span>pendingVault :: Text -&gt; [Text] -&gt; SetupStep
+<span class="lineno">  332 </span><span class="decl"><span class="istickedoff">pendingVault detail = SetupStep vaultStepId True StepPending (Just detail)</span></span>
+<span class="lineno">  333 </span>
+<span class="lineno">  334 </span>blockedVault :: Text -&gt; [Text] -&gt; SetupStep
+<span class="lineno">  335 </span><span class="decl"><span class="istickedoff">blockedVault detail = SetupStep vaultStepId True StepBlocked (Just detail)</span></span>
+<span class="lineno">  336 </span>
+<span class="lineno">  337 </span>readyProvider :: Text -&gt; SetupStep
+<span class="lineno">  338 </span><span class="decl"><span class="istickedoff">readyProvider detail = SetupStep providerStepId True StepReady (Just detail) <span class="nottickedoff">[]</span></span></span>
+<span class="lineno">  339 </span>
+<span class="lineno">  340 </span>pendingProvider :: Text -&gt; [Text] -&gt; SetupStep
+<span class="lineno">  341 </span><span class="decl"><span class="istickedoff">pendingProvider detail = SetupStep providerStepId True StepPending (Just detail)</span></span>
+
+</pre>
+</body>
+</html>

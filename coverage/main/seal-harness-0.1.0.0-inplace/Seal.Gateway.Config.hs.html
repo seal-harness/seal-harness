@@ -1,0 +1,315 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The @[gateway]@ config section: port, bind host, static dir, allowed
+<span class="lineno">    3 </span>-- origins. The server binds loopback by default; a non-loopback host emits
+<span class="lineno">    4 </span>-- a runtime warning (the full slash-command surface is reachable by
+<span class="lineno">    5 </span>-- anything that can reach the address).
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- The section is defined here and configured in @~\/.seal\/security.toml@
+<span class="lineno">    8 </span>-- (@[gateway]@ in 'Seal.Config.Security.SecurityConfig'), not in
+<span class="lineno">    9 </span>-- @config.toml@: the bind address, the Origin allowlist and the TLS settings
+<span class="lineno">   10 </span>-- decide who can reach the gateway, so no opcode or gateway config writer may
+<span class="lineno">   11 </span>-- express a change to them.
+<span class="lineno">   12 </span>module Seal.Gateway.Config
+<span class="lineno">   13 </span>  ( GatewayConfig (..)
+<span class="lineno">   14 </span>  , PartialGatewayConfig (..)
+<span class="lineno">   15 </span>  , defaultGatewayConfig
+<span class="lineno">   16 </span>  , gatewayConfigCodec
+<span class="lineno">   17 </span>  , gatewayTableCodec
+<span class="lineno">   18 </span>  , loadLegacyGatewayTable
+<span class="lineno">   19 </span>  , withGatewayDefaults
+<span class="lineno">   20 </span>  , tlsEnabled
+<span class="lineno">   21 </span>  , effectiveTlsPaths
+<span class="lineno">   22 </span>  , tlsConfigError
+<span class="lineno">   23 </span>  , tlsOriginError
+<span class="lineno">   24 </span>  , gatewayHostError
+<span class="lineno">   25 </span>  , hostResolves
+<span class="lineno">   26 </span>  , gatewayHostResolutionError
+<span class="lineno">   27 </span>  ) where
+<span class="lineno">   28 </span>
+<span class="lineno">   29 </span>import Control.Exception (IOException, try)
+<span class="lineno">   30 </span>import Data.Char (isSpace)
+<span class="lineno">   31 </span>import Data.Maybe (fromMaybe, isJust)
+<span class="lineno">   32 </span>import Data.Text (Text)
+<span class="lineno">   33 </span>import Data.Text qualified as T
+<span class="lineno">   34 </span>import Data.Text.IO qualified as TIO
+<span class="lineno">   35 </span>import Network.Socket
+<span class="lineno">   36 </span>  ( AddrInfo (..), AddrInfoFlag (AI_PASSIVE), SocketType (Stream), defaultHints
+<span class="lineno">   37 </span>  , getAddrInfo )
+<span class="lineno">   38 </span>import System.Directory (doesFileExist)
+<span class="lineno">   39 </span>import Validation (Validation (..))
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>import Toml ((.=))
+<span class="lineno">   42 </span>import Toml qualified
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>-- | The gateway config section.
+<span class="lineno">   45 </span>data GatewayConfig = GatewayConfig
+<span class="lineno">   46 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">gcPort</span></span></span>           :: Int        -- ^ default 8080 (REST + static + the WS stream)
+<span class="lineno">   47 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">gcHost</span></span></span>           :: Text
+<span class="lineno">   48 </span>    -- ^ default &quot;localhost&quot; — the one loopback name browsers treat as a
+<span class="lineno">   49 </span>    -- passkey-capable secure context. Handed to Warp as the bind address.
+<span class="lineno">   50 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">gcStaticDir</span></span></span>      :: Maybe Text  -- ^ the frontend dist dir (Nothing = no static serving)
+<span class="lineno">   51 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">gcAllowedOrigins</span></span></span> :: [Text]     -- ^ the WS Origin allowlist (default localhost:8080)
+<span class="lineno">   52 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">gcFileExplorerEnabled</span></span></span> :: Maybe Bool -- ^ enable the file explorer (default True; set False to disable)
+<span class="lineno">   53 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">gcTlsCert</span></span></span>        :: Maybe Text
+<span class="lineno">   54 </span>    -- ^ PEM certificate chain. Set together with 'gcTlsKey' to serve HTTPS
+<span class="lineno">   55 </span>    -- directly, with no reverse proxy in front.
+<span class="lineno">   56 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">gcTlsKey</span></span></span>         :: Maybe Text
+<span class="lineno">   57 </span>    -- ^ PEM private key.
+<span class="lineno">   58 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">gcTls</span></span></span>            :: Bool
+<span class="lineno">   59 </span>    -- ^ Serve HTTPS. The PEM paths default to @keys\/tls\/@{cert,key}@.on.pem
+<span class="lineno">   60 </span>    -- under @SEAL_HOME@, so this flag alone is the whole configuration.
+<span class="lineno">   61 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">gcTlsHosts</span></span></span>       :: [Text]
+<span class="lineno">   62 </span>    -- ^ Names to put in a generated certificate's subject alternative name.
+<span class="lineno">   63 </span>    -- These come first, in order. Everything else is derived: the origin's
+<span class="lineno">   64 </span>    -- host, the bind host (if it names a machine), the machine hostname, every
+<span class="lineno">   65 </span>    -- local interface address, and loopback — see
+<span class="lineno">   66 </span>    -- 'Seal.Security.TlsCert.sanHostsFor'.
+<span class="lineno">   67 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   68 </span>
+<span class="lineno">   69 </span>-- | The compiled-in default. Loopback + port 8080 + the local origin.
+<span class="lineno">   70 </span>defaultGatewayConfig :: GatewayConfig
+<span class="lineno">   71 </span><span class="decl"><span class="istickedoff">defaultGatewayConfig = GatewayConfig</span>
+<span class="lineno">   72 </span><span class="spaces">  </span><span class="istickedoff">{ gcPort = 8080</span>
+<span class="lineno">   73 </span><span class="spaces">  </span><span class="istickedoff">, gcHost = &quot;localhost&quot;</span>
+<span class="lineno">   74 </span><span class="spaces">  </span><span class="istickedoff">, gcStaticDir = Nothing</span>
+<span class="lineno">   75 </span><span class="spaces">  </span><span class="istickedoff">, gcAllowedOrigins = [&quot;http://localhost:8080&quot;]</span>
+<span class="lineno">   76 </span><span class="spaces">  </span><span class="istickedoff">, gcFileExplorerEnabled = Nothing</span>
+<span class="lineno">   77 </span><span class="spaces">  </span><span class="istickedoff">, gcTlsCert = Nothing</span>
+<span class="lineno">   78 </span><span class="spaces">  </span><span class="istickedoff">, gcTlsKey = Nothing</span>
+<span class="lineno">   79 </span><span class="spaces">  </span><span class="istickedoff">, gcTls = False</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">, gcTlsHosts = []</span>
+<span class="lineno">   81 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   82 </span>
+<span class="lineno">   83 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   84 </span>-- Host validation
+<span class="lineno">   85 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   86 </span>--
+<span class="lineno">   87 </span>-- @[gateway] host@ is handed straight to Warp (see 'Seal.Gateway.Server.warpSettingsFor'),
+<span class="lineno">   88 </span>-- so a value that cannot bind is now a boot refusal. Before the host was wired
+<span class="lineno">   89 </span>-- to the listener, any string was survivable: it only fed the printed URL, the
+<span class="lineno">   90 </span>-- derived origins, and the exposed-bind warning.
+<span class="lineno">   91 </span>
+<span class="lineno">   92 </span>-- | A @[gateway] host@ value that could never be bound. Purely syntactic.
+<span class="lineno">   93 </span>--
+<span class="lineno">   94 </span>-- 'gatewayHostResolutionError' asks the resolver about the values that pass
+<span class="lineno">   95 </span>-- this check, so the two refusals stay independently testable.
+<span class="lineno">   96 </span>-- Every clause inspects @raw@, never a trimmed copy: the caller hands this
+<span class="lineno">   97 </span>-- exact string to Warp ('Seal.Gateway.Server.warpSettingsFor'), so a value that
+<span class="lineno">   98 </span>-- passes here has to be one the resolver will accept. Trimming first would let
+<span class="lineno">   99 </span>-- @host = &quot; localhost &quot;@ through both gates and fail inside the bind, after the
+<span class="lineno">  100 </span>-- banner, with a message that names neither the key nor the mistake.
+<span class="lineno">  101 </span>gatewayHostError :: Text -&gt; Maybe Text
+<span class="lineno">  102 </span><span class="decl"><span class="istickedoff">gatewayHostError raw</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">| T.null (T.strip raw) = Just (hostRefusal &quot;it is empty or blank&quot; emptyFix)</span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="istickedoff">| T.any isSpace raw    = Just <span class="nottickedoff">(hostRefusal &quot;it contains whitespace&quot; spacedFix)</span></span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="istickedoff">| T.any (== '/') raw   = Just <span class="nottickedoff">(hostRefusal &quot;it looks like a URL or a path&quot; bareFix)</span></span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="istickedoff">| T.any (`elem` bracketed) raw =</span>
+<span class="lineno">  107 </span><span class="spaces">      </span><span class="istickedoff">Just <span class="nottickedoff">(hostRefusal &quot;it is bracketed&quot;</span></span>
+<span class="lineno">  108 </span><span class="spaces">             </span><span class="istickedoff"><span class="nottickedoff">&quot;write an IPv6 literal without brackets, e.g. \&quot;::1\&quot;&quot;)</span></span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Nothing</span>
+<span class="lineno">  110 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  111 </span><span class="spaces">    </span><span class="istickedoff">bracketed = &quot;[]&quot; :: String</span>
+<span class="lineno">  112 </span><span class="spaces">    </span><span class="istickedoff">emptyFix = &quot;set a hostname (\&quot;localhost\&quot;) or a wildcard (\&quot;0.0.0.0\&quot;)&quot;</span>
+<span class="lineno">  113 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">spacedFix = &quot;remove the surrounding or embedded whitespace: \&quot;localhost\&quot;&quot;</span></span>
+<span class="lineno">  114 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">bareFix = &quot;write the bare host or address, e.g. \&quot;localhost\&quot; or \&quot;0.0.0.0\&quot;&quot;</span></span></span>
+<span class="lineno">  115 </span>
+<span class="lineno">  116 </span>hostRefusal :: Text -&gt; Text -&gt; Text
+<span class="lineno">  117 </span><span class="decl"><span class="istickedoff">hostRefusal why fix =</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">&quot;[gateway] host is not a bindable address: &quot; &lt;&gt; why &lt;&gt; &quot;.\n  &quot; &lt;&gt; fix</span></span>
+<span class="lineno">  119 </span>
+<span class="lineno">  120 </span>-- | Does @host@ resolve to at least one address?
+<span class="lineno">  121 </span>--
+<span class="lineno">  122 </span>-- &quot;Resolvable&quot;, not &quot;local&quot;: Warp may legitimately bind any address this
+<span class="lineno">  123 </span>-- machine has, and a tailnet or LAN address is a normal @[gateway] host@ value.
+<span class="lineno">  124 </span>-- A name that resolves to an address the machine does not own still fails at
+<span class="lineno">  125 </span>-- bind time with Warp's own error; this check exists to catch typos and
+<span class="lineno">  126 </span>-- unusable spellings before anything starts listening.
+<span class="lineno">  127 </span>hostResolves :: Text -&gt; IO Bool
+<span class="lineno">  128 </span><span class="decl"><span class="istickedoff">hostResolves raw = do</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="istickedoff">let hints = defaultHints { addrFlags = [AI_PASSIVE], addrSocketType = Stream }</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">resolved &lt;-</span>
+<span class="lineno">  131 </span><span class="spaces">    </span><span class="istickedoff">try (getAddrInfo (Just hints) (Just (T.unpack raw)) Nothing)</span>
+<span class="lineno">  132 </span><span class="spaces">      </span><span class="istickedoff">:: IO (Either IOException [AddrInfo])</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="istickedoff">pure (either <span class="nottickedoff">(const False)</span> (not . null) resolved)</span></span>
+<span class="lineno">  134 </span>
+<span class="lineno">  135 </span>-- | The resolver-backed half of the host check.
+<span class="lineno">  136 </span>--
+<span class="lineno">  137 </span>-- The resolver is a parameter so the refusal branch is testable without DNS;
+<span class="lineno">  138 </span>-- @seal serve@ passes 'hostResolves'.
+<span class="lineno">  139 </span>gatewayHostResolutionError :: (Text -&gt; IO Bool) -&gt; Text -&gt; IO (Maybe Text)
+<span class="lineno">  140 </span><span class="decl"><span class="istickedoff">gatewayHostResolutionError resolves raw = do</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">ok &lt;- resolves raw</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">pure $ if ok</span>
+<span class="lineno">  143 </span><span class="spaces">    </span><span class="istickedoff">then Nothing</span>
+<span class="lineno">  144 </span><span class="spaces">    </span><span class="istickedoff">else Just</span>
+<span class="lineno">  145 </span><span class="spaces">      </span><span class="istickedoff">(&quot;[gateway] host = \&quot;&quot; &lt;&gt; raw &lt;&gt; &quot;\&quot; does not resolve to any address.\n&quot;</span>
+<span class="lineno">  146 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot;  Fix or remove the line (the default is \&quot;localhost\&quot;), or set\n&quot;</span>
+<span class="lineno">  147 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot;  host = \&quot;0.0.0.0\&quot; to bind every interface.&quot;)</span></span>
+<span class="lineno">  148 </span>
+<span class="lineno">  149 </span>-- | Bidirectional tomland codec for the @[gateway]@ section. Every field is
+<span class="lineno">  150 </span>-- optional: a missing key decodes as 'Nothing', then 'withGatewayDefaults'
+<span class="lineno">  151 </span>-- (called by 'Seal.Command.Serve.runServeMain') fills in the
+<span class="lineno">  152 </span>-- 'defaultGatewayConfig' values. This lets a user set just @host@ or just
+<span class="lineno">  153 </span>-- @port@ without specifying the rest.
+<span class="lineno">  154 </span>gatewayConfigCodec :: Toml.TomlCodec PartialGatewayConfig
+<span class="lineno">  155 </span><span class="decl"><span class="istickedoff">gatewayConfigCodec = PartialGatewayConfig</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="istickedoff">&lt;$&gt; Toml.dimap (fmap fromIntegral) (fmap fromIntegral) (Toml.dioptional (Toml.integer &quot;port&quot;)) .= pgcPort</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;host&quot;) .= pgcHost</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;static_dir&quot;) .= pgcStaticDir</span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; originsCodec .= pgcAllowedOrigins</span>
+<span class="lineno">  160 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.bool &quot;file_explorer_enabled&quot;) .= pgcFileExplorerEnabled</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;tls_cert&quot;) .= pgcTlsCert</span>
+<span class="lineno">  162 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;tls_key&quot;) .= pgcTlsKey</span>
+<span class="lineno">  163 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.bool &quot;tls&quot;) .= pgcTls</span>
+<span class="lineno">  164 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; hostsCodec .= pgcTlsHosts</span></span>
+<span class="lineno">  165 </span>
+<span class="lineno">  166 </span>-- | Codec for the @[gateway]@ table itself — the one definition of where the
+<span class="lineno">  167 </span>-- section lives. Three consumers share it: @security.toml@'s document codec
+<span class="lineno">  168 </span>-- ('Seal.Config.Security.securityConfigCodec'), the pre-migration
+<span class="lineno">  169 </span>-- read-through in @seal access-control@ ('loadLegacyGatewayTable'), and the
+<span class="lineno">  170 </span>-- write guard that refuses to re-encode a @config.toml@ still carrying the
+<span class="lineno">  171 </span>-- table ('Seal.Config.File.updateRuntimeConfig').
+<span class="lineno">  172 </span>gatewayTableCodec :: Toml.TomlCodec (Maybe PartialGatewayConfig)
+<span class="lineno">  173 </span><span class="decl"><span class="istickedoff">gatewayTableCodec = Toml.dioptional (Toml.table gatewayConfigCodec &quot;gateway&quot;)</span></span>
+<span class="lineno">  174 </span>
+<span class="lineno">  175 </span>-- | Decode the @[gateway]@ table out of a TOML file, ignoring every other key.
+<span class="lineno">  176 </span>-- 'Nothing' means the file is absent, does not parse, or has no table.
+<span class="lineno">  177 </span>--
+<span class="lineno">  178 </span>-- Only for the upgrade window: while an install still has its gateway settings
+<span class="lineno">  179 </span>-- in @config.toml@, @seal access-control@ reads them from there instead of
+<span class="lineno">  180 </span>-- silently resolving the loopback defaults. The first @seal serve@/@seal tui@
+<span class="lineno">  181 </span>-- moves the table into @security.toml@ and this path goes quiet.
+<span class="lineno">  182 </span>loadLegacyGatewayTable :: FilePath -&gt; IO (Maybe PartialGatewayConfig)
+<span class="lineno">  183 </span><span class="decl"><span class="istickedoff">loadLegacyGatewayTable path = do</span>
+<span class="lineno">  184 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  185 </span><span class="spaces">  </span><span class="istickedoff">if not exists then pure Nothing else do</span>
+<span class="lineno">  186 </span><span class="spaces">    </span><span class="istickedoff">outcome &lt;- try (TIO.readFile path) :: IO (Either IOException Text)</span>
+<span class="lineno">  187 </span><span class="spaces">    </span><span class="istickedoff">pure $ case outcome of</span>
+<span class="lineno">  188 </span><span class="spaces">      </span><span class="istickedoff">Left _     -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  189 </span><span class="spaces">      </span><span class="istickedoff">Right text -&gt; case Toml.parse text of</span>
+<span class="lineno">  190 </span><span class="spaces">        </span><span class="istickedoff">Left _     -&gt; Nothing</span>
+<span class="lineno">  191 </span><span class="spaces">        </span><span class="istickedoff">Right toml -&gt; case Toml.runTomlCodec gatewayTableCodec toml of</span>
+<span class="lineno">  192 </span><span class="spaces">          </span><span class="istickedoff">Success table -&gt; table</span>
+<span class="lineno">  193 </span><span class="spaces">          </span><span class="istickedoff">Failure _     -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  194 </span>
+<span class="lineno">  195 </span>-- | A partial gateway config where every field is optional. 'withGatewayDefaults'
+<span class="lineno">  196 </span>-- merges it with 'defaultGatewayConfig' to produce a complete 'GatewayConfig'.
+<span class="lineno">  197 </span>data PartialGatewayConfig = PartialGatewayConfig
+<span class="lineno">  198 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">pgcPort</span></span></span>           :: Maybe Int
+<span class="lineno">  199 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pgcHost</span></span></span>           :: Maybe Text
+<span class="lineno">  200 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pgcStaticDir</span></span></span>      :: Maybe Text
+<span class="lineno">  201 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pgcAllowedOrigins</span></span></span> :: [Text]
+<span class="lineno">  202 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pgcFileExplorerEnabled</span></span></span> :: Maybe Bool
+<span class="lineno">  203 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pgcTlsCert</span></span></span>        :: Maybe Text
+<span class="lineno">  204 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pgcTlsKey</span></span></span>         :: Maybe Text
+<span class="lineno">  205 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pgcTls</span></span></span>            :: Maybe Bool
+<span class="lineno">  206 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pgcTlsHosts</span></span></span>       :: [Text]
+<span class="lineno">  207 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  208 </span>
+<span class="lineno">  209 </span>-- | Merge a partial gateway config with the compiled-in defaults, producing
+<span class="lineno">  210 </span>-- a complete 'GatewayConfig'. Each 'Nothing' field falls back to
+<span class="lineno">  211 </span>-- 'defaultGatewayConfig'; an empty 'pgcAllowedOrigins' also falls back (so
+<span class="lineno">  212 </span>-- omitting @allowed_origins@ keeps the safe loopback default rather than
+<span class="lineno">  213 </span>-- opening to all origins).
+<span class="lineno">  214 </span>withGatewayDefaults :: PartialGatewayConfig -&gt; GatewayConfig
+<span class="lineno">  215 </span><span class="decl"><span class="istickedoff">withGatewayDefaults p = GatewayConfig</span>
+<span class="lineno">  216 </span><span class="spaces">  </span><span class="istickedoff">{ gcPort           = fromMaybe (gcPort defaultGatewayConfig) (pgcPort p)</span>
+<span class="lineno">  217 </span><span class="spaces">  </span><span class="istickedoff">, gcHost           = fromMaybe (gcHost defaultGatewayConfig) (pgcHost p)</span>
+<span class="lineno">  218 </span><span class="spaces">  </span><span class="istickedoff">, gcStaticDir      = pgcStaticDir p  -- Nothing = no static serving (the default)</span>
+<span class="lineno">  219 </span><span class="spaces">  </span><span class="istickedoff">, gcAllowedOrigins = if null (pgcAllowedOrigins p)</span>
+<span class="lineno">  220 </span><span class="spaces">                         </span><span class="istickedoff">then gcAllowedOrigins defaultGatewayConfig</span>
+<span class="lineno">  221 </span><span class="spaces">                         </span><span class="istickedoff">else pgcAllowedOrigins p</span>
+<span class="lineno">  222 </span><span class="spaces">  </span><span class="istickedoff">, gcFileExplorerEnabled = pgcFileExplorerEnabled p</span>
+<span class="lineno">  223 </span><span class="spaces">  </span><span class="istickedoff">, gcTlsCert        = pgcTlsCert p</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="istickedoff">, gcTlsKey         = pgcTlsKey p</span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="istickedoff">, gcTls            = fromMaybe False (pgcTls p)</span>
+<span class="lineno">  226 </span><span class="spaces">  </span><span class="istickedoff">, gcTlsHosts       = pgcTlsHosts p</span>
+<span class="lineno">  227 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  228 </span>
+<span class="lineno">  229 </span>-- | Codec for the @allowed_origins@ array (a TOML array of strings).
+<span class="lineno">  230 </span>originsCodec :: Toml.TomlCodec [Text]
+<span class="lineno">  231 </span><span class="decl"><span class="istickedoff">originsCodec = Toml.dimap Just maybeToList (Toml.dioptional (Toml.arrayOf Toml._Text &quot;allowed_origins&quot;))</span>
+<span class="lineno">  232 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  233 </span><span class="spaces">    </span><span class="istickedoff">maybeToList Nothing   = []</span>
+<span class="lineno">  234 </span><span class="spaces">    </span><span class="istickedoff">maybeToList (Just xs) = xs</span></span>
+<span class="lineno">  235 </span>
+<span class="lineno">  236 </span>-- | Codec for the @tls_hosts@ array (a TOML array of strings).
+<span class="lineno">  237 </span>hostsCodec :: Toml.TomlCodec [Text]
+<span class="lineno">  238 </span><span class="decl"><span class="istickedoff">hostsCodec = Toml.dimap Just maybeToList (Toml.dioptional (Toml.arrayOf Toml._Text &quot;tls_hosts&quot;))</span>
+<span class="lineno">  239 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  240 </span><span class="spaces">    </span><span class="istickedoff">maybeToList Nothing   = []</span>
+<span class="lineno">  241 </span><span class="spaces">    </span><span class="istickedoff">maybeToList (Just xs) = xs</span></span>
+<span class="lineno">  242 </span>
+<span class="lineno">  243 </span>-- | Is the gateway configured to terminate TLS itself?
+<span class="lineno">  244 </span>--
+<span class="lineno">  245 </span>-- Serving HTTPS in-process means no reverse proxy is needed, which matters for
+<span class="lineno">  246 </span>-- passkeys: a WebAuthn ceremony requires a secure context, and a bare
+<span class="lineno">  247 </span>-- @http://@ LAN address is not one.
+<span class="lineno">  248 </span>tlsEnabled :: GatewayConfig -&gt; Bool
+<span class="lineno">  249 </span><span class="decl"><span class="istickedoff">tlsEnabled cfg = gcTls cfg || (isJust (gcTlsCert cfg) &amp;&amp; isJust (gcTlsKey cfg))</span></span>
+<span class="lineno">  250 </span>
+<span class="lineno">  251 </span>-- | The PEM paths to load, given the defaults for this @SEAL_HOME@.
+<span class="lineno">  252 </span>--
+<span class="lineno">  253 </span>-- 'gcTls' opts in; an explicit path overrides the default; and setting both
+<span class="lineno">  254 </span>-- paths still turns TLS on by itself, which is the spelling the README used
+<span class="lineno">  255 </span>-- before the flag existed.
+<span class="lineno">  256 </span>effectiveTlsPaths :: FilePath -&gt; FilePath -&gt; GatewayConfig -&gt; (FilePath, FilePath)
+<span class="lineno">  257 </span><span class="decl"><span class="istickedoff">effectiveTlsPaths defaultCert defaultKey cfg =</span>
+<span class="lineno">  258 </span><span class="spaces">  </span><span class="istickedoff">( maybe defaultCert T.unpack (gcTlsCert cfg)</span>
+<span class="lineno">  259 </span><span class="spaces">  </span><span class="istickedoff">, maybe defaultKey T.unpack (gcTlsKey cfg) )</span></span>
+<span class="lineno">  260 </span>
+<span class="lineno">  261 </span>-- | A TLS setting that cannot be served.
+<span class="lineno">  262 </span>--
+<span class="lineno">  263 </span>-- The two PEM paths are only meaningful together. A certificate without its
+<span class="lineno">  264 </span>-- key (or the reverse) is a typo, and saying so at boot beats failing inside
+<span class="lineno">  265 </span>-- the TLS handshake on the first connection.
+<span class="lineno">  266 </span>tlsConfigError :: GatewayConfig -&gt; Maybe Text
+<span class="lineno">  267 </span><span class="decl"><span class="istickedoff">tlsConfigError cfg = case (gcTlsCert cfg, gcTlsKey cfg) of</span>
+<span class="lineno">  268 </span><span class="spaces">  </span><span class="istickedoff">(Nothing, Nothing) -&gt; Nothing</span>
+<span class="lineno">  269 </span><span class="spaces">  </span><span class="istickedoff">(Just _, Just _)   -&gt; Nothing</span>
+<span class="lineno">  270 </span><span class="spaces">  </span><span class="istickedoff">(Just _, Nothing)  -&gt;</span>
+<span class="lineno">  271 </span><span class="spaces">    </span><span class="istickedoff">Just <span class="nottickedoff">&quot;[gateway] tls_cert is set but tls_key is not: both are required to serve HTTPS.&quot;</span></span>
+<span class="lineno">  272 </span><span class="spaces">  </span><span class="istickedoff">(Nothing, Just _)  -&gt;</span>
+<span class="lineno">  273 </span><span class="spaces">    </span><span class="istickedoff">Just <span class="nottickedoff">&quot;[gateway] tls_key is set but tls_cert is not: both are required to serve HTTPS.&quot;</span></span></span>
+<span class="lineno">  274 </span>
+<span class="lineno">  275 </span>-- | Is the configured origin consistent with serving HTTPS?
+<span class="lineno">  276 </span>--
+<span class="lineno">  277 </span>-- Once TLS is on, browsers reach the gateway at @https:\/\/@, so a verified
+<span class="lineno">  278 </span>-- origin that says @http:\/\/@ can never match: every registration and every
+<span class="lineno">  279 </span>-- assertion would be refused as an origin mismatch. The derived loopback
+<span class="lineno">  280 </span>-- origin (@http:\/\/localhost:\&lt;port\&gt;@) is exactly that case, so enabling TLS
+<span class="lineno">  281 </span>-- on a loopback bind also requires an explicit @origin@.
+<span class="lineno">  282 </span>tlsOriginError :: Bool -&gt; Maybe Text -&gt; Maybe Text
+<span class="lineno">  283 </span><span class="decl"><span class="istickedoff">tlsOriginError tls mOrigin</span>
+<span class="lineno">  284 </span><span class="spaces">  </span><span class="istickedoff">| not tls = Nothing</span>
+<span class="lineno">  285 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case mOrigin of</span>
+<span class="lineno">  286 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; Nothing</span>
+<span class="lineno">  287 </span><span class="spaces">      </span><span class="istickedoff">Just o</span>
+<span class="lineno">  288 </span><span class="spaces">        </span><span class="istickedoff">| &quot;https://&quot; `T.isPrefixOf` o -&gt; Nothing</span>
+<span class="lineno">  289 </span><span class="spaces">        </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt;</span>
+<span class="lineno">  290 </span><span class="spaces">            </span><span class="istickedoff">Just (&quot;[gateway] tls_cert/tls_key are set but [access_control] origin is \&quot;&quot;</span>
+<span class="lineno">  291 </span><span class="spaces">                   </span><span class="istickedoff">&lt;&gt; o &lt;&gt; &quot;\&quot;.\n  Clients will reach this gateway over https, so set origin to &quot;</span>
+<span class="lineno">  292 </span><span class="spaces">                   </span><span class="istickedoff">&lt;&gt; &quot;the https URL they use (rp_id follows from its host).&quot;)</span></span>
+
+</pre>
+</body>
+</html>

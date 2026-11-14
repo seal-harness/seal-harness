@@ -1,0 +1,499 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The @seal serve@ startup wiring: build the gateway + broker + API from
+<span class="lineno">    3 </span>-- the existing startup (paths → config → vault → session → backends →
+<span class="lineno">    4 </span>-- tabsHandle → broker → gateway). Parallel to @seal tui@ and @seal signal@.
+<span class="lineno">    5 </span>module Seal.Command.Serve
+<span class="lineno">    6 </span>  ( runServeMain
+<span class="lineno">    7 </span>  ) where
+<span class="lineno">    8 </span>
+<span class="lineno">    9 </span>import Control.Concurrent (forkIO)
+<span class="lineno">   10 </span>import Control.Monad (filterM)
+<span class="lineno">   11 </span>import Data.Foldable (for_)
+<span class="lineno">   12 </span>import Data.Either (fromRight)
+<span class="lineno">   13 </span>import Data.IORef (newIORef, readIORef, writeIORef)
+<span class="lineno">   14 </span>import Data.Maybe (fromMaybe, isJust)
+<span class="lineno">   15 </span>import Data.Text qualified as T
+<span class="lineno">   16 </span>import Network.HTTP.Client.TLS (newTlsManager)
+<span class="lineno">   17 </span>import System.Directory (doesFileExist)
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>import Katip (Severity (..), ls)
+<span class="lineno">   20 </span>
+<span class="lineno">   21 </span>import qualified Seal.Signal.Config
+<span class="lineno">   22 </span>import qualified Seal.Telegram.Config
+<span class="lineno">   23 </span>import qualified Data.Text.Encoding as TE
+<span class="lineno">   24 </span>import qualified Seal.Channels.Telegram.Commands
+<span class="lineno">   25 </span>import Seal.Channels.Telegram.Transport (mkRealTelegramTransport, tgSetCommands)
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>import Seal.Channel.Cli (Backends (..), newBackends, resolveSessionProvider)
+<span class="lineno">   28 </span>import Seal.Channels.Cursor
+<span class="lineno">   29 </span>  ( newPersistingCursorStore, seedCursorStore )
+<span class="lineno">   30 </span>import Seal.Channels.Cursor.Persist (loadCursorMap)
+<span class="lineno">   31 </span>import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, plainTurn, plainTurnWithCaps, runChannelLoop, mkTabCloseNotifier)
+<span class="lineno">   32 </span>import Seal.Channels.Signal (withSignalChannel)
+<span class="lineno">   33 </span>import Seal.Channels.Signal.Transport (mkRealSignalTransport)
+<span class="lineno">   34 </span>import Seal.Channels.Telegram (withTelegramChannel)
+<span class="lineno">   35 </span>import Seal.Channels.Telegram.Run (mkTelegramHandleCaps, onTelegramCallback)
+<span class="lineno">   36 </span>import Seal.Command.Call (callCommandSpec)
+<span class="lineno">   37 </span>import Seal.Command.Skill (skillCommandSpec)
+<span class="lineno">   38 </span>import Seal.Core.Types (OpName (..))
+<span class="lineno">   39 </span>import Seal.ISA.Dispatch (DispatchError (OpNotFound))
+<span class="lineno">   40 </span>import Seal.Command.New (NewDeps (..), newCommandSpec)
+<span class="lineno">   41 </span>import Seal.Command.Provider (ProviderRuntime (..))
+<span class="lineno">   42 </span>import Seal.Command.Model (mkModelTranscriptWriter)
+<span class="lineno">   43 </span>import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
+<span class="lineno">   44 </span>import Seal.Command.Repo (RepoTestSeam (..))
+<span class="lineno">   45 </span>import Seal.Command.Stop (mkStopTranscriptWriter)
+<span class="lineno">   46 </span>import Seal.Command.Spec (mkRegistry, Registry)
+<span class="lineno">   47 </span>import Seal.Gateway.Send (SendDeps (..), handleSetupRepo)
+<span class="lineno">   48 </span>import Seal.Logging.Logger (SealLogger, logIO)
+<span class="lineno">   49 </span>import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
+<span class="lineno">   50 </span>import Seal.Config.Migrate (migrateSecurityConfig)
+<span class="lineno">   51 </span>import Seal.Config.Security (SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
+<span class="lineno">   52 </span>import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
+<span class="lineno">   53 </span>import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, sessionMetaPath, sshAgentsDir, tabListPath, vaultFilePath)
+<span class="lineno">   54 </span>import Seal.Gateway.API (ApiDeps (..))
+<span class="lineno">   55 </span>import Seal.Gateway.Config (GatewayConfig (..), defaultGatewayConfig, withGatewayDefaults)
+<span class="lineno">   56 </span>import Seal.Gateway.Server (runGateway)
+<span class="lineno">   57 </span>import Seal.Gateway.Stream (StreamGuard (..), runStreamServer)
+<span class="lineno">   58 </span>import Seal.Gateway.StreamBroker (newStreamBroker)
+<span class="lineno">   59 </span>import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
+<span class="lineno">   60 </span>import Seal.Harness.Registry (newHarnessRegistry)
+<span class="lineno">   61 </span>import Seal.Harness.Tmux (mkRealTmuxRunner)
+<span class="lineno">   62 </span>import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
+<span class="lineno">   63 </span>import Seal.Handles.Tab (mkTabIndex, TabKind(..))
+<span class="lineno">   64 </span>import Seal.Ingest (emptyChain)
+<span class="lineno">   65 </span>import Seal.Providers.Registry (configuredProviders)
+<span class="lineno">   66 </span>import Seal.Security.Adoption (ConsentChannel (..))
+<span class="lineno">   67 </span>import Seal.Security.Policy (AutonomyLevel)
+<span class="lineno">   68 </span>import Seal.Security.Vault.Age (VaultError (..))
+<span class="lineno">   69 </span>import Seal.Security.Vault (VaultConfig (..), VaultHandle (..), openVault)
+<span class="lineno">   70 </span>import qualified Seal.SourceControl.Clone as Clone
+<span class="lineno">   71 </span>import Seal.SourceControl.Clone (lsRemoteRepo)
+<span class="lineno">   72 </span>import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
+<span class="lineno">   73 </span>import Seal.Session.AgentMetaCache
+<span class="lineno">   74 </span>  ( agentMetaCacheDir, gcAgentMetaCache, agentMetaCacheKeepN )
+<span class="lineno">   75 </span>import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle, arProbeAndSweep)
+<span class="lineno">   76 </span>import Seal.SourceControl.Registry (RepoRegistryHandle, mkRepoRegistryHandle)
+<span class="lineno">   77 </span>import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
+<span class="lineno">   78 </span>import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
+<span class="lineno">   79 </span>import Seal.Signal.Config (resolveSignalConfig)
+<span class="lineno">   80 </span>import Seal.Tabs (newPersistingTabsHandle, insertTabH, seedTabsHandle)
+<span class="lineno">   81 </span>import Seal.Tabs.Persist (loadTabList)
+<span class="lineno">   82 </span>import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
+<span class="lineno">   83 </span>import Seal.Session.Meta (SessionMeta (..))
+<span class="lineno">   84 </span>import Seal.Telegram.Config (resolveTelegramConfig)
+<span class="lineno">   85 </span>import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
+<span class="lineno">   86 </span>import Seal.Vault.Commands (VaultRuntime (..))
+<span class="lineno">   87 </span>import Seal.Web.UiState (newUiStateHandle)
+<span class="lineno">   88 </span>
+<span class="lineno">   89 </span>-- | Full @seal serve@ startup wiring. Mirrors 'Seal.Tui.runTui': paths →
+<span class="lineno">   90 </span>-- config → vault → session → backends → tabsH → broker → gateway + WS
+<span class="lineno">   91 </span>-- server.
+<span class="lineno">   92 </span>runServeMain :: AutonomyLevel -&gt; SealLogger -&gt; IO ()
+<span class="lineno">   93 </span><span class="decl"><span class="nottickedoff">runServeMain autonomy logger = do</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="nottickedoff">paths &lt;- getSealPaths</span>
+<span class="lineno">   95 </span><span class="spaces">  </span><span class="nottickedoff">ensureSealDirs paths</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="nottickedoff">-- Probe + sweep the persistent ssh-agent registry: GC dead agents from</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="nottickedoff">-- a crashed/killed seal process so their stale entries don't accumulate</span>
+<span class="lineno">   98 </span><span class="spaces">  </span><span class="nottickedoff">-- (#88). Live agents are reused (the key is still loaded).</span>
+<span class="lineno">   99 </span><span class="spaces">  </span><span class="nottickedoff">startupAgentRegH &lt;- mkAgentRegistryHandle (sshAgentsDir paths)</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="nottickedoff">arProbeAndSweep startupAgentRegH</span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="nottickedoff">-- GC the content-addressed agent-metadata snapshot cache: keep the</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="nottickedoff">-- newest N entries, drop the rest. Best-effort — failures are ignored.</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="nottickedoff">gcAgentMetaCache (agentMetaCacheDir paths) agentMetaCacheKeepN</span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="nottickedoff">migrateSecurityConfig paths</span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="nottickedoff">let cfgPath = configFilePath paths</span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="nottickedoff">cfg &lt;- loadRuntimeConfig cfgPath &gt;&gt;= \case</span>
+<span class="lineno">  107 </span><span class="spaces">    </span><span class="nottickedoff">Left err -&gt; do</span>
+<span class="lineno">  108 </span><span class="spaces">      </span><span class="nottickedoff">logIO logger WarningS (&quot;could not load config: &quot; &lt;&gt; ls err)</span>
+<span class="lineno">  109 </span><span class="spaces">      </span><span class="nottickedoff">pure defaultRuntimeConfig</span>
+<span class="lineno">  110 </span><span class="spaces">    </span><span class="nottickedoff">Right c  -&gt; pure c</span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="nottickedoff">secCfg &lt;- loadSecurityConfig (securityFilePath paths) &gt;&gt;= \case</span>
+<span class="lineno">  112 </span><span class="spaces">    </span><span class="nottickedoff">Left err -&gt; do</span>
+<span class="lineno">  113 </span><span class="spaces">      </span><span class="nottickedoff">logIO logger WarningS (&quot;could not load security config: &quot; &lt;&gt; ls err)</span>
+<span class="lineno">  114 </span><span class="spaces">      </span><span class="nottickedoff">pure defaultSecurityConfig</span>
+<span class="lineno">  115 </span><span class="spaces">    </span><span class="nottickedoff">Right c  -&gt; pure c</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="nottickedoff">mHandle &lt;- tryOpenVault paths secCfg logger</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="nottickedoff">ref     &lt;- newIORef mHandle</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="nottickedoff">let rt = VaultRuntime</span>
+<span class="lineno">  119 </span><span class="spaces">            </span><span class="nottickedoff">{ vrPaths      = paths</span>
+<span class="lineno">  120 </span><span class="spaces">            </span><span class="nottickedoff">, vrConfigPath = cfgPath</span>
+<span class="lineno">  121 </span><span class="spaces">            </span><span class="nottickedoff">, vrHandleRef  = ref</span>
+<span class="lineno">  122 </span><span class="spaces">            </span><span class="nottickedoff">}</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="nottickedoff">mgr &lt;- newTlsManager</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="nottickedoff">callCounter &lt;- newIORef 0</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="nottickedoff">let pr = ProviderRuntime</span>
+<span class="lineno">  126 </span><span class="spaces">            </span><span class="nottickedoff">{ prConfigPath  = cfgPath</span>
+<span class="lineno">  127 </span><span class="spaces">            </span><span class="nottickedoff">, prVault       = rt</span>
+<span class="lineno">  128 </span><span class="spaces">            </span><span class="nottickedoff">, prManager     = mgr</span>
+<span class="lineno">  129 </span><span class="spaces">            </span><span class="nottickedoff">, prCallCounter = callCounter</span>
+<span class="lineno">  130 </span><span class="spaces">            </span><span class="nottickedoff">}</span>
+<span class="lineno">  131 </span><span class="spaces">      </span><span class="nottickedoff">cfgRoot = spConfig paths</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="nottickedoff">ensureConfigRepo cfgRoot</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="nottickedoff">let repo = openConfigRepo cfgRoot</span>
+<span class="lineno">  134 </span><span class="spaces">  </span><span class="nottickedoff">backends &lt;- newBackends cfgRoot repo</span>
+<span class="lineno">  135 </span><span class="spaces">  </span><span class="nottickedoff">-- W4: the source-control repo registry handle (closes over</span>
+<span class="lineno">  136 </span><span class="spaces">  </span><span class="nottickedoff">-- repos.toml). Built once at startup and threaded into ApiDeps for</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="nottickedoff">-- /api/repos CRUD. The handle's rrhList/rrhMutate re-read the file on</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="nottickedoff">-- each call so mutations from other processes are reflected.</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="nottickedoff">repoRegH &lt;- mkRepoRegistryHandle (reposFilePath paths)</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="nottickedoff">-- W5: the /repo slash command's test seam. The ls-remote arm runs real</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="nottickedoff">-- git against repoCloneStateDir; the vault-list arm backs the /repo info</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="nottickedoff">-- non-blocking vault-key advisory. The vault handle (mHandle) may be</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="nottickedoff">-- 'Nothing' if the vault is not configured — in that case /repo test</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="nottickedoff">-- surfaces 'vault locked' (fail-closed) and /repo info skips the advisory.</span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="nottickedoff">repoSeam &lt;- mkRepoTestSeam rt repoRegH paths</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="nottickedoff">-- W5: persisting tab handle. Load the persisted tab list, drop tabs whose</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="nottickedoff">-- session.json is missing on disk (stale), and seed the TVar. Harness tabs</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="nottickedoff">-- (BoundHarness) are kept as-is; the periodic reconcile sweep (run later)</span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="nottickedoff">-- re-resolves their liveness and marks missing windows 'orphaned'. No</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="nottickedoff">-- broadcast at boot (no WS client connected yet); the first subscriber's</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="nottickedoff">-- broadcast trigger refreshes the sidebar.</span>
+<span class="lineno">  152 </span><span class="spaces">  </span><span class="nottickedoff">let tabsPath = tabListPath paths</span>
+<span class="lineno">  153 </span><span class="spaces">  </span><span class="nottickedoff">tabsH &lt;- newPersistingTabsHandle tabsPath</span>
+<span class="lineno">  154 </span><span class="spaces">  </span><span class="nottickedoff">mPersisted &lt;- loadTabList tabsPath</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="nottickedoff">case mPersisted of</span>
+<span class="lineno">  156 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure ()</span>
+<span class="lineno">  157 </span><span class="spaces">    </span><span class="nottickedoff">Just tl -&gt; do</span>
+<span class="lineno">  158 </span><span class="spaces">      </span><span class="nottickedoff">kept &lt;- filterM (sessionTabExists paths) (tlTabs tl)</span>
+<span class="lineno">  159 </span><span class="spaces">      </span><span class="nottickedoff">seedTabsHandle tabsH (renumberTabs kept)</span>
+<span class="lineno">  160 </span><span class="spaces">  </span><span class="nottickedoff">-- Persisting cursor store: load + seed so existing Telegram/Signal</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="nottickedoff">-- conversations re-resolve to their prior sessions (carrying the user's</span>
+<span class="lineno">  162 </span><span class="spaces">  </span><span class="nottickedoff">-- /model use choice) after a seal serve restart. A cursor pointing at a</span>
+<span class="lineno">  163 </span><span class="spaces">  </span><span class="nottickedoff">-- session whose session.json is missing degrades gracefully —</span>
+<span class="lineno">  164 </span><span class="spaces">  </span><span class="nottickedoff">-- resolveTabSession returns Nothing and the loop mints a fresh session</span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="nottickedoff">-- on the next message (exactly as if the cursor were absent). No</span>
+<span class="lineno">  166 </span><span class="spaces">  </span><span class="nottickedoff">-- boot-time stale sweep is needed.</span>
+<span class="lineno">  167 </span><span class="spaces">  </span><span class="nottickedoff">cursorsH &lt;- newPersistingCursorStore (cursorMapPath paths)</span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="nottickedoff">mCursors &lt;- loadCursorMap (cursorMapPath paths)</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="nottickedoff">for_ mCursors (seedCursorStore cursorsH)</span>
+<span class="lineno">  170 </span><span class="spaces">  </span><span class="nottickedoff">reg     &lt;- newHarnessRegistry</span>
+<span class="lineno">  171 </span><span class="spaces">  </span><span class="nottickedoff">tmuxR   &lt;- mkRealTmuxRunner</span>
+<span class="lineno">  172 </span><span class="spaces">  </span><span class="nottickedoff">uiState &lt;- newUiStateHandle paths</span>
+<span class="lineno">  173 </span><span class="spaces">  </span><span class="nottickedoff">askReply &lt;- newAskReplyStore 0  -- 0 = block indefinitely (no timeout); a</span>
+<span class="lineno">  174 </span><span class="spaces">                                 </span><span class="nottickedoff">-- future phase may surface a configurable</span>
+<span class="lineno">  175 </span><span class="spaces">                                 </span><span class="nottickedoff">-- per-session timeout.</span>
+<span class="lineno">  176 </span><span class="spaces">  </span><span class="nottickedoff">approvals &lt;- newApprovalCache</span>
+<span class="lineno">  177 </span><span class="spaces">  </span><span class="nottickedoff">-- Build an in-memory active session (NOT persisted to disk) so the</span>
+<span class="lineno">  178 </span><span class="spaces">  </span><span class="nottickedoff">-- active-session ref has valid provider/model fallbacks. The session</span>
+<span class="lineno">  179 </span><span class="spaces">  </span><span class="nottickedoff">-- only lands on disk when the user sends the first message (the web send</span>
+<span class="lineno">  180 </span><span class="spaces">  </span><span class="nottickedoff">-- handler writes the transcript to the session dir). This avoids</span>
+<span class="lineno">  181 </span><span class="spaces">  </span><span class="nottickedoff">-- polluting the sessions list with an empty session on every `seal serve`.</span>
+<span class="lineno">  182 </span><span class="spaces">  </span><span class="nottickedoff">sessionMeta &lt;- initSessionMeta paths cfg (bAgentDefs backends)</span>
+<span class="lineno">  183 </span><span class="spaces">  </span><span class="nottickedoff">activeRef   &lt;- newIORef sessionMeta</span>
+<span class="lineno">  184 </span><span class="spaces">  </span><span class="nottickedoff">broker &lt;- newStreamBroker 1024</span>
+<span class="lineno">  185 </span><span class="spaces">  </span><span class="nottickedoff">-- Build the shared ChannelDeps early so the reply registry + write locks</span>
+<span class="lineno">  186 </span><span class="spaces">  </span><span class="nottickedoff">-- can be shared with the web send handler (SendDeps). The cursor store,</span>
+<span class="lineno">  187 </span><span class="spaces">  </span><span class="nottickedoff">-- reply registry, and write locks are created inside newChannelDeps.</span>
+<span class="lineno">  188 </span><span class="spaces">  </span><span class="nottickedoff">let loadCfg = fromRight defaultRuntimeConfig &lt;$&gt; loadRuntimeConfig cfgPath</span>
+<span class="lineno">  189 </span><span class="spaces">      </span><span class="nottickedoff">isRemoteExec = case untrustedExecConfigFromSecurity secCfg of</span>
+<span class="lineno">  190 </span><span class="spaces">        </span><span class="nottickedoff">Just uec -&gt; uecMode uec == UemRemote</span>
+<span class="lineno">  191 </span><span class="spaces">        </span><span class="nottickedoff">Nothing  -&gt; False</span>
+<span class="lineno">  192 </span><span class="spaces">  </span><span class="nottickedoff">chanDeps &lt;- newChannelDeps</span>
+<span class="lineno">  193 </span><span class="spaces">        </span><span class="nottickedoff">paths rt repoRegH pr backends autonomy (Just broker)</span>
+<span class="lineno">  194 </span><span class="spaces">        </span><span class="nottickedoff">reg tmuxR (Just mgr) approvals loadCfg isRemoteExec tabsH logger cursorsH</span>
+<span class="lineno">  195 </span><span class="spaces">  </span><span class="nottickedoff">let sr = SessionRuntime</span>
+<span class="lineno">  196 </span><span class="spaces">             </span><span class="nottickedoff">{ srPaths      = paths</span>
+<span class="lineno">  197 </span><span class="spaces">             </span><span class="nottickedoff">, srConfigPath = cfgPath</span>
+<span class="lineno">  198 </span><span class="spaces">             </span><span class="nottickedoff">, srActive     = activeRef</span>
+<span class="lineno">  199 </span><span class="spaces">             </span><span class="nottickedoff">}</span>
+<span class="lineno">  200 </span><span class="spaces">      </span><span class="nottickedoff">-- The /new command for the web: mints a fresh session, swaps srActive,</span>
+<span class="lineno">  201 </span><span class="spaces">      </span><span class="nottickedoff">-- inserts a new tab into the TabsHandle, swaps srActive to the new</span>
+<span class="lineno">  202 </span><span class="spaces">      </span><span class="nottickedoff">-- session, and returns the old sid. When -r/--repo is given, the</span>
+<span class="lineno">  203 </span><span class="spaces">      </span><span class="nottickedoff">-- repo is cloned via SETUP_REPO (same as the web &quot;Set up repo&quot;).</span>
+<span class="lineno">  204 </span><span class="spaces">      </span><span class="nottickedoff">newDeps = NewDeps</span>
+<span class="lineno">  205 </span><span class="spaces">        </span><span class="nottickedoff">{ ndPaths = paths</span>
+<span class="lineno">  206 </span><span class="spaces">        </span><span class="nottickedoff">, ndCfg = loadCfg</span>
+<span class="lineno">  207 </span><span class="spaces">        </span><span class="nottickedoff">, ndAgentDefs = backends</span>
+<span class="lineno">  208 </span><span class="spaces">        </span><span class="nottickedoff">, ndChannelLabel = &quot;web&quot;</span>
+<span class="lineno">  209 </span><span class="spaces">        </span><span class="nottickedoff">, ndOldMeta = readIORef activeRef</span>
+<span class="lineno">  210 </span><span class="spaces">        </span><span class="nottickedoff">, ndInsertTab = \_caps newMeta -&gt; do</span>
+<span class="lineno">  211 </span><span class="spaces">            </span><span class="nottickedoff">oldMeta &lt;- readIORef activeRef</span>
+<span class="lineno">  212 </span><span class="spaces">            </span><span class="nottickedoff">let oldSid = smId oldMeta</span>
+<span class="lineno">  213 </span><span class="spaces">            </span><span class="nottickedoff">_ &lt;- insertTabH tabsH (BoundSession (smId newMeta)) KindProvider Nothing</span>
+<span class="lineno">  214 </span><span class="spaces">            </span><span class="nottickedoff">writeIORef activeRef newMeta</span>
+<span class="lineno">  215 </span><span class="spaces">            </span><span class="nottickedoff">pure oldSid</span>
+<span class="lineno">  216 </span><span class="spaces">        </span><span class="nottickedoff">, ndSetupRepo = Just (handleSetupRepo sendDeps)</span>
+<span class="lineno">  217 </span><span class="spaces">        </span><span class="nottickedoff">, ndRepoReg = Just repoRegH</span>
+<span class="lineno">  218 </span><span class="spaces">        </span><span class="nottickedoff">}</span>
+<span class="lineno">  219 </span><span class="spaces">      </span><span class="nottickedoff">-- The slash-command registry is built from the shared</span>
+<span class="lineno">  220 </span><span class="spaces">      </span><span class="nottickedoff">-- 'coreCommandSpecs' (the channel-agnostic core: vault, provider,</span>
+<span class="lineno">  221 </span><span class="spaces">      </span><span class="nottickedoff">-- session, model, agent, tab, stop, terseGrammar, new, repo) plus</span>
+<span class="lineno">  222 </span><span class="spaces">      </span><span class="nottickedoff">-- the web's call/skill placeholders. 'runSlash' rebuilds call/skill</span>
+<span class="lineno">  223 </span><span class="spaces">      </span><span class="nottickedoff">-- AND stop per-request via 'replaceCallSkillSpecs' so those commands</span>
+<span class="lineno">  224 </span><span class="spaces">      </span><span class="nottickedoff">-- target the request's explicit 'SessionId' (the web is</span>
+<span class="lineno">  225 </span><span class="spaces">      </span><span class="nottickedoff">-- multi-session; srActive is not authoritative). The placeholders</span>
+<span class="lineno">  226 </span><span class="spaces">      </span><span class="nottickedoff">-- here never run.</span>
+<span class="lineno">  227 </span><span class="spaces">      </span><span class="nottickedoff">placeholderDispatcher _ _ = pure (Left (OpNotFound (OpName &quot;placeholder&quot;)))</span>
+<span class="lineno">  228 </span><span class="spaces">      </span><span class="nottickedoff">coreDeps = CoreCommandDeps</span>
+<span class="lineno">  229 </span><span class="spaces">        </span><span class="nottickedoff">{ ccdVault       = rt</span>
+<span class="lineno">  230 </span><span class="spaces">        </span><span class="nottickedoff">, ccdProvider    = pr</span>
+<span class="lineno">  231 </span><span class="spaces">        </span><span class="nottickedoff">, ccdSession     = sr</span>
+<span class="lineno">  232 </span><span class="spaces">        </span><span class="nottickedoff">, ccdAgentDefs   = bAgentDefs backends</span>
+<span class="lineno">  233 </span><span class="spaces">        </span><span class="nottickedoff">, ccdCfgPath     = cfgPath</span>
+<span class="lineno">  234 </span><span class="spaces">        </span><span class="nottickedoff">, ccdPaths       = paths</span>
+<span class="lineno">  235 </span><span class="spaces">        </span><span class="nottickedoff">, ccdTabs        = tabsH</span>
+<span class="lineno">  236 </span><span class="spaces">        </span><span class="nottickedoff">, ccdTabCloseNotifier = mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps)</span>
+<span class="lineno">  237 </span><span class="spaces">        </span><span class="nottickedoff">, ccdAbortReg    = cdAbortReg chanDeps</span>
+<span class="lineno">  238 </span><span class="spaces">        </span><span class="nottickedoff">, ccdStopWriter  = mkStopTranscriptWriter paths (Just broker)</span>
+<span class="lineno">  239 </span><span class="spaces">        </span><span class="nottickedoff">, ccdModelWriter = mkModelTranscriptWriter paths (Just broker)</span>
+<span class="lineno">  240 </span><span class="spaces">        </span><span class="nottickedoff">, ccdRepoReg     = repoRegH</span>
+<span class="lineno">  241 </span><span class="spaces">        </span><span class="nottickedoff">, ccdRepoSeam    = Just repoSeam</span>
+<span class="lineno">  242 </span><span class="spaces">        </span><span class="nottickedoff">}</span>
+<span class="lineno">  243 </span><span class="spaces">      </span><span class="nottickedoff">registry = mkRegistry</span>
+<span class="lineno">  244 </span><span class="spaces">        </span><span class="nottickedoff">( coreCommandSpecs coreDeps</span>
+<span class="lineno">  245 </span><span class="spaces">          </span><span class="nottickedoff">&lt;&gt; [ skillCommandSpec (bSkills backends) placeholderDispatcher</span>
+<span class="lineno">  246 </span><span class="spaces">             </span><span class="nottickedoff">, callCommandSpec placeholderDispatcher</span>
+<span class="lineno">  247 </span><span class="spaces">             </span><span class="nottickedoff">, newCommandSpec newDeps</span>
+<span class="lineno">  248 </span><span class="spaces">             </span><span class="nottickedoff">]</span>
+<span class="lineno">  249 </span><span class="spaces">        </span><span class="nottickedoff">)</span>
+<span class="lineno">  250 </span><span class="spaces">      </span><span class="nottickedoff">sendDeps = SendDeps</span>
+<span class="lineno">  251 </span><span class="spaces">        </span><span class="nottickedoff">{ sdPaths      = paths</span>
+<span class="lineno">  252 </span><span class="spaces">        </span><span class="nottickedoff">, sdVault      = rt</span>
+<span class="lineno">  253 </span><span class="spaces">        </span><span class="nottickedoff">, sdRepoReg    = repoRegH</span>
+<span class="lineno">  254 </span><span class="spaces">        </span><span class="nottickedoff">, sdProvider   = pr</span>
+<span class="lineno">  255 </span><span class="spaces">        </span><span class="nottickedoff">, sdSession    = sr</span>
+<span class="lineno">  256 </span><span class="spaces">        </span><span class="nottickedoff">, sdBackends   = backends</span>
+<span class="lineno">  257 </span><span class="spaces">        </span><span class="nottickedoff">, sdConfigRepo = repo</span>
+<span class="lineno">  258 </span><span class="spaces">        </span><span class="nottickedoff">, sdPreprocess = emptyChain</span>
+<span class="lineno">  259 </span><span class="spaces">        </span><span class="nottickedoff">, sdRegistry   = registry</span>
+<span class="lineno">  260 </span><span class="spaces">        </span><span class="nottickedoff">, sdResolve    = resolveSessionProvider pr</span>
+<span class="lineno">  261 </span><span class="spaces">        </span><span class="nottickedoff">, sdAutonomy   = autonomy</span>
+<span class="lineno">  262 </span><span class="spaces">        </span><span class="nottickedoff">, sdBroker     = Just broker</span>
+<span class="lineno">  263 </span><span class="spaces">        </span><span class="nottickedoff">, sdHarnessRegistry = reg</span>
+<span class="lineno">  264 </span><span class="spaces">        </span><span class="nottickedoff">, sdTmuxRunner  = tmuxR</span>
+<span class="lineno">  265 </span><span class="spaces">        </span><span class="nottickedoff">, sdHttpManager = Just mgr</span>
+<span class="lineno">  266 </span><span class="spaces">        </span><span class="nottickedoff">, sdAskReply    = askReply</span>
+<span class="lineno">  267 </span><span class="spaces">        </span><span class="nottickedoff">, sdApprovals   = approvals</span>
+<span class="lineno">  268 </span><span class="spaces">        </span><span class="nottickedoff">, sdReplies     = cdReplies chanDeps</span>
+<span class="lineno">  269 </span><span class="spaces">        </span><span class="nottickedoff">, sdLocks       = cdLocks chanDeps</span>
+<span class="lineno">  270 </span><span class="spaces">        </span><span class="nottickedoff">, sdAbortReg    = cdAbortReg chanDeps</span>
+<span class="lineno">  271 </span><span class="spaces">        </span><span class="nottickedoff">, sdTabsHandle  = tabsH</span>
+<span class="lineno">  272 </span><span class="spaces">        </span><span class="nottickedoff">, sdLogger      = logger</span>
+<span class="lineno">  273 </span><span class="spaces">        </span><span class="nottickedoff">, sdIsRemote    = isRemoteExec</span>
+<span class="lineno">  274 </span><span class="spaces">        </span><span class="nottickedoff">, sdExecCache   = cdExecCache chanDeps</span>
+<span class="lineno">  275 </span><span class="spaces">        </span><span class="nottickedoff">, sdRemoteRunner = Nothing</span>
+<span class="lineno">  276 </span><span class="spaces">          </span><span class="nottickedoff">-- ^ ONE shared instance: turns (web + channels), /call dispatches,</span>
+<span class="lineno">  277 </span><span class="spaces">          </span><span class="nottickedoff">-- and GET /api/sessions/:id/agents all hit the same cache.</span>
+<span class="lineno">  278 </span><span class="spaces">        </span><span class="nottickedoff">, sdMkWorker    = Nothing</span>
+<span class="lineno">  279 </span><span class="spaces">          </span><span class="nottickedoff">-- ^ Production: always use the real 'buildWorker' →</span>
+<span class="lineno">  280 </span><span class="spaces">          </span><span class="nottickedoff">-- 'mkDelegateWorker' path. The 'sdMkWorker' seam is for gateway</span>
+<span class="lineno">  281 </span><span class="spaces">          </span><span class="nottickedoff">-- API integration tests only.</span>
+<span class="lineno">  282 </span><span class="spaces">        </span><span class="nottickedoff">}</span>
+<span class="lineno">  283 </span><span class="spaces">  </span><span class="nottickedoff">-- Build the gateway config (from the [gateway] section or the default)</span>
+<span class="lineno">  284 </span><span class="spaces">  </span><span class="nottickedoff">let gwCfg = maybe defaultGatewayConfig withGatewayDefaults (rcGateway cfg)</span>
+<span class="lineno">  285 </span><span class="spaces">      </span><span class="nottickedoff">deps = ApiDeps</span>
+<span class="lineno">  286 </span><span class="spaces">        </span><span class="nottickedoff">{ adSessionRuntime  = sr</span>
+<span class="lineno">  287 </span><span class="spaces">        </span><span class="nottickedoff">, adTabsHandle      = tabsH</span>
+<span class="lineno">  288 </span><span class="spaces">        </span><span class="nottickedoff">, adHarnessRegistry = reg</span>
+<span class="lineno">  289 </span><span class="spaces">        </span><span class="nottickedoff">, adAdoptConsent    = Just CcWeb</span>
+<span class="lineno">  290 </span><span class="spaces">        </span><span class="nottickedoff">, adAgentDefs       = bAgentDefs backends</span>
+<span class="lineno">  291 </span><span class="spaces">        </span><span class="nottickedoff">, adSkills          = bSkills backends</span>
+<span class="lineno">  292 </span><span class="spaces">        </span><span class="nottickedoff">, adProviders       = do</span>
+<span class="lineno">  293 </span><span class="spaces">            </span><span class="nottickedoff">-- The configured-provider list is computed on each request so</span>
+<span class="lineno">  294 </span><span class="spaces">            </span><span class="nottickedoff">-- newly-added credentials are reflected without a restart. The</span>
+<span class="lineno">  295 </span><span class="spaces">            </span><span class="nottickedoff">-- vault handle is read from the same ref the commands use.</span>
+<span class="lineno">  296 </span><span class="spaces">            </span><span class="nottickedoff">mh &lt;- readIORef (vrHandleRef rt)</span>
+<span class="lineno">  297 </span><span class="spaces">            </span><span class="nottickedoff">configuredProviders mh cfg</span>
+<span class="lineno">  298 </span><span class="spaces">        </span><span class="nottickedoff">, adUiState         = uiState</span>
+<span class="lineno">  299 </span><span class="spaces">        </span><span class="nottickedoff">, adSend            = Just sendDeps</span>
+<span class="lineno">  300 </span><span class="spaces">        </span><span class="nottickedoff">, adDefaultAgent    = rcDefaultAgent &lt;$&gt; loadCfg</span>
+<span class="lineno">  301 </span><span class="spaces">        </span><span class="nottickedoff">, adBroker          = Just broker</span>
+<span class="lineno">  302 </span><span class="spaces">        </span><span class="nottickedoff">, adTabCloseNotifier = mkTabCloseNotifier (cdCursors chanDeps) (cdReplies chanDeps)</span>
+<span class="lineno">  303 </span><span class="spaces">        </span><span class="nottickedoff">, adRepoRegistry     = repoRegH</span>
+<span class="lineno">  304 </span><span class="spaces">        </span><span class="nottickedoff">, adConfigRepo       = repo</span>
+<span class="lineno">  305 </span><span class="spaces">        </span><span class="nottickedoff">, adVault            = rt</span>
+<span class="lineno">  306 </span><span class="spaces">        </span><span class="nottickedoff">, adPaths            = paths</span>
+<span class="lineno">  307 </span><span class="spaces">        </span><span class="nottickedoff">, adWsPort           = gcWsPort gwCfg</span>
+<span class="lineno">  308 </span><span class="spaces">        </span><span class="nottickedoff">, adSecurityConfig   = secCfg</span>
+<span class="lineno">  309 </span><span class="spaces">        </span><span class="nottickedoff">, adMkSessionExec    = Nothing</span>
+<span class="lineno">  310 </span><span class="spaces">        </span><span class="nottickedoff">, adAbortReg         = cdAbortReg chanDeps</span>
+<span class="lineno">  311 </span><span class="spaces">        </span><span class="nottickedoff">}</span>
+<span class="lineno">  312 </span><span class="spaces">  </span><span class="nottickedoff">-- Start the WS stream server on the WS port.</span>
+<span class="lineno">  313 </span><span class="spaces">  </span><span class="nottickedoff">-- The Origin allowlist is the configured list PLUS origins derived from</span>
+<span class="lineno">  314 </span><span class="spaces">  </span><span class="nottickedoff">-- the HTTP server's host + port. A wildcard host (0.0.0.0) means &quot;bind all</span>
+<span class="lineno">  315 </span><span class="spaces">  </span><span class="nottickedoff">-- interfaces&quot; — the browser may reach the server via any of them, so we</span>
+<span class="lineno">  316 </span><span class="spaces">  </span><span class="nottickedoff">-- can't enumerate the allowed origins ahead of time. In that case, pass an</span>
+<span class="lineno">  317 </span><span class="spaces">  </span><span class="nottickedoff">-- empty allowlist to the WS guard, which triggers wildcard mode (accept</span>
+<span class="lineno">  318 </span><span class="spaces">  </span><span class="nottickedoff">-- any Origin) — overriding even the default loopback origin. For a specific</span>
+<span class="lineno">  319 </span><span class="spaces">  </span><span class="nottickedoff">-- host, derive the origin + prepend it to the configured list.</span>
+<span class="lineno">  320 </span><span class="spaces">  </span><span class="nottickedoff">let isWildcard = gcHost gwCfg == &quot;0.0.0.0&quot; || gcHost gwCfg == &quot;::&quot;</span>
+<span class="lineno">  321 </span><span class="spaces">      </span><span class="nottickedoff">httpOrigins = [ &quot;http://&quot; &lt;&gt; gcHost gwCfg &lt;&gt; &quot;:&quot; &lt;&gt; T.pack (show (gcPort gwCfg))</span>
+<span class="lineno">  322 </span><span class="spaces">                    </span><span class="nottickedoff">| not isWildcard ]</span>
+<span class="lineno">  323 </span><span class="spaces">      </span><span class="nottickedoff">origins = if isWildcard</span>
+<span class="lineno">  324 </span><span class="spaces">                  </span><span class="nottickedoff">then []  -- wildcard host → empty allowlist → Stream.hs accepts any</span>
+<span class="lineno">  325 </span><span class="spaces">                  </span><span class="nottickedoff">else httpOrigins &lt;&gt; gcAllowedOrigins gwCfg</span>
+<span class="lineno">  326 </span><span class="spaces">      </span><span class="nottickedoff">guard = StreamGuard { sgAllowedOrigins = origins, sgGlobalCap = 1024, sgTabsHandle = tabsH, sgPaths = paths }</span>
+<span class="lineno">  327 </span><span class="spaces">  </span><span class="nottickedoff">logIO logger InfoS (&quot;WS stream server binding to &quot; &lt;&gt; ls (gcHost gwCfg &lt;&gt; &quot;:&quot; &lt;&gt; T.pack (show (gcWsPort gwCfg))))</span>
+<span class="lineno">  328 </span><span class="spaces">  </span><span class="nottickedoff">_ &lt;- forkIO (runStreamServer (gcHost gwCfg) (gcWsPort gwCfg) guard broker)</span>
+<span class="lineno">  329 </span><span class="spaces">  </span><span class="nottickedoff">-- Fork channel listeners for any configured channel. Each channel gets</span>
+<span class="lineno">  330 </span><span class="spaces">  </span><span class="nottickedoff">-- its own askReply store; the tab list is shared (passed by the</span>
+<span class="lineno">  331 </span><span class="spaces">  </span><span class="nottickedoff">-- listener). The listener runs the shared 'runChannelLoop' + 'plainTurn'</span>
+<span class="lineno">  332 </span><span class="spaces">  </span><span class="nottickedoff">-- so the agent loop is identical to the standalone modes.</span>
+<span class="lineno">  333 </span><span class="spaces">  </span><span class="nottickedoff">forkSignalListener chanDeps cfg registry</span>
+<span class="lineno">  334 </span><span class="spaces">  </span><span class="nottickedoff">forkTelegramListener chanDeps cfg registry</span>
+<span class="lineno">  335 </span><span class="spaces">  </span><span class="nottickedoff">-- Run the HTTP gateway (blocks). Fail-closed on non-loopback when</span>
+<span class="lineno">  336 </span><span class="spaces">  </span><span class="nottickedoff">-- mode=remote (design V6: prevents network access to the unauthenticated</span>
+<span class="lineno">  337 </span><span class="spaces">  </span><span class="nottickedoff">-- updateRuntimeConfig caller).</span>
+<span class="lineno">  338 </span><span class="spaces">  </span><span class="nottickedoff">let isRemote = case scUntrustedExec secCfg of</span>
+<span class="lineno">  339 </span><span class="spaces">        </span><span class="nottickedoff">Just uefc -&gt; uefcMode uefc == &quot;remote&quot;</span>
+<span class="lineno">  340 </span><span class="spaces">        </span><span class="nottickedoff">Nothing   -&gt; False</span>
+<span class="lineno">  341 </span><span class="spaces">  </span><span class="nottickedoff">runGateway gwCfg isRemote deps</span></span>
+<span class="lineno">  342 </span>
+<span class="lineno">  343 </span>-- | Build the /repo command's 'RepoTestSeam' from the live vault runtime +
+<span class="lineno">  344 </span>-- paths. The 'VaultRuntime' holds the 'IORef' of the (maybe) live
+<span class="lineno">  345 </span>-- 'VaultHandle'; when the vault is unconfigured/locked ('Nothing' in the
+<span class="lineno">  346 </span>-- ref), @rtsLsRemote@ fails closed to 'CloneVaultError VaultLocked' (via
+<span class="lineno">  347 </span>-- 'Clone.resolveVaultHandle') and @rtsVaultList@ returns 'Left VaultLocked'
+<span class="lineno">  348 </span>-- (/repo info shows the locked advisory). Mirrors 'vaultGetByName' in
+<span class="lineno">  349 </span>-- 'Seal.ISA.Ops.Secret'.
+<span class="lineno">  350 </span>mkRepoTestSeam :: VaultRuntime -&gt; RepoRegistryHandle -&gt; SealPaths -&gt; IO RepoTestSeam
+<span class="lineno">  351 </span><span class="decl"><span class="nottickedoff">mkRepoTestSeam rt repoRegH paths = do</span>
+<span class="lineno">  352 </span><span class="spaces">  </span><span class="nottickedoff">agentRegH &lt;- mkAgentRegistryHandle (sshAgentsDir paths)</span>
+<span class="lineno">  353 </span><span class="spaces">  </span><span class="nottickedoff">pure RepoTestSeam</span>
+<span class="lineno">  354 </span><span class="spaces">    </span><span class="nottickedoff">{ rtsLsRemote  = \repo -&gt; do</span>
+<span class="lineno">  355 </span><span class="spaces">        </span><span class="nottickedoff">let deps = Clone.CloneDeps</span>
+<span class="lineno">  356 </span><span class="spaces">              </span><span class="nottickedoff">{ Clone.cdVault = rt</span>
+<span class="lineno">  357 </span><span class="spaces">              </span><span class="nottickedoff">, Clone.cdRepoReg = repoRegH</span>
+<span class="lineno">  358 </span><span class="spaces">              </span><span class="nottickedoff">, Clone.cdSshAgent = mkRealSshAgentHandle</span>
+<span class="lineno">  359 </span><span class="spaces">              </span><span class="nottickedoff">, Clone.cdAgentRegistry = agentRegH</span>
+<span class="lineno">  360 </span><span class="spaces">              </span><span class="nottickedoff">, Clone.cdPinnedKnownHosts = pinnedGithubKnownHosts</span>
+<span class="lineno">  361 </span><span class="spaces">              </span><span class="nottickedoff">, Clone.cdKeyfilesDir = repoKeysDir paths</span>
+<span class="lineno">  362 </span><span class="spaces">              </span><span class="nottickedoff">, Clone.cdIsRemote = False</span>
+<span class="lineno">  363 </span><span class="spaces">              </span><span class="nottickedoff">}</span>
+<span class="lineno">  364 </span><span class="spaces">        </span><span class="nottickedoff">lsRemoteRepo deps repo</span>
+<span class="lineno">  365 </span><span class="spaces">  </span><span class="nottickedoff">, rtsVaultList = do</span>
+<span class="lineno">  366 </span><span class="spaces">      </span><span class="nottickedoff">mh &lt;- readIORef (vrHandleRef rt)</span>
+<span class="lineno">  367 </span><span class="spaces">      </span><span class="nottickedoff">case mh of</span>
+<span class="lineno">  368 </span><span class="spaces">        </span><span class="nottickedoff">Nothing -&gt; pure (Left VaultLocked)</span>
+<span class="lineno">  369 </span><span class="spaces">        </span><span class="nottickedoff">Just vh -&gt; vhList vh</span>
+<span class="lineno">  370 </span><span class="spaces">  </span><span class="nottickedoff">, rtsVaultPut = \k v -&gt; do</span>
+<span class="lineno">  371 </span><span class="spaces">      </span><span class="nottickedoff">mh &lt;- readIORef (vrHandleRef rt)</span>
+<span class="lineno">  372 </span><span class="spaces">      </span><span class="nottickedoff">case mh of</span>
+<span class="lineno">  373 </span><span class="spaces">        </span><span class="nottickedoff">Nothing -&gt; pure (Left VaultLocked)</span>
+<span class="lineno">  374 </span><span class="spaces">        </span><span class="nottickedoff">Just vh -&gt; vhPut vh k v</span>
+<span class="lineno">  375 </span><span class="spaces">  </span><span class="nottickedoff">}</span></span>
+<span class="lineno">  376 </span>
+<span class="lineno">  377 </span>-- | Open the vault if both recipient and identity are configured. Mirrors
+<span class="lineno">  378 </span>-- 'Seal.Tui.tryOpenVault'; duplicated to keep this module standalone.
+<span class="lineno">  379 </span>tryOpenVault :: SealPaths -&gt; SecurityConfig -&gt; SealLogger -&gt; IO (Maybe VaultHandle)
+<span class="lineno">  380 </span><span class="decl"><span class="nottickedoff">tryOpenVault paths fcfg logger =</span>
+<span class="lineno">  381 </span><span class="spaces">  </span><span class="nottickedoff">case (scVaultRecipient fcfg, scVaultIdentity fcfg) of</span>
+<span class="lineno">  382 </span><span class="spaces">    </span><span class="nottickedoff">(Just _, Just _) -&gt;</span>
+<span class="lineno">  383 </span><span class="spaces">      </span><span class="nottickedoff">resolveEncryptor fcfg &gt;&gt;= \case</span>
+<span class="lineno">  384 </span><span class="spaces">        </span><span class="nottickedoff">Left err -&gt; do</span>
+<span class="lineno">  385 </span><span class="spaces">          </span><span class="nottickedoff">logIO logger WarningS (&quot;vault not available: &quot; &lt;&gt; ls (T.pack (show err)))</span>
+<span class="lineno">  386 </span><span class="spaces">          </span><span class="nottickedoff">pure Nothing</span>
+<span class="lineno">  387 </span><span class="spaces">        </span><span class="nottickedoff">Right enc -&gt; do</span>
+<span class="lineno">  388 </span><span class="spaces">          </span><span class="nottickedoff">let vcfg = VaultConfig</span>
+<span class="lineno">  389 </span><span class="spaces">                </span><span class="nottickedoff">{ vcPath    = maybe (vaultFilePath paths) T.unpack (scVaultPath fcfg)</span>
+<span class="lineno">  390 </span><span class="spaces">                </span><span class="nottickedoff">, vcKeyType = fromMaybe &quot;x25519&quot; (scVaultKeyType fcfg)</span>
+<span class="lineno">  391 </span><span class="spaces">                </span><span class="nottickedoff">, vcUnlock  = parseUnlockMode (scVaultUnlock fcfg)</span>
+<span class="lineno">  392 </span><span class="spaces">                </span><span class="nottickedoff">}</span>
+<span class="lineno">  393 </span><span class="spaces">          </span><span class="nottickedoff">Just &lt;$&gt; openVault vcfg enc</span>
+<span class="lineno">  394 </span><span class="spaces">    </span><span class="nottickedoff">_ -&gt; pure Nothing</span></span>
+<span class="lineno">  395 </span>
+<span class="lineno">  396 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  397 </span>-- Channel listener forking
+<span class="lineno">  398 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  399 </span>
+<span class="lineno">  400 </span>-- | Does the session.json backing a 'BoundSession' tab exist on disk? Used
+<span class="lineno">  401 </span>-- at boot to drop stale tabs (the session was deleted out-of-band). Harness
+<span class="lineno">  402 </span>-- tabs (BoundHarness) are always kept (the reconcile sweep handles them).
+<span class="lineno">  403 </span>sessionTabExists :: SealPaths -&gt; Tab -&gt; IO Bool
+<span class="lineno">  404 </span><span class="decl"><span class="nottickedoff">sessionTabExists paths t = case tRef t of</span>
+<span class="lineno">  405 </span><span class="spaces">  </span><span class="nottickedoff">BoundSession sid -&gt; doesFileExist (sessionMetaPath paths sid)</span>
+<span class="lineno">  406 </span><span class="spaces">  </span><span class="nottickedoff">BoundHarness _  -&gt; pure True</span></span>
+<span class="lineno">  407 </span>
+<span class="lineno">  408 </span>-- | Renumber a tab list so slots stay contiguous 0..n-1 after dropping stale
+<span class="lineno">  409 </span>-- tabs (I1: the tab list invariant). The TVar's smart constructors would
+<span class="lineno">  410 </span>-- do this via 'removeTab', but here we renumber in bulk after a boot-time
+<span class="lineno">  411 </span>-- filter, so the indices are recomputed from position.
+<span class="lineno">  412 </span>renumberTabs :: [Tab] -&gt; TabList
+<span class="lineno">  413 </span><span class="decl"><span class="nottickedoff">renumberTabs ts = TabList (zipWith renumber [0..] ts)</span>
+<span class="lineno">  414 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  415 </span><span class="spaces">    </span><span class="nottickedoff">renumber n t = t { tIndex = mkIdx n }</span>
+<span class="lineno">  416 </span><span class="spaces">    </span><span class="nottickedoff">mkIdx n = case mkTabIndex n of</span>
+<span class="lineno">  417 </span><span class="spaces">      </span><span class="nottickedoff">Right i -&gt; i</span>
+<span class="lineno">  418 </span><span class="spaces">      </span><span class="nottickedoff">Left _  -&gt; error (&quot;renumberTabs: index out of range (unreachable, n=&quot; &lt;&gt; show n &lt;&gt; &quot;)&quot;)</span></span>
+<span class="lineno">  419 </span>
+<span class="lineno">  420 </span>-- | Fork the Signal channel listener if @[signal]@ is configured. Resolves
+<span class="lineno">  421 </span>-- the config section, spawns the signal-cli transport, and runs the shared
+<span class="lineno">  422 </span>-- inbox-driven loop in a background thread. A missing/unresolved section
+<span class="lineno">  423 </span>-- is logged to stderr and skipped (not fatal — the gateway still starts).
+<span class="lineno">  424 </span>forkSignalListener :: ChannelDeps -&gt; RuntimeConfig -&gt; Registry -&gt; IO ()
+<span class="lineno">  425 </span><span class="decl"><span class="nottickedoff">forkSignalListener deps cfg registry =</span>
+<span class="lineno">  426 </span><span class="spaces">  </span><span class="nottickedoff">case resolveSignalConfig (rcSignal cfg) Nothing of</span>
+<span class="lineno">  427 </span><span class="spaces">    </span><span class="nottickedoff">Left _ -&gt; pure ()  -- not configured; skip silently</span>
+<span class="lineno">  428 </span><span class="spaces">    </span><span class="nottickedoff">Right (account, chunkLimit, allow) -&gt; do</span>
+<span class="lineno">  429 </span><span class="spaces">      </span><span class="nottickedoff">let accountLabel = Seal.Signal.Config.signalAccountText account</span>
+<span class="lineno">  430 </span><span class="spaces">      </span><span class="nottickedoff">eTransport &lt;- mkRealSignalTransport accountLabel</span>
+<span class="lineno">  431 </span><span class="spaces">      </span><span class="nottickedoff">case eTransport of</span>
+<span class="lineno">  432 </span><span class="spaces">        </span><span class="nottickedoff">Left err -&gt; logIO (cdLogger deps) WarningS (&quot;seal serve: signal channel skipped: &quot; &lt;&gt; ls err)</span>
+<span class="lineno">  433 </span><span class="spaces">        </span><span class="nottickedoff">Right transport -&gt; do</span>
+<span class="lineno">  434 </span><span class="spaces">          </span><span class="nottickedoff">let tabsH = cdTabs deps</span>
+<span class="lineno">  435 </span><span class="spaces">          </span><span class="nottickedoff">askReply &lt;- newAskReplyStore 0</span>
+<span class="lineno">  436 </span><span class="spaces">          </span><span class="nottickedoff">let withCh = withSignalChannel (allow, chunkLimit) account transport (cdLogger deps)</span>
+<span class="lineno">  437 </span><span class="spaces">              </span><span class="nottickedoff">plainHandler h = plainTurn deps h askReply</span>
+<span class="lineno">  438 </span><span class="spaces">          </span><span class="nottickedoff">_ &lt;- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH Nothing Nothing)</span>
+<span class="lineno">  439 </span><span class="spaces">          </span><span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  440 </span>
+<span class="lineno">  441 </span>-- | Fork the Telegram channel listener if @[telegram]@ is configured.
+<span class="lineno">  442 </span>-- Resolves the config section, spawns the Bot API transport, registers the
+<span class="lineno">  443 </span>-- bot's slash-command menu with BotFather for auto-completion, and runs the
+<span class="lineno">  444 </span>-- shared inbox-driven loop in a background thread. A missing/unresolved
+<span class="lineno">  445 </span>-- section is logged to stderr and skipped.
+<span class="lineno">  446 </span>forkTelegramListener :: ChannelDeps -&gt; RuntimeConfig -&gt; Registry -&gt; IO ()
+<span class="lineno">  447 </span><span class="decl"><span class="nottickedoff">forkTelegramListener deps cfg registry = do</span>
+<span class="lineno">  448 </span><span class="spaces">  </span><span class="nottickedoff">-- Read the bot token from the vault (the wizard stores it there).</span>
+<span class="lineno">  449 </span><span class="spaces">  </span><span class="nottickedoff">mh &lt;- readIORef (vrHandleRef (cdVault deps))</span>
+<span class="lineno">  450 </span><span class="spaces">  </span><span class="nottickedoff">mVaultToken &lt;- case mh of</span>
+<span class="lineno">  451 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure Nothing</span>
+<span class="lineno">  452 </span><span class="spaces">    </span><span class="nottickedoff">Just vh -&gt; do</span>
+<span class="lineno">  453 </span><span class="spaces">      </span><span class="nottickedoff">r &lt;- vhGet vh Seal.Telegram.Config.telegramVaultKey</span>
+<span class="lineno">  454 </span><span class="spaces">      </span><span class="nottickedoff">pure $ case r of</span>
+<span class="lineno">  455 </span><span class="spaces">        </span><span class="nottickedoff">Right bs -&gt; Just (TE.decodeUtf8 bs)</span>
+<span class="lineno">  456 </span><span class="spaces">        </span><span class="nottickedoff">Left _   -&gt; Nothing</span>
+<span class="lineno">  457 </span><span class="spaces">  </span><span class="nottickedoff">case resolveTelegramConfig (rcTelegram cfg) mVaultToken of</span>
+<span class="lineno">  458 </span><span class="spaces">    </span><span class="nottickedoff">Left err</span>
+<span class="lineno">  459 </span><span class="spaces">      </span><span class="nottickedoff">| isJust (rcTelegram cfg) -&gt;</span>
+<span class="lineno">  460 </span><span class="spaces">          </span><span class="nottickedoff">-- The [telegram] section is present but unresolved (e.g. the vault</span>
+<span class="lineno">  461 </span><span class="spaces">          </span><span class="nottickedoff">-- is locked / missing the token). Surface it so the channel isn't</span>
+<span class="lineno">  462 </span><span class="spaces">          </span><span class="nottickedoff">-- silently dropped on startup.</span>
+<span class="lineno">  463 </span><span class="spaces">          </span><span class="nottickedoff">logIO (cdLogger deps) WarningS (&quot;seal serve: telegram channel skipped: &quot; &lt;&gt; ls err)</span>
+<span class="lineno">  464 </span><span class="spaces">      </span><span class="nottickedoff">| otherwise -&gt; pure ()  -- not configured; skip silently</span>
+<span class="lineno">  465 </span><span class="spaces">    </span><span class="nottickedoff">Right (token, chunkLimit, allow) -&gt; do</span>
+<span class="lineno">  466 </span><span class="spaces">      </span><span class="nottickedoff">mgr &lt;- newTlsManager</span>
+<span class="lineno">  467 </span><span class="spaces">      </span><span class="nottickedoff">transport &lt;- mkRealTelegramTransport (Seal.Telegram.Config.telegramTokenText token) mgr</span>
+<span class="lineno">  468 </span><span class="spaces">      </span><span class="nottickedoff">-- Register the bot's slash-command menu with BotFather.</span>
+<span class="lineno">  469 </span><span class="spaces">      </span><span class="nottickedoff">tgSetCommands transport (Seal.Channels.Telegram.Commands.telegramBotCommands registry)</span>
+<span class="lineno">  470 </span><span class="spaces">      </span><span class="nottickedoff">let tabsH = cdTabs deps</span>
+<span class="lineno">  471 </span><span class="spaces">      </span><span class="nottickedoff">askReply &lt;- newAskReplyStore 0</span>
+<span class="lineno">  472 </span><span class="spaces">      </span><span class="nottickedoff">let withCh = withTelegramChannel (allow, chunkLimit) transport (cdLogger deps)</span>
+<span class="lineno">  473 </span><span class="spaces">          </span><span class="nottickedoff">plainHandler h = plainTurnWithCaps deps h askReply (Just (mkTelegramHandleCaps transport))</span>
+<span class="lineno">  474 </span><span class="spaces">      </span><span class="nottickedoff">_ &lt;- forkIO (runChannelLoop deps withCh plainHandler registry emptyChain askReply tabsH</span>
+<span class="lineno">  475 </span><span class="spaces">                     </span><span class="nottickedoff">(Just (mkTelegramHandleCaps transport)) (Just (onTelegramCallback askReply)))</span>
+<span class="lineno">  476 </span><span class="spaces">      </span><span class="nottickedoff">pure ()</span></span>
+
+</pre>
+</body>
+</html>

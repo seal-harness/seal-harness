@@ -1,0 +1,273 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Per-session workdir lifecycle: creation, cleanup, and validation.
+<span class="lineno">    3 </span>-- Each session gets a fresh working directory at
+<span class="lineno">    4 </span>-- @~/.seal/cache/workdirs/&lt;session-id&gt;@. The untrusted opcodes' workspace
+<span class="lineno">    5 </span>-- root is this directory, not the cwd.
+<span class="lineno">    6 </span>module Seal.Session.Workdir
+<span class="lineno">    7 </span>  ( WorkdirError (..)
+<span class="lineno">    8 </span>  , ensureSessionWorkdir
+<span class="lineno">    9 </span>  , cleanupSessionWorkdir
+<span class="lineno">   10 </span>  , remoteSessionWorkdirPath
+<span class="lineno">   11 </span>  , ensureRemoteSessionWorkdir
+<span class="lineno">   12 </span>  , mkSessionUntrustedIO
+<span class="lineno">   13 </span>  , SessionExec (..)
+<span class="lineno">   14 </span>  , mkSessionExec
+<span class="lineno">   15 </span>  , failClosedSessionExec
+<span class="lineno">   16 </span>  , isFailClosedSessionExec
+<span class="lineno">   17 </span>  ) where
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>import Control.Exception (IOException, try)
+<span class="lineno">   20 </span>import Data.List (isPrefixOf)
+<span class="lineno">   21 </span>import Data.Text (Text)
+<span class="lineno">   22 </span>import Data.Text qualified as T
+<span class="lineno">   23 </span>import System.Directory
+<span class="lineno">   24 </span>  ( canonicalizePath, createDirectoryIfMissing, doesDirectoryExist
+<span class="lineno">   25 </span>  , removeDirectoryRecursive )
+<span class="lineno">   26 </span>import System.FilePath (splitDirectories)
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>import Seal.Config.Paths (SealPaths (..), sessionWorkdir, workdirsRoot)
+<span class="lineno">   29 </span>import Seal.Config.Security (SecurityConfig, untrustedExecConfigFromSecurity)
+<span class="lineno">   30 </span>import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
+<span class="lineno">   31 </span>import Seal.Core.Types (SessionId, sessionIdText, isValidSessionId)
+<span class="lineno">   32 </span>import Seal.Security.Path (WorkspaceRoot (..))
+<span class="lineno">   33 </span>import Seal.SourceControl.Clone (CloneDeps, stubCloneDeps)
+<span class="lineno">   34 </span>import Seal.Text.LineFile (maxScanBytes)
+<span class="lineno">   35 </span>import Seal.Tools.Exec.Remote
+<span class="lineno">   36 </span>  (RemoteRunner (..), mkRealRemoteRunner, runRemoteShell)
+<span class="lineno">   37 </span>import Seal.Tools.Args (mkShellCommand)
+<span class="lineno">   38 </span>import Seal.Tools.Exec.Types (SshConfig (..), getRemotePath, mkRemotePath)
+<span class="lineno">   39 </span>import Seal.Tools.Exec.UIO.Internal (UIOEnv (..), mkTestUIOEnv)
+<span class="lineno">   40 </span>import Seal.Tools.Exec.UntrustedIO
+<span class="lineno">   41 </span>  ( UntrustedIO, mkLocalUntrustedIO, mkRemoteUntrustedIO
+<span class="lineno">   42 </span>  , mkRemoteUntrustedIOStub )
+<span class="lineno">   43 </span>import Seal.Tools.Exec.WorkdirFs
+<span class="lineno">   44 </span>  ( WorkdirFs, mkLocalWorkdirFs, mkRemoteWorkdirFs, mkWorkdirFsStub )
+<span class="lineno">   45 </span>
+<span class="lineno">   46 </span>-- | The error type for workdir lifecycle operations.
+<span class="lineno">   47 </span>data WorkdirError
+<span class="lineno">   48 </span>  = WdMkdirFailed FilePath Text      -- ^ local mkdir failed (path, reason)
+<span class="lineno">   49 </span>  | WdRemoteMkdirFailed Text          -- ^ remote SSH mkdir failed (reason)
+<span class="lineno">   50 </span>  | WdInvalidSessionId Text           -- ^ SessionId failed validation
+<span class="lineno">   51 </span>  | WdNotUnderWorkdirsRoot FilePath    -- ^ cleanup path escaped workdirsRoot
+<span class="lineno">   52 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>-- | Create the per-session workdir at @&lt;cache&gt;/workdirs/&lt;sid&gt;@.
+<span class="lineno">   55 </span>-- Idempotent: if the workdir already exists, it is reused (NOT cleared —
+<span class="lineno">   56 </span>-- the operator may want to resume or inspect). Returns the workdir path
+<span class="lineno">   57 </span>-- on success. Fails closed on permission errors (does NOT fall back to
+<span class="lineno">   58 </span>-- the cwd — that would reintroduce the cross-session clobber bug).
+<span class="lineno">   59 </span>ensureSessionWorkdir :: SealPaths -&gt; SessionId -&gt; IO (Either WorkdirError FilePath)
+<span class="lineno">   60 </span><span class="decl"><span class="istickedoff">ensureSessionWorkdir paths sid = do</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">let sidText = sessionIdText sid</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">not (isValidSessionId sidText)</span></span>
+<span class="lineno">   63 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">pure (Left (WdInvalidSessionId sidText))</span></span>
+<span class="lineno">   64 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">   65 </span><span class="spaces">      </span><span class="istickedoff">let wdPath = sessionWorkdir paths sid</span>
+<span class="lineno">   66 </span><span class="spaces">      </span><span class="istickedoff">eResult &lt;- try (createDirectoryIfMissing True wdPath) :: IO (Either IOException ())</span>
+<span class="lineno">   67 </span><span class="spaces">      </span><span class="istickedoff">pure $ case eResult of</span>
+<span class="lineno">   68 </span><span class="spaces">        </span><span class="istickedoff">Left ioErr -&gt; Left (WdMkdirFailed <span class="nottickedoff">wdPath</span> <span class="nottickedoff">(T.pack (show ioErr))</span>)</span>
+<span class="lineno">   69 </span><span class="spaces">        </span><span class="istickedoff">Right _   -&gt; Right wdPath</span></span>
+<span class="lineno">   70 </span>
+<span class="lineno">   71 </span>-- | Remove the per-session workdir. Asserts the path is under
+<span class="lineno">   72 </span>-- 'workdirsRoot' (canonicalize + prefix check — defeats symlink swap).
+<span class="lineno">   73 </span>-- Idempotent: no error if the workdir is already gone. Returns
+<span class="lineno">   74 </span>-- 'Either WorkdirError ()' so cleanup failures are not silently
+<span class="lineno">   75 </span>-- swallowed.
+<span class="lineno">   76 </span>cleanupSessionWorkdir :: SealPaths -&gt; SessionId -&gt; IO (Either WorkdirError ())
+<span class="lineno">   77 </span><span class="decl"><span class="istickedoff">cleanupSessionWorkdir paths sid = do</span>
+<span class="lineno">   78 </span><span class="spaces">  </span><span class="istickedoff">let sidText = sessionIdText sid</span>
+<span class="lineno">   79 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">not (isValidSessionId sidText)</span></span>
+<span class="lineno">   80 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">pure (Left (WdInvalidSessionId sidText))</span></span>
+<span class="lineno">   81 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">   82 </span><span class="spaces">      </span><span class="istickedoff">let wdPath = sessionWorkdir paths sid</span>
+<span class="lineno">   83 </span><span class="spaces">          </span><span class="istickedoff">wdRoot = workdirsRoot paths</span>
+<span class="lineno">   84 </span><span class="spaces">      </span><span class="istickedoff">exists &lt;- doesDirectoryExist wdPath</span>
+<span class="lineno">   85 </span><span class="spaces">      </span><span class="istickedoff">if not exists</span>
+<span class="lineno">   86 </span><span class="spaces">        </span><span class="istickedoff">then pure (Right <span class="nottickedoff">()</span>)  -- already gone — idempotent</span>
+<span class="lineno">   87 </span><span class="spaces">        </span><span class="istickedoff">else do</span>
+<span class="lineno">   88 </span><span class="spaces">          </span><span class="istickedoff">-- Defense-in-depth: canonicalize and verify the path is under</span>
+<span class="lineno">   89 </span><span class="spaces">          </span><span class="istickedoff">-- workdirsRoot before rm -rf (defeats symlink swap).</span>
+<span class="lineno">   90 </span><span class="spaces">          </span><span class="istickedoff">canonWd &lt;- canonicalizePath wdPath</span>
+<span class="lineno">   91 </span><span class="spaces">          </span><span class="istickedoff">canonRoot &lt;- canonicalizePath wdRoot</span>
+<span class="lineno">   92 </span><span class="spaces">          </span><span class="istickedoff">if <span class="tickonlyfalse">not (splitDirectories canonRoot `isPrefixOf` splitDirectories canonWd)</span></span>
+<span class="lineno">   93 </span><span class="spaces">            </span><span class="istickedoff">then <span class="nottickedoff">pure (Left (WdNotUnderWorkdirsRoot canonWd))</span></span>
+<span class="lineno">   94 </span><span class="spaces">            </span><span class="istickedoff">else do</span>
+<span class="lineno">   95 </span><span class="spaces">              </span><span class="istickedoff">eResult &lt;- try (removeDirectoryRecursive canonWd) :: IO (Either IOException ())</span>
+<span class="lineno">   96 </span><span class="spaces">              </span><span class="istickedoff">pure $ case eResult of</span>
+<span class="lineno">   97 </span><span class="spaces">                </span><span class="istickedoff">Left ioErr -&gt; <span class="nottickedoff">Left (WdMkdirFailed canonWd (T.pack (show ioErr)))</span></span>
+<span class="lineno">   98 </span><span class="spaces">                </span><span class="istickedoff">Right _   -&gt; Right <span class="nottickedoff">()</span></span></span>
+<span class="lineno">   99 </span>
+<span class="lineno">  100 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  101 </span>-- Remote workdir (mode=remote)
+<span class="lineno">  102 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  103 </span>
+<span class="lineno">  104 </span>-- | Compute the remote per-session workdir path:
+<span class="lineno">  105 </span>-- @&lt;scWorkspace&gt;/workdirs/&lt;sid&gt;@. Pure — no IO, no SSH.
+<span class="lineno">  106 </span>remoteSessionWorkdirPath :: SshConfig -&gt; SessionId -&gt; Text
+<span class="lineno">  107 </span><span class="decl"><span class="istickedoff">remoteSessionWorkdirPath sshCfg sid =</span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="istickedoff">getRemotePath (scWorkspace sshCfg) &lt;&gt; &quot;/workdirs/&quot; &lt;&gt; sessionIdText sid</span></span>
+<span class="lineno">  109 </span>
+<span class="lineno">  110 </span>-- | Create the per-session workdir on the REMOTE machine via SSH
+<span class="lineno">  111 </span>-- @mkdir -p@. Validates the 'SessionId' before the SSH call. Idempotent
+<span class="lineno">  112 </span>-- (mkdir -p is a no-op if the dir exists). Returns the remote workdir
+<span class="lineno">  113 </span>-- path (as 'Text') on success. Fails closed on SSH errors (does NOT
+<span class="lineno">  114 </span>-- fall back to the shared scWorkspace — that would reintroduce the
+<span class="lineno">  115 </span>-- cross-session clobber bug).
+<span class="lineno">  116 </span>ensureRemoteSessionWorkdir
+<span class="lineno">  117 </span>  :: SshConfig -&gt; RemoteRunner -&gt; SessionId
+<span class="lineno">  118 </span>  -&gt; IO (Either WorkdirError Text)
+<span class="lineno">  119 </span><span class="decl"><span class="istickedoff">ensureRemoteSessionWorkdir sshCfg runner sid = do</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">let sidText = sessionIdText sid</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">not (isValidSessionId sidText)</span></span>
+<span class="lineno">  122 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">pure (Left (WdInvalidSessionId sidText))</span></span>
+<span class="lineno">  123 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  124 </span><span class="spaces">      </span><span class="istickedoff">let remoteWd = remoteSessionWorkdirPath sshCfg sid</span>
+<span class="lineno">  125 </span><span class="spaces">          </span><span class="istickedoff">cmdText = &quot;mkdir -p '&quot; &lt;&gt; T.unpack remoteWd &lt;&gt; &quot;'&quot;</span>
+<span class="lineno">  126 </span><span class="spaces">      </span><span class="istickedoff">case mkShellCommand (T.pack cmdText) of</span>
+<span class="lineno">  127 </span><span class="spaces">        </span><span class="istickedoff">Left _err -&gt; <span class="nottickedoff">pure (Left (WdRemoteMkdirFailed &quot;invalid mkdir command&quot;))</span></span>
+<span class="lineno">  128 </span><span class="spaces">        </span><span class="istickedoff">Right cmd -&gt; do</span>
+<span class="lineno">  129 </span><span class="spaces">          </span><span class="istickedoff">res &lt;- runRemoteShell runner sshCfg cmd</span>
+<span class="lineno">  130 </span><span class="spaces">          </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">  131 </span><span class="spaces">            </span><span class="istickedoff">Left e   -&gt; Left (WdRemoteMkdirFailed <span class="nottickedoff">(T.pack (show e))</span>)</span>
+<span class="lineno">  132 </span><span class="spaces">            </span><span class="istickedoff">Right _  -&gt; Right remoteWd</span></span>
+<span class="lineno">  133 </span>
+<span class="lineno">  134 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  135 </span>-- Unified session UntrustedIO construction (local + remote)
+<span class="lineno">  136 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  137 </span>
+<span class="lineno">  138 </span>-- | The fail-closed 'WorkspaceRoot' returned when workdir creation fails.
+<span class="lineno">  139 </span>-- Matches the convention used at the wiring sites (e.g. @Cli.hs@).
+<span class="lineno">  140 </span>failClosedRoot :: WorkspaceRoot
+<span class="lineno">  141 </span><span class="decl"><span class="istickedoff">failClosedRoot = WorkspaceRoot &quot;/nonexistent-workdir-fail-closed&quot;</span></span>
+<span class="lineno">  142 </span>
+<span class="lineno">  143 </span>-- | The per-session execution bundle: the 'UIOEnv' (carrying 'UntrustedIO'
+<span class="lineno">  144 </span>-- + 'CloneDeps'), the 'WorkdirFs' for discovery, and the shared
+<span class="lineno">  145 </span>-- 'WorkspaceRoot' used by UIO + WorkdirFs + the ISA registry. Constructed
+<span class="lineno">  146 </span>-- by 'mkSessionExec' from the 'SecurityConfig'; the single 'RemoteRunner'
+<span class="lineno">  147 </span>-- is shared between 'seUIOEnv' (UIO's 'UntrustedIO') and 'seWorkdirFs'
+<span class="lineno">  148 </span>-- (via 'runUIOWithEnv') — one SSH connection, not two. On ANY workdir-
+<span class="lineno">  149 </span>-- creation failure, ALL three fields are stubs (fail-closed) — never a
+<span class="lineno">  150 </span>-- mix of real + stub.
+<span class="lineno">  151 </span>data SessionExec = SessionExec
+<span class="lineno">  152 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">seUIOEnv</span></span></span>        :: UIOEnv
+<span class="lineno">  153 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">seWorkdirFs</span></span></span>     :: WorkdirFs
+<span class="lineno">  154 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">seWorkspaceRoot</span></span></span> :: WorkspaceRoot
+<span class="lineno">  155 </span>  }
+<span class="lineno">  156 </span>
+<span class="lineno">  157 </span>-- | Construct the per-session 'SessionExec' from the 'SecurityConfig'.
+<span class="lineno">  158 </span>-- Mirrors 'mkSessionUntrustedIO' with the same three cases (local,
+<span class="lineno">  159 </span>-- remote + configured, remote + absent/incomplete) but additionally
+<span class="lineno">  160 </span>-- builds the 'WorkdirFs' and the shared 'WorkspaceRoot'. The
+<span class="lineno">  161 </span>-- 'RemoteRunner' is passed explicitly so tests can inject
+<span class="lineno">  162 </span>-- 'mkFakeRemoteRunnerRecording' (no real SSH); production wiring passes
+<span class="lineno">  163 </span>-- 'mkRealRemoteRunner'. The single runner is shared between 'seUIOEnv'
+<span class="lineno">  164 </span>-- and 'seWorkdirFs'. On ANY workdir-creation failure, returns a
+<span class="lineno">  165 </span>-- 'SessionExec' with both handles as stubs and 'seWorkspaceRoot' as
+<span class="lineno">  166 </span>-- 'failClosedRoot' — never mixed.
+<span class="lineno">  167 </span>mkSessionExec
+<span class="lineno">  168 </span>  :: SealPaths -&gt; SecurityConfig -&gt; SessionId
+<span class="lineno">  169 </span>  -&gt; CloneDeps -&gt; RemoteRunner -&gt; IO SessionExec
+<span class="lineno">  170 </span><span class="decl"><span class="istickedoff">mkSessionExec paths secCfg sid cloneDeps runner =</span>
+<span class="lineno">  171 </span><span class="spaces">  </span><span class="istickedoff">case untrustedExecConfigFromSecurity secCfg of</span>
+<span class="lineno">  172 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  173 </span><span class="spaces">      </span><span class="istickedoff">eWd &lt;- ensureSessionWorkdir paths sid</span>
+<span class="lineno">  174 </span><span class="spaces">      </span><span class="istickedoff">case eWd of</span>
+<span class="lineno">  175 </span><span class="spaces">        </span><span class="istickedoff">Right wd -&gt;</span>
+<span class="lineno">  176 </span><span class="spaces">          </span><span class="istickedoff">let wsRoot  = WorkspaceRoot wd</span>
+<span class="lineno">  177 </span><span class="spaces">              </span><span class="istickedoff">uio     = mkLocalUntrustedIO wsRoot</span>
+<span class="lineno">  178 </span><span class="spaces">              </span><span class="istickedoff">uioEnv  = mkTestUIOEnv uio cloneDeps</span>
+<span class="lineno">  179 </span><span class="spaces">              </span><span class="istickedoff">wfs     = mkLocalWorkdirFs wsRoot maxScanBytes</span>
+<span class="lineno">  180 </span><span class="spaces">          </span><span class="istickedoff">in pure SessionExec</span>
+<span class="lineno">  181 </span><span class="spaces">               </span><span class="istickedoff">{ seUIOEnv        = uioEnv</span>
+<span class="lineno">  182 </span><span class="spaces">               </span><span class="istickedoff">, seWorkdirFs     = wfs</span>
+<span class="lineno">  183 </span><span class="spaces">               </span><span class="istickedoff">, seWorkspaceRoot = wsRoot</span>
+<span class="lineno">  184 </span><span class="spaces">               </span><span class="istickedoff">}</span>
+<span class="lineno">  185 </span><span class="spaces">        </span><span class="istickedoff">Left _err -&gt; pure (failClosedSessionExec <span class="nottickedoff">cloneDeps</span>)</span>
+<span class="lineno">  186 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  187 </span><span class="spaces">    </span><span class="istickedoff">Just uec -&gt;</span>
+<span class="lineno">  188 </span><span class="spaces">      </span><span class="istickedoff">case uecRemote uec of</span>
+<span class="lineno">  189 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; pure (failClosedSessionExec <span class="nottickedoff">cloneDeps</span>)</span>
+<span class="lineno">  190 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  191 </span><span class="spaces">        </span><span class="istickedoff">Just sshCfg -&gt; do</span>
+<span class="lineno">  192 </span><span class="spaces">          </span><span class="istickedoff">eRemoteWd &lt;- ensureRemoteSessionWorkdir sshCfg runner sid</span>
+<span class="lineno">  193 </span><span class="spaces">          </span><span class="istickedoff">case eRemoteWd of</span>
+<span class="lineno">  194 </span><span class="spaces">            </span><span class="istickedoff">Left _err -&gt; pure (failClosedSessionExec <span class="nottickedoff">cloneDeps</span>)</span>
+<span class="lineno">  195 </span><span class="spaces">            </span><span class="istickedoff">Right remoteWdText -&gt;</span>
+<span class="lineno">  196 </span><span class="spaces">              </span><span class="istickedoff">case mkRemotePath remoteWdText of</span>
+<span class="lineno">  197 </span><span class="spaces">                </span><span class="istickedoff">Left _err -&gt; <span class="nottickedoff">pure (failClosedSessionExec cloneDeps)</span></span>
+<span class="lineno">  198 </span><span class="spaces">                </span><span class="istickedoff">Right remotePath -&gt;</span>
+<span class="lineno">  199 </span><span class="spaces">                  </span><span class="istickedoff">let sshCfg' = sshCfg { scWorkspace = remotePath }</span>
+<span class="lineno">  200 </span><span class="spaces">                      </span><span class="istickedoff">wsRoot  = WorkspaceRoot (T.unpack (getRemotePath remotePath))</span>
+<span class="lineno">  201 </span><span class="spaces">                      </span><span class="istickedoff">uio     = mkRemoteUntrustedIO sshCfg' runner</span>
+<span class="lineno">  202 </span><span class="spaces">                      </span><span class="istickedoff">uioEnv  = mkTestUIOEnv uio cloneDeps</span>
+<span class="lineno">  203 </span><span class="spaces">                      </span><span class="istickedoff">wfs     = mkRemoteWorkdirFs uioEnv <span class="nottickedoff">sshCfg'</span> wsRoot maxScanBytes</span>
+<span class="lineno">  204 </span><span class="spaces">                  </span><span class="istickedoff">in pure SessionExec</span>
+<span class="lineno">  205 </span><span class="spaces">                       </span><span class="istickedoff">{ seUIOEnv        = uioEnv</span>
+<span class="lineno">  206 </span><span class="spaces">                       </span><span class="istickedoff">, seWorkdirFs     = wfs</span>
+<span class="lineno">  207 </span><span class="spaces">                       </span><span class="istickedoff">, seWorkspaceRoot = wsRoot</span>
+<span class="lineno">  208 </span><span class="spaces">                       </span><span class="istickedoff">}</span></span>
+<span class="lineno">  209 </span>
+<span class="lineno">  210 </span>-- | The fail-closed 'SessionExec': both handles are stubs, the root is
+<span class="lineno">  211 </span>-- 'failClosedRoot'. Used on ANY workdir-creation failure.
+<span class="lineno">  212 </span>failClosedSessionExec :: CloneDeps -&gt; SessionExec
+<span class="lineno">  213 </span><span class="decl"><span class="istickedoff">failClosedSessionExec cloneDeps = SessionExec</span>
+<span class="lineno">  214 </span><span class="spaces">  </span><span class="istickedoff">{ seUIOEnv        = <span class="nottickedoff">mkTestUIOEnv mkRemoteUntrustedIOStub cloneDeps</span></span>
+<span class="lineno">  215 </span><span class="spaces">  </span><span class="istickedoff">, seWorkdirFs     = mkWorkdirFsStub</span>
+<span class="lineno">  216 </span><span class="spaces">  </span><span class="istickedoff">, seWorkspaceRoot = failClosedRoot</span>
+<span class="lineno">  217 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  218 </span>
+<span class="lineno">  219 </span>-- | Did this exec fail closed? (The workdir bootstrap failed and every
+<span class="lineno">  220 </span>-- handle is a stub.) The exec cache uses this to avoid memoizing failures.
+<span class="lineno">  221 </span>isFailClosedSessionExec :: SessionExec -&gt; Bool
+<span class="lineno">  222 </span><span class="decl"><span class="istickedoff">isFailClosedSessionExec e = seWorkspaceRoot e == failClosedRoot</span></span>
+<span class="lineno">  223 </span>
+<span class="lineno">  224 </span>-- | Construct the per-session 'UntrustedIO' from the 'SecurityConfig':
+<span class="lineno">  225 </span>--
+<span class="lineno">  226 </span>--   * @mode=local@ (or absent): create the local workdir via
+<span class="lineno">  227 </span>--     'ensureSessionWorkdir' and construct 'mkLocalUntrustedIO' with it
+<span class="lineno">  228 </span>--     as the 'WorkspaceRoot'.
+<span class="lineno">  229 </span>--
+<span class="lineno">  230 </span>--   * @mode=remote@ + remote configured: create the remote workdir via
+<span class="lineno">  231 </span>--     'ensureRemoteSessionWorkdir' (SSH @mkdir -p@), clone the
+<span class="lineno">  232 </span>--     'SshConfig' with @scWorkspace@ = the per-session remote workdir,
+<span class="lineno">  233 </span>--     and construct 'mkRemoteUntrustedIO' with the cloned config.
+<span class="lineno">  234 </span>--
+<span class="lineno">  235 </span>--   * @mode=remote@ + remote absent/incomplete: return the fail-closed
+<span class="lineno">  236 </span>--     stub ('mkRemoteUntrustedIOStub').
+<span class="lineno">  237 </span>--
+<span class="lineno">  238 </span>-- This is the single entry point the wiring sites call — it handles
+<span class="lineno">  239 </span>-- both local and remote, creates the workdir, and returns the handle.
+<span class="lineno">  240 </span>-- On workdir creation failure, returns the fail-closed stub (the session
+<span class="lineno">  241 </span>-- should surface the error and NOT proceed — the wiring site checks the
+<span class="lineno">  242 </span>-- 'WorkdirError' via 'ensureSessionWorkdir' separately if it needs to
+<span class="lineno">  243 </span>-- surface the error to the user).
+<span class="lineno">  244 </span>--
+<span class="lineno">  245 </span>-- Back-compat thin wrapper over 'mkSessionExec' (threads
+<span class="lineno">  246 </span>-- 'mkRealRemoteRunner', preserving EXACT current semantics).
+<span class="lineno">  247 </span>mkSessionUntrustedIO
+<span class="lineno">  248 </span>  :: SealPaths -&gt; SecurityConfig -&gt; SessionId -&gt; IO UntrustedIO
+<span class="lineno">  249 </span><span class="decl"><span class="istickedoff">mkSessionUntrustedIO paths secCfg sid =</span>
+<span class="lineno">  250 </span><span class="spaces">  </span><span class="istickedoff">uieUntrustedIO . seUIOEnv &lt;$&gt; mkSessionExec paths secCfg sid stubCloneDeps <span class="nottickedoff">mkRealRemoteRunner</span></span></span>
+
+</pre>
+</body>
+</html>

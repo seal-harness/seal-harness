@@ -1,0 +1,113 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Watch-state persistence — the per-conversation watch-all-tabs map
+<span class="lineno">    3 </span>-- survives a @seal serve@ restart. Written atomically (0600) to
+<span class="lineno">    4 </span>-- @\&lt;state\&gt;\/watch_state.json@ on every watch-mode mutation via
+<span class="lineno">    5 </span>-- 'Seal.Util.AtomicJson.saveJsonAtomic'; loaded at boot by 'loadWatchMap'
+<span class="lineno">    6 </span>-- so a conversation's watch mode is restored instead of reset to off.
+<span class="lineno">    7 </span>--
+<span class="lineno">    8 </span>-- The map is encoded as a JSON array of
+<span class="lineno">    9 </span>-- @{&quot;key&quot;: {&quot;channel&quot;: &quot;...&quot;, &quot;conv&quot;: &quot;...&quot;}, &quot;enabled&quot;: true}@ pairs.
+<span class="lineno">   10 </span>-- 'ConversationKey' is a record, not a JSON-string-keyable type, so the
+<span class="lineno">   11 </span>-- map is serialized as a list of wire objects (mirroring
+<span class="lineno">   12 </span>-- 'Seal.Channels.Cursor.Persist.CursorWire').
+<span class="lineno">   13 </span>module Seal.Channels.Chat.WatchPersist
+<span class="lineno">   14 </span>  ( saveWatchMap
+<span class="lineno">   15 </span>  , loadWatchMap
+<span class="lineno">   16 </span>  ) where
+<span class="lineno">   17 </span>
+<span class="lineno">   18 </span>import Data.Aeson qualified as A
+<span class="lineno">   19 </span>import Data.Aeson.Key qualified as Key
+<span class="lineno">   20 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   21 </span>import Data.Map.Strict (Map)
+<span class="lineno">   22 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   23 </span>import System.Directory (doesFileExist)
+<span class="lineno">   24 </span>
+<span class="lineno">   25 </span>import Katip (Severity (..))
+<span class="lineno">   26 </span>import Seal.Channels.Chat.Types (ConversationKey (..))
+<span class="lineno">   27 </span>import Seal.Logging.Global (globalLogIO)
+<span class="lineno">   28 </span>import Seal.Util.AtomicJson (saveJsonAtomic)
+<span class="lineno">   29 </span>import Seal.Util.StrictIO (decodeFileStrict)
+<span class="lineno">   30 </span>
+<span class="lineno">   31 </span>-- | The on-disk wire type: a key/enabled pair. The map is converted to/from
+<span class="lineno">   32 </span>-- this list on save/load.
+<span class="lineno">   33 </span>data WatchWire = WatchWire
+<span class="lineno">   34 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">wwKey</span></span></span>     :: ConversationKey
+<span class="lineno">   35 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">wwEnabled</span></span></span> :: Bool
+<span class="lineno">   36 </span>  }
+<span class="lineno">   37 </span>
+<span class="lineno">   38 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">A.ToJSON WatchWire</span></span></span></span></span></span></span></span> where
+<span class="lineno">   39 </span>  <span class="decl"><span class="istickedoff">toJSON w = A.object</span>
+<span class="lineno">   40 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;key&quot;     A..= ckToJSON (wwKey w)</span>
+<span class="lineno">   41 </span><span class="spaces">    </span><span class="istickedoff">, &quot;enabled&quot; A..= wwEnabled w</span>
+<span class="lineno">   42 </span><span class="spaces">    </span><span class="istickedoff">]</span>
+<span class="lineno">   43 </span><span class="spaces">    </span><span class="istickedoff">where</span>
+<span class="lineno">   44 </span><span class="spaces">      </span><span class="istickedoff">ckToJSON (ConversationKey ch cv) = A.object</span>
+<span class="lineno">   45 </span><span class="spaces">        </span><span class="istickedoff">[ &quot;channel&quot; A..= ch</span>
+<span class="lineno">   46 </span><span class="spaces">        </span><span class="istickedoff">, &quot;conv&quot;    A..= cv</span>
+<span class="lineno">   47 </span><span class="spaces">        </span><span class="istickedoff">]</span></span>
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">A.FromJSON WatchWire</span></span></span></span> where
+<span class="lineno">   50 </span>  <span class="decl"><span class="istickedoff">parseJSON = A.withObject <span class="nottickedoff">&quot;WatchWire&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">   51 </span><span class="spaces">    </span><span class="istickedoff">keyVal &lt;- o A..: &quot;key&quot;</span>
+<span class="lineno">   52 </span><span class="spaces">    </span><span class="istickedoff">enabled &lt;- o A..: &quot;enabled&quot;</span>
+<span class="lineno">   53 </span><span class="spaces">    </span><span class="istickedoff">case keyVal of</span>
+<span class="lineno">   54 </span><span class="spaces">      </span><span class="istickedoff">A.Object ko -&gt;</span>
+<span class="lineno">   55 </span><span class="spaces">        </span><span class="istickedoff">case (asText (KeyMap.lookup (Key.fromText &quot;channel&quot;) ko),</span>
+<span class="lineno">   56 </span><span class="spaces">              </span><span class="istickedoff">asText (KeyMap.lookup (Key.fromText &quot;conv&quot;) ko)) of</span>
+<span class="lineno">   57 </span><span class="spaces">          </span><span class="istickedoff">(Just ch, Just cv) -&gt; pure (WatchWire (ConversationKey ch cv) enabled)</span>
+<span class="lineno">   58 </span><span class="spaces">          </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">fail &quot;missing channel or conv field&quot;</span></span>
+<span class="lineno">   59 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">fail &quot;key is not an object&quot;</span></span>
+<span class="lineno">   60 </span><span class="spaces">    </span><span class="istickedoff">where</span>
+<span class="lineno">   61 </span><span class="spaces">      </span><span class="istickedoff">asText (Just (A.String t)) = Just t</span>
+<span class="lineno">   62 </span><span class="spaces">      </span><span class="istickedoff">asText _ = <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">   63 </span>
+<span class="lineno">   64 </span>-- | Save a watch-state map to @path@ atomically (0600, MVar-serialized via
+<span class="lineno">   65 </span>-- 'saveJsonAtomic'). Never throws; a write failure is the caller's
+<span class="lineno">   66 </span>-- responsibility to 'catch' (the persisting watch state does so and logs
+<span class="lineno">   67 </span>-- a warning, matching the cursor-store pattern).
+<span class="lineno">   68 </span>saveWatchMap :: FilePath -&gt; Map ConversationKey Bool -&gt; IO ()
+<span class="lineno">   69 </span><span class="decl"><span class="istickedoff">saveWatchMap path m =</span>
+<span class="lineno">   70 </span><span class="spaces">  </span><span class="istickedoff">saveJsonAtomic path (A.encode (map (uncurry WatchWire) (Map.toList m)))</span></span>
+<span class="lineno">   71 </span>
+<span class="lineno">   72 </span>-- | Load the watch-state map from @path@. Missing file -&gt; 'Nothing' (fresh
+<span class="lineno">   73 </span>-- empty store). Corrupt JSON -&gt; 'Nothing' + a stderr warning (no
+<span class="lineno">   74 </span>-- conversation content in the file — just channel/conversation ids + a
+<span class="lineno">   75 </span>-- boolean). Entries with a missing or malformed key are dropped
+<span class="lineno">   76 </span>-- (defense-in-depth against a tampered file), mirroring
+<span class="lineno">   77 </span>-- 'Seal.Channels.Cursor.Persist.filterValid'.
+<span class="lineno">   78 </span>loadWatchMap :: FilePath -&gt; IO (Maybe (Map ConversationKey Bool))
+<span class="lineno">   79 </span><span class="decl"><span class="istickedoff">loadWatchMap path = do</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">   81 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">   82 </span><span class="spaces">    </span><span class="istickedoff">then pure Nothing</span>
+<span class="lineno">   83 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">   84 </span><span class="spaces">      </span><span class="istickedoff">mWires &lt;- decodeFileStrict path :: IO (Maybe [WatchWire])</span>
+<span class="lineno">   85 </span><span class="spaces">      </span><span class="istickedoff">case mWires of</span>
+<span class="lineno">   86 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">   87 </span><span class="spaces">          </span><span class="istickedoff">globalLogIO <span class="nottickedoff">WarningS</span> <span class="nottickedoff">&quot;could not parse watch_state.json; using empty watch state&quot;</span></span>
+<span class="lineno">   88 </span><span class="spaces">          </span><span class="istickedoff">pure Nothing</span>
+<span class="lineno">   89 </span><span class="spaces">        </span><span class="istickedoff">Just ws -&gt;</span>
+<span class="lineno">   90 </span><span class="spaces">          </span><span class="istickedoff">pure (Just (Map.fromList [ (wwKey w, wwEnabled w) | w &lt;- ws ]))</span></span>
+
+</pre>
+</body>
+</html>

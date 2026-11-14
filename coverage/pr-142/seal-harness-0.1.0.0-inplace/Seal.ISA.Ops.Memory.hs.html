@@ -1,0 +1,264 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The Memory opcode group: MEMORY_WRITE, MEMORY_RECALL, MEMORY_DELETE.
+<span class="lineno">    3 </span>-- All Audited — the dispatcher writes both the session transcript and the
+<span class="lineno">    4 </span>-- Audited log; the opcodes mutate the in-memory/SQLite/Markdown backend
+<span class="lineno">    5 </span>-- (the materialized view). 'orRecorded' carries the secret-free 'MemoryId'
+<span class="lineno">    6 </span>-- + op name + @was_new@ flag (so the audit log distinguishes create vs
+<span class="lineno">    7 </span>-- update); the memory CONTENT is agent-visible data (not a vault secret)
+<span class="lineno">    8 </span>-- and is recorded in full in both logs.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- 'MEMORY_WRITE' is an upsert: if the memory already exists, its content
+<span class="lineno">   11 </span>-- and/or tags are updated (the original 'meSession' provenance and
+<span class="lineno">   12 </span>-- 'meCreatedAt' are preserved; only 'meUpdatedAt' is bumped); if not, a
+<span class="lineno">   13 </span>-- fresh entry is created. This merges the former MEMORY_STORE +
+<span class="lineno">   14 </span>-- MEMORY_UPDATE into a single opcode, eliminating one failure path.
+<span class="lineno">   15 </span>--
+<span class="lineno">   16 </span>-- 'MEMORY_RECALL' uses the dynamic-retrieval pager ('Seal.Core.Paging'):
+<span class="lineno">   17 </span>-- @page_size = clamp floor ceiling (round (coeff * sqrt total))@, where total
+<span class="lineno">   18 </span>-- is the number of matching memories.
+<span class="lineno">   19 </span>module Seal.ISA.Ops.Memory
+<span class="lineno">   20 </span>  ( memoryWriteOp
+<span class="lineno">   21 </span>  , memoryRecallOp
+<span class="lineno">   22 </span>  , memoryDeleteOp
+<span class="lineno">   23 </span>  ) where
+<span class="lineno">   24 </span>
+<span class="lineno">   25 </span>import Control.Monad.IO.Class (liftIO)
+<span class="lineno">   26 </span>import Data.Aeson
+<span class="lineno">   27 </span>  ( Value, object, withObject, (.:), (.:?), (.=) )
+<span class="lineno">   28 </span>import Data.Aeson.Key (fromText)
+<span class="lineno">   29 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   30 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   31 </span>import Data.Text (Text)
+<span class="lineno">   32 </span>import Data.Text qualified as T
+<span class="lineno">   33 </span>import Data.Time (getCurrentTime)
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>import Seal.Core.Paging (Page (..), PageParams, paginate)
+<span class="lineno">   36 </span>import Seal.Core.Types (OpName (..), SessionId, TrustLevel (..))
+<span class="lineno">   37 </span>import Seal.ISA.Opcode
+<span class="lineno">   38 </span>import Seal.Memory.Backend (MemoryBackend (..))
+<span class="lineno">   39 </span>import Seal.Memory.Types (MemoryEntry (..), memoryIdText, mkMemoryId)
+<span class="lineno">   40 </span>import Seal.Providers.Class (ToolResultPart (..))
+<span class="lineno">   41 </span>
+<span class="lineno">   42 </span>-- | Build a JSON-Schema object with a single required string property.
+<span class="lineno">   43 </span>singleStringSchema :: Text -&gt; Text -&gt; Value
+<span class="lineno">   44 </span><span class="decl"><span class="istickedoff">singleStringSchema fieldName fieldDesc =</span>
+<span class="lineno">   45 </span><span class="spaces">  </span><span class="istickedoff">object</span>
+<span class="lineno">   46 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">   47 </span><span class="spaces">    </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">   48 </span><span class="spaces">        </span><span class="istickedoff">[fromText fieldName .= object</span>
+<span class="lineno">   49 </span><span class="spaces">           </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">   50 </span><span class="spaces">           </span><span class="istickedoff">, &quot;description&quot; .= fieldDesc</span>
+<span class="lineno">   51 </span><span class="spaces">           </span><span class="istickedoff">]]</span>
+<span class="lineno">   52 </span><span class="spaces">    </span><span class="istickedoff">, &quot;required&quot; .= ([fieldName] :: [Text])</span>
+<span class="lineno">   53 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">   54 </span>
+<span class="lineno">   55 </span>-- | Extract the @id@ string field from a JSON object.
+<span class="lineno">   56 </span>idField :: Value -&gt; Maybe Text
+<span class="lineno">   57 </span><span class="decl"><span class="istickedoff">idField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;id&quot;))</span></span>
+<span class="lineno">   58 </span>
+<span class="lineno">   59 </span>-- | Extract the @content@ string field (defaults to empty when absent).
+<span class="lineno">   60 </span>contentField :: Value -&gt; Text
+<span class="lineno">   61 </span><span class="decl"><span class="istickedoff">contentField v = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;content&quot;)) v)</span></span>
+<span class="lineno">   62 </span>
+<span class="lineno">   63 </span>-- | Extract the optional @tags@ array field (defaults to [] when absent).
+<span class="lineno">   64 </span>tagsField :: Value -&gt; [Text]
+<span class="lineno">   65 </span><span class="decl"><span class="istickedoff">tagsField v =</span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;tags&quot;)) v :: Maybe (Maybe [Text]) of</span>
+<span class="lineno">   67 </span><span class="spaces">    </span><span class="istickedoff">Just (Just ts) -&gt; <span class="nottickedoff">ts</span></span>
+<span class="lineno">   68 </span><span class="spaces">    </span><span class="istickedoff">_              -&gt; []</span></span>
+<span class="lineno">   69 </span>
+<span class="lineno">   70 </span>-- | Extract the optional @query@ string field for RECALL (substring filter).
+<span class="lineno">   71 </span>queryField :: Value -&gt; Maybe Text
+<span class="lineno">   72 </span><span class="decl"><span class="istickedoff">queryField v =</span>
+<span class="lineno">   73 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;query&quot;)) v :: Maybe (Maybe Text) of</span>
+<span class="lineno">   74 </span><span class="spaces">    </span><span class="istickedoff">Just (Just q) -&gt; Just q</span>
+<span class="lineno">   75 </span><span class="spaces">    </span><span class="istickedoff">_             -&gt; Nothing</span></span>
+<span class="lineno">   76 </span>
+<span class="lineno">   77 </span>-- | Extract the optional @limit@ integer field for RECALL.
+<span class="lineno">   78 </span>limitField :: Value -&gt; Maybe Int
+<span class="lineno">   79 </span><span class="decl"><span class="istickedoff">limitField v =</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;limit&quot;)) v :: Maybe (Maybe Int) of</span>
+<span class="lineno">   81 </span><span class="spaces">    </span><span class="istickedoff">Just (Just n) | <span class="nottickedoff">n &gt;= 0</span> -&gt; <span class="nottickedoff">Just n</span></span>
+<span class="lineno">   82 </span><span class="spaces">    </span><span class="istickedoff">_                      -&gt; Nothing</span></span>
+<span class="lineno">   83 </span>
+<span class="lineno">   84 </span>-- | Extract the optional @offset@ integer field for RECALL (defaults to 0).
+<span class="lineno">   85 </span>offsetField :: Value -&gt; Int
+<span class="lineno">   86 </span><span class="decl"><span class="istickedoff">offsetField v =</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;offset&quot;)) v :: Maybe (Maybe Int) of</span>
+<span class="lineno">   88 </span><span class="spaces">    </span><span class="istickedoff">Just (Just n) | <span class="nottickedoff">n &gt;= 0</span> -&gt; <span class="nottickedoff">n</span></span>
+<span class="lineno">   89 </span><span class="spaces">    </span><span class="istickedoff">_                      -&gt; 0</span></span>
+<span class="lineno">   90 </span>
+<span class="lineno">   91 </span>-- | MEMORY_WRITE: upsert a memory by id. If the memory already exists, its
+<span class="lineno">   92 </span>-- content and/or tags are updated (the original 'meSession' provenance and
+<span class="lineno">   93 </span>-- 'meCreatedAt' are preserved; only 'meUpdatedAt' is bumped); if not, a
+<span class="lineno">   94 </span>-- fresh entry is created with the current session as provenance. The
+<span class="lineno">   95 </span>-- content and tags are recorded in full (agent-visible data); 'orRecorded'
+<span class="lineno">   96 </span>-- carries the id + op name + content + tags + @was_new@ (secret-free).
+<span class="lineno">   97 </span>memoryWriteOp :: MemoryBackend -&gt; SessionId -&gt; Opcode
+<span class="lineno">   98 </span><span class="decl"><span class="istickedoff">memoryWriteOp backend session = TrustedOpcode</span>
+<span class="lineno">   99 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;MEMORY_WRITE&quot;</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Create or update an agent memory by id (upsert; preserves provenance on update).&quot;</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = object</span>
+<span class="lineno">  103 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  104 </span><span class="spaces">      </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">  105 </span><span class="spaces">          </span><span class="istickedoff">[ fromText &quot;id&quot; .= object</span>
+<span class="lineno">  106 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  107 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Memory id ([A-Za-z0-9_-]+).&quot; :: Text)</span>
+<span class="lineno">  108 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  109 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;content&quot; .= object</span>
+<span class="lineno">  110 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  111 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;The memory content (agent-visible).&quot; :: Text)</span>
+<span class="lineno">  112 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  113 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;tags&quot; .= object</span>
+<span class="lineno">  114 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;array&quot; :: Text)</span>
+<span class="lineno">  115 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Optional tags.&quot; :: Text)</span>
+<span class="lineno">  116 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  117 </span><span class="spaces">          </span><span class="istickedoff">]</span>
+<span class="lineno">  118 </span><span class="spaces">      </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;id&quot;, &quot;content&quot;] :: [Text])</span>
+<span class="lineno">  119 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = maybe <span class="nottickedoff">(Left &quot;MEMORY_WRITE requires {id:string}&quot;)</span> checkId . idField</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; do</span>
+<span class="lineno">  123 </span><span class="spaces">      </span><span class="istickedoff">let mId = idField v &gt;&gt;= either (const Nothing) Just . mkMemoryId</span>
+<span class="lineno">  124 </span><span class="spaces">      </span><span class="istickedoff">case mId of</span>
+<span class="lineno">  125 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; pure (OpResult <span class="nottickedoff">[TrpText &quot;invalid memory id&quot;]</span> True <span class="nottickedoff">(object [])</span>)</span>
+<span class="lineno">  126 </span><span class="spaces">        </span><span class="istickedoff">Just mid -&gt; do</span>
+<span class="lineno">  127 </span><span class="spaces">          </span><span class="istickedoff">mExisting &lt;- liftIO (mbRecall backend mid)</span>
+<span class="lineno">  128 </span><span class="spaces">          </span><span class="istickedoff">now &lt;- liftIO getCurrentTime</span>
+<span class="lineno">  129 </span><span class="spaces">          </span><span class="istickedoff">let (entry, wasNew) = case mExisting of</span>
+<span class="lineno">  130 </span><span class="spaces">                </span><span class="istickedoff">Just existing -&gt;</span>
+<span class="lineno">  131 </span><span class="spaces">                  </span><span class="istickedoff">( existing</span>
+<span class="lineno">  132 </span><span class="spaces">                      </span><span class="istickedoff">{ meContent = contentField v</span>
+<span class="lineno">  133 </span><span class="spaces">                      </span><span class="istickedoff">, meTags = <span class="nottickedoff">tagsField v</span></span>
+<span class="lineno">  134 </span><span class="spaces">                      </span><span class="istickedoff">, meUpdatedAt = <span class="nottickedoff">now</span></span>
+<span class="lineno">  135 </span><span class="spaces">                      </span><span class="istickedoff">}</span>
+<span class="lineno">  136 </span><span class="spaces">                  </span><span class="istickedoff">, False</span>
+<span class="lineno">  137 </span><span class="spaces">                  </span><span class="istickedoff">)</span>
+<span class="lineno">  138 </span><span class="spaces">                </span><span class="istickedoff">Nothing -&gt;</span>
+<span class="lineno">  139 </span><span class="spaces">                  </span><span class="istickedoff">( MemoryEntry</span>
+<span class="lineno">  140 </span><span class="spaces">                      </span><span class="istickedoff">{ meId = mid</span>
+<span class="lineno">  141 </span><span class="spaces">                      </span><span class="istickedoff">, meContent = contentField v</span>
+<span class="lineno">  142 </span><span class="spaces">                      </span><span class="istickedoff">, meTags = tagsField v</span>
+<span class="lineno">  143 </span><span class="spaces">                      </span><span class="istickedoff">, meCreatedAt = now</span>
+<span class="lineno">  144 </span><span class="spaces">                      </span><span class="istickedoff">, meUpdatedAt = now</span>
+<span class="lineno">  145 </span><span class="spaces">                      </span><span class="istickedoff">, meSession = session</span>
+<span class="lineno">  146 </span><span class="spaces">                      </span><span class="istickedoff">}</span>
+<span class="lineno">  147 </span><span class="spaces">                  </span><span class="istickedoff">, True</span>
+<span class="lineno">  148 </span><span class="spaces">                  </span><span class="istickedoff">)</span>
+<span class="lineno">  149 </span><span class="spaces">          </span><span class="istickedoff">liftIO (mbStore backend entry)</span>
+<span class="lineno">  150 </span><span class="spaces">          </span><span class="istickedoff">let recorded = object</span>
+<span class="lineno">  151 </span><span class="spaces">                </span><span class="istickedoff">[ &quot;id&quot; .= memoryIdText mid</span>
+<span class="lineno">  152 </span><span class="spaces">                </span><span class="istickedoff">, &quot;content&quot; .= meContent entry</span>
+<span class="lineno">  153 </span><span class="spaces">                </span><span class="istickedoff">, &quot;tags&quot; .= meTags entry</span>
+<span class="lineno">  154 </span><span class="spaces">                </span><span class="istickedoff">, &quot;created_at&quot; .= meCreatedAt entry</span>
+<span class="lineno">  155 </span><span class="spaces">                </span><span class="istickedoff">, &quot;updated_at&quot; .= meUpdatedAt entry</span>
+<span class="lineno">  156 </span><span class="spaces">                </span><span class="istickedoff">, &quot;session&quot; .= meSession entry</span>
+<span class="lineno">  157 </span><span class="spaces">                </span><span class="istickedoff">, &quot;was_new&quot; .= wasNew</span>
+<span class="lineno">  158 </span><span class="spaces">                </span><span class="istickedoff">]</span>
+<span class="lineno">  159 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult [TrpText (if wasNew then &quot;stored&quot; else &quot;updated&quot;)] False recorded)</span>
+<span class="lineno">  160 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  162 </span><span class="spaces">    </span><span class="istickedoff">checkId t = either <span class="nottickedoff">(Left . (&quot;invalid memory id: &quot; &lt;&gt;))</span> (const (Right ())) (mkMemoryId t)</span></span>
+<span class="lineno">  163 </span>
+<span class="lineno">  164 </span>-- | MEMORY_RECALL: return a paged window of memories, optionally filtered by a
+<span class="lineno">  165 </span>-- substring query. Uses the dynamic-retrieval pager.
+<span class="lineno">  166 </span>memoryRecallOp :: PageParams -&gt; MemoryBackend -&gt; Opcode
+<span class="lineno">  167 </span><span class="decl"><span class="istickedoff">memoryRecallOp params backend = TrustedOpcode</span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;MEMORY_RECALL&quot;</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  170 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Recall agent memories, optionally filtered by a substring query.&quot;</span>
+<span class="lineno">  171 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = object</span>
+<span class="lineno">  172 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  173 </span><span class="spaces">      </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">  174 </span><span class="spaces">          </span><span class="istickedoff">[ fromText &quot;query&quot; .= object</span>
+<span class="lineno">  175 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  176 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Optional substring filter over content+tags.&quot; :: Text)</span>
+<span class="lineno">  177 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  178 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;limit&quot; .= object</span>
+<span class="lineno">  179 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;integer&quot; :: Text)</span>
+<span class="lineno">  180 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Max items to return (clamped to the pager ceiling).&quot; :: Text)</span>
+<span class="lineno">  181 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  182 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;offset&quot; .= object</span>
+<span class="lineno">  183 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;integer&quot; :: Text)</span>
+<span class="lineno">  184 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;0-based offset (defaults to 0).&quot; :: Text)</span>
+<span class="lineno">  185 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  186 </span><span class="spaces">          </span><span class="istickedoff">]</span>
+<span class="lineno">  187 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  188 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  189 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = const (Right ())</span>
+<span class="lineno">  190 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; do</span>
+<span class="lineno">  191 </span><span class="spaces">      </span><span class="istickedoff">let mQuery = queryField v</span>
+<span class="lineno">  192 </span><span class="spaces">          </span><span class="istickedoff">offset = offsetField v</span>
+<span class="lineno">  193 </span><span class="spaces">          </span><span class="istickedoff">mLimit = limitField v</span>
+<span class="lineno">  194 </span><span class="spaces">      </span><span class="istickedoff">allEntries &lt;- liftIO (mbList backend)</span>
+<span class="lineno">  195 </span><span class="spaces">      </span><span class="istickedoff">let filtered = filter (matches mQuery) allEntries</span>
+<span class="lineno">  196 </span><span class="spaces">          </span><span class="istickedoff">page = paginate params offset mLimit filtered</span>
+<span class="lineno">  197 </span><span class="spaces">          </span><span class="istickedoff">rendered = T.intercalate &quot;\n&quot; (map renderEntry (pgItems page))</span>
+<span class="lineno">  198 </span><span class="spaces">                    </span><span class="istickedoff">&lt;&gt; &quot;\n---\npage &quot; &lt;&gt; T.pack (show (pgOffset page))</span>
+<span class="lineno">  199 </span><span class="spaces">                    </span><span class="istickedoff">&lt;&gt; &quot; of &quot; &lt;&gt; T.pack (show (pgTotal page))</span>
+<span class="lineno">  200 </span><span class="spaces">                    </span><span class="istickedoff">&lt;&gt; if <span class="tickonlyfalse">pgHasMore page</span> then <span class="nottickedoff">&quot; (has more)&quot;</span> else &quot; (end)&quot;</span>
+<span class="lineno">  201 </span><span class="spaces">      </span><span class="istickedoff">let <span class="nottickedoff">recorded = object</span></span>
+<span class="lineno">  202 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">[ &quot;query&quot; .= mQuery</span></span>
+<span class="lineno">  203 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, &quot;offset&quot; .= offset</span></span>
+<span class="lineno">  204 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, &quot;limit&quot; .= mLimit</span></span>
+<span class="lineno">  205 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, &quot;total&quot; .= pgTotal page</span></span>
+<span class="lineno">  206 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  207 </span><span class="spaces">      </span><span class="istickedoff">pure (OpResult [TrpText rendered] False <span class="nottickedoff">recorded</span>)</span>
+<span class="lineno">  208 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">  209 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  210 </span><span class="spaces">    </span><span class="istickedoff">matches mQuery e =</span>
+<span class="lineno">  211 </span><span class="spaces">      </span><span class="istickedoff">case mQuery of</span>
+<span class="lineno">  212 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; True</span>
+<span class="lineno">  213 </span><span class="spaces">        </span><span class="istickedoff">Just q  -&gt; q `T.isInfixOf` meContent e || any <span class="nottickedoff">(q `T.isInfixOf`)</span> (meTags e)</span>
+<span class="lineno">  214 </span><span class="spaces">    </span><span class="istickedoff">renderEntry e =</span>
+<span class="lineno">  215 </span><span class="spaces">      </span><span class="istickedoff">memoryIdText (meId e) &lt;&gt; &quot;: &quot; &lt;&gt; meContent e</span></span>
+<span class="lineno">  216 </span>
+<span class="lineno">  217 </span>-- | MEMORY_DELETE: remove a memory by id. Idempotent (deleting a missing id is
+<span class="lineno">  218 </span>-- a success with a &quot;not present&quot; message, not an error).
+<span class="lineno">  219 </span>memoryDeleteOp :: MemoryBackend -&gt; Opcode
+<span class="lineno">  220 </span><span class="decl"><span class="istickedoff">memoryDeleteOp backend = TrustedOpcode</span>
+<span class="lineno">  221 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;MEMORY_DELETE&quot;</span>
+<span class="lineno">  222 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  223 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Delete an agent memory by id (idempotent).&quot;</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = singleStringSchema &quot;id&quot; &quot;The memory id to delete.&quot;</span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  226 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = maybe <span class="nottickedoff">(Left &quot;MEMORY_DELETE requires {id:string}&quot;)</span> checkId . idField</span>
+<span class="lineno">  227 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; do</span>
+<span class="lineno">  228 </span><span class="spaces">      </span><span class="istickedoff">let mId = idField v &gt;&gt;= either <span class="nottickedoff">(const Nothing)</span> Just . mkMemoryId</span>
+<span class="lineno">  229 </span><span class="spaces">      </span><span class="istickedoff">case mId of</span>
+<span class="lineno">  230 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (OpResult [TrpText &quot;invalid memory id&quot;] True (object []))</span></span>
+<span class="lineno">  231 </span><span class="spaces">        </span><span class="istickedoff">Just mid -&gt; do</span>
+<span class="lineno">  232 </span><span class="spaces">          </span><span class="istickedoff">mExisting &lt;- liftIO (mbRecall backend mid)</span>
+<span class="lineno">  233 </span><span class="spaces">          </span><span class="istickedoff">liftIO (mbDelete backend mid)</span>
+<span class="lineno">  234 </span><span class="spaces">          </span><span class="istickedoff">let msg = case mExisting of</span>
+<span class="lineno">  235 </span><span class="spaces">                </span><span class="istickedoff">Nothing -&gt; &quot;deleted (was not present)&quot;</span>
+<span class="lineno">  236 </span><span class="spaces">                </span><span class="istickedoff">Just _  -&gt; <span class="nottickedoff">&quot;deleted&quot;</span></span>
+<span class="lineno">  237 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">recorded = object [&quot;id&quot; .= memoryIdText mid]</span></span>
+<span class="lineno">  238 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult [TrpText msg] False <span class="nottickedoff">recorded</span>)</span>
+<span class="lineno">  239 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">  240 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  241 </span><span class="spaces">    </span><span class="istickedoff">checkId t = either <span class="nottickedoff">(Left . (&quot;invalid memory id: &quot; &lt;&gt;))</span> (const (Right ())) (mkMemoryId t)</span></span>
+
+</pre>
+</body>
+</html>

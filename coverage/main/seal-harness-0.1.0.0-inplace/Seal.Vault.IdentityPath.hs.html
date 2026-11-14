@@ -1,0 +1,98 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | A validated path to an age identity file.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- The value travels to a subprocess argv (@age --decrypt --identity=\&lt;path\&gt;@)
+<span class="lineno">    5 </span>-- and is stored in @security.toml@, so it is a smart-constructed newtype rather
+<span class="lineno">    6 </span>-- than raw 'FilePath' (AGENTS.md invariant 2). The constructor is deliberately
+<span class="lineno">    7 </span>-- not exported: the ONLY way to obtain a 'VaultIdentityPath' is
+<span class="lineno">    8 </span>-- 'mkVaultIdentityPath', so no code path can hand @age@ an unvalidated path.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- This module imports neither &quot;Seal.Vault.Provision&quot; nor &quot;Seal.Vault.Backend&quot;
+<span class="lineno">   11 </span>-- nor &quot;Seal.Config.Security&quot;, which is what lets all three depend on it without
+<span class="lineno">   12 </span>-- an import cycle.
+<span class="lineno">   13 </span>module Seal.Vault.IdentityPath
+<span class="lineno">   14 </span>  ( VaultIdentityPath
+<span class="lineno">   15 </span>  , mkVaultIdentityPath
+<span class="lineno">   16 </span>  , vaultIdentityPathText
+<span class="lineno">   17 </span>  , vaultIdentityPathDisplay
+<span class="lineno">   18 </span>  ) where
+<span class="lineno">   19 </span>
+<span class="lineno">   20 </span>import Control.Exception (IOException, try)
+<span class="lineno">   21 </span>import Data.Text (Text)
+<span class="lineno">   22 </span>import Data.Text qualified as T
+<span class="lineno">   23 </span>import System.Directory (doesFileExist)
+<span class="lineno">   24 </span>import System.FilePath (isAbsolute, takeFileName)
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>-- | An absolute, existing, regular, readable file path with no control
+<span class="lineno">   27 </span>-- characters and no leading @-@ (which a subprocess could mistake for a flag).
+<span class="lineno">   28 </span>newtype VaultIdentityPath = VaultIdentityPath FilePath
+<span class="lineno">   29 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   30 </span>
+<span class="lineno">   31 </span>-- | Validate a user-supplied path.
+<span class="lineno">   32 </span>--
+<span class="lineno">   33 </span>-- Rejections, in order: empty, a control character (including newline and NUL),
+<span class="lineno">   34 </span>-- a leading @-@ (option injection), a relative path, a path that does not
+<span class="lineno">   35 </span>-- exist, a path that exists but is not a regular file.
+<span class="lineno">   36 </span>--
+<span class="lineno">   37 </span>-- The path is NOT canonicalised: the operator named it, and storing the exact
+<span class="lineno">   38 </span>-- string they gave keeps @security.toml@ legible. Symlinks are followed only
+<span class="lineno">   39 </span>-- for the existence/regular-file checks.
+<span class="lineno">   40 </span>mkVaultIdentityPath :: FilePath -&gt; IO (Either Text VaultIdentityPath)
+<span class="lineno">   41 </span><span class="decl"><span class="istickedoff">mkVaultIdentityPath raw</span>
+<span class="lineno">   42 </span><span class="spaces">  </span><span class="istickedoff">| null raw = pure (Left <span class="nottickedoff">&quot;identity path is empty&quot;</span>)</span>
+<span class="lineno">   43 </span><span class="spaces">  </span><span class="istickedoff">| any isControlChar raw =</span>
+<span class="lineno">   44 </span><span class="spaces">      </span><span class="istickedoff">pure (Left <span class="nottickedoff">&quot;identity path contains a control character&quot;</span>)</span>
+<span class="lineno">   45 </span><span class="spaces">  </span><span class="istickedoff">| &quot;-&quot; `isPrefix` raw =</span>
+<span class="lineno">   46 </span><span class="spaces">      </span><span class="istickedoff">pure (Left <span class="nottickedoff">&quot;identity path must not start with '-'&quot;</span>)</span>
+<span class="lineno">   47 </span><span class="spaces">  </span><span class="istickedoff">| not (isAbsolute raw) =</span>
+<span class="lineno">   48 </span><span class="spaces">      </span><span class="istickedoff">pure (Left <span class="nottickedoff">&quot;identity path must be absolute&quot;</span>)</span>
+<span class="lineno">   49 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = do</span>
+<span class="lineno">   50 </span><span class="spaces">      </span><span class="istickedoff">exists &lt;- doesFileExist raw</span>
+<span class="lineno">   51 </span><span class="spaces">      </span><span class="istickedoff">if not exists</span>
+<span class="lineno">   52 </span><span class="spaces">        </span><span class="istickedoff">then pure (Left <span class="nottickedoff">(&quot;identity file does not exist: &quot; &lt;&gt; T.pack raw)</span>)</span>
+<span class="lineno">   53 </span><span class="spaces">        </span><span class="istickedoff">else do</span>
+<span class="lineno">   54 </span><span class="spaces">          </span><span class="istickedoff">-- doesFileExist is False for directories, so this also rejects them.</span>
+<span class="lineno">   55 </span><span class="spaces">          </span><span class="istickedoff">regular &lt;- try @IOException (doesFileExist raw)</span>
+<span class="lineno">   56 </span><span class="spaces">          </span><span class="istickedoff">pure $ case regular of</span>
+<span class="lineno">   57 </span><span class="spaces">            </span><span class="istickedoff">Left err  -&gt; <span class="nottickedoff">Left (&quot;identity path is not readable: &quot; &lt;&gt; T.pack (show err))</span></span>
+<span class="lineno">   58 </span><span class="spaces">            </span><span class="istickedoff">Right ok</span>
+<span class="lineno">   59 </span><span class="spaces">              </span><span class="istickedoff">| <span class="tickonlytrue">ok</span>        -&gt; Right (VaultIdentityPath raw)</span>
+<span class="lineno">   60 </span><span class="spaces">              </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span> -&gt; <span class="nottickedoff">Left (&quot;identity path is not a regular file: &quot; &lt;&gt; T.pack raw)</span></span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   62 </span><span class="spaces">    </span><span class="istickedoff">isPrefix prefix s = take (length prefix) s == prefix</span>
+<span class="lineno">   63 </span><span class="spaces">    </span><span class="istickedoff">-- Anything below space, plus DEL. Tab is rejected too: it never appears in</span>
+<span class="lineno">   64 </span><span class="spaces">    </span><span class="istickedoff">-- a legitimate path and hiding one in a prompt or a log is a trick.</span>
+<span class="lineno">   65 </span><span class="spaces">    </span><span class="istickedoff">isControlChar c = c &lt; ' ' || c == '\DEL'</span></span>
+<span class="lineno">   66 </span>
+<span class="lineno">   67 </span>-- | The raw path, for the one place that must hand it to @age@ or store it.
+<span class="lineno">   68 </span>vaultIdentityPathText :: VaultIdentityPath -&gt; FilePath
+<span class="lineno">   69 </span><span class="decl"><span class="istickedoff">vaultIdentityPathText (VaultIdentityPath p) = p</span></span>
+<span class="lineno">   70 </span>
+<span class="lineno">   71 </span>-- | A short, log-safe rendering: the file name only, never the directory.
+<span class="lineno">   72 </span>-- Used in user-facing messages so an error never discloses the operator's
+<span class="lineno">   73 </span>-- home layout.
+<span class="lineno">   74 </span>vaultIdentityPathDisplay :: VaultIdentityPath -&gt; Text
+<span class="lineno">   75 </span><span class="decl"><span class="istickedoff">vaultIdentityPathDisplay (VaultIdentityPath p) = T.pack (takeFileName p)</span></span>
+
+</pre>
+</body>
+</html>

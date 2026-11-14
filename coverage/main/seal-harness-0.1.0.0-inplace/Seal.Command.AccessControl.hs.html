@@ -1,0 +1,836 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | @seal access-control@ — the human-driven admin path for the passkey
+<span class="lineno">    3 </span>-- settings in @~\/.seal\/security.toml@.
+<span class="lineno">    4 </span>--
+<span class="lineno">    5 </span>-- This is the terminal escape hatch: @reset@ removes the @[access_control]@
+<span class="lineno">    6 </span>-- table so an operator who lost their only passkey can get back to the setup
+<span class="lineno">    7 </span>-- screen, and @enroll@ mints the one-time authority that adds a new one. It is
+<span class="lineno">    8 </span>-- a CLI command, never an opcode — nothing an agent can invoke reaches
+<span class="lineno">    9 </span>-- @~\/.seal@.
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- Every action returns an 'ExitCode' instead of exiting: @exitWith@ stays at
+<span class="lineno">   12 </span>-- the @AppMain.hs@ call site, so @0@ (ok) / @1@ (refusal) / @2@ (usage) are
+<span class="lineno">   13 </span>-- assertable in-process.
+<span class="lineno">   14 </span>module Seal.Command.AccessControl
+<span class="lineno">   15 </span>  ( runAccessControl
+<span class="lineno">   16 </span>  , runAccessControlWith
+<span class="lineno">   17 </span>  , Outputs (..)
+<span class="lineno">   18 </span>  , defaultOutputs
+<span class="lineno">   19 </span>  , configureWith
+<span class="lineno">   20 </span>  , ConfigureError (..)
+<span class="lineno">   21 </span>  , PlannedConfigure (..)
+<span class="lineno">   22 </span>  , planConfigure
+<span class="lineno">   23 </span>  , configureExit
+<span class="lineno">   24 </span>  ) where
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>import Control.Applicative ((&lt;|&gt;))
+<span class="lineno">   27 </span>import Control.Exception (IOException, finally, try)
+<span class="lineno">   28 </span>import Control.Monad (filterM, forM_, unless, when)
+<span class="lineno">   29 </span>import Data.ByteString qualified as BS
+<span class="lineno">   30 </span>import Data.Char (isControl, isSpace)
+<span class="lineno">   31 </span>import Data.List (nub)
+<span class="lineno">   32 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   33 </span>import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, maybeToList)
+<span class="lineno">   34 </span>import Data.Text (Text)
+<span class="lineno">   35 </span>import Data.Text qualified as T
+<span class="lineno">   36 </span>import Data.Text.IO qualified as TIO
+<span class="lineno">   37 </span>import Data.Time (diffUTCTime, getCurrentTime)
+<span class="lineno">   38 </span>import System.Directory (doesFileExist, removeFile)
+<span class="lineno">   39 </span>import System.Exit (ExitCode (..))
+<span class="lineno">   40 </span>import System.FilePath (isAbsolute)
+<span class="lineno">   41 </span>import System.IO (hIsTerminalDevice, hPutStrLn, stderr)
+<span class="lineno">   42 </span>import Text.Read (readMaybe)
+<span class="lineno">   43 </span>import Toml qualified
+<span class="lineno">   44 </span>
+<span class="lineno">   45 </span>import Seal.Config.BootPlan
+<span class="lineno">   46 </span>  ( BindCoordinates (..), BootInputs (..), BootPlan (..), CredentialsPresence
+<span class="lineno">   47 </span>  , bootPlan, bootRefusalMessage, preflight )
+<span class="lineno">   48 </span>import Seal.Config.Credentials
+<span class="lineno">   49 </span>  ( MigrationOutcome (..), migrateLegacyCredentials )
+<span class="lineno">   50 </span>import Seal.Config.Migrate (configHasLegacySecurityFields)
+<span class="lineno">   51 </span>import Seal.Config.Paths
+<span class="lineno">   52 </span>  ( SealPaths, configFilePath, credentialsFilePath, ensureSealDirs, getSealPaths
+<span class="lineno">   53 </span>  , securityFilePath, enrollmentTokenPath, serveLockPath, tlsCertPath, tlsKeyPath )
+<span class="lineno">   54 </span>import Seal.Config.Security
+<span class="lineno">   55 </span>  ( AccessControlFileConfig (..), WriteMode (..), clearAccessControlSection
+<span class="lineno">   56 </span>  , SecurityConfig (..), decodeSecurityConfig, gatewayConfigFromSecurity
+<span class="lineno">   57 </span>  , loadSecurityConfig, securityConfigCodec, updateAccessControlSection
+<span class="lineno">   58 </span>  , updateSecurityConfig, writeSecretFile )
+<span class="lineno">   59 </span>import Seal.Config.Templates (ensureConfigTemplates)
+<span class="lineno">   60 </span>import Seal.Gateway.Audit
+<span class="lineno">   61 </span>  ( AuditEvent (..), AuditFields (..), appendAudit, emptyAuditFields )
+<span class="lineno">   62 </span>import Seal.Gateway.Config
+<span class="lineno">   63 </span>  ( GatewayConfig (..), PartialGatewayConfig (..), defaultGatewayConfig
+<span class="lineno">   64 </span>  , effectiveTlsPaths, gatewayHostError, gatewayHostResolutionError, hostResolves
+<span class="lineno">   65 </span>  , loadLegacyGatewayTable, tlsConfigError, tlsEnabled, tlsOriginError
+<span class="lineno">   66 </span>  , withGatewayDefaults )
+<span class="lineno">   67 </span>import Seal.Security.AccessControl
+<span class="lineno">   68 </span>  ( CredentialAvailability (NoCredentials), canonicalOriginFor
+<span class="lineno">   69 </span>  , credentialAvailability, isIpLiteral, isLoopbackHost, isWildcardHost )
+<span class="lineno">   70 </span>import Seal.Security.DaemonLock
+<span class="lineno">   71 </span>  ( acquireServeLock, daemonHoldsLock, releaseServeLock )
+<span class="lineno">   72 </span>import Seal.Security.EnrollmentGrant
+<span class="lineno">   73 </span>  ( Grant (..), GrantSource (..), MintedGrant (..), cancelGrant, defaultTtlFor
+<span class="lineno">   74 </span>  , enrollGrant, grantSourceText, parseTtl )
+<span class="lineno">   75 </span>import Seal.Security.WebAuthn (normalizeOrigin)
+<span class="lineno">   76 </span>import Seal.Security.WebAuthn.Types (AccessMode (..), Credential (..))
+<span class="lineno">   77 </span>import Seal.Security.TlsCert (generatedCertificateTrustHint)
+<span class="lineno">   78 </span>import Seal.Types.Command
+<span class="lineno">   79 </span>  ( AccessControlAction (..), ConfigureOptions (..), EnrollOptions (..) )
+<span class="lineno">   80 </span>
+<span class="lineno">   81 </span>-- | Entry point for @seal access-control@.
+<span class="lineno">   82 </span>runAccessControl :: AccessControlAction -&gt; IO ExitCode
+<span class="lineno">   83 </span><span class="decl"><span class="nottickedoff">runAccessControl action = do</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="nottickedoff">paths &lt;- getSealPaths</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="nottickedoff">-- Scaffold the two config files on first use, exactly as `serve` and `tui` do.</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="nottickedoff">-- This is not decorative here: `disable`, `reset` and `migrate-credentials`</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="nottickedoff">-- write security.toml, and 'Seal.Config.Security.saveSecurityConfig' creates it</span>
+<span class="lineno">   88 </span><span class="spaces">  </span><span class="nottickedoff">-- when absent — so without this a fresh install that runs one of those first</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="nottickedoff">-- would keep a comment-free file and never see the template.</span>
+<span class="lineno">   90 </span><span class="spaces">  </span><span class="nottickedoff">(created, warnings) &lt;- ensureConfigTemplates paths</span>
+<span class="lineno">   91 </span><span class="spaces">  </span><span class="nottickedoff">forM_ created $ \fp -&gt;</span>
+<span class="lineno">   92 </span><span class="spaces">    </span><span class="nottickedoff">hPutStrLn stderr (&quot;[seal] wrote a documented config template at &quot; &lt;&gt; fp)</span>
+<span class="lineno">   93 </span><span class="spaces">  </span><span class="nottickedoff">forM_ warnings $ \w -&gt; hPutStrLn stderr (&quot;[seal] &quot; &lt;&gt; T.unpack w)</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="nottickedoff">runAccessControlWith paths action</span></span>
+<span class="lineno">   95 </span>
+<span class="lineno">   96 </span>-- | 'runAccessControl' against an explicit 'SealPaths'.
+<span class="lineno">   97 </span>--
+<span class="lineno">   98 </span>-- Split out so tests can point the command at a temporary home without
+<span class="lineno">   99 </span>-- mutating @SEAL_HOME@ for the whole process (which every other test in the
+<span class="lineno">  100 </span>-- suite shares).
+<span class="lineno">  101 </span>runAccessControlWith :: SealPaths -&gt; AccessControlAction -&gt; IO ExitCode
+<span class="lineno">  102 </span><span class="decl"><span class="istickedoff">runAccessControlWith paths action = case action of</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">AcStatus                   -&gt; status paths</span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="istickedoff">AcEnroll opts              -&gt; enroll paths opts</span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="istickedoff">AcConfigure opts           -&gt; configureWith defaultOutputs <span class="nottickedoff">hostResolves</span> paths <span class="nottickedoff">opts</span></span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="istickedoff">AcDisable yes              -&gt; disable paths yes</span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="istickedoff">AcReset                    -&gt; reset paths</span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="istickedoff">AcMigrateCredentials force -&gt; migrate paths <span class="nottickedoff">force</span></span></span>
+<span class="lineno">  109 </span>
+<span class="lineno">  110 </span>-- | Say why, on stderr, and report a refusal.
+<span class="lineno">  111 </span>--
+<span class="lineno">  112 </span>-- stdout carries data (the status report, the enrollment token); stderr carries
+<span class="lineno">  113 </span>-- reasons. Keeping them apart is what lets an operator do
+<span class="lineno">  114 </span>-- @seal access-control enroll &gt;token.txt@ and still see what happened.
+<span class="lineno">  115 </span>refuse :: T.Text -&gt; IO ExitCode
+<span class="lineno">  116 </span><span class="decl"><span class="istickedoff">refuse message = hPutStrLn stderr (T.unpack message) &gt;&gt; pure (ExitFailure 1)</span></span>
+<span class="lineno">  117 </span>
+<span class="lineno">  118 </span>-- | A usage error: the flags do not make sense together, or a value is
+<span class="lineno">  119 </span>-- malformed. Exit code 2, distinguishing &quot;you typed it wrong&quot; from &quot;the state
+<span class="lineno">  120 </span>-- refused you&quot; (design §12).
+<span class="lineno">  121 </span>usage :: T.Text -&gt; IO ExitCode
+<span class="lineno">  122 </span><span class="decl"><span class="istickedoff">usage message = hPutStrLn stderr (T.unpack message) &gt;&gt; pure (ExitFailure 2)</span></span>
+<span class="lineno">  123 </span>
+<span class="lineno">  124 </span>-- | Refuse to touch the store while a daemon owns this @SEAL_HOME@.
+<span class="lineno">  125 </span>--
+<span class="lineno">  126 </span>-- The probe is the kernel lock, not a pid file: a daemon that crashed leaves no
+<span class="lineno">  127 </span>-- false refusal behind (design §12).
+<span class="lineno">  128 </span>requireDaemonStopped :: SealPaths -&gt; T.Text -&gt; IO (Either T.Text ())
+<span class="lineno">  129 </span><span class="decl"><span class="istickedoff">requireDaemonStopped paths action = do</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">running &lt;- daemonHoldsLock (serveLockPath paths)</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">pure $ if running</span>
+<span class="lineno">  132 </span><span class="spaces">    </span><span class="istickedoff">then Left (&quot;refusing to &quot; &lt;&gt; action &lt;&gt; &quot;: `seal serve` is running for this SEAL_HOME.\n&quot;</span>
+<span class="lineno">  133 </span><span class="spaces">                </span><span class="istickedoff">&lt;&gt; &quot;  Stop it first — it has the credential store and state files open.&quot;)</span>
+<span class="lineno">  134 </span><span class="spaces">    </span><span class="istickedoff">else Right ()</span></span>
+<span class="lineno">  135 </span>
+<span class="lineno">  136 </span>-- | Print the current mode, the resolved origin/rpId and the enrolled
+<span class="lineno">  137 </span>-- credentials (labels and counters — never key material).
+<span class="lineno">  138 </span>status :: SealPaths -&gt; IO ExitCode
+<span class="lineno">  139 </span><span class="decl"><span class="istickedoff">status paths = do</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">gwCfg &lt;- gatewayConfig paths</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">inputs &lt;- preflight paths</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">let coords = BindCoordinates (gcHost gwCfg) (gcPort gwCfg)</span>
+<span class="lineno">  143 </span><span class="spaces">      </span><span class="istickedoff">decision = inputs &gt;&gt;= bootPlan coords</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">case decision of</span>
+<span class="lineno">  145 </span><span class="spaces">    </span><span class="istickedoff">Left refusal -&gt;</span>
+<span class="lineno">  146 </span><span class="spaces">      </span><span class="istickedoff">refuse (&quot;Access control: INVALID — &quot; &lt;&gt; bootRefusalMessage refusal)</span>
+<span class="lineno">  147 </span><span class="spaces">    </span><span class="istickedoff">Right plan -&gt; do</span>
+<span class="lineno">  148 </span><span class="spaces">      </span><span class="istickedoff">TIO.putStrLn (&quot;Access control: &quot; &lt;&gt; describe (bpMode plan))</span>
+<span class="lineno">  149 </span><span class="spaces">      </span><span class="istickedoff">case (bpOrigin plan, bpRpId plan) of</span>
+<span class="lineno">  150 </span><span class="spaces">        </span><span class="istickedoff">(Just origin, Just rpId) -&gt; do</span>
+<span class="lineno">  151 </span><span class="spaces">          </span><span class="istickedoff">TIO.putStrLn (&quot;  origin: &quot; &lt;&gt; origin)</span>
+<span class="lineno">  152 </span><span class="spaces">          </span><span class="istickedoff">TIO.putStrLn (&quot;  rp id:  &quot; &lt;&gt; rpId)</span>
+<span class="lineno">  153 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">TIO.putStrLn &quot;  (no origin resolved — set [access_control] origin for a wildcard bind)&quot;</span></span>
+<span class="lineno">  154 </span><span class="spaces">      </span><span class="istickedoff">let creds = Map.toList (bpCreds plan)</span>
+<span class="lineno">  155 </span><span class="spaces">      </span><span class="istickedoff">if <span class="tickonlytrue">null creds</span></span>
+<span class="lineno">  156 </span><span class="spaces">        </span><span class="istickedoff">then TIO.putStrLn &quot;  credentials: none enrolled&quot;</span>
+<span class="lineno">  157 </span><span class="spaces">        </span><span class="istickedoff">else <span class="nottickedoff">do</span></span>
+<span class="lineno">  158 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">TIO.putStrLn (&quot;  credentials: &quot; &lt;&gt; T.pack (show (length creds)))</span></span>
+<span class="lineno">  159 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">mapM_ (printCred (bpRpId plan)) creds</span></span>
+<span class="lineno">  160 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">when (any (\(_, cred) -&gt; Just (credRpId cred) /= bpRpId plan) creds) $</span></span>
+<span class="lineno">  161 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">TIO.putStrLn</span></span>
+<span class="lineno">  162 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">&quot;  hint: a credential is bound to another rp_id. Recover with\n\</span></span>
+<span class="lineno">  163 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">\  `seal access-control reset --yes` (deletes all passkeys), then\n\</span></span>
+<span class="lineno">  164 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">\  `seal access-control configure ...`, serve, and enroll again.&quot;</span></span>
+<span class="lineno">  165 </span><span class="spaces">      </span><span class="istickedoff">TIO.putStrLn (case bpMintGrant plan of</span>
+<span class="lineno">  166 </span><span class="spaces">        </span><span class="istickedoff">Just _  -&gt; &quot;  enrollment: boot mints a token (run `seal access-control enroll`)&quot;</span>
+<span class="lineno">  167 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">&quot;  enrollment: a usable passkey authorizes a new one&quot;</span>)</span>
+<span class="lineno">  168 </span><span class="spaces">      </span><span class="istickedoff">pure ExitSuccess</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  170 </span><span class="spaces">    </span><span class="istickedoff">describe mode = case mode of</span>
+<span class="lineno">  171 </span><span class="spaces">      </span><span class="istickedoff">AccessPasskey      -&gt; &quot;passkey&quot;</span>
+<span class="lineno">  172 </span><span class="spaces">      </span><span class="istickedoff">AccessOpen         -&gt; <span class="nottickedoff">&quot;none (explicitly waived — anyone who can reach the gateway has full control)&quot;</span></span>
+<span class="lineno">  173 </span><span class="spaces">      </span><span class="istickedoff">AccessUnconfigured -&gt; &quot;not configured (the gateway serves only the setup screen)&quot;</span>
+<span class="lineno">  174 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  175 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">printCred rpId (credIdText, cred) = TIO.putStrLn</span></span>
+<span class="lineno">  176 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">(&quot;    - &quot; &lt;&gt; credIdText &lt;&gt; &quot;  &quot; &lt;&gt; credLabel cred</span></span>
+<span class="lineno">  177 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;  rp_id=&quot; &lt;&gt; credRpId cred</span></span>
+<span class="lineno">  178 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;  &quot; &lt;&gt; (if Just (credRpId cred) == rpId then &quot;usable&quot; else &quot;not usable here&quot;)</span></span>
+<span class="lineno">  179 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;  sign_count=&quot; &lt;&gt; T.pack (show (credSignCount cred)))</span></span></span>
+<span class="lineno">  180 </span>
+<span class="lineno">  181 </span>-- | @enroll@: mint the one-time authority that adds a credential.
+<span class="lineno">  182 </span>--
+<span class="lineno">  183 </span>-- stdout carries the token (and nothing else), stderr carries the hints, so
+<span class="lineno">  184 </span>-- @seal access-control enroll &gt; token.txt@ works and still tells the operator
+<span class="lineno">  185 </span>-- what to do with it.
+<span class="lineno">  186 </span>enroll :: SealPaths -&gt; EnrollOptions -&gt; IO ExitCode
+<span class="lineno">  187 </span><span class="decl"><span class="istickedoff">enroll paths opts</span>
+<span class="lineno">  188 </span><span class="spaces">  </span><span class="istickedoff">| eoCancel opts, eoNoToken opts || eoForce opts || isJust (eoTtl opts) =</span>
+<span class="lineno">  189 </span><span class="spaces">      </span><span class="istickedoff">usage &quot;--cancel cannot be combined with --no-token, --ttl or --force.&quot;</span>
+<span class="lineno">  190 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case traverse (parseTtl . T.pack) (eoTtl opts) of</span>
+<span class="lineno">  191 </span><span class="spaces">      </span><span class="istickedoff">Left err -&gt; usage err</span>
+<span class="lineno">  192 </span><span class="spaces">      </span><span class="istickedoff">Right mTtl</span>
+<span class="lineno">  193 </span><span class="spaces">        </span><span class="istickedoff">| eoCancel opts -&gt; do</span>
+<span class="lineno">  194 </span><span class="spaces">            </span><span class="istickedoff">cancelGrant paths</span>
+<span class="lineno">  195 </span><span class="spaces">            </span><span class="istickedoff">TIO.putStrLn &quot;Cancelled any outstanding enrollment grant.&quot;</span>
+<span class="lineno">  196 </span><span class="spaces">            </span><span class="istickedoff">pure ExitSuccess</span>
+<span class="lineno">  197 </span><span class="spaces">        </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; do</span>
+<span class="lineno">  198 </span><span class="spaces">            </span><span class="istickedoff">let source = if eoNoToken opts then CliWindow else CliToken</span>
+<span class="lineno">  199 </span><span class="spaces">                </span><span class="istickedoff">ttl = fromMaybe (defaultTtlFor source) mTtl</span>
+<span class="lineno">  200 </span><span class="spaces">            </span><span class="istickedoff">allowed &lt;- windowAllowed paths source</span>
+<span class="lineno">  201 </span><span class="spaces">            </span><span class="istickedoff">case allowed of</span>
+<span class="lineno">  202 </span><span class="spaces">              </span><span class="istickedoff">Left err -&gt; refuse err</span>
+<span class="lineno">  203 </span><span class="spaces">              </span><span class="istickedoff">Right () -&gt; do</span>
+<span class="lineno">  204 </span><span class="spaces">                </span><span class="istickedoff">minted &lt;- enrollGrant paths source ttl (eoForce opts)</span>
+<span class="lineno">  205 </span><span class="spaces">                </span><span class="istickedoff">case minted of</span>
+<span class="lineno">  206 </span><span class="spaces">                  </span><span class="istickedoff">Left err     -&gt; refuse err</span>
+<span class="lineno">  207 </span><span class="spaces">                  </span><span class="istickedoff">Right result -&gt; announce paths result</span></span>
+<span class="lineno">  208 </span>
+<span class="lineno">  209 </span>-- | @--no-token@ is authority with no secret, so it is confined to the
+<span class="lineno">  210 </span>-- bootstrap state (design §7.1, §12): a loopback bind, a loopback resolved
+<span class="lineno">  211 </span>-- origin, and nothing enrolled. There is no override — a window on a reachable
+<span class="lineno">  212 </span>-- gateway is anyone's enrollment.
+<span class="lineno">  213 </span>windowAllowed :: SealPaths -&gt; GrantSource -&gt; IO (Either T.Text ())
+<span class="lineno">  214 </span><span class="decl"><span class="istickedoff">windowAllowed _ CliToken = pure (Right ())</span>
+<span class="lineno">  215 </span><span class="spaces"></span><span class="istickedoff">windowAllowed _ Assertion = <span class="nottickedoff">pure (Right ())</span></span>
+<span class="lineno">  216 </span><span class="spaces"></span><span class="istickedoff">-- A browser-minted grant is created by the gateway, never by this command, so</span>
+<span class="lineno">  217 </span><span class="spaces"></span><span class="istickedoff">-- reaching here would be a bug. Refuse rather than wave it through: the</span>
+<span class="lineno">  218 </span><span class="spaces"></span><span class="istickedoff">-- window preflight is what keeps authority-without-a-secret off a reachable port.</span>
+<span class="lineno">  219 </span><span class="spaces"></span><span class="istickedoff">windowAllowed _ UiToken = <span class="nottickedoff">pure (Left &quot;ui_token grants are minted by the gateway, not by `seal access-control enroll`.&quot;)</span></span>
+<span class="lineno">  220 </span><span class="spaces"></span><span class="istickedoff">windowAllowed paths CliWindow = do</span>
+<span class="lineno">  221 </span><span class="spaces">  </span><span class="istickedoff">gwCfg &lt;- gatewayConfig paths</span>
+<span class="lineno">  222 </span><span class="spaces">  </span><span class="istickedoff">inputs &lt;- preflight paths</span>
+<span class="lineno">  223 </span><span class="spaces">  </span><span class="istickedoff">let coords = BindCoordinates (gcHost gwCfg) (gcPort gwCfg)</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="istickedoff">pure $ case inputs &gt;&gt;= bootPlan coords of</span>
+<span class="lineno">  225 </span><span class="spaces">    </span><span class="istickedoff">Left refusal -&gt; Left (windowRefusal</span>
+<span class="lineno">  226 </span><span class="spaces">      </span><span class="istickedoff">(&quot;this SEAL_HOME cannot serve as configured: &quot; &lt;&gt; bootRefusalMessage refusal))</span>
+<span class="lineno">  227 </span><span class="spaces">    </span><span class="istickedoff">Right plan</span>
+<span class="lineno">  228 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">not (isLoopbackHost (bcHost coords))</span> -&gt;</span>
+<span class="lineno">  229 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">Left (windowRefusal &quot;the gateway binds a non-loopback address&quot;)</span></span>
+<span class="lineno">  230 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">not (maybe <span class="nottickedoff">False</span> isLoopbackHost (bpRpId plan))</span> -&gt;</span>
+<span class="lineno">  231 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">Left (windowRefusal &quot;the resolved origin is not loopback&quot;)</span></span>
+<span class="lineno">  232 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">credentialAvailability <span class="nottickedoff">(bpRpId plan)</span> (bpCreds plan) /= NoCredentials</span> -&gt;</span>
+<span class="lineno">  233 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">Left (windowRefusal &quot;credentials are already enrolled; use a token or an assertion&quot;)</span></span>
+<span class="lineno">  234 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; Right ()</span>
+<span class="lineno">  235 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  236 </span><span class="spaces">    </span><span class="istickedoff">windowRefusal reason =</span>
+<span class="lineno">  237 </span><span class="spaces">      </span><span class="istickedoff">&quot;--no-token is not available here: &quot; &lt;&gt; reason &lt;&gt; &quot;.\n&quot;</span>
+<span class="lineno">  238 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot;  An enrollment window presents no secret, so it exists only while\n&quot;</span>
+<span class="lineno">  239 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot;  nothing is enrolled and the gateway is reachable from this machine\n&quot;</span>
+<span class="lineno">  240 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot;  alone. Mint a token instead: `seal access-control enroll`.&quot;</span></span>
+<span class="lineno">  241 </span>
+<span class="lineno">  242 </span>-- | Print the minted grant: token on stdout, everything else on stderr.
+<span class="lineno">  243 </span>announce :: SealPaths -&gt; MintedGrant -&gt; IO ExitCode
+<span class="lineno">  244 </span><span class="decl"><span class="istickedoff">announce paths minted = do</span>
+<span class="lineno">  245 </span><span class="spaces">  </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  246 </span><span class="spaces">  </span><span class="istickedoff">_ &lt;- appendAudit paths now (emptyAuditFields GrantMinted)</span>
+<span class="lineno">  247 </span><span class="spaces">         </span><span class="istickedoff">{ afVia = Just (grSource (mgGrant minted))</span>
+<span class="lineno">  248 </span><span class="spaces">         </span><span class="istickedoff">, afRemainingSeconds = Just (secondsLeft now (mgGrant minted))</span>
+<span class="lineno">  249 </span><span class="spaces">         </span><span class="istickedoff">}</span>
+<span class="lineno">  250 </span><span class="spaces">  </span><span class="istickedoff">interactive &lt;- hIsTerminalDevice stderr</span>
+<span class="lineno">  251 </span><span class="spaces">  </span><span class="istickedoff">case mgToken minted of</span>
+<span class="lineno">  252 </span><span class="spaces">    </span><span class="istickedoff">Just token -&gt; do</span>
+<span class="lineno">  253 </span><span class="spaces">      </span><span class="istickedoff">TIO.putStrLn token</span>
+<span class="lineno">  254 </span><span class="spaces">      </span><span class="istickedoff">unless interactive $ do</span>
+<span class="lineno">  255 </span><span class="spaces">        </span><span class="istickedoff">writeSecretFile (enrollmentTokenPath paths) token</span>
+<span class="lineno">  256 </span><span class="spaces">        </span><span class="istickedoff">hPutStrLn stderr (&quot;The token is also stored at &quot;</span>
+<span class="lineno">  257 </span><span class="spaces">                            </span><span class="istickedoff">&lt;&gt; enrollmentTokenPath paths &lt;&gt; &quot; (mode 0600), because &quot;</span>
+<span class="lineno">  258 </span><span class="spaces">                            </span><span class="istickedoff">&lt;&gt; &quot;stderr is not a terminal.&quot;)</span>
+<span class="lineno">  259 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt;</span>
+<span class="lineno">  260 </span><span class="spaces">      </span><span class="istickedoff">TIO.putStrLn &quot;No token: this is a loopback enrollment window (5 minutes).&quot;</span>
+<span class="lineno">  261 </span><span class="spaces">  </span><span class="istickedoff">hPutStrLn stderr (T.unpack (summary now (mgGrant minted)))</span>
+<span class="lineno">  262 </span><span class="spaces">  </span><span class="istickedoff">pure ExitSuccess</span>
+<span class="lineno">  263 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  264 </span><span class="spaces">    </span><span class="istickedoff">secondsLeft now grant =</span>
+<span class="lineno">  265 </span><span class="spaces">      </span><span class="istickedoff">max 0 (ceiling (realToFrac (diffUTCTime (grExpiresAt grant) now) :: Double) :: Int)</span>
+<span class="lineno">  266 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  267 </span><span class="spaces">    </span><span class="istickedoff">summary now grant =</span>
+<span class="lineno">  268 </span><span class="spaces">      </span><span class="istickedoff">&quot;Grant minted via &quot; &lt;&gt; grantSourceText (grSource grant) &lt;&gt; &quot;, expiring in &quot;</span>
+<span class="lineno">  269 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; T.pack (show (max 0 (ceiling</span>
+<span class="lineno">  270 </span><span class="spaces">             </span><span class="istickedoff">(realToFrac (diffUTCTime (grExpiresAt grant) now) :: Double) :: Int)))</span>
+<span class="lineno">  271 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot;s. Open the web UI and enroll a passkey; the grant is consumed on success.&quot;</span></span>
+<span class="lineno">  272 </span>
+<span class="lineno">  273 </span>-- | @disable@: the only way to turn access control off.
+<span class="lineno">  274 </span>--
+<span class="lineno">  275 </span>-- No HTTP request can do this (design §5 invariant 7), which is what removes
+<span class="lineno">  276 </span>-- the &quot;one token enrolls and disables&quot; blast radius. Credentials are kept: the
+<span class="lineno">  277 </span>-- operator who wants them gone runs @reset --yes@.
+<span class="lineno">  278 </span>disable :: SealPaths -&gt; Bool -&gt; IO ExitCode
+<span class="lineno">  279 </span><span class="decl"><span class="istickedoff">disable _ False =</span>
+<span class="lineno">  280 </span><span class="spaces">  </span><span class="istickedoff">usage &quot;disable requires --yes: it turns access control off, and anyone who can reach the gateway gets full control.&quot;</span>
+<span class="lineno">  281 </span><span class="spaces"></span><span class="istickedoff">disable paths True = do</span>
+<span class="lineno">  282 </span><span class="spaces">  </span><span class="istickedoff">stopped &lt;- requireDaemonStopped paths &quot;disable access control&quot;</span>
+<span class="lineno">  283 </span><span class="spaces">  </span><span class="istickedoff">case stopped of</span>
+<span class="lineno">  284 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; refuse err</span>
+<span class="lineno">  285 </span><span class="spaces">    </span><span class="istickedoff">Right () -&gt; do</span>
+<span class="lineno">  286 </span><span class="spaces">      </span><span class="istickedoff">written &lt;- updateAccessControlSection (securityFilePath paths) $ \cfg -&gt;</span>
+<span class="lineno">  287 </span><span class="spaces">        </span><span class="istickedoff">cfg { acfcMode = Just &quot;none&quot; }</span>
+<span class="lineno">  288 </span><span class="spaces">      </span><span class="istickedoff">case written of</span>
+<span class="lineno">  289 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">refuse (&quot;could not disable access control: &quot; &lt;&gt; err)</span></span>
+<span class="lineno">  290 </span><span class="spaces">        </span><span class="istickedoff">Right _ -&gt; do</span>
+<span class="lineno">  291 </span><span class="spaces">          </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  292 </span><span class="spaces">          </span><span class="istickedoff">_ &lt;- appendAudit paths now (emptyAuditFields ModeDisabled)</span>
+<span class="lineno">  293 </span><span class="spaces">          </span><span class="istickedoff">TIO.putStrLn &quot;Access control is off ([access_control] mode = \&quot;none\&quot;).&quot;</span>
+<span class="lineno">  294 </span><span class="spaces">          </span><span class="istickedoff">TIO.putStrLn &quot;  Credentials are kept. `seal access-control enroll` turns it back on.&quot;</span>
+<span class="lineno">  295 </span><span class="spaces">          </span><span class="istickedoff">pure ExitSuccess</span></span>
+<span class="lineno">  296 </span>
+<span class="lineno">  297 </span>-- | Move credentials out of @security.toml@ and into @credentials.toml@.
+<span class="lineno">  298 </span>migrate :: SealPaths -&gt; Bool -&gt; IO ExitCode
+<span class="lineno">  299 </span><span class="decl"><span class="istickedoff">migrate paths force = do</span>
+<span class="lineno">  300 </span><span class="spaces">  </span><span class="istickedoff">stopped &lt;- requireDaemonStopped paths <span class="nottickedoff">&quot;migrate credentials&quot;</span></span>
+<span class="lineno">  301 </span><span class="spaces">  </span><span class="istickedoff">case stopped of</span>
+<span class="lineno">  302 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">refuse err</span></span>
+<span class="lineno">  303 </span><span class="spaces">    </span><span class="istickedoff">Right () -&gt; migrateWith paths <span class="nottickedoff">force</span></span></span>
+<span class="lineno">  304 </span>
+<span class="lineno">  305 </span>migrateWith :: SealPaths -&gt; Bool -&gt; IO ExitCode
+<span class="lineno">  306 </span><span class="decl"><span class="istickedoff">migrateWith paths force = do</span>
+<span class="lineno">  307 </span><span class="spaces">  </span><span class="istickedoff">result &lt;- migrateLegacyCredentials (securityFilePath paths)</span>
+<span class="lineno">  308 </span><span class="spaces">                                     </span><span class="istickedoff"><span class="nottickedoff">(credentialsFilePath paths)</span> <span class="nottickedoff">force</span></span>
+<span class="lineno">  309 </span><span class="spaces">  </span><span class="istickedoff">case result of</span>
+<span class="lineno">  310 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">refuse (&quot;Could not migrate credentials: &quot; &lt;&gt; err)</span></span>
+<span class="lineno">  311 </span><span class="spaces">    </span><span class="istickedoff">Right NothingToMigrate -&gt; do</span>
+<span class="lineno">  312 </span><span class="spaces">      </span><span class="istickedoff">TIO.putStrLn &quot;Nothing to migrate: security.toml holds no credential tables.&quot;</span>
+<span class="lineno">  313 </span><span class="spaces">      </span><span class="istickedoff">pure ExitSuccess</span>
+<span class="lineno">  314 </span><span class="spaces">    </span><span class="istickedoff">Right (Migrated count) -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  315 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">TIO.putStrLn (&quot;Moved &quot; &lt;&gt; T.pack (show count) &lt;&gt; &quot; credential(s) to &quot;</span></span>
+<span class="lineno">  316 </span><span class="spaces">                     </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; T.pack (credentialsFilePath paths) &lt;&gt; &quot;.&quot;)</span></span>
+<span class="lineno">  317 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">TIO.putStrLn &quot;  Removed the [access_control.credentials] tables from security.toml.&quot;</span></span>
+<span class="lineno">  318 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">TIO.putStrLn &quot;  Restart `seal serve` to pick up the new store.&quot;</span></span>
+<span class="lineno">  319 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">pure ExitSuccess</span></span></span>
+<span class="lineno">  320 </span>
+<span class="lineno">  321 </span>-- | Remove the @[access_control]@ table, returning the gateway to the setup
+<span class="lineno">  322 </span>-- screen.
+<span class="lineno">  323 </span>--
+<span class="lineno">  324 </span>-- 'DropCredentials' is correct here and nowhere else on this path: @reset@ is
+<span class="lineno">  325 </span>-- CLI-only and @--yes@ is mandatory, so a human decided to destroy the
+<span class="lineno">  326 </span>-- credential tables rather than be blocked by them. Every other writer keeps
+<span class="lineno">  327 </span>-- 'PreserveCredentials' and is refused instead.
+<span class="lineno">  328 </span>reset :: SealPaths -&gt; IO ExitCode
+<span class="lineno">  329 </span><span class="decl"><span class="istickedoff">reset paths = do</span>
+<span class="lineno">  330 </span><span class="spaces">  </span><span class="istickedoff">stopped &lt;- requireDaemonStopped paths <span class="nottickedoff">&quot;reset access control&quot;</span></span>
+<span class="lineno">  331 </span><span class="spaces">  </span><span class="istickedoff">case stopped of</span>
+<span class="lineno">  332 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">refuse err</span></span>
+<span class="lineno">  333 </span><span class="spaces">    </span><span class="istickedoff">Right () -&gt; resetWith paths</span></span>
+<span class="lineno">  334 </span>
+<span class="lineno">  335 </span>resetWith :: SealPaths -&gt; IO ExitCode
+<span class="lineno">  336 </span><span class="decl"><span class="istickedoff">resetWith paths = do</span>
+<span class="lineno">  337 </span><span class="spaces">  </span><span class="istickedoff">result &lt;- clearAccessControlSection (securityFilePath paths) DropCredentials</span>
+<span class="lineno">  338 </span><span class="spaces">  </span><span class="istickedoff">case result of</span>
+<span class="lineno">  339 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">refuse (&quot;Could not reset access control: &quot; &lt;&gt; err)</span></span>
+<span class="lineno">  340 </span><span class="spaces">    </span><span class="istickedoff">Right () -&gt; do</span>
+<span class="lineno">  341 </span><span class="spaces">      </span><span class="istickedoff">TIO.putStrLn &quot;Removed [access_control] from ~/.seal/security.toml.&quot;</span>
+<span class="lineno">  342 </span><span class="spaces">      </span><span class="istickedoff">TIO.putStrLn &quot;  This also deleted every enrolled passkey. Enrolling again is required.&quot;</span>
+<span class="lineno">  343 </span><span class="spaces">      </span><span class="istickedoff">TIO.putStrLn &quot;  A running `seal serve` keeps its current mode until you restart it.&quot;</span>
+<span class="lineno">  344 </span><span class="spaces">      </span><span class="istickedoff">TIO.putStrLn &quot;  To target a hostname other than localhost, run&quot;</span>
+<span class="lineno">  345 </span><span class="spaces">      </span><span class="istickedoff">TIO.putStrLn &quot;  `seal access-control configure --origin https://HOST --rp-id HOST`&quot;</span>
+<span class="lineno">  346 </span><span class="spaces">      </span><span class="istickedoff">TIO.putStrLn &quot;  before restarting, then open the web UI to enroll a new passkey.&quot;</span>
+<span class="lineno">  347 </span><span class="spaces">      </span><span class="istickedoff">-- `reset` is the lost-every-device escape hatch, so it also destroys what</span>
+<span class="lineno">  348 </span><span class="spaces">      </span><span class="istickedoff">-- would otherwise be left half-configured: the store, the outstanding</span>
+<span class="lineno">  349 </span><span class="spaces">      </span><span class="istickedoff">-- grant and its token. The [access_control] section is already gone, so a</span>
+<span class="lineno">  350 </span><span class="spaces">      </span><span class="istickedoff">-- crash from here leaves the loud `unconfigured` state, not a locked-out</span>
+<span class="lineno">  351 </span><span class="spaces">      </span><span class="istickedoff">-- one.</span>
+<span class="lineno">  352 </span><span class="spaces">      </span><span class="istickedoff">cancelGrant paths</span>
+<span class="lineno">  353 </span><span class="spaces">      </span><span class="istickedoff">removeStoreFile paths</span>
+<span class="lineno">  354 </span><span class="spaces">      </span><span class="istickedoff">pure ExitSuccess</span></span>
+<span class="lineno">  355 </span>
+<span class="lineno">  356 </span>-- | Delete @credentials.toml@ if it exists. Only @reset --yes@ may do this.
+<span class="lineno">  357 </span>removeStoreFile :: SealPaths -&gt; IO ()
+<span class="lineno">  358 </span><span class="decl"><span class="istickedoff">removeStoreFile paths = do</span>
+<span class="lineno">  359 </span><span class="spaces">  </span><span class="istickedoff">let path = credentialsFilePath paths</span>
+<span class="lineno">  360 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  361 </span><span class="spaces">  </span><span class="istickedoff">when exists (removeFile path)</span></span>
+<span class="lineno">  362 </span>
+<span class="lineno">  363 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  364 </span>-- configure: first-run gateway coordinates
+<span class="lineno">  365 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  366 </span>
+<span class="lineno">  367 </span>-- | Where @configure@ writes its operator-facing output. The seam exists so
+<span class="lineno">  368 </span>-- tests can capture stdout/stderr without redirecting the process.
+<span class="lineno">  369 </span>data Outputs = Outputs
+<span class="lineno">  370 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">outLine</span></span></span> :: !(Text -&gt; IO ())
+<span class="lineno">  371 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">errLine</span></span></span> :: !(Text -&gt; IO ())
+<span class="lineno">  372 </span>  }
+<span class="lineno">  373 </span>
+<span class="lineno">  374 </span>defaultOutputs :: Outputs
+<span class="lineno">  375 </span><span class="decl"><span class="istickedoff">defaultOutputs = Outputs TIO.putStrLn (hPutStrLn stderr . T.unpack)</span></span>
+<span class="lineno">  376 </span>
+<span class="lineno">  377 </span>-- | A configure failure. The constructor decides the exit code: malformed
+<span class="lineno">  378 </span>-- flags are usage (2), a state/environment refusal is 1.
+<span class="lineno">  379 </span>data ConfigureError
+<span class="lineno">  380 </span>  = ConfigureUsage !Text
+<span class="lineno">  381 </span>  | ConfigureRefusal !Text
+<span class="lineno">  382 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  383 </span>
+<span class="lineno">  384 </span>configureExit :: ConfigureError -&gt; ExitCode
+<span class="lineno">  385 </span><span class="decl"><span class="istickedoff">configureExit = \case</span>
+<span class="lineno">  386 </span><span class="spaces">  </span><span class="istickedoff">ConfigureUsage _   -&gt; ExitFailure 2</span>
+<span class="lineno">  387 </span><span class="spaces">  </span><span class="istickedoff">ConfigureRefusal _ -&gt; ExitFailure 1</span></span>
+<span class="lineno">  388 </span>
+<span class="lineno">  389 </span>configureMessage :: ConfigureError -&gt; Text
+<span class="lineno">  390 </span><span class="decl"><span class="istickedoff">configureMessage = \case</span>
+<span class="lineno">  391 </span><span class="spaces">  </span><span class="istickedoff">ConfigureUsage m   -&gt; <span class="nottickedoff">m</span></span>
+<span class="lineno">  392 </span><span class="spaces">  </span><span class="istickedoff">ConfigureRefusal m -&gt; m</span></span>
+<span class="lineno">  393 </span>
+<span class="lineno">  394 </span>-- | The validated result: the document to write and the origin/rp_id it
+<span class="lineno">  395 </span>-- resolves to.
+<span class="lineno">  396 </span>data PlannedConfigure = PlannedConfigure
+<span class="lineno">  397 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">plConfig</span></span></span> :: !SecurityConfig
+<span class="lineno">  398 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">plOrigin</span></span></span> :: !(Maybe Text)
+<span class="lineno">  399 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">plRpId</span></span></span>   :: !(Maybe Text)
+<span class="lineno">  400 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  401 </span>
+<span class="lineno">  402 </span>-- | Persist the gateway coordinates. Acquires the serve lock so it cannot race
+<span class="lineno">  403 </span>-- a running daemon; a concurrent @tui@/@vault setup@ writer can still race the
+<span class="lineno">  404 </span>-- later write (accepted residual risk, see the plan).
+<span class="lineno">  405 </span>configureWith
+<span class="lineno">  406 </span>  :: Outputs
+<span class="lineno">  407 </span>  -&gt; (Text -&gt; IO Bool)
+<span class="lineno">  408 </span>  -&gt; SealPaths
+<span class="lineno">  409 </span>  -&gt; ConfigureOptions
+<span class="lineno">  410 </span>  -&gt; IO ExitCode
+<span class="lineno">  411 </span><span class="decl"><span class="istickedoff">configureWith out resolves paths opts = do</span>
+<span class="lineno">  412 </span><span class="spaces">  </span><span class="istickedoff">ensureSealDirs paths</span>
+<span class="lineno">  413 </span><span class="spaces">  </span><span class="istickedoff">acquired &lt;- acquireServeLock (serveLockPath paths)</span>
+<span class="lineno">  414 </span><span class="spaces">  </span><span class="istickedoff">case acquired of</span>
+<span class="lineno">  415 </span><span class="spaces">    </span><span class="istickedoff">Left _ -&gt; report out (ConfigureRefusal</span>
+<span class="lineno">  416 </span><span class="spaces">      </span><span class="istickedoff">&quot;`seal serve` is running for this SEAL_HOME; stop it before configuring coordinates.&quot;)</span>
+<span class="lineno">  417 </span><span class="spaces">    </span><span class="istickedoff">Right lock -&gt; configureLocked out resolves paths opts</span>
+<span class="lineno">  418 </span><span class="spaces">                     </span><span class="istickedoff">`finally` releaseServeLock lock</span></span>
+<span class="lineno">  419 </span>
+<span class="lineno">  420 </span>configureLocked
+<span class="lineno">  421 </span>  :: Outputs -&gt; (Text -&gt; IO Bool) -&gt; SealPaths -&gt; ConfigureOptions -&gt; IO ExitCode
+<span class="lineno">  422 </span><span class="decl"><span class="istickedoff">configureLocked out resolves paths opts = do</span>
+<span class="lineno">  423 </span><span class="spaces">  </span><span class="istickedoff">legacy &lt;- legacyConfigProblem paths</span>
+<span class="lineno">  424 </span><span class="spaces">  </span><span class="istickedoff">case legacy of</span>
+<span class="lineno">  425 </span><span class="spaces">    </span><span class="istickedoff">Just problem -&gt; report out problem</span>
+<span class="lineno">  426 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  427 </span><span class="spaces">      </span><span class="istickedoff">loaded &lt;- loadSecurityConfig (securityFilePath paths)</span>
+<span class="lineno">  428 </span><span class="spaces">      </span><span class="istickedoff">case loaded of</span>
+<span class="lineno">  429 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">report out</span></span>
+<span class="lineno">  430 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(ConfigureRefusal (&quot;security.toml could not be read: &quot; &lt;&gt; err))</span></span>
+<span class="lineno">  431 </span><span class="spaces">        </span><span class="istickedoff">Right cfg -&gt; do</span>
+<span class="lineno">  432 </span><span class="spaces">          </span><span class="istickedoff">inputs &lt;- preflight paths</span>
+<span class="lineno">  433 </span><span class="spaces">          </span><span class="istickedoff">case inputs of</span>
+<span class="lineno">  434 </span><span class="spaces">            </span><span class="istickedoff">Left refusal -&gt; <span class="nottickedoff">report out</span></span>
+<span class="lineno">  435 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">(ConfigureRefusal (bootRefusalMessage refusal))</span></span>
+<span class="lineno">  436 </span><span class="spaces">            </span><span class="istickedoff">Right bi -&gt; case planConfigure cfg (biCredentials bi) opts of</span>
+<span class="lineno">  437 </span><span class="spaces">              </span><span class="istickedoff">Left problem -&gt; report out problem</span>
+<span class="lineno">  438 </span><span class="spaces">              </span><span class="istickedoff">Right plan -&gt; applyPlan out resolves paths opts cfg plan</span></span>
+<span class="lineno">  439 </span>
+<span class="lineno">  440 </span>applyPlan
+<span class="lineno">  441 </span>  :: Outputs -&gt; (Text -&gt; IO Bool) -&gt; SealPaths -&gt; ConfigureOptions
+<span class="lineno">  442 </span>  -&gt; SecurityConfig -&gt; PlannedConfigure -&gt; IO ExitCode
+<span class="lineno">  443 </span><span class="decl"><span class="istickedoff">applyPlan out resolves paths opts oldCfg plan = do</span>
+<span class="lineno">  444 </span><span class="spaces">  </span><span class="istickedoff">let <span class="nottickedoff">eff = gatewayConfigFromSecurity (plConfig plan)</span></span>
+<span class="lineno">  445 </span><span class="spaces">  </span><span class="istickedoff">resolution &lt;- gatewayHostResolutionError resolves <span class="nottickedoff">(gcHost eff)</span></span>
+<span class="lineno">  446 </span><span class="spaces">  </span><span class="istickedoff">case resolution of</span>
+<span class="lineno">  447 </span><span class="spaces">    </span><span class="istickedoff">Just err -&gt; <span class="nottickedoff">report out (ConfigureRefusal err)</span></span>
+<span class="lineno">  448 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  449 </span><span class="spaces">      </span><span class="istickedoff">keys &lt;- validateKeyFiles opts</span>
+<span class="lineno">  450 </span><span class="spaces">      </span><span class="istickedoff">case keys of</span>
+<span class="lineno">  451 </span><span class="spaces">        </span><span class="istickedoff">Left problem -&gt; <span class="nottickedoff">report out problem</span></span>
+<span class="lineno">  452 </span><span class="spaces">        </span><span class="istickedoff">Right () -&gt; do</span>
+<span class="lineno">  453 </span><span class="spaces">          </span><span class="istickedoff">written &lt;- updateSecurityConfig (securityFilePath paths)</span>
+<span class="lineno">  454 </span><span class="spaces">                       </span><span class="istickedoff">(const (plConfig plan))</span>
+<span class="lineno">  455 </span><span class="spaces">          </span><span class="istickedoff">case written of</span>
+<span class="lineno">  456 </span><span class="spaces">            </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">report out</span></span>
+<span class="lineno">  457 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">(ConfigureRefusal (&quot;could not write security.toml: &quot; &lt;&gt; err))</span></span>
+<span class="lineno">  458 </span><span class="spaces">            </span><span class="istickedoff">Right () -&gt; do</span>
+<span class="lineno">  459 </span><span class="spaces">              </span><span class="istickedoff">printConfigure out oldCfg plan</span>
+<span class="lineno">  460 </span><span class="spaces">              </span><span class="istickedoff">printHints out paths plan</span>
+<span class="lineno">  461 </span><span class="spaces">              </span><span class="istickedoff">pure <span class="nottickedoff">ExitSuccess</span></span></span>
+<span class="lineno">  462 </span>
+<span class="lineno">  463 </span>report :: Outputs -&gt; ConfigureError -&gt; IO ExitCode
+<span class="lineno">  464 </span><span class="decl"><span class="istickedoff">report out problem = errLine out (configureMessage problem)</span>
+<span class="lineno">  465 </span><span class="spaces">                       </span><span class="istickedoff">&gt;&gt; pure (configureExit problem)</span></span>
+<span class="lineno">  466 </span>
+<span class="lineno">  467 </span>-- | Refuse when @config.toml@ still carries pre-split security fields. Running
+<span class="lineno">  468 </span>-- @configure@ then would create a @security.toml@ that makes the next boot's
+<span class="lineno">  469 </span>-- migration take the &quot;security.toml wins&quot; branch and drop the un-migrated
+<span class="lineno">  470 </span>-- vault/execution settings, so we send the operator through one migration boot
+<span class="lineno">  471 </span>-- first instead.
+<span class="lineno">  472 </span>legacyConfigProblem :: SealPaths -&gt; IO (Maybe ConfigureError)
+<span class="lineno">  473 </span><span class="decl"><span class="istickedoff">legacyConfigProblem paths = do</span>
+<span class="lineno">  474 </span><span class="spaces">  </span><span class="istickedoff">let path = configFilePath paths</span>
+<span class="lineno">  475 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  476 </span><span class="spaces">  </span><span class="istickedoff">if not exists then pure Nothing else do</span>
+<span class="lineno">  477 </span><span class="spaces">    </span><span class="istickedoff">read' &lt;- try (TIO.readFile path) :: IO (Either IOException Text)</span>
+<span class="lineno">  478 </span><span class="spaces">    </span><span class="istickedoff">pure $ case read' of</span>
+<span class="lineno">  479 </span><span class="spaces">      </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">Just (ConfigureRefusal</span></span>
+<span class="lineno">  480 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">(&quot;config.toml could not be read: &quot; &lt;&gt; T.pack (show err)))</span></span>
+<span class="lineno">  481 </span><span class="spaces">      </span><span class="istickedoff">Right raw</span>
+<span class="lineno">  482 </span><span class="spaces">        </span><span class="istickedoff">| <span class="tickonlytrue">configHasLegacySecurityFields raw</span> -&gt; Just (ConfigureRefusal</span>
+<span class="lineno">  483 </span><span class="spaces">            </span><span class="istickedoff">(&quot;config.toml still carries pre-split security fields.\n&quot;</span>
+<span class="lineno">  484 </span><span class="spaces">              </span><span class="istickedoff">&lt;&gt; &quot;  Run `seal serve` once to migrate them into security.toml, &quot;</span>
+<span class="lineno">  485 </span><span class="spaces">              </span><span class="istickedoff">&lt;&gt; &quot;then retry configure.&quot;))</span>
+<span class="lineno">  486 </span><span class="spaces">        </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span> -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  487 </span>
+<span class="lineno">  488 </span>validateKeyFiles :: ConfigureOptions -&gt; IO (Either ConfigureError ())
+<span class="lineno">  489 </span><span class="decl"><span class="istickedoff">validateKeyFiles opts = do</span>
+<span class="lineno">  490 </span><span class="spaces">  </span><span class="istickedoff">let named = catMaybes [coTlsCert opts, coTlsKey opts]</span>
+<span class="lineno">  491 </span><span class="spaces">  </span><span class="istickedoff">bad &lt;- filterM <span class="nottickedoff">(fmap not . readable)</span> named</span>
+<span class="lineno">  492 </span><span class="spaces">  </span><span class="istickedoff">pure $ case bad of</span>
+<span class="lineno">  493 </span><span class="spaces">    </span><span class="istickedoff">[]      -&gt; Right ()</span>
+<span class="lineno">  494 </span><span class="spaces">    </span><span class="istickedoff">(p : _) -&gt; <span class="nottickedoff">Left (ConfigureRefusal</span></span>
+<span class="lineno">  495 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">(&quot;TLS key file \&quot;&quot; &lt;&gt; T.pack p &lt;&gt; &quot;\&quot; is missing or unreadable.&quot;))</span></span>
+<span class="lineno">  496 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  497 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">readable p = do</span></span>
+<span class="lineno">  498 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">exists &lt;- doesFileExist p</span></span>
+<span class="lineno">  499 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">if not exists then pure False else do</span></span>
+<span class="lineno">  500 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">content &lt;- try (BS.readFile p) :: IO (Either IOException BS.ByteString)</span></span>
+<span class="lineno">  501 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">pure (either (const False) (const True) content)</span></span></span>
+<span class="lineno">  502 </span>
+<span class="lineno">  503 </span>printConfigure :: Outputs -&gt; SecurityConfig -&gt; PlannedConfigure -&gt; IO ()
+<span class="lineno">  504 </span><span class="decl"><span class="istickedoff">printConfigure out oldCfg plan = do</span>
+<span class="lineno">  505 </span><span class="spaces">  </span><span class="istickedoff">let oldGw = gatewayConfigFromSecurity oldCfg</span>
+<span class="lineno">  506 </span><span class="spaces">      </span><span class="istickedoff">newGw = gatewayConfigFromSecurity (plConfig plan)</span>
+<span class="lineno">  507 </span><span class="spaces">      </span><span class="istickedoff">oldAc = scAccessControl oldCfg</span>
+<span class="lineno">  508 </span><span class="spaces">      </span><span class="istickedoff">newAc = scAccessControl (plConfig plan)</span>
+<span class="lineno">  509 </span><span class="spaces">      </span><span class="istickedoff">fmtList xs = if null xs then &quot;(none)&quot; else T.intercalate <span class="nottickedoff">&quot;,&quot;</span> xs</span>
+<span class="lineno">  510 </span><span class="spaces">      </span><span class="istickedoff">fields =</span>
+<span class="lineno">  511 </span><span class="spaces">        </span><span class="istickedoff">[ (<span class="nottickedoff">&quot;bind_host&quot;</span>, gcHost oldGw, gcHost newGw)</span>
+<span class="lineno">  512 </span><span class="spaces">        </span><span class="istickedoff">, (&quot;bind_port&quot;, tshow (gcPort oldGw), tshow (gcPort newGw))</span>
+<span class="lineno">  513 </span><span class="spaces">        </span><span class="istickedoff">, (<span class="nottickedoff">&quot;tls&quot;</span>, onOff (tlsEnabled oldGw), onOff (tlsEnabled newGw))</span>
+<span class="lineno">  514 </span><span class="spaces">        </span><span class="istickedoff">, (<span class="nottickedoff">&quot;origin&quot;</span>, fromMaybe &quot;(none)&quot; (oldAc &gt;&gt;= acfcOrigin)</span>
+<span class="lineno">  515 </span><span class="spaces">                   </span><span class="istickedoff">, fromMaybe &quot;(none)&quot; (newAc &gt;&gt;= acfcOrigin))</span>
+<span class="lineno">  516 </span><span class="spaces">        </span><span class="istickedoff">, (<span class="nottickedoff">&quot;rp_id&quot;</span>, fromMaybe &quot;(none)&quot; (oldAc &gt;&gt;= acfcRpId)</span>
+<span class="lineno">  517 </span><span class="spaces">                  </span><span class="istickedoff">, fromMaybe &quot;(none)&quot; (newAc &gt;&gt;= acfcRpId))</span>
+<span class="lineno">  518 </span><span class="spaces">        </span><span class="istickedoff">, (&quot;allowed_origins&quot;, fmtList (gcAllowedOrigins oldGw)</span>
+<span class="lineno">  519 </span><span class="spaces">                            </span><span class="istickedoff">, fmtList (gcAllowedOrigins newGw))</span>
+<span class="lineno">  520 </span><span class="spaces">        </span><span class="istickedoff">, (<span class="nottickedoff">&quot;tls_hosts&quot;</span>, fmtList (gcTlsHosts oldGw), fmtList (gcTlsHosts newGw))</span>
+<span class="lineno">  521 </span><span class="spaces">        </span><span class="istickedoff">]</span>
+<span class="lineno">  522 </span><span class="spaces">  </span><span class="istickedoff">forM_ [ (k, o, n) | (k, o, n) &lt;- fields, o /= n ] $ \(k, o, n) -&gt;</span>
+<span class="lineno">  523 </span><span class="spaces">    </span><span class="istickedoff">outLine out (k &lt;&gt; &quot;: &quot; &lt;&gt; o &lt;&gt; &quot; -&gt; &quot; &lt;&gt; n)</span>
+<span class="lineno">  524 </span><span class="spaces">  </span><span class="istickedoff">outLine out (&quot;bind_host: &quot; &lt;&gt; gcHost newGw)</span>
+<span class="lineno">  525 </span><span class="spaces">  </span><span class="istickedoff">outLine out (&quot;bind_port: &quot; &lt;&gt; tshow (gcPort newGw))</span>
+<span class="lineno">  526 </span><span class="spaces">  </span><span class="istickedoff">outLine out <span class="nottickedoff">(&quot;tls: &quot; &lt;&gt; onOff (tlsEnabled newGw))</span></span>
+<span class="lineno">  527 </span><span class="spaces">  </span><span class="istickedoff">outLine out <span class="nottickedoff">(&quot;origin: &quot; &lt;&gt; fromMaybe &quot;(none)&quot; (plOrigin plan))</span></span>
+<span class="lineno">  528 </span><span class="spaces">  </span><span class="istickedoff">outLine out <span class="nottickedoff">(&quot;rp_id: &quot; &lt;&gt; fromMaybe &quot;(none)&quot; (plRpId plan))</span></span></span>
+<span class="lineno">  529 </span>
+<span class="lineno">  530 </span>printHints :: Outputs -&gt; SealPaths -&gt; PlannedConfigure -&gt; IO ()
+<span class="lineno">  531 </span><span class="decl"><span class="istickedoff">printHints out paths plan = do</span>
+<span class="lineno">  532 </span><span class="spaces">  </span><span class="istickedoff">let gw = gatewayConfigFromSecurity (plConfig plan)</span>
+<span class="lineno">  533 </span><span class="spaces">      </span><span class="istickedoff">mode = scAccessControl (plConfig plan) &gt;&gt;= acfcMode</span>
+<span class="lineno">  534 </span><span class="spaces">      </span><span class="istickedoff">(certPath, _) =</span>
+<span class="lineno">  535 </span><span class="spaces">        </span><span class="istickedoff">effectiveTlsPaths (tlsCertPath paths) <span class="nottickedoff">(tlsKeyPath paths)</span> gw</span>
+<span class="lineno">  536 </span><span class="spaces">  </span><span class="istickedoff">when (tlsEnabled gw &amp;&amp; isNothing (gcTlsCert gw)) $</span>
+<span class="lineno">  537 </span><span class="spaces">    </span><span class="istickedoff">errLine out (generatedCertificateTrustHint certPath)</span>
+<span class="lineno">  538 </span><span class="spaces">  </span><span class="istickedoff">when (mode == Just <span class="nottickedoff">&quot;none&quot;</span></span>
+<span class="lineno">  539 </span><span class="spaces">         </span><span class="istickedoff">&amp;&amp; <span class="nottickedoff">not (isLoopbackHost (gcHost gw))</span></span>
+<span class="lineno">  540 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">&amp;&amp; maybe False (not . isHttps) (plOrigin plan)</span>) $</span>
+<span class="lineno">  541 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">errLine out</span></span>
+<span class="lineno">  542 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">&quot;warning: mode \&quot;none\&quot; on a non-loopback plain-http bind exposes the \</span></span>
+<span class="lineno">  543 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">\gateway without authentication.&quot;</span></span>
+<span class="lineno">  544 </span><span class="spaces">  </span><span class="istickedoff">errLine out &quot;next: run `seal serve`, then `seal access-control status`.&quot;</span>
+<span class="lineno">  545 </span><span class="spaces">  </span><span class="istickedoff">errLine out &quot;      Enroll through the origin clients use; changing it later orphans passkeys.&quot;</span></span>
+<span class="lineno">  546 </span>
+<span class="lineno">  547 </span>-- | Pure planning and validation. No I/O, no filesystem; the handler supplies
+<span class="lineno">  548 </span>-- credentials and runs the resolver/certificate checks.
+<span class="lineno">  549 </span>planConfigure
+<span class="lineno">  550 </span>  :: SecurityConfig
+<span class="lineno">  551 </span>  -&gt; CredentialsPresence
+<span class="lineno">  552 </span>  -&gt; ConfigureOptions
+<span class="lineno">  553 </span>  -&gt; Either ConfigureError PlannedConfigure
+<span class="lineno">  554 </span><span class="decl"><span class="istickedoff">planConfigure sec creds opts = do</span>
+<span class="lineno">  555 </span><span class="spaces">  </span><span class="istickedoff">whenE (not (anyOption opts)) (usageE</span>
+<span class="lineno">  556 </span><span class="spaces">    </span><span class="istickedoff">&quot;configure needs at least one of --host, --port, --tls, --no-tls, \</span>
+<span class="lineno">  557 </span><span class="spaces">    </span><span class="istickedoff">\--tls-cert, --tls-key, --tls-host, --origin or --rp-id.&quot;)</span>
+<span class="lineno">  558 </span><span class="spaces">  </span><span class="istickedoff">mPort &lt;- traverse parsePort (coPort opts)</span>
+<span class="lineno">  559 </span><span class="spaces">  </span><span class="istickedoff">whenE (coTls opts &amp;&amp; coNoTls opts) (usageE</span>
+<span class="lineno">  560 </span><span class="spaces">    </span><span class="istickedoff">&quot;--tls and --no-tls cannot be combined.&quot;)</span>
+<span class="lineno">  561 </span><span class="spaces">  </span><span class="istickedoff">whenE (coNoTls opts &amp;&amp; any isJust [coTlsCert opts, coTlsKey opts]</span>
+<span class="lineno">  562 </span><span class="spaces">          </span><span class="istickedoff">|| coNoTls opts &amp;&amp; not (null (coTlsHosts opts))) <span class="nottickedoff">(usageE</span></span>
+<span class="lineno">  563 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">&quot;--no-tls cannot be combined with --tls-cert, --tls-key or --tls-host.&quot;)</span></span>
+<span class="lineno">  564 </span><span class="spaces">  </span><span class="istickedoff">case (coTlsCert opts, coTlsKey opts) of</span>
+<span class="lineno">  565 </span><span class="spaces">    </span><span class="istickedoff">(Just _, Nothing) -&gt; <span class="nottickedoff">usageE &quot;--tls-cert requires --tls-key.&quot;</span></span>
+<span class="lineno">  566 </span><span class="spaces">    </span><span class="istickedoff">(Nothing, Just _) -&gt; <span class="nottickedoff">usageE &quot;--tls-key requires --tls-cert.&quot;</span></span>
+<span class="lineno">  567 </span><span class="spaces">    </span><span class="istickedoff">_                 -&gt; Right <span class="nottickedoff">()</span></span>
+<span class="lineno">  568 </span><span class="spaces">  </span><span class="istickedoff">mapM_ <span class="nottickedoff">checkCertPath</span> (catMaybes [coTlsCert opts, coTlsKey opts])</span>
+<span class="lineno">  569 </span><span class="spaces">  </span><span class="istickedoff">mapM_ <span class="nottickedoff">checkTlsHost</span> (coTlsHosts opts)</span>
+<span class="lineno">  570 </span><span class="spaces">  </span><span class="istickedoff">requestedOrigin &lt;- traverse parseOriginStrict (coOrigin opts)</span>
+<span class="lineno">  571 </span><span class="spaces">  </span><span class="istickedoff">requestedRpId &lt;- traverse parseRpIdText (coRpId opts)</span>
+<span class="lineno">  572 </span><span class="spaces">  </span><span class="istickedoff">let oldGw = fromMaybe emptyGateway (scGateway sec)</span>
+<span class="lineno">  573 </span><span class="spaces">      </span><span class="istickedoff">oldAc = fromMaybe emptyAccess (scAccessControl sec)</span>
+<span class="lineno">  574 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">oldEff = gatewayConfigFromSecurity sec</span></span>
+<span class="lineno">  575 </span><span class="spaces">      </span><span class="istickedoff">newGw0 = applyGatewayDeltas oldGw mPort opts</span>
+<span class="lineno">  576 </span><span class="spaces">      </span><span class="istickedoff">newGw1 = if coTls opts || isJust (coTlsCert opts) || isJust (coTlsKey opts)</span>
+<span class="lineno">  577 </span><span class="spaces">                 </span><span class="istickedoff">then newGw0 { pgcTls = Just True }</span>
+<span class="lineno">  578 </span><span class="spaces">                 </span><span class="istickedoff">else newGw0</span>
+<span class="lineno">  579 </span><span class="spaces">      </span><span class="istickedoff">newGw2 = if <span class="tickonlytrue">null (coTlsHosts opts)</span></span>
+<span class="lineno">  580 </span><span class="spaces">                 </span><span class="istickedoff">then newGw1</span>
+<span class="lineno">  581 </span><span class="spaces">                 </span><span class="istickedoff">else <span class="nottickedoff">newGw1 { pgcTlsHosts = coTlsHosts opts }</span></span>
+<span class="lineno">  582 </span><span class="spaces">      </span><span class="istickedoff">newGw3 = if coNoTls opts</span>
+<span class="lineno">  583 </span><span class="spaces">                 </span><span class="istickedoff">then newGw1 { pgcTls = Just False, pgcTlsCert = Nothing</span>
+<span class="lineno">  584 </span><span class="spaces">                             </span><span class="istickedoff">, pgcTlsKey = Nothing, pgcTlsHosts = [] }</span>
+<span class="lineno">  585 </span><span class="spaces">                 </span><span class="istickedoff">else newGw2</span>
+<span class="lineno">  586 </span><span class="spaces">      </span><span class="istickedoff">effGw = withGatewayDefaults newGw3</span>
+<span class="lineno">  587 </span><span class="spaces">      </span><span class="istickedoff">effTls = tlsEnabled effGw</span>
+<span class="lineno">  588 </span><span class="spaces">  </span><span class="istickedoff">whenE (not (null (coTlsHosts opts)) &amp;&amp; <span class="nottickedoff">not effTls</span>) <span class="nottickedoff">(usageE</span></span>
+<span class="lineno">  589 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">&quot;--tls-host requires TLS: pass --tls or --tls-cert/--tls-key.&quot;)</span></span>
+<span class="lineno">  590 </span><span class="spaces">  </span><span class="istickedoff">chosenOrigin &lt;- chooseOrigin opts oldAc effGw effTls requestedOrigin</span>
+<span class="lineno">  591 </span><span class="spaces">  </span><span class="istickedoff">let derivedRpId = chosenOrigin &gt;&gt;= originHost</span>
+<span class="lineno">  592 </span><span class="spaces">      </span><span class="istickedoff">effectiveRpId = requestedRpId &lt;|&gt; acfcRpId oldAc &lt;|&gt; derivedRpId</span>
+<span class="lineno">  593 </span><span class="spaces">  </span><span class="istickedoff">validateRpId chosenOrigin effectiveRpId</span>
+<span class="lineno">  594 </span><span class="spaces">  </span><span class="istickedoff">let <span class="nottickedoff">oldDerived = derivedOriginForm (gcHost oldEff) (gcPort oldEff)</span></span>
+<span class="lineno">  595 </span><span class="spaces">      </span><span class="istickedoff">newDerived = if <span class="tickonlyfalse">effTls</span></span>
+<span class="lineno">  596 </span><span class="spaces">                     </span><span class="istickedoff">then <span class="nottickedoff">httpsOriginFor (gcHost effGw) (gcPort effGw)</span></span>
+<span class="lineno">  597 </span><span class="spaces">                     </span><span class="istickedoff">else derivedOriginForm (gcHost effGw) (gcPort effGw)</span>
+<span class="lineno">  598 </span><span class="spaces">      </span><span class="istickedoff">managedNew = chosenOrigin &lt;|&gt; newDerived</span>
+<span class="lineno">  599 </span><span class="spaces">      </span><span class="istickedoff">removed = catMaybes [acfcOrigin oldAc, <span class="nottickedoff">oldDerived</span>]</span>
+<span class="lineno">  600 </span><span class="spaces">      </span><span class="istickedoff">kept = filter (`notElem` removed)</span>
+<span class="lineno">  601 </span><span class="spaces">               </span><span class="istickedoff">(map normaliseEntry (pgcAllowedOrigins oldGw))</span>
+<span class="lineno">  602 </span><span class="spaces">      </span><span class="istickedoff">merged = nub (kept ++ maybeToList managedNew)</span>
+<span class="lineno">  603 </span><span class="spaces">      </span><span class="istickedoff">merged' = if <span class="tickonlyfalse">null merged</span> then <span class="nottickedoff">maybeToList managedNew</span> else merged</span>
+<span class="lineno">  604 </span><span class="spaces">      </span><span class="istickedoff">newGw = newGw3 { pgcAllowedOrigins = merged' }</span>
+<span class="lineno">  605 </span><span class="spaces">      </span><span class="istickedoff">newAc = oldAc { acfcOrigin = chosenOrigin</span>
+<span class="lineno">  606 </span><span class="spaces">                    </span><span class="istickedoff">, acfcRpId = requestedRpId &lt;|&gt; acfcRpId oldAc }</span>
+<span class="lineno">  607 </span><span class="spaces">      </span><span class="istickedoff">newCfg = sec { scGateway = Just newGw, scAccessControl = Just newAc }</span>
+<span class="lineno">  608 </span><span class="spaces">      </span><span class="istickedoff">raw = Toml.encode securityConfigCodec newCfg</span>
+<span class="lineno">  609 </span><span class="spaces">      </span><span class="istickedoff">coords = BindCoordinates (gcHost effGw) (gcPort effGw)</span>
+<span class="lineno">  610 </span><span class="spaces">      </span><span class="istickedoff">inputs = BootInputs raw (scAccessControl newCfg) creds</span>
+<span class="lineno">  611 </span><span class="spaces">  </span><span class="istickedoff">plan &lt;- case bootPlan coords inputs of</span>
+<span class="lineno">  612 </span><span class="spaces">    </span><span class="istickedoff">Left refusal -&gt; refusalE (bootRefusalMessage refusal)</span>
+<span class="lineno">  613 </span><span class="spaces">    </span><span class="istickedoff">Right p      -&gt; Right p</span>
+<span class="lineno">  614 </span><span class="spaces">  </span><span class="istickedoff">maybe (Right <span class="nottickedoff">()</span>) <span class="nottickedoff">usageE</span> (gatewayHostError (gcHost effGw))</span>
+<span class="lineno">  615 </span><span class="spaces">  </span><span class="istickedoff">maybe (Right <span class="nottickedoff">()</span>) <span class="nottickedoff">refusalE</span> (tlsConfigError effGw)</span>
+<span class="lineno">  616 </span><span class="spaces">  </span><span class="istickedoff">maybe (Right <span class="nottickedoff">()</span>) refusalE</span>
+<span class="lineno">  617 </span><span class="spaces">    </span><span class="istickedoff">(tlsOriginError (tlsEnabled effGw) (bpOrigin plan))</span>
+<span class="lineno">  618 </span><span class="spaces">  </span><span class="istickedoff">whenE (not (isLoopbackHost (gcHost effGw))</span>
+<span class="lineno">  619 </span><span class="spaces">          </span><span class="istickedoff">&amp;&amp; not (maybe <span class="nottickedoff">False</span> isHttps (bpOrigin plan))</span>
+<span class="lineno">  620 </span><span class="spaces">          </span><span class="istickedoff">&amp;&amp; <span class="nottickedoff">bpMode plan /= AccessOpen</span>) <span class="nottickedoff">(refusalE</span></span>
+<span class="lineno">  621 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">&quot;refusing to write a non-loopback plain-http gateway. Bind loopback (and \</span></span>
+<span class="lineno">  622 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">\use a TLS reverse proxy), enable TLS, or use mode \&quot;none\&quot; explicitly.&quot;)</span></span>
+<span class="lineno">  623 </span><span class="spaces">  </span><span class="istickedoff">let enrolled = bpCreds plan</span>
+<span class="lineno">  624 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">rp = bpRpId plan</span></span>
+<span class="lineno">  625 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">orphans = maybe True (\r -&gt; any ((/= r) . credRpId) (Map.elems enrolled)) rp</span></span>
+<span class="lineno">  626 </span><span class="spaces">  </span><span class="istickedoff">whenE (not (Map.null enrolled) &amp;&amp; <span class="nottickedoff">orphans</span>) <span class="nottickedoff">(refusalE</span></span>
+<span class="lineno">  627 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">(&quot;this change would orphan every enrolled passkey. Recover with:\n&quot;</span></span>
+<span class="lineno">  628 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;  seal access-control reset --yes   (deletes all enrolled passkeys)\n&quot;</span></span>
+<span class="lineno">  629 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;  seal access-control configure ... (the coordinates you want)\n&quot;</span></span>
+<span class="lineno">  630 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;  seal serve, then enroll a new passkey.&quot;))</span></span>
+<span class="lineno">  631 </span><span class="spaces">  </span><span class="istickedoff">case decodeSecurityConfig raw of</span>
+<span class="lineno">  632 </span><span class="spaces">    </span><span class="istickedoff">Right decoded | <span class="tickonlytrue">decoded == newCfg</span> -&gt; Right <span class="nottickedoff">()</span></span>
+<span class="lineno">  633 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">refusalE</span></span>
+<span class="lineno">  634 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">&quot;refusing to write security.toml: the encoded document does not round-trip.&quot;</span></span>
+<span class="lineno">  635 </span><span class="spaces">  </span><span class="istickedoff">pure PlannedConfigure</span>
+<span class="lineno">  636 </span><span class="spaces">    </span><span class="istickedoff">{ plConfig = newCfg</span>
+<span class="lineno">  637 </span><span class="spaces">    </span><span class="istickedoff">, plOrigin = bpOrigin plan</span>
+<span class="lineno">  638 </span><span class="spaces">    </span><span class="istickedoff">, plRpId = bpRpId plan</span>
+<span class="lineno">  639 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">  640 </span>
+<span class="lineno">  641 </span>anyOption :: ConfigureOptions -&gt; Bool
+<span class="lineno">  642 </span><span class="decl"><span class="istickedoff">anyOption opts =</span>
+<span class="lineno">  643 </span><span class="spaces">  </span><span class="istickedoff">any isJust [coHost opts, coPort opts, coOrigin opts, coRpId opts]</span>
+<span class="lineno">  644 </span><span class="spaces">    </span><span class="istickedoff">|| any isJust [coTlsCert opts, coTlsKey opts]</span>
+<span class="lineno">  645 </span><span class="spaces">    </span><span class="istickedoff">|| coTls opts || coNoTls opts || not (null (coTlsHosts opts))</span></span>
+<span class="lineno">  646 </span>
+<span class="lineno">  647 </span>parsePort :: Text -&gt; Either ConfigureError Int
+<span class="lineno">  648 </span><span class="decl"><span class="istickedoff">parsePort raw = case readMaybe (T.unpack raw) of</span>
+<span class="lineno">  649 </span><span class="spaces">  </span><span class="istickedoff">Just n | n &gt;= 1 &amp;&amp; n &lt;= 65535 -&gt; Right n</span>
+<span class="lineno">  650 </span><span class="spaces">  </span><span class="istickedoff">_ -&gt; usageE (&quot;--port must be an integer between 1 and 65535, got \&quot;&quot; &lt;&gt; raw &lt;&gt; &quot;\&quot;.&quot;)</span></span>
+<span class="lineno">  651 </span>
+<span class="lineno">  652 </span>checkCertPath :: FilePath -&gt; Either ConfigureError ()
+<span class="lineno">  653 </span><span class="decl"><span class="nottickedoff">checkCertPath p</span>
+<span class="lineno">  654 </span><span class="spaces">  </span><span class="nottickedoff">| isAbsolute p = Right ()</span>
+<span class="lineno">  655 </span><span class="spaces">  </span><span class="nottickedoff">| otherwise = usageE (&quot;--tls-cert/--tls-key must be absolute paths, got \&quot;&quot;</span>
+<span class="lineno">  656 </span><span class="spaces">                          </span><span class="nottickedoff">&lt;&gt; T.pack p &lt;&gt; &quot;\&quot;.&quot;)</span></span>
+<span class="lineno">  657 </span>
+<span class="lineno">  658 </span>checkTlsHost :: Text -&gt; Either ConfigureError ()
+<span class="lineno">  659 </span><span class="decl"><span class="nottickedoff">checkTlsHost h</span>
+<span class="lineno">  660 </span><span class="spaces">  </span><span class="nottickedoff">| T.null (T.strip h) = usageE &quot;--tls-host must not be empty.&quot;</span>
+<span class="lineno">  661 </span><span class="spaces">  </span><span class="nottickedoff">| T.any (\c -&gt; isSpace c || isControl c) h = usageE</span>
+<span class="lineno">  662 </span><span class="spaces">      </span><span class="nottickedoff">&quot;--tls-host must not contain whitespace or control characters.&quot;</span>
+<span class="lineno">  663 </span><span class="spaces">  </span><span class="nottickedoff">| otherwise = Right ()</span></span>
+<span class="lineno">  664 </span>
+<span class="lineno">  665 </span>parseOriginStrict :: Text -&gt; Either ConfigureError Text
+<span class="lineno">  666 </span><span class="decl"><span class="istickedoff">parseOriginStrict raw</span>
+<span class="lineno">  667 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">T.any isSpace raw</span> = <span class="nottickedoff">usageE</span></span>
+<span class="lineno">  668 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">&quot;an origin must not contain whitespace.&quot;</span></span>
+<span class="lineno">  669 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">T.any (`elem` (&quot;@?#\\&quot; :: String)) raw</span> = <span class="nottickedoff">usageE</span></span>
+<span class="lineno">  670 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">&quot;an origin must be scheme://host[:port] with no userinfo, query, fragment or path.&quot;</span></span>
+<span class="lineno">  671 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case normalizeOrigin raw of</span>
+<span class="lineno">  672 </span><span class="spaces">      </span><span class="istickedoff">Just o | <span class="tickonlytrue">isHttpOrigin o</span> -&gt; Right o</span>
+<span class="lineno">  673 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">usageE (&quot;\&quot;&quot; &lt;&gt; raw &lt;&gt; &quot;\&quot; is not an absolute http:// or https:// origin.&quot;)</span></span></span>
+<span class="lineno">  674 </span>
+<span class="lineno">  675 </span>parseRpIdText :: Text -&gt; Either ConfigureError Text
+<span class="lineno">  676 </span><span class="decl"><span class="istickedoff">parseRpIdText raw</span>
+<span class="lineno">  677 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">T.null rp</span> = <span class="nottickedoff">usageE &quot;--rp-id must not be empty.&quot;</span></span>
+<span class="lineno">  678 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">isIpLiteral rp</span> = <span class="nottickedoff">usageE</span></span>
+<span class="lineno">  679 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">(&quot;--rp-id \&quot;&quot; &lt;&gt; rp &lt;&gt; &quot;\&quot; is an IP address; a WebAuthn rp_id must be a domain name.&quot;)</span></span>
+<span class="lineno">  680 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Right rp</span>
+<span class="lineno">  681 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  682 </span><span class="spaces">    </span><span class="istickedoff">rp = T.toLower (T.strip raw)</span></span>
+<span class="lineno">  683 </span>
+<span class="lineno">  684 </span>validateRpId :: Maybe Text -&gt; Maybe Text -&gt; Either ConfigureError ()
+<span class="lineno">  685 </span><span class="decl"><span class="istickedoff">validateRpId Nothing (Just _) = <span class="nottickedoff">refusalE</span></span>
+<span class="lineno">  686 </span><span class="spaces">  </span><span class="istickedoff"><span class="nottickedoff">&quot;an rp_id needs an origin; pass --origin as well.&quot;</span></span>
+<span class="lineno">  687 </span><span class="spaces"></span><span class="istickedoff">validateRpId _ Nothing = Right <span class="nottickedoff">()</span></span>
+<span class="lineno">  688 </span><span class="spaces"></span><span class="istickedoff">validateRpId (Just origin) (Just rp) =</span>
+<span class="lineno">  689 </span><span class="spaces">  </span><span class="istickedoff">let host = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (originHost origin)</span>
+<span class="lineno">  690 </span><span class="spaces">  </span><span class="istickedoff">in if <span class="tickonlytrue">rp == host</span></span>
+<span class="lineno">  691 </span><span class="spaces">       </span><span class="istickedoff"><span class="tickonlytrue">|| <span class="nottickedoff">((&quot;.&quot; &lt;&gt; rp) `T.isSuffixOf` host &amp;&amp; T.count &quot;.&quot; rp &gt;= 1)</span></span></span>
+<span class="lineno">  692 </span><span class="spaces">       </span><span class="istickedoff">then Right <span class="nottickedoff">()</span></span>
+<span class="lineno">  693 </span><span class="spaces">       </span><span class="istickedoff">else <span class="nottickedoff">usageE (&quot;--rp-id \&quot;&quot; &lt;&gt; rp &lt;&gt; &quot;\&quot; is not a parent domain of the origin host \&quot;&quot;</span></span>
+<span class="lineno">  694 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; host &lt;&gt; &quot;\&quot;.&quot;)</span></span></span>
+<span class="lineno">  695 </span>
+<span class="lineno">  696 </span>chooseOrigin
+<span class="lineno">  697 </span>  :: ConfigureOptions
+<span class="lineno">  698 </span>  -&gt; AccessControlFileConfig
+<span class="lineno">  699 </span>  -&gt; GatewayConfig
+<span class="lineno">  700 </span>  -&gt; Bool
+<span class="lineno">  701 </span>  -&gt; Maybe Text
+<span class="lineno">  702 </span>  -&gt; Either ConfigureError (Maybe Text)
+<span class="lineno">  703 </span><span class="decl"><span class="istickedoff">chooseOrigin opts oldAc effGw effTls requested = case requested of</span>
+<span class="lineno">  704 </span><span class="spaces">  </span><span class="istickedoff">Just o -&gt; Right (Just o)</span>
+<span class="lineno">  705 </span><span class="spaces">  </span><span class="istickedoff">Nothing</span>
+<span class="lineno">  706 </span><span class="spaces">    </span><span class="istickedoff">| coNoTls opts -&gt; Right (acfcOrigin oldAc)</span>
+<span class="lineno">  707 </span><span class="spaces">    </span><span class="istickedoff">| not effTls   -&gt; Right (acfcOrigin oldAc)</span>
+<span class="lineno">  708 </span><span class="spaces">    </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; case acfcOrigin oldAc of</span>
+<span class="lineno">  709 </span><span class="spaces">        </span><span class="istickedoff">Just o | <span class="nottickedoff">isHttps o</span> -&gt; <span class="nottickedoff">Right (Just o)</span></span>
+<span class="lineno">  710 </span><span class="spaces">               </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span> -&gt; <span class="nottickedoff">refusalE</span></span>
+<span class="lineno">  711 </span><span class="spaces">                   </span><span class="istickedoff"><span class="nottickedoff">(&quot;TLS is enabled but [access_control] origin is \&quot;&quot; &lt;&gt; o</span></span>
+<span class="lineno">  712 </span><span class="spaces">                     </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;\&quot;; pass --origin https://&lt;the host clients use&gt;.&quot;)</span></span>
+<span class="lineno">  713 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; case httpsOriginFor (gcHost effGw) (gcPort effGw) of</span>
+<span class="lineno">  714 </span><span class="spaces">          </span><span class="istickedoff">Just o  -&gt; Right (Just o)</span>
+<span class="lineno">  715 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">refusalE</span></span>
+<span class="lineno">  716 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">(&quot;cannot derive an https origin for bind host \&quot;&quot; &lt;&gt; gcHost effGw</span></span>
+<span class="lineno">  717 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;\&quot;; pass --origin.&quot;)</span></span></span>
+<span class="lineno">  718 </span>
+<span class="lineno">  719 </span>applyGatewayDeltas
+<span class="lineno">  720 </span>  :: PartialGatewayConfig -&gt; Maybe Int -&gt; ConfigureOptions -&gt; PartialGatewayConfig
+<span class="lineno">  721 </span><span class="decl"><span class="istickedoff">applyGatewayDeltas oldGw mPort opts = oldGw</span>
+<span class="lineno">  722 </span><span class="spaces">  </span><span class="istickedoff">{ pgcHost = coHost opts &lt;|&gt; pgcHost oldGw</span>
+<span class="lineno">  723 </span><span class="spaces">  </span><span class="istickedoff">, pgcPort = mPort &lt;|&gt; pgcPort oldGw</span>
+<span class="lineno">  724 </span><span class="spaces">  </span><span class="istickedoff">, pgcTlsCert = fmap <span class="nottickedoff">T.pack</span> (coTlsCert opts) &lt;|&gt; pgcTlsCert oldGw</span>
+<span class="lineno">  725 </span><span class="spaces">  </span><span class="istickedoff">, pgcTlsKey = fmap <span class="nottickedoff">T.pack</span> (coTlsKey opts) &lt;|&gt; pgcTlsKey oldGw</span>
+<span class="lineno">  726 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  727 </span>
+<span class="lineno">  728 </span>derivedOriginForm :: Text -&gt; Int -&gt; Maybe Text
+<span class="lineno">  729 </span><span class="decl"><span class="istickedoff">derivedOriginForm host port</span>
+<span class="lineno">  730 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">isWildcardHost host</span> = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  731 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Just (canonicalOriginFor host port)</span></span>
+<span class="lineno">  732 </span>
+<span class="lineno">  733 </span>httpsOriginFor :: Text -&gt; Int -&gt; Maybe Text
+<span class="lineno">  734 </span><span class="decl"><span class="istickedoff">httpsOriginFor host port</span>
+<span class="lineno">  735 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">isWildcardHost host</span> = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  736 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">isLoopbackHost host</span> = Just (httpsUrl &quot;localhost&quot; port)</span>
+<span class="lineno">  737 </span><span class="spaces">  </span><span class="istickedoff">| <span class="nottickedoff">isIpLiteral host || T.isInfixOf &quot;:&quot; host</span> = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  738 </span><span class="spaces">  </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span> = <span class="nottickedoff">Just (httpsUrl (T.toLower host) port)</span></span>
+<span class="lineno">  739 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  740 </span><span class="spaces">    </span><span class="istickedoff">httpsUrl h p</span>
+<span class="lineno">  741 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">p == 443</span> = <span class="nottickedoff">&quot;https://&quot; &lt;&gt; h</span></span>
+<span class="lineno">  742 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = &quot;https://&quot; &lt;&gt; h &lt;&gt; &quot;:&quot; &lt;&gt; tshow p</span></span>
+<span class="lineno">  743 </span>
+<span class="lineno">  744 </span>originHost :: Text -&gt; Maybe Text
+<span class="lineno">  745 </span><span class="decl"><span class="istickedoff">originHost origin =</span>
+<span class="lineno">  746 </span><span class="spaces">  </span><span class="istickedoff">let (_, rest) = T.breakOn &quot;://&quot; origin</span>
+<span class="lineno">  747 </span><span class="spaces">  </span><span class="istickedoff">in if <span class="tickonlyfalse">T.null rest</span></span>
+<span class="lineno">  748 </span><span class="spaces">       </span><span class="istickedoff">then <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  749 </span><span class="spaces">       </span><span class="istickedoff">else let authority = T.drop 3 rest</span>
+<span class="lineno">  750 </span><span class="spaces">            </span><span class="istickedoff">in Just (T.toLower (T.takeWhile (/= ':') authority))</span></span>
+<span class="lineno">  751 </span>
+<span class="lineno">  752 </span>normaliseEntry :: Text -&gt; Text
+<span class="lineno">  753 </span><span class="decl"><span class="istickedoff">normaliseEntry raw = fromMaybe <span class="nottickedoff">raw</span> (normalizeOrigin raw)</span></span>
+<span class="lineno">  754 </span>
+<span class="lineno">  755 </span>isHttpOrigin :: Text -&gt; Bool
+<span class="lineno">  756 </span><span class="decl"><span class="istickedoff">isHttpOrigin o = &quot;http://&quot; `T.isPrefixOf` o || &quot;https://&quot; `T.isPrefixOf` o</span></span>
+<span class="lineno">  757 </span>
+<span class="lineno">  758 </span>isHttps :: Text -&gt; Bool
+<span class="lineno">  759 </span><span class="decl"><span class="istickedoff">isHttps o = &quot;https://&quot; `T.isPrefixOf` o</span></span>
+<span class="lineno">  760 </span>
+<span class="lineno">  761 </span>onOff :: Bool -&gt; Text
+<span class="lineno">  762 </span><span class="decl"><span class="istickedoff">onOff True  = &quot;on&quot;</span>
+<span class="lineno">  763 </span><span class="spaces"></span><span class="istickedoff">onOff False = &quot;off&quot;</span></span>
+<span class="lineno">  764 </span>
+<span class="lineno">  765 </span>tshow :: Show a =&gt; a -&gt; Text
+<span class="lineno">  766 </span><span class="decl"><span class="istickedoff">tshow = T.pack . show</span></span>
+<span class="lineno">  767 </span>
+<span class="lineno">  768 </span>usageE :: Text -&gt; Either ConfigureError a
+<span class="lineno">  769 </span><span class="decl"><span class="istickedoff">usageE = Left . ConfigureUsage</span></span>
+<span class="lineno">  770 </span>
+<span class="lineno">  771 </span>refusalE :: Text -&gt; Either ConfigureError a
+<span class="lineno">  772 </span><span class="decl"><span class="istickedoff">refusalE = Left . ConfigureRefusal</span></span>
+<span class="lineno">  773 </span>
+<span class="lineno">  774 </span>whenE :: Bool -&gt; Either ConfigureError () -&gt; Either ConfigureError ()
+<span class="lineno">  775 </span><span class="decl"><span class="istickedoff">whenE True  action = action</span>
+<span class="lineno">  776 </span><span class="spaces"></span><span class="istickedoff">whenE False _      = Right <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  777 </span>
+<span class="lineno">  778 </span>emptyGateway :: PartialGatewayConfig
+<span class="lineno">  779 </span><span class="decl"><span class="istickedoff">emptyGateway = PartialGatewayConfig</span>
+<span class="lineno">  780 </span><span class="spaces">  </span><span class="istickedoff">{ pgcPort = Nothing</span>
+<span class="lineno">  781 </span><span class="spaces">  </span><span class="istickedoff">, pgcHost = Nothing</span>
+<span class="lineno">  782 </span><span class="spaces">  </span><span class="istickedoff">, pgcStaticDir = Nothing</span>
+<span class="lineno">  783 </span><span class="spaces">  </span><span class="istickedoff">, pgcAllowedOrigins = []</span>
+<span class="lineno">  784 </span><span class="spaces">  </span><span class="istickedoff">, pgcFileExplorerEnabled = Nothing</span>
+<span class="lineno">  785 </span><span class="spaces">  </span><span class="istickedoff">, pgcTlsCert = Nothing</span>
+<span class="lineno">  786 </span><span class="spaces">  </span><span class="istickedoff">, pgcTlsKey = Nothing</span>
+<span class="lineno">  787 </span><span class="spaces">  </span><span class="istickedoff">, pgcTls = Nothing</span>
+<span class="lineno">  788 </span><span class="spaces">  </span><span class="istickedoff">, pgcTlsHosts = []</span>
+<span class="lineno">  789 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  790 </span>
+<span class="lineno">  791 </span>emptyAccess :: AccessControlFileConfig
+<span class="lineno">  792 </span><span class="decl"><span class="istickedoff">emptyAccess = AccessControlFileConfig</span>
+<span class="lineno">  793 </span><span class="spaces">  </span><span class="istickedoff">{ acfcMode = Nothing</span>
+<span class="lineno">  794 </span><span class="spaces">  </span><span class="istickedoff">, acfcOrigin = Nothing</span>
+<span class="lineno">  795 </span><span class="spaces">  </span><span class="istickedoff">, acfcRpId = Nothing</span>
+<span class="lineno">  796 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  797 </span>
+<span class="lineno">  798 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  799 </span>
+<span class="lineno">  800 </span>gatewayConfig :: SealPaths -&gt; IO GatewayConfig
+<span class="lineno">  801 </span><span class="decl"><span class="istickedoff">gatewayConfig paths = do</span>
+<span class="lineno">  802 </span><span class="spaces">  </span><span class="istickedoff">sec &lt;- loadSecurityConfig (securityFilePath paths)</span>
+<span class="lineno">  803 </span><span class="spaces">  </span><span class="istickedoff">case sec of</span>
+<span class="lineno">  804 </span><span class="spaces">    </span><span class="istickedoff">Right cfg | isJust (scGateway cfg) -&gt; pure (gatewayConfigFromSecurity cfg)</span>
+<span class="lineno">  805 </span><span class="spaces">    </span><span class="istickedoff">-- Upgrade window: this SEAL_HOME has not booted serve/tui since the</span>
+<span class="lineno">  806 </span><span class="spaces">    </span><span class="istickedoff">-- [gateway] section moved, so the table is still in config.toml. Read it</span>
+<span class="lineno">  807 </span><span class="spaces">    </span><span class="istickedoff">-- from there — read-only. `status` and `enroll` must not rewrite</span>
+<span class="lineno">  808 </span><span class="spaces">    </span><span class="istickedoff">-- security.toml: a pre-upgrade daemon may be running, and the write lock</span>
+<span class="lineno">  809 </span><span class="spaces">    </span><span class="istickedoff">-- is process-local. The next serve/tui boot moves the table and this path</span>
+<span class="lineno">  810 </span><span class="spaces">    </span><span class="istickedoff">-- goes quiet.</span>
+<span class="lineno">  811 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; do</span>
+<span class="lineno">  812 </span><span class="spaces">      </span><span class="istickedoff">legacy &lt;- loadLegacyGatewayTable (configFilePath paths)</span>
+<span class="lineno">  813 </span><span class="spaces">      </span><span class="istickedoff">pure (maybe defaultGatewayConfig withGatewayDefaults legacy)</span></span>
+
+</pre>
+</body>
+</html>

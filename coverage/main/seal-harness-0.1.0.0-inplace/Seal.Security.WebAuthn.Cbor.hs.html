@@ -1,0 +1,200 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | A strict, bounded CBOR decoder — just enough of RFC 8949 to read a
+<span class="lineno">    3 </span>-- WebAuthn @attestationObject@ and its COSE @EC2@ public key, and hostile to
+<span class="lineno">    4 </span>-- everything else.
+<span class="lineno">    5 </span>--
+<span class="lineno">    6 </span>-- Deliberate restrictions (all fail closed with @Left@):
+<span class="lineno">    7 </span>--
+<span class="lineno">    8 </span>-- * definite lengths only — indefinite-length items (additional info 31) are
+<span class="lineno">    9 </span>--   rejected, so a decoder never has to buffer an unbounded stream;
+<span class="lineno">   10 </span>-- * no tags, no floats, no @undefined@;
+<span class="lineno">   11 </span>-- * nesting depth ≤ 'maxDepth' and array/map arity ≤ 'maxItems';
+<span class="lineno">   12 </span>-- * every declared length is checked against the bytes that remain, so a
+<span class="lineno">   13 </span>--   4-gigabyte array header cannot make the decoder spin;
+<span class="lineno">   14 </span>-- * the whole input is capped at 'maxInput' bytes, which bounds item count
+<span class="lineno">   15 </span>--   structurally;
+<span class="lineno">   16 </span>-- * 'decodeCbor' rejects trailing bytes.
+<span class="lineno">   17 </span>--
+<span class="lineno">   18 </span>-- There are no partial functions here: every length prefix is validated
+<span class="lineno">   19 </span>-- before it is used.
+<span class="lineno">   20 </span>module Seal.Security.WebAuthn.Cbor
+<span class="lineno">   21 </span>  ( Cbor (..)
+<span class="lineno">   22 </span>  , decodeCbor
+<span class="lineno">   23 </span>  , decodeCborPrefix
+<span class="lineno">   24 </span>  , cborLookupInt
+<span class="lineno">   25 </span>  , maxInput
+<span class="lineno">   26 </span>  ) where
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>import Data.Bits (shiftL, shiftR, (.&amp;.))
+<span class="lineno">   29 </span>import Data.ByteString (ByteString)
+<span class="lineno">   30 </span>import Data.ByteString qualified as BS
+<span class="lineno">   31 </span>import Data.Text (Text)
+<span class="lineno">   32 </span>import Data.Text qualified as T
+<span class="lineno">   33 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   34 </span>import Data.Word (Word8)
+<span class="lineno">   35 </span>
+<span class="lineno">   36 </span>-- | A decoded CBOR value. Only the shapes WebAuthn actually uses are
+<span class="lineno">   37 </span>-- representable.
+<span class="lineno">   38 </span>data Cbor
+<span class="lineno">   39 </span>  = CborInt !Integer
+<span class="lineno">   40 </span>  | CborBytes !ByteString
+<span class="lineno">   41 </span>  | CborText !Text
+<span class="lineno">   42 </span>  | CborArray ![Cbor]
+<span class="lineno">   43 </span>  | CborMap ![(Cbor, Cbor)]
+<span class="lineno">   44 </span>  | CborBool !Bool
+<span class="lineno">   45 </span>  | CborNull
+<span class="lineno">   46 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   47 </span>
+<span class="lineno">   48 </span>-- | Upper bound on an input we will parse at all (64 KiB). WebAuthn
+<span class="lineno">   49 </span>-- attestation objects are a few hundred bytes; anything near this is an
+<span class="lineno">   50 </span>-- attack.
+<span class="lineno">   51 </span>maxInput :: Int
+<span class="lineno">   52 </span><span class="decl"><span class="istickedoff">maxInput = 65536</span></span>
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>maxDepth :: Int
+<span class="lineno">   55 </span><span class="decl"><span class="istickedoff">maxDepth = 32</span></span>
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>maxItems :: Int
+<span class="lineno">   58 </span><span class="decl"><span class="istickedoff">maxItems = 1024</span></span>
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>-- | Decode exactly one CBOR value; trailing bytes are an error.
+<span class="lineno">   61 </span>decodeCbor :: ByteString -&gt; Either Text Cbor
+<span class="lineno">   62 </span><span class="decl"><span class="istickedoff">decodeCbor bs = do</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="istickedoff">(v, rest) &lt;- decodeCborPrefix bs</span>
+<span class="lineno">   64 </span><span class="spaces">  </span><span class="istickedoff">if BS.null rest</span>
+<span class="lineno">   65 </span><span class="spaces">    </span><span class="istickedoff">then Right v</span>
+<span class="lineno">   66 </span><span class="spaces">    </span><span class="istickedoff">else Left <span class="nottickedoff">&quot;trailing bytes after CBOR value&quot;</span></span></span>
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>-- | Decode one CBOR value and return it with the unconsumed remainder. Used
+<span class="lineno">   69 </span>-- for the COSE key that is followed by optional extension data inside
+<span class="lineno">   70 </span>-- @attestedCredentialData@.
+<span class="lineno">   71 </span>decodeCborPrefix :: ByteString -&gt; Either Text (Cbor, ByteString)
+<span class="lineno">   72 </span><span class="decl"><span class="istickedoff">decodeCborPrefix bs</span>
+<span class="lineno">   73 </span><span class="spaces">  </span><span class="istickedoff">| BS.length bs &gt; maxInput =</span>
+<span class="lineno">   74 </span><span class="spaces">      </span><span class="istickedoff">Left <span class="nottickedoff">(&quot;CBOR input larger than &quot; &lt;&gt; tshow maxInput &lt;&gt; &quot; bytes&quot;)</span></span>
+<span class="lineno">   75 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = decodeItem 0 bs</span></span>
+<span class="lineno">   76 </span>
+<span class="lineno">   77 </span>decodeItem :: Int -&gt; ByteString -&gt; Either Text (Cbor, ByteString)
+<span class="lineno">   78 </span><span class="decl"><span class="istickedoff">decodeItem depth bs</span>
+<span class="lineno">   79 </span><span class="spaces">  </span><span class="istickedoff">| depth &gt; maxDepth = Left <span class="nottickedoff">&quot;CBOR nesting too deep&quot;</span></span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = do</span>
+<span class="lineno">   81 </span><span class="spaces">      </span><span class="istickedoff">(h, rest) &lt;- uncons <span class="nottickedoff">&quot;truncated CBOR value&quot;</span></span>
+<span class="lineno">   82 </span><span class="spaces">      </span><span class="istickedoff">let major = h `shiftR` 5</span>
+<span class="lineno">   83 </span><span class="spaces">          </span><span class="istickedoff">ai    = h .&amp;. 0x1f</span>
+<span class="lineno">   84 </span><span class="spaces">      </span><span class="istickedoff">case major of</span>
+<span class="lineno">   85 </span><span class="spaces">        </span><span class="istickedoff">0 -&gt; do</span>
+<span class="lineno">   86 </span><span class="spaces">          </span><span class="istickedoff">(n, rest') &lt;- readLen ai rest</span>
+<span class="lineno">   87 </span><span class="spaces">          </span><span class="istickedoff">Right (CborInt n, rest')</span>
+<span class="lineno">   88 </span><span class="spaces">        </span><span class="istickedoff">1 -&gt; do</span>
+<span class="lineno">   89 </span><span class="spaces">          </span><span class="istickedoff">(n, rest') &lt;- readLen ai rest</span>
+<span class="lineno">   90 </span><span class="spaces">          </span><span class="istickedoff">Right (CborInt (negate n - 1), rest')</span>
+<span class="lineno">   91 </span><span class="spaces">        </span><span class="istickedoff">2 -&gt; do</span>
+<span class="lineno">   92 </span><span class="spaces">          </span><span class="istickedoff">(n, rest') &lt;- readLen ai rest</span>
+<span class="lineno">   93 </span><span class="spaces">          </span><span class="istickedoff">(b, rest2) &lt;- takeBytes n rest'</span>
+<span class="lineno">   94 </span><span class="spaces">          </span><span class="istickedoff">Right (CborBytes b, rest2)</span>
+<span class="lineno">   95 </span><span class="spaces">        </span><span class="istickedoff">3 -&gt; do</span>
+<span class="lineno">   96 </span><span class="spaces">          </span><span class="istickedoff">(n, rest') &lt;- readLen ai rest</span>
+<span class="lineno">   97 </span><span class="spaces">          </span><span class="istickedoff">(b, rest2) &lt;- takeBytes n rest'</span>
+<span class="lineno">   98 </span><span class="spaces">          </span><span class="istickedoff">case TE.decodeUtf8' b of</span>
+<span class="lineno">   99 </span><span class="spaces">            </span><span class="istickedoff">Left _  -&gt; Left <span class="nottickedoff">&quot;CBOR text string is not valid UTF-8&quot;</span></span>
+<span class="lineno">  100 </span><span class="spaces">            </span><span class="istickedoff">Right t -&gt; Right (CborText t, rest2)</span>
+<span class="lineno">  101 </span><span class="spaces">        </span><span class="istickedoff">4 -&gt; do</span>
+<span class="lineno">  102 </span><span class="spaces">          </span><span class="istickedoff">(n, rest') &lt;- readLen ai rest</span>
+<span class="lineno">  103 </span><span class="spaces">          </span><span class="istickedoff">checkArity n rest'</span>
+<span class="lineno">  104 </span><span class="spaces">          </span><span class="istickedoff">decodeList (depth + 1) n rest'</span>
+<span class="lineno">  105 </span><span class="spaces">        </span><span class="istickedoff">5 -&gt; do</span>
+<span class="lineno">  106 </span><span class="spaces">          </span><span class="istickedoff">(n, rest') &lt;- readLen ai rest</span>
+<span class="lineno">  107 </span><span class="spaces">          </span><span class="istickedoff">checkArity n rest'</span>
+<span class="lineno">  108 </span><span class="spaces">          </span><span class="istickedoff">decodeMap (depth + 1) n rest'</span>
+<span class="lineno">  109 </span><span class="spaces">        </span><span class="istickedoff">6 -&gt; Left <span class="nottickedoff">&quot;CBOR tags are not accepted&quot;</span></span>
+<span class="lineno">  110 </span><span class="spaces">        </span><span class="istickedoff">7 -&gt; case ai of</span>
+<span class="lineno">  111 </span><span class="spaces">               </span><span class="istickedoff">20 -&gt; Right (CborBool False, rest)</span>
+<span class="lineno">  112 </span><span class="spaces">               </span><span class="istickedoff">21 -&gt; Right (CborBool True, rest)</span>
+<span class="lineno">  113 </span><span class="spaces">               </span><span class="istickedoff">22 -&gt; Right (CborNull, rest)</span>
+<span class="lineno">  114 </span><span class="spaces">               </span><span class="istickedoff">_  -&gt; Left <span class="nottickedoff">&quot;unsupported CBOR simple/float value&quot;</span></span>
+<span class="lineno">  115 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Left &quot;invalid CBOR major type&quot;</span></span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  117 </span><span class="spaces">    </span><span class="istickedoff">uncons msg = case BS.uncons bs of</span>
+<span class="lineno">  118 </span><span class="spaces">      </span><span class="istickedoff">Nothing     -&gt; Left <span class="nottickedoff">(&quot;truncated CBOR: &quot; &lt;&gt; msg)</span></span>
+<span class="lineno">  119 </span><span class="spaces">      </span><span class="istickedoff">Just (x, xs) -&gt; Right (x, xs)</span></span>
+<span class="lineno">  120 </span>
+<span class="lineno">  121 </span>-- | Read the length payload for an additional-info nibble.
+<span class="lineno">  122 </span>readLen :: Word8 -&gt; ByteString -&gt; Either Text (Integer, ByteString)
+<span class="lineno">  123 </span><span class="decl"><span class="istickedoff">readLen ai rest</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">| ai &lt;= 23 = Right (fromIntegral ai, rest)</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="istickedoff">| ai == 24 = readN 1 rest</span>
+<span class="lineno">  126 </span><span class="spaces">  </span><span class="istickedoff">| ai == 25 = readN 2 rest</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="istickedoff">| ai == 26 = readN 4 rest</span>
+<span class="lineno">  128 </span><span class="spaces">  </span><span class="istickedoff">| ai == 27 = readN 8 rest</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Left <span class="nottickedoff">&quot;CBOR indefinite or reserved length is not accepted&quot;</span></span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  131 </span><span class="spaces">    </span><span class="istickedoff">readN n bs</span>
+<span class="lineno">  132 </span><span class="spaces">      </span><span class="istickedoff">| BS.length bs &lt; n = Left <span class="nottickedoff">&quot;truncated CBOR length&quot;</span></span>
+<span class="lineno">  133 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = do</span>
+<span class="lineno">  134 </span><span class="spaces">          </span><span class="istickedoff">let (raw, rest') = BS.splitAt n bs</span>
+<span class="lineno">  135 </span><span class="spaces">          </span><span class="istickedoff">Right (foldl (\acc w -&gt; acc `shiftL` 8 + fromIntegral w) 0 (BS.unpack raw), rest')</span></span>
+<span class="lineno">  136 </span>
+<span class="lineno">  137 </span>-- | Take @n@ bytes, refusing a length that exceeds the remaining input.
+<span class="lineno">  138 </span>takeBytes :: Integer -&gt; ByteString -&gt; Either Text (ByteString, ByteString)
+<span class="lineno">  139 </span><span class="decl"><span class="istickedoff">takeBytes n bs</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">n &lt; 0</span> = <span class="nottickedoff">Left &quot;negative CBOR length&quot;</span></span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">| n &gt; fromIntegral (BS.length bs) = Left <span class="nottickedoff">&quot;CBOR length exceeds remaining input&quot;</span></span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Right (BS.splitAt (fromIntegral n) bs)</span></span>
+<span class="lineno">  143 </span>
+<span class="lineno">  144 </span>-- | Reject an arity that could not possibly be satisfied by the remaining
+<span class="lineno">  145 </span>-- bytes (every element needs at least one byte; a map entry needs two).
+<span class="lineno">  146 </span>checkArity :: Integer -&gt; ByteString -&gt; Either Text ()
+<span class="lineno">  147 </span><span class="decl"><span class="istickedoff">checkArity n rest</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">n &lt; 0</span> = <span class="nottickedoff">Left &quot;negative CBOR arity&quot;</span></span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="istickedoff">| n &gt; fromIntegral maxItems = Left <span class="nottickedoff">(&quot;CBOR container arity exceeds &quot; &lt;&gt; tshow maxItems)</span></span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">n &gt; fromIntegral (BS.length rest)</span> = <span class="nottickedoff">Left &quot;CBOR arity exceeds remaining input&quot;</span></span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Right <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  152 </span>
+<span class="lineno">  153 </span>decodeList :: Int -&gt; Integer -&gt; ByteString -&gt; Either Text (Cbor, ByteString)
+<span class="lineno">  154 </span><span class="decl"><span class="istickedoff">decodeList depth n = go n []</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  156 </span><span class="spaces">    </span><span class="istickedoff">go 0 acc rest = Right (CborArray (reverse acc), rest)</span>
+<span class="lineno">  157 </span><span class="spaces">    </span><span class="istickedoff">go k acc rest = do</span>
+<span class="lineno">  158 </span><span class="spaces">      </span><span class="istickedoff">(v, rest') &lt;- decodeItem depth rest</span>
+<span class="lineno">  159 </span><span class="spaces">      </span><span class="istickedoff">go (k - 1) (v : acc) rest'</span></span>
+<span class="lineno">  160 </span>
+<span class="lineno">  161 </span>decodeMap :: Int -&gt; Integer -&gt; ByteString -&gt; Either Text (Cbor, ByteString)
+<span class="lineno">  162 </span><span class="decl"><span class="istickedoff">decodeMap depth n = go n []</span>
+<span class="lineno">  163 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  164 </span><span class="spaces">    </span><span class="istickedoff">go 0 acc rest = Right (CborMap (reverse acc), rest)</span>
+<span class="lineno">  165 </span><span class="spaces">    </span><span class="istickedoff">go k acc rest = do</span>
+<span class="lineno">  166 </span><span class="spaces">      </span><span class="istickedoff">(key, rest1) &lt;- decodeItem depth rest</span>
+<span class="lineno">  167 </span><span class="spaces">      </span><span class="istickedoff">(val, rest2) &lt;- decodeItem depth rest1</span>
+<span class="lineno">  168 </span><span class="spaces">      </span><span class="istickedoff">go (k - 1) ((key, val) : acc) rest2</span></span>
+<span class="lineno">  169 </span>
+<span class="lineno">  170 </span>-- | Look up an integer key in a CBOR map. COSE keys are small integers, some
+<span class="lineno">  171 </span>-- negative (@-1@..@-3@), so this is the only lookup the verifier needs.
+<span class="lineno">  172 </span>cborLookupInt :: Integer -&gt; Cbor -&gt; Maybe Cbor
+<span class="lineno">  173 </span><span class="decl"><span class="istickedoff">cborLookupInt k (CborMap pairs) = lookup (CborInt k) pairs</span>
+<span class="lineno">  174 </span><span class="spaces"></span><span class="istickedoff">cborLookupInt _ _               = <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  175 </span>
+<span class="lineno">  176 </span>tshow :: Show a =&gt; a -&gt; Text
+<span class="lineno">  177 </span><span class="decl"><span class="nottickedoff">tshow = T.pack . show</span></span>
+
+</pre>
+</body>
+</html>

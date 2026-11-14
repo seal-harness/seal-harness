@@ -1,0 +1,301 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The access-control audit log: @\&lt;state\&gt;\/access-control.log@.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- Detective, not preventive (design §15). It exists so an operator can answer
+<span class="lineno">    5 </span>-- &quot;when did this passkey appear, and what authorised it?&quot; after the fact —
+<span class="lineno">    6 </span>-- under the accepted risk R2 (same-uid code can truncate it) it is a detective
+<span class="lineno">    7 </span>-- aid, not tamper-evidence. That sentence is the honest scope; nothing here
+<span class="lineno">    8 </span>-- should be read as stronger.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- Two properties are load-bearing and both are enforced structurally:
+<span class="lineno">   11 </span>--
+<span class="lineno">   12 </span>-- * __The field set is closed.__ 'AuditFields' is a record, and 'auditLine'
+<span class="lineno">   13 </span>--   renders exactly its fields. A caller cannot add a request-derived value —
+<span class="lineno">   14 </span>--   no @rawId@, no client-supplied origin, no presented token, no digest, no
+<span class="lineno">   15 </span>--   @User-Agent@ — because there is nowhere to put one.
+<span class="lineno">   16 </span>-- * __Refusals cannot flood.__ 'admitRefusal' aggregates them per
+<span class="lineno">   17 </span>--   @(source, minute)@ on a fixed-size table with backoff, and they go to a
+<span class="lineno">   18 </span>--   separate file, so a pre-auth flood cannot rotate the state-changing
+<span class="lineno">   19 </span>--   evidence away.
+<span class="lineno">   20 </span>--
+<span class="lineno">   21 </span>-- The log is opened @O_APPEND|O_CREAT|O_NOFOLLOW@ at @0600@ and refused if the
+<span class="lineno">   22 </span>-- target is a symlink or not a regular file: a log that can be pointed at
+<span class="lineno">   23 </span>-- another file is a write primitive.
+<span class="lineno">   24 </span>module Seal.Gateway.Audit
+<span class="lineno">   25 </span>  ( AuditEvent (..)
+<span class="lineno">   26 </span>  , auditEventText
+<span class="lineno">   27 </span>  , AuditFields (..)
+<span class="lineno">   28 </span>  , emptyAuditFields
+<span class="lineno">   29 </span>  , auditLine
+<span class="lineno">   30 </span>  , auditLogPath
+<span class="lineno">   31 </span>  , auditRefusalLogPath
+<span class="lineno">   32 </span>  , appendAudit
+<span class="lineno">   33 </span>  , AuditGate
+<span class="lineno">   34 </span>  , newAuditGate
+<span class="lineno">   35 </span>  , admitRefusal
+<span class="lineno">   36 </span>  , auditMaxBytes
+<span class="lineno">   37 </span>  ) where
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>import Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
+<span class="lineno">   40 </span>import Control.Exception (IOException, try)
+<span class="lineno">   41 </span>import Control.Monad (when)
+<span class="lineno">   42 </span>import Data.ByteString qualified as BS
+<span class="lineno">   43 </span>import Data.Map.Strict (Map)
+<span class="lineno">   44 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   45 </span>import Data.Text (Text)
+<span class="lineno">   46 </span>import Data.Text qualified as T
+<span class="lineno">   47 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   48 </span>import Data.Time (UTCTime, diffUTCTime)
+<span class="lineno">   49 </span>import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
+<span class="lineno">   50 </span>import System.Directory (doesFileExist, removeFile, renameFile)
+<span class="lineno">   51 </span>import System.FilePath ((&lt;/&gt;))
+<span class="lineno">   52 </span>import System.IO (hClose)
+<span class="lineno">   53 </span>import System.Posix.Files (fileSize, getFileStatus, isRegularFile)
+<span class="lineno">   54 </span>import System.Posix.Types (FileOffset)
+<span class="lineno">   55 </span>import System.Posix.IO
+<span class="lineno">   56 </span>  ( OpenFileFlags (append, creat, nofollow), OpenMode (WriteOnly)
+<span class="lineno">   57 </span>  , defaultFileFlags, fdToHandle, openFd )
+<span class="lineno">   58 </span>
+<span class="lineno">   59 </span>import Seal.Config.Paths (SealPaths (..))
+<span class="lineno">   60 </span>import Seal.Security.EnrollmentGrant (GrantSource, grantSourceText)
+<span class="lineno">   61 </span>
+<span class="lineno">   62 </span>-- | The enumerated events. Nothing else may be logged, so the log's vocabulary
+<span class="lineno">   63 </span>-- is a compile-time fact rather than a convention.
+<span class="lineno">   64 </span>data AuditEvent
+<span class="lineno">   65 </span>  = CredentialAdded
+<span class="lineno">   66 </span>  | CredentialRemoved
+<span class="lineno">   67 </span>  | CredentialRelabeled
+<span class="lineno">   68 </span>  | GrantMinted
+<span class="lineno">   69 </span>  | GrantConsumed
+<span class="lineno">   70 </span>  | GrantRefused
+<span class="lineno">   71 </span>  | ModeEnabled
+<span class="lineno">   72 </span>  | ModeDisabled
+<span class="lineno">   73 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   74 </span>
+<span class="lineno">   75 </span>auditEventText :: AuditEvent -&gt; Text
+<span class="lineno">   76 </span><span class="decl"><span class="istickedoff">auditEventText event = case event of</span>
+<span class="lineno">   77 </span><span class="spaces">  </span><span class="istickedoff">CredentialAdded -&gt; &quot;credential_added&quot;</span>
+<span class="lineno">   78 </span><span class="spaces">  </span><span class="istickedoff">CredentialRemoved -&gt; &quot;credential_removed&quot;</span>
+<span class="lineno">   79 </span><span class="spaces">  </span><span class="istickedoff">CredentialRelabeled -&gt; &quot;credential_relabeled&quot;</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">GrantMinted -&gt; &quot;grant_minted&quot;</span>
+<span class="lineno">   81 </span><span class="spaces">  </span><span class="istickedoff">GrantConsumed -&gt; <span class="nottickedoff">&quot;grant_consumed&quot;</span></span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="istickedoff">GrantRefused -&gt; &quot;grant_refused&quot;</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">ModeEnabled -&gt; <span class="nottickedoff">&quot;mode_enabled&quot;</span></span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">ModeDisabled -&gt; &quot;mode_disabled&quot;</span></span>
+<span class="lineno">   85 </span>
+<span class="lineno">   86 </span>-- | The closed field set.
+<span class="lineno">   87 </span>data AuditFields = AuditFields
+<span class="lineno">   88 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">afEvent</span></span></span>            :: !AuditEvent
+<span class="lineno">   89 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">afCredentialId</span></span></span>     :: !(Maybe Text)
+<span class="lineno">   90 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">afLabel</span></span></span>            :: !(Maybe Text)
+<span class="lineno">   91 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">afRpId</span></span></span>             :: !(Maybe Text)
+<span class="lineno">   92 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">afOrigin</span></span></span>           :: !(Maybe Text)
+<span class="lineno">   93 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">afVia</span></span></span>              :: !(Maybe GrantSource)
+<span class="lineno">   94 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">afRemainingSeconds</span></span></span> :: !(Maybe Int)
+<span class="lineno">   95 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   96 </span>
+<span class="lineno">   97 </span>-- | A record with only the event set; every optional field absent.
+<span class="lineno">   98 </span>emptyAuditFields :: AuditEvent -&gt; AuditFields
+<span class="lineno">   99 </span><span class="decl"><span class="istickedoff">emptyAuditFields event = AuditFields</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">{ afEvent            = event</span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="istickedoff">, afCredentialId     = Nothing</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">, afLabel            = Nothing</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">, afRpId             = Nothing</span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="istickedoff">, afOrigin           = Nothing</span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="istickedoff">, afVia              = Nothing</span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="istickedoff">, afRemainingSeconds = Nothing</span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  108 </span>
+<span class="lineno">  109 </span>-- | Render one line.
+<span class="lineno">  110 </span>--
+<span class="lineno">  111 </span>-- Values are sanitised: control characters become spaces and each value is
+<span class="lineno">  112 </span>-- capped, so a credential label an operator typed cannot forge a log line or
+<span class="lineno">  113 </span>-- blow the file up. The event names come from 'auditEventText', never from
+<span class="lineno">  114 </span>-- input.
+<span class="lineno">  115 </span>auditLine :: UTCTime -&gt; AuditFields -&gt; Text
+<span class="lineno">  116 </span><span class="decl"><span class="istickedoff">auditLine now fields = T.intercalate &quot; &quot; (timestampPart : map renderField present)</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  118 </span><span class="spaces">    </span><span class="istickedoff">timestampPart = &quot;ts=&quot; &lt;&gt; isoTimeText now</span>
+<span class="lineno">  119 </span><span class="spaces">    </span><span class="istickedoff">present = [ (&quot;event&quot;, auditEventText (afEvent fields)) ]</span>
+<span class="lineno">  120 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; [ (&quot;credential_id&quot;, value) | Just value' &lt;- [afCredentialId fields]</span>
+<span class="lineno">  121 </span><span class="spaces">                                    </span><span class="istickedoff">, let value = sanitize 128 value' ]</span>
+<span class="lineno">  122 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; [ (&quot;label&quot;, sanitize 64 value) | Just value &lt;- [afLabel fields] ]</span>
+<span class="lineno">  123 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; [ (&quot;rp_id&quot;, sanitize 128 value) | Just value &lt;- [afRpId fields] ]</span>
+<span class="lineno">  124 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; [ (&quot;origin&quot;, sanitize 200 value) | Just value &lt;- [afOrigin fields] ]</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; [ (&quot;via&quot;, grantSourceText source) | Just source &lt;- [afVia fields] ]</span>
+<span class="lineno">  126 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; [ (&quot;remaining_s&quot;, tshow value) | Just value &lt;- [afRemainingSeconds fields] ]</span>
+<span class="lineno">  127 </span><span class="spaces">    </span><span class="istickedoff">renderField (key, value) = key &lt;&gt; &quot;=&quot; &lt;&gt; value</span></span>
+<span class="lineno">  128 </span>
+<span class="lineno">  129 </span>-- | Percent-encode everything that could break the line format.
+<span class="lineno">  130 </span>--
+<span class="lineno">  131 </span>-- The log is @key=value@ pairs separated by single spaces, so a value must never
+<span class="lineno">  132 </span>-- contain a space, an @=@ or a control character: otherwise a credential label
+<span class="lineno">  133 </span>-- an operator typed (or a hostile one) could append its own fields. Encoding
+<span class="lineno">  134 </span>-- rather than stripping keeps the value recognisable.
+<span class="lineno">  135 </span>sanitize :: Int -&gt; Text -&gt; Text
+<span class="lineno">  136 </span><span class="decl"><span class="istickedoff">sanitize limit = T.take limit . T.concatMap escape</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  138 </span><span class="spaces">    </span><span class="istickedoff">escape c</span>
+<span class="lineno">  139 </span><span class="spaces">      </span><span class="istickedoff">| c == ' '  = &quot;%20&quot;</span>
+<span class="lineno">  140 </span><span class="spaces">      </span><span class="istickedoff">| c == '='  = &quot;%3D&quot;</span>
+<span class="lineno">  141 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">c == '&quot;'</span>  = <span class="nottickedoff">&quot;%22&quot;</span></span>
+<span class="lineno">  142 </span><span class="spaces">      </span><span class="istickedoff">| c == '\n' = &quot;%0A&quot;</span>
+<span class="lineno">  143 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">c == '\r'</span> = <span class="nottickedoff">&quot;%0D&quot;</span></span>
+<span class="lineno">  144 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">c &lt; ' ' || c == '\DEL'</span> = <span class="nottickedoff">&quot;%&quot; &lt;&gt; pad (showHexChar c)</span></span>
+<span class="lineno">  145 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = T.singleton c</span>
+<span class="lineno">  146 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">pad raw = if T.length raw &lt; 2 then &quot;0&quot; &lt;&gt; raw else raw</span></span>
+<span class="lineno">  147 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">showHexChar c =</span></span>
+<span class="lineno">  148 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">let n = fromEnum c</span></span>
+<span class="lineno">  149 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">in T.map toUpperChar (T.pack [ hexDigit (n `div` 16), hexDigit (n `mod` 16) ])</span></span>
+<span class="lineno">  150 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">toUpperChar ch = if ch &gt;= 'a' &amp;&amp; ch &lt;= 'f' then toEnum (fromEnum ch - 32) else ch</span></span>
+<span class="lineno">  151 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">hexDigit n</span></span>
+<span class="lineno">  152 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">| n &lt; 10 = toEnum (fromEnum '0' + n)</span></span>
+<span class="lineno">  153 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">| otherwise = toEnum (fromEnum 'A' + n - 10)</span></span></span>
+<span class="lineno">  154 </span>
+<span class="lineno">  155 </span>isoTimeText :: UTCTime -&gt; Text
+<span class="lineno">  156 </span><span class="decl"><span class="istickedoff">isoTimeText stamp =</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="istickedoff">let seconds = floor (utcTimeToPOSIXSeconds stamp) :: Integer</span>
+<span class="lineno">  158 </span><span class="spaces">      </span><span class="istickedoff">daySeconds = seconds `mod` 86400</span>
+<span class="lineno">  159 </span><span class="spaces">      </span><span class="istickedoff">hours = daySeconds `div` 3600</span>
+<span class="lineno">  160 </span><span class="spaces">      </span><span class="istickedoff">minutes = (daySeconds `mod` 3600) `div` 60</span>
+<span class="lineno">  161 </span><span class="spaces">      </span><span class="istickedoff">secs = daySeconds `mod` 60</span>
+<span class="lineno">  162 </span><span class="spaces">      </span><span class="istickedoff">days = seconds `div` 86400</span>
+<span class="lineno">  163 </span><span class="spaces">      </span><span class="istickedoff">(year, month, day) = civilFromDays days</span>
+<span class="lineno">  164 </span><span class="spaces">      </span><span class="istickedoff">pad2 n = if n &lt; 10 then &quot;0&quot; &lt;&gt; tshow n else tshow n</span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="istickedoff">in tshow year &lt;&gt; &quot;-&quot; &lt;&gt; pad2 month &lt;&gt; &quot;-&quot; &lt;&gt; pad2 day &lt;&gt; &quot;T&quot;</span>
+<span class="lineno">  166 </span><span class="spaces">       </span><span class="istickedoff">&lt;&gt; pad2 hours &lt;&gt; &quot;:&quot; &lt;&gt; pad2 minutes &lt;&gt; &quot;:&quot; &lt;&gt; pad2 secs &lt;&gt; &quot;Z&quot;</span></span>
+<span class="lineno">  167 </span>
+<span class="lineno">  168 </span>-- | Howard Hinnant's @civil_from_days@: days since the Unix epoch to a calendar
+<span class="lineno">  169 </span>-- date, without pulling a formatter into a hot path.
+<span class="lineno">  170 </span>civilFromDays :: Integer -&gt; (Integer, Integer, Integer)
+<span class="lineno">  171 </span><span class="decl"><span class="istickedoff">civilFromDays days =</span>
+<span class="lineno">  172 </span><span class="spaces">  </span><span class="istickedoff">let z = days + 719468</span>
+<span class="lineno">  173 </span><span class="spaces">      </span><span class="istickedoff">era = (if <span class="tickonlytrue">z &gt;= 0</span> then z else <span class="nottickedoff">z - 146096</span>) `div` 146097</span>
+<span class="lineno">  174 </span><span class="spaces">      </span><span class="istickedoff">doe = z - era * 146097</span>
+<span class="lineno">  175 </span><span class="spaces">      </span><span class="istickedoff">yoe = (doe - doe `div` 1460 + doe `div` 36524 - doe `div` 146096) `div` 365</span>
+<span class="lineno">  176 </span><span class="spaces">      </span><span class="istickedoff">y = yoe + era * 400</span>
+<span class="lineno">  177 </span><span class="spaces">      </span><span class="istickedoff">doy = doe - (365 * yoe + yoe `div` 4 - yoe `div` 100)</span>
+<span class="lineno">  178 </span><span class="spaces">      </span><span class="istickedoff">mp = (5 * doy + 2) `div` 153</span>
+<span class="lineno">  179 </span><span class="spaces">      </span><span class="istickedoff">d = doy - (153 * mp + 2) `div` 5 + 1</span>
+<span class="lineno">  180 </span><span class="spaces">      </span><span class="istickedoff">m = if mp &lt; 10 then mp + 3 else mp - 9</span>
+<span class="lineno">  181 </span><span class="spaces">  </span><span class="istickedoff">in (if m &lt;= 2 then y + 1 else y, m, d)</span></span>
+<span class="lineno">  182 </span>
+<span class="lineno">  183 </span>tshow :: Show a =&gt; a -&gt; Text
+<span class="lineno">  184 </span><span class="decl"><span class="istickedoff">tshow = T.pack . show</span></span>
+<span class="lineno">  185 </span>
+<span class="lineno">  186 </span>-- | State-changing events, in one file.
+<span class="lineno">  187 </span>auditLogPath :: SealPaths -&gt; FilePath
+<span class="lineno">  188 </span><span class="decl"><span class="istickedoff">auditLogPath paths = spState paths &lt;/&gt; &quot;access-control.log&quot;</span></span>
+<span class="lineno">  189 </span>
+<span class="lineno">  190 </span>-- | Refusals, in another: a flood must not rotate the evidence away.
+<span class="lineno">  191 </span>auditRefusalLogPath :: SealPaths -&gt; FilePath
+<span class="lineno">  192 </span><span class="decl"><span class="istickedoff">auditRefusalLogPath paths = spState paths &lt;/&gt; &quot;access-control-refusals.log&quot;</span></span>
+<span class="lineno">  193 </span>
+<span class="lineno">  194 </span>-- | Rotate at 4 MiB.
+<span class="lineno">  195 </span>auditMaxBytes :: FileOffset
+<span class="lineno">  196 </span><span class="decl"><span class="istickedoff">auditMaxBytes = 4 * 1024 * 1024</span></span>
+<span class="lineno">  197 </span>
+<span class="lineno">  198 </span>-- | Append one event.
+<span class="lineno">  199 </span>--
+<span class="lineno">  200 </span>-- Failures are returned rather than thrown: an audit write must never fail the
+<span class="lineno">  201 </span>-- request or the command it describes.
+<span class="lineno">  202 </span>appendAudit :: SealPaths -&gt; UTCTime -&gt; AuditFields -&gt; IO (Either Text ())
+<span class="lineno">  203 </span><span class="decl"><span class="istickedoff">appendAudit paths now fields = do</span>
+<span class="lineno">  204 </span><span class="spaces">  </span><span class="istickedoff">let path = case afEvent fields of</span>
+<span class="lineno">  205 </span><span class="spaces">        </span><span class="istickedoff">GrantRefused -&gt; auditRefusalLogPath paths</span>
+<span class="lineno">  206 </span><span class="spaces">        </span><span class="istickedoff">_            -&gt; auditLogPath paths</span>
+<span class="lineno">  207 </span><span class="spaces">  </span><span class="istickedoff">rotateIfNeeded path</span>
+<span class="lineno">  208 </span><span class="spaces">  </span><span class="istickedoff">appended &lt;- try (appendLine path (auditLine now fields))</span>
+<span class="lineno">  209 </span><span class="spaces">  </span><span class="istickedoff">pure $ case appended of</span>
+<span class="lineno">  210 </span><span class="spaces">    </span><span class="istickedoff">Left (err :: IOException) -&gt; Left <span class="nottickedoff">(T.pack path &lt;&gt; &quot;: &quot; &lt;&gt; T.pack (show err))</span></span>
+<span class="lineno">  211 </span><span class="spaces">    </span><span class="istickedoff">Right () -&gt; Right ()</span></span>
+<span class="lineno">  212 </span>
+<span class="lineno">  213 </span>appendLine :: FilePath -&gt; Text -&gt; IO ()
+<span class="lineno">  214 </span><span class="decl"><span class="istickedoff">appendLine path line = do</span>
+<span class="lineno">  215 </span><span class="spaces">  </span><span class="istickedoff">fd &lt;- openFd path WriteOnly defaultFileFlags</span>
+<span class="lineno">  216 </span><span class="spaces">          </span><span class="istickedoff">{ append = True, creat = Just 0o600, nofollow = True }</span>
+<span class="lineno">  217 </span><span class="spaces">  </span><span class="istickedoff">status &lt;- getFileStatus path</span>
+<span class="lineno">  218 </span><span class="spaces">  </span><span class="istickedoff">-- A symlink is refused by O_NOFOLLOW; anything else that is not a regular</span>
+<span class="lineno">  219 </span><span class="spaces">  </span><span class="istickedoff">-- file (a fifo, a device) is refused here, because appending to it is not</span>
+<span class="lineno">  220 </span><span class="spaces">  </span><span class="istickedoff">-- writing a log.</span>
+<span class="lineno">  221 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">not (isRegularFile status)</span></span>
+<span class="lineno">  222 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">hClose =&lt;&lt; fdToHandle fd</span></span>
+<span class="lineno">  223 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  224 </span><span class="spaces">      </span><span class="istickedoff">handle &lt;- fdToHandle fd</span>
+<span class="lineno">  225 </span><span class="spaces">      </span><span class="istickedoff">BS.hPut handle (TE.encodeUtf8 (line &lt;&gt; &quot;\n&quot;))</span>
+<span class="lineno">  226 </span><span class="spaces">      </span><span class="istickedoff">hClose handle</span></span>
+<span class="lineno">  227 </span>
+<span class="lineno">  228 </span>rotateIfNeeded :: FilePath -&gt; IO ()
+<span class="lineno">  229 </span><span class="decl"><span class="istickedoff">rotateIfNeeded path = do</span>
+<span class="lineno">  230 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  231 </span><span class="spaces">  </span><span class="istickedoff">when exists $ do</span>
+<span class="lineno">  232 </span><span class="spaces">    </span><span class="istickedoff">status &lt;- getFileStatus path</span>
+<span class="lineno">  233 </span><span class="spaces">    </span><span class="istickedoff">when (fileSize status &gt; auditMaxBytes) $ do</span>
+<span class="lineno">  234 </span><span class="spaces">      </span><span class="istickedoff">let rotated = path &lt;&gt; &quot;.1&quot;</span>
+<span class="lineno">  235 </span><span class="spaces">      </span><span class="istickedoff">rotatedExists &lt;- doesFileExist rotated</span>
+<span class="lineno">  236 </span><span class="spaces">      </span><span class="istickedoff">when rotatedExists <span class="nottickedoff">(removeFile rotated)</span></span>
+<span class="lineno">  237 </span><span class="spaces">      </span><span class="istickedoff">renameFile path rotated</span></span>
+<span class="lineno">  238 </span>
+<span class="lineno">  239 </span>-- | Aggregation state for refusal events.
+<span class="lineno">  240 </span>--
+<span class="lineno">  241 </span>-- Keyed on the /source/ and the minute, never on the presented value: an
+<span class="lineno">  242 </span>-- attacker-chosen key would be an unbounded allocation on a pre-auth path.
+<span class="lineno">  243 </span>newtype AuditGate = AuditGate (MVar (Map (Text, Integer) RefusalSlot))
+<span class="lineno">  244 </span>
+<span class="lineno">  245 </span>data RefusalSlot = RefusalSlot
+<span class="lineno">  246 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">rsCount</span></span></span>    :: !Int
+<span class="lineno">  247 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rsLastEmit</span></span></span> :: !UTCTime
+<span class="lineno">  248 </span>  }
+<span class="lineno">  249 </span>
+<span class="lineno">  250 </span>newAuditGate :: IO AuditGate
+<span class="lineno">  251 </span><span class="decl"><span class="istickedoff">newAuditGate = AuditGate &lt;$&gt; newMVar Map.empty</span></span>
+<span class="lineno">  252 </span>
+<span class="lineno">  253 </span>-- | May this refusal be written?
+<span class="lineno">  254 </span>--
+<span class="lineno">  255 </span>-- One line per @(source, minute)@ at most, and exponential backoff on repeats
+<span class="lineno">  256 </span>-- (1 s doubling to a 60 s cap), so a pre-auth flood produces a handful of lines
+<span class="lineno">  257 </span>-- rather than a gigabyte. The table is capped: once it is full, further keys are
+<span class="lineno">  258 </span>-- dropped rather than allowed to grow it.
+<span class="lineno">  259 </span>admitRefusal :: AuditGate -&gt; UTCTime -&gt; Text -&gt; IO Bool
+<span class="lineno">  260 </span><span class="decl"><span class="istickedoff">admitRefusal (AuditGate cells) now source =</span>
+<span class="lineno">  261 </span><span class="spaces">  </span><span class="istickedoff">modifyMVar cells $ \table -&gt; do</span>
+<span class="lineno">  262 </span><span class="spaces">    </span><span class="istickedoff">let key = (source, minuteOf now)</span>
+<span class="lineno">  263 </span><span class="spaces">        </span><span class="istickedoff">backoff count = fromIntegral (min (60 :: Int) (<span class="nottickedoff">2</span> ^ max 0 (count - 1)))</span>
+<span class="lineno">  264 </span><span class="spaces">    </span><span class="istickedoff">case Map.lookup key table of</span>
+<span class="lineno">  265 </span><span class="spaces">      </span><span class="istickedoff">Just slot -&gt;</span>
+<span class="lineno">  266 </span><span class="spaces">        </span><span class="istickedoff">if realToFrac (diffUTCTime now (rsLastEmit slot)) &lt; (backoff (rsCount slot) :: Double)</span>
+<span class="lineno">  267 </span><span class="spaces">          </span><span class="istickedoff">then pure (table, False)</span>
+<span class="lineno">  268 </span><span class="spaces">          </span><span class="istickedoff">else pure (Map.insert key slot { rsCount = rsCount slot + 1, rsLastEmit = now } table, True)</span>
+<span class="lineno">  269 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt;</span>
+<span class="lineno">  270 </span><span class="spaces">        </span><span class="istickedoff">if Map.size table &gt;= maxRefusalKeys</span>
+<span class="lineno">  271 </span><span class="spaces">          </span><span class="istickedoff">then pure (table, False)</span>
+<span class="lineno">  272 </span><span class="spaces">          </span><span class="istickedoff">else pure (Map.insert key (RefusalSlot 1 now) table, True)</span></span>
+<span class="lineno">  273 </span>
+<span class="lineno">  274 </span>maxRefusalKeys :: Int
+<span class="lineno">  275 </span><span class="decl"><span class="istickedoff">maxRefusalKeys = 256</span></span>
+<span class="lineno">  276 </span>
+<span class="lineno">  277 </span>minuteOf :: UTCTime -&gt; Integer
+<span class="lineno">  278 </span><span class="decl"><span class="istickedoff">minuteOf stamp = floor (utcTimeToPOSIXSeconds stamp) `div` 60</span></span>
+
+</pre>
+</body>
+</html>

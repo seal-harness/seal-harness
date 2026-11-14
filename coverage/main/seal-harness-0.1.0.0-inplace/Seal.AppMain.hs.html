@@ -1,0 +1,151 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>module Seal.AppMain
+<span class="lineno">    2 </span>  ( appMain
+<span class="lineno">    3 </span>  , reorderGlobalArgs
+<span class="lineno">    4 </span>  , withDefaultArgs
+<span class="lineno">    5 </span>  ) where
+<span class="lineno">    6 </span>
+<span class="lineno">    7 </span>import Control.Monad.IO.Class (liftIO)
+<span class="lineno">    8 </span>import Control.Lens (view)
+<span class="lineno">    9 </span>import System.Environment (getArgs, withArgs)
+<span class="lineno">   10 </span>import qualified Configuration.Utils as CUtils
+<span class="lineno">   11 </span>import System.Exit (exitWith)
+<span class="lineno">   12 </span>import System.Posix.Resource
+<span class="lineno">   13 </span>  ( ResourceLimits (..), ResourceLimit (..), Resource (ResourceOpenFiles)
+<span class="lineno">   14 </span>  , getResourceLimit, setResourceLimit )
+<span class="lineno">   15 </span>
+<span class="lineno">   16 </span>import Seal.Logging.Logger (withSealLogger)
+<span class="lineno">   17 </span>import Seal.Logging.Global (setGlobalLogger)
+<span class="lineno">   18 </span>import Seal.Types.Config
+<span class="lineno">   19 </span>import Seal.Types.Command
+<span class="lineno">   20 </span>import Seal.Types.Env
+<span class="lineno">   21 </span>import Seal.Types.App
+<span class="lineno">   22 </span>import qualified Seal.Tui
+<span class="lineno">   23 </span>import qualified Seal.Command.AccessControl
+<span class="lineno">   24 </span>import qualified Seal.Command.Serve
+<span class="lineno">   25 </span>import qualified Seal.Gateway.OpenApi
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   28 </span>import System.IO (stdout)
+<span class="lineno">   29 </span>
+<span class="lineno">   30 </span>-- | Program information for 'runWithConfiguration'. Provides @--config-file@,
+<span class="lineno">   31 </span>-- @--print-config@, and @--help@ automatically.
+<span class="lineno">   32 </span>programInfo :: CUtils.ProgramInfo Config
+<span class="lineno">   33 </span><span class="decl"><span class="nottickedoff">programInfo = CUtils.programInfo &quot;seal — secure AI agent execution around the SealOp ISA&quot;</span>
+<span class="lineno">   34 </span><span class="spaces">  </span><span class="nottickedoff">pConfig defaultConfig</span></span>
+<span class="lineno">   35 </span>
+<span class="lineno">   36 </span>-- | Dispatch on the selected command, running it in 'App'. The 'SealLogger'
+<span class="lineno">   37 </span>-- is built once via 'withSealLogger' (a bracket that closes the scribe on
+<span class="lineno">   38 </span>-- exit) and threaded into 'Env' so 'App'-level 'logMsg' and 'IO'-level
+<span class="lineno">   39 </span>-- 'logIO' reach the same scribe.
+<span class="lineno">   40 </span>dispatch :: Config -&gt; IO ()
+<span class="lineno">   41 </span><span class="decl"><span class="nottickedoff">dispatch cfg =</span>
+<span class="lineno">   42 </span><span class="spaces">  </span><span class="nottickedoff">withSealLogger (view config_logLevel cfg) (Just &quot;seal.log&quot;) $ \logger -&gt; do</span>
+<span class="lineno">   43 </span><span class="spaces">    </span><span class="nottickedoff">setGlobalLogger logger</span>
+<span class="lineno">   44 </span><span class="spaces">    </span><span class="nottickedoff">env &lt;- mkEnv logger cfg</span>
+<span class="lineno">   45 </span><span class="spaces">    </span><span class="nottickedoff">runApp env $ case _config_command cfg of</span>
+<span class="lineno">   46 </span><span class="spaces">      </span><span class="nottickedoff">CommandNoOp   -&gt; pure ()</span>
+<span class="lineno">   47 </span><span class="spaces">      </span><span class="nottickedoff">CommandTui autonomy -&gt; liftIO (Seal.Tui.runTui autonomy logger)</span>
+<span class="lineno">   48 </span><span class="spaces">      </span><span class="nottickedoff">CommandServe autonomy mStaticDir noEnrollToken -&gt; liftIO (Seal.Command.Serve.runServeMain autonomy mStaticDir noEnrollToken logger)</span>
+<span class="lineno">   49 </span><span class="spaces">      </span><span class="nottickedoff">CommandAccessControl action -&gt; do</span>
+<span class="lineno">   50 </span><span class="spaces">        </span><span class="nottickedoff">-- The command returns its code; exiting stays here so every code is</span>
+<span class="lineno">   51 </span><span class="spaces">        </span><span class="nottickedoff">-- assertable in-process (design §12).</span>
+<span class="lineno">   52 </span><span class="spaces">        </span><span class="nottickedoff">code &lt;- liftIO (Seal.Command.AccessControl.runAccessControl action)</span>
+<span class="lineno">   53 </span><span class="spaces">        </span><span class="nottickedoff">liftIO (exitWith code)</span>
+<span class="lineno">   54 </span><span class="spaces">      </span><span class="nottickedoff">CommandGenOpenApi -&gt; liftIO (BL.hPutStr stdout Seal.Gateway.OpenApi.encodeOpenApi)</span></span>
+<span class="lineno">   55 </span>
+<span class="lineno">   56 </span>-- | Map the process arguments so that an empty argument list behaves as if
+<span class="lineno">   57 </span>-- @--help@ was passed. Running @seal@ with no arguments should print usage
+<span class="lineno">   58 </span>-- rather than silently doing nothing. Any non-empty argument list is passed
+<span class="lineno">   59 </span>-- through unchanged.
+<span class="lineno">   60 </span>withDefaultArgs :: [String] -&gt; [String]
+<span class="lineno">   61 </span><span class="decl"><span class="istickedoff">withDefaultArgs [] = [&quot;--help&quot;]</span>
+<span class="lineno">   62 </span><span class="spaces"></span><span class="istickedoff">withDefaultArgs as = as</span></span>
+<span class="lineno">   63 </span>
+<span class="lineno">   64 </span>-- | Raise the soft FD limit to the hard limit. The default macOS soft limit
+<span class="lineno">   65 </span>-- is 256, which the gateway's @buildListsSnapshot@ hot path blows through
+<span class="lineno">   66 </span>-- (hundreds of small files per request, historically via lazy IO that left
+<span class="lineno">   67 </span>-- handles open for the GC). Even with strict reads, raising the soft limit
+<span class="lineno">   68 </span>-- to the hard ceiling is cheap defense-in-depth against FD exhaustion. The
+<span class="lineno">   69 </span>-- raise is best-effort: a failure (e.g. a sandboxed runner that blocks
+<span class="lineno">   70 </span>-- @setrlimit@) is swallowed so the binary still starts.
+<span class="lineno">   71 </span>raiseFdLimit :: IO ()
+<span class="lineno">   72 </span><span class="decl"><span class="nottickedoff">raiseFdLimit = do</span>
+<span class="lineno">   73 </span><span class="spaces">  </span><span class="nottickedoff">limits &lt;- getResourceLimit ResourceOpenFiles</span>
+<span class="lineno">   74 </span><span class="spaces">  </span><span class="nottickedoff">case hardLimit limits of</span>
+<span class="lineno">   75 </span><span class="spaces">    </span><span class="nottickedoff">ResourceLimit _hard | softLimit limits /= hardLimit limits -&gt;</span>
+<span class="lineno">   76 </span><span class="spaces">      </span><span class="nottickedoff">setResourceLimit ResourceOpenFiles limits { softLimit = hardLimit limits }</span>
+<span class="lineno">   77 </span><span class="spaces">    </span><span class="nottickedoff">_ -&gt; pure ()</span></span>
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- | Entry point: parse defaults + config file + CLI flags, then dispatch.
+<span class="lineno">   80 </span>-- With no arguments, fall back to @--help@.
+<span class="lineno">   81 </span>appMain :: IO ()
+<span class="lineno">   82 </span><span class="decl"><span class="nottickedoff">appMain = do</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="nottickedoff">raiseFdLimit</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="nottickedoff">args &lt;- getArgs</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="nottickedoff">withArgs (withDefaultArgs (reorderGlobalArgs args)) (CUtils.runWithConfiguration programInfo dispatch)</span></span>
+<span class="lineno">   86 </span>
+<span class="lineno">   87 </span>-- | Move global options (those defined at the @pConfig@ level, outside any
+<span class="lineno">   88 </span>-- @hsubparser@) before the subcommand keyword. @Options.Applicative@'s
+<span class="lineno">   89 </span>-- @hsubparser@ creates a hard parser boundary: once the subcommand keyword
+<span class="lineno">   90 </span>-- (e.g. @serve@) is seen, only subcommand-specific options are recognised.
+<span class="lineno">   91 </span>-- A global option like @--log-level@ that appears after @serve@ is rejected.
+<span class="lineno">   92 </span>--
+<span class="lineno">   93 </span>-- This preprocessing lets @make serve ARGS=&quot;--yolo --log-level debug
+<span class="lineno">   94 </span>-- --no-enrollment-token&quot;@ work: @--log-level@ is hoisted before @serve@,
+<span class="lineno">   95 </span>-- and the subcommand options (@--yolo@, @--no-enrollment-token@) stay after.
+<span class="lineno">   96 </span>-- Options that are already before the subcommand are left in place.
+<span class="lineno">   97 </span>-- @--flag=value@ syntax is a single token and passes through unchanged
+<span class="lineno">   98 </span>-- (it does not match the bare @--flag@ name).
+<span class="lineno">   99 </span>reorderGlobalArgs :: [String] -&gt; [String]
+<span class="lineno">  100 </span><span class="decl"><span class="istickedoff">reorderGlobalArgs args =</span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="istickedoff">case break isSubcommand args of</span>
+<span class="lineno">  102 </span><span class="spaces">    </span><span class="istickedoff">(_, []) -&gt; args</span>
+<span class="lineno">  103 </span><span class="spaces">    </span><span class="istickedoff">(pre, cmd : post) -&gt; pre ++ hoistGlobals post ++ [cmd] ++ stripGlobals post</span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  105 </span><span class="spaces">    </span><span class="istickedoff">subcommands = [&quot;serve&quot;, &quot;tui&quot;, &quot;access-control&quot;, &quot;gen-openapi&quot;]</span>
+<span class="lineno">  106 </span><span class="spaces">    </span><span class="istickedoff">isSubcommand s = s `elem` subcommands</span>
+<span class="lineno">  107 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  108 </span><span class="spaces">    </span><span class="istickedoff">-- Global option names (defined in pConfig, outside any hsubparser). Each</span>
+<span class="lineno">  109 </span><span class="spaces">    </span><span class="istickedoff">-- takes exactly one argument. The gateway's bind host/port live in</span>
+<span class="lineno">  110 </span><span class="spaces">    </span><span class="istickedoff">-- security.toml, so there are no server flags to hoist.</span>
+<span class="lineno">  111 </span><span class="spaces">    </span><span class="istickedoff">globalOpts = [&quot;--log-level&quot;]</span>
+<span class="lineno">  112 </span><span class="spaces">    </span><span class="istickedoff">isGlobalOpt s = s `elem` globalOpts</span>
+<span class="lineno">  113 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  114 </span><span class="spaces">    </span><span class="istickedoff">-- Extract global option pairs (flag + value) from the post-subcommand</span>
+<span class="lineno">  115 </span><span class="spaces">    </span><span class="istickedoff">-- args, preserving order, for hoisting before the subcommand keyword.</span>
+<span class="lineno">  116 </span><span class="spaces">    </span><span class="istickedoff">hoistGlobals = go []</span>
+<span class="lineno">  117 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno">  118 </span><span class="spaces">        </span><span class="istickedoff">go acc [] = reverse acc</span>
+<span class="lineno">  119 </span><span class="spaces">        </span><span class="istickedoff">go acc (f : v : rest) | isGlobalOpt f = go (v : f : acc) rest</span>
+<span class="lineno">  120 </span><span class="spaces">        </span><span class="istickedoff">go acc (_ : rest) = go acc rest</span>
+<span class="lineno">  121 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  122 </span><span class="spaces">    </span><span class="istickedoff">-- Remove global option pairs from the post-subcommand args, leaving</span>
+<span class="lineno">  123 </span><span class="spaces">    </span><span class="istickedoff">-- only subcommand-specific options.</span>
+<span class="lineno">  124 </span><span class="spaces">    </span><span class="istickedoff">stripGlobals = go</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno">  126 </span><span class="spaces">        </span><span class="istickedoff">go [] = []</span>
+<span class="lineno">  127 </span><span class="spaces">        </span><span class="istickedoff">go (f : _v : rest) | isGlobalOpt f = go rest</span>
+<span class="lineno">  128 </span><span class="spaces">        </span><span class="istickedoff">go (x : rest) = x : go rest</span></span>
+
+</pre>
+</body>
+</html>

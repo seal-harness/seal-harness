@@ -1,0 +1,564 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The content-addressed agent-metadata cache: a local, sanitized snapshot
+<span class="lineno">    3 </span>-- of a remote repo's @.agents/@ tree, keyed by @(repo URL, content hash)@ so
+<span class="lineno">    4 </span>-- every session working the same repo at the same content shares one entry.
+<span class="lineno">    5 </span>--
+<span class="lineno">    6 </span>-- Why: post-clone agent-def discovery reads @agents.md@ plus one
+<span class="lineno">    7 </span>-- @agent.md@ per discovered agent over SSH — two round trips per file. On a
+<span class="lineno">    8 </span>-- remote host with slow per-call setup this crawls; a single rsync of the
+<span class="lineno">    9 </span>-- whole tree (or a cache hit) collapses it to one probe + one transfer.
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- Security posture (untrusted bytes land on the trusted harness machine):
+<span class="lineno">   12 </span>--
+<span class="lineno">   13 </span>--   * Consumers are pure Markdown parsers — nothing in a snapshot is ever
+<span class="lineno">   14 </span>--     executed. This module enforces that structurally anyway:
+<span class="lineno">   15 </span>--   * 'sanitizeSnapshot' strips exec bits (files 0600, dirs 0700) and
+<span class="lineno">   16 </span>--     DELETES any non-regular entry — symlinks above all, so a malicious
+<span class="lineno">   17 </span>--     repo cannot plant @agent.md -&gt; ~/.ssh/id_ed25519@ and have a parser
+<span class="lineno">   18 </span>--     read through it.
+<span class="lineno">   19 </span>--   * The transfer uses a minimal fixed rsync argv (no @-a@/@-p@/@-o@/@-g@/
+<span class="lineno">   20 </span>--     @-t@ — no owner/perms/times preservation), per-file size cap, and an
+<span class="lineno">   21 </span>--     @-e@ rsh string built ONLY from our own pinned 'SshConfig' options.
+<span class="lineno">   22 </span>--   * The probe hashes the tar stream (@tar -cf - .agents | sha256sum@):
+<span class="lineno">   23 </span>--     headers make it sensitive to names/renames/deletes, and sha256 is
+<span class="lineno">   24 </span>--     required because the input is adversarial — a weak checksum would let
+<span class="lineno">   25 </span>--     a malicious repo serve different agent sets under one cache key.
+<span class="lineno">   26 </span>--   * Any failure (rsync missing remotely, probe garbage, transfer error)
+<span class="lineno">   27 </span>--     yields 'MetaFallback' and callers use the legacy per-file crawl.
+<span class="lineno">   28 </span>module Seal.Session.AgentMetaCache
+<span class="lineno">   29 </span>  ( AgentMetaOutcome (..)
+<span class="lineno">   30 </span>  , MetaCacheEnv (..)
+<span class="lineno">   31 </span>  , agentMetaCacheDir
+<span class="lineno">   32 </span>  , agentMetaCacheKeepN
+<span class="lineno">   33 </span>  , agentMetaCacheKey
+<span class="lineno">   34 </span>  , agentMetaMaxFileSize
+<span class="lineno">   35 </span>  , agentMetaTransferArgv
+<span class="lineno">   36 </span>  , agentMetaProbeCmd
+<span class="lineno">   37 </span>  , buildRoutingWorkdirFs
+<span class="lineno">   38 </span>  , ensureAgentMetaSnapshot
+<span class="lineno">   39 </span>  , gcAgentMetaCache
+<span class="lineno">   40 </span>  , parseGitConfigUrl
+<span class="lineno">   41 </span>  , parseProbeHash
+<span class="lineno">   42 </span>  , probeRepoUrlCmd
+<span class="lineno">   43 </span>  , rsyncArgv
+<span class="lineno">   44 </span>  , rsyncRshString
+<span class="lineno">   45 </span>  , rsyncTransferIO
+<span class="lineno">   46 </span>  , sanitizeSnapshot
+<span class="lineno">   47 </span>  ) where
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>import Control.Exception (IOException, try)
+<span class="lineno">   50 </span>import Data.Either (fromRight)
+<span class="lineno">   51 </span>import Data.Maybe (isNothing)
+<span class="lineno">   52 </span>import Data.List (sortOn)
+<span class="lineno">   53 </span>import Data.Ord (Down (..))
+<span class="lineno">   54 </span>import Data.Text (Text)
+<span class="lineno">   55 </span>import Data.Text qualified as T
+<span class="lineno">   56 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   57 </span>import Data.Time.Clock (getCurrentTime, UTCTime)
+<span class="lineno">   58 </span>import Data.Time.Format (defaultTimeLocale, formatTime)
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>import System.Directory
+<span class="lineno">   61 </span>  ( createDirectoryIfMissing, doesFileExist, getModificationTime
+<span class="lineno">   62 </span>  , listDirectory, removeDirectoryRecursive, removeFile, renameDirectory
+<span class="lineno">   63 </span>  )
+<span class="lineno">   64 </span>import System.FilePath ((&lt;/&gt;))
+<span class="lineno">   65 </span>import System.Posix.Files
+<span class="lineno">   66 </span>  ( getSymbolicLinkStatus, isDirectory, isRegularFile, isSymbolicLink
+<span class="lineno">   67 </span>  , setFileMode
+<span class="lineno">   68 </span>  )
+<span class="lineno">   69 </span>import System.Exit (ExitCode (..))
+<span class="lineno">   70 </span>import System.Process
+<span class="lineno">   71 </span>  ( CreateProcess (..), StdStream (..), proc, waitForProcess )
+<span class="lineno">   72 </span>
+<span class="lineno">   73 </span>import Katip qualified as K
+<span class="lineno">   74 </span>
+<span class="lineno">   75 </span>import Seal.Config.Paths (SealPaths (..))
+<span class="lineno">   76 </span>import Control.Monad (forM, when)
+<span class="lineno">   77 </span>
+<span class="lineno">   78 </span>import Seal.Logging.Global (globalLogIO)
+<span class="lineno">   79 </span>import Seal.Security.Crypto (sha256Hash)
+<span class="lineno">   80 </span>import Seal.Security.Path (WorkspaceRoot (..))
+<span class="lineno">   81 </span>import Seal.Tools.Args (mkShellCommand)
+<span class="lineno">   82 </span>import Seal.Tools.Exec.Local (readBounded, withManagedProcess)
+<span class="lineno">   83 </span>import Seal.Tools.Exec.Remote (RemoteRunner (..), runRemoteShell)
+<span class="lineno">   84 </span>import Seal.Tools.Exec.Types
+<span class="lineno">   85 </span>  ( ExecError (..), RemotePath, SshConfig (..), getRemotePath, getSshHost
+<span class="lineno">   86 </span>  , getSshUser, mkRemotePath
+<span class="lineno">   87 </span>  )
+<span class="lineno">   88 </span>import Seal.Tools.Exec.WorkdirFs
+<span class="lineno">   89 </span>  ( WorkdirFs (..), WorkdirFsErr (..), mkLocalWorkdirFs
+<span class="lineno">   90 </span>  )
+<span class="lineno">   91 </span>
+<span class="lineno">   92 </span>-- | Debug-level logging for the agent-metadata cache. Routed through the
+<span class="lineno">   93 </span>-- global logger so --log-level debug surfaces every gate: routing
+<span class="lineno">   94 </span>-- decisions, probe results, cache hits/misses, and fallback reasons.
+<span class="lineno">   95 </span>amcLog :: Text -&gt; IO ()
+<span class="lineno">   96 </span><span class="decl"><span class="istickedoff">amcLog msg = globalLogIO <span class="nottickedoff">K.DebugS</span> <span class="nottickedoff">(K.ls (&quot;[agent-meta] &quot; &lt;&gt; msg))</span></span></span>
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>-- | The fixed remote probe command for a repo dir's @.agents/@ content
+<span class="lineno">   99 </span>-- hash. Anchored with @cd@ (single-quoted — the path is SafePath-derived,
+<span class="lineno">  100 </span>-- quoting is defense-in-depth), streams the whole tree through @tar@ so
+<span class="lineno">  101 </span>-- names/sizes/types participate in the hash, and pipes into @sha256sum@
+<span class="lineno">  102 </span>-- (GNU coreutils — present on Linux remotes; its absence fails the probe
+<span class="lineno">  103 </span>-- and the caller falls back to the legacy crawl).
+<span class="lineno">  104 </span>agentMetaProbeCmd :: FilePath -&gt; Text
+<span class="lineno">  105 </span><span class="decl"><span class="istickedoff">agentMetaProbeCmd repoDir =</span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="istickedoff">&quot;cd &quot; &lt;&gt; shellQuoteDir (T.pack repoDir)</span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot; &amp;&amp; tar -cf - .agents 2&gt;/dev/null | sha256sum&quot;</span></span>
+<span class="lineno">  108 </span>
+<span class="lineno">  109 </span>-- | Single-quote a path for the remote shell (embedded quotes escaped via
+<span class="lineno">  110 </span>-- the standard @'\\''@ idiom).
+<span class="lineno">  111 </span>shellQuoteDir :: Text -&gt; Text
+<span class="lineno">  112 </span><span class="decl"><span class="istickedoff">shellQuoteDir t = &quot;'&quot; &lt;&gt; T.concatMap q t &lt;&gt; &quot;'&quot;</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  114 </span><span class="spaces">    </span><span class="istickedoff">q :: Char -&gt; Text</span>
+<span class="lineno">  115 </span><span class="spaces">    </span><span class="istickedoff">q '\'' = <span class="nottickedoff">&quot;'\\''&quot;</span></span>
+<span class="lineno">  116 </span><span class="spaces">    </span><span class="istickedoff">q c    = T.singleton c</span></span>
+<span class="lineno">  117 </span>
+<span class="lineno">  118 </span>-- | Parse the probe output (@sha256sum@ prints @\&lt;hex\&gt;\\s\\s-@ for stdin).
+<span class="lineno">  119 </span>-- Returns 'Nothing' unless the output leads with an exact 64-hex-digit
+<span class="lineno">  120 </span>-- digest — anything else (tar errors leaking through, missing-sha256sum
+<span class="lineno">  121 </span>-- diagnostics, empty output) fails the probe.
+<span class="lineno">  122 </span>parseProbeHash :: Text -&gt; Maybe Text
+<span class="lineno">  123 </span><span class="decl"><span class="istickedoff">parseProbeHash out =</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">case filter (not . T.null) (T.words out) of</span>
+<span class="lineno">  125 </span><span class="spaces">    </span><span class="istickedoff">(hex : _)</span>
+<span class="lineno">  126 </span><span class="spaces">      </span><span class="istickedoff">| T.length hex == 64</span>
+<span class="lineno">  127 </span><span class="spaces">          </span><span class="istickedoff">&amp;&amp; T.all (`elem` (&quot;0123456789abcdefABCDEF&quot; :: String)) hex</span>
+<span class="lineno">  128 </span><span class="spaces">      </span><span class="istickedoff">-&gt; Just (T.toLower hex)</span>
+<span class="lineno">  129 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; Nothing</span></span>
+<span class="lineno">  130 </span>
+<span class="lineno">  131 </span>-- | Derive the cache entry directory name:
+<span class="lineno">  132 </span>-- @\&lt;sha256(normalizedUrl)\&gt;-\&lt;sha256(content)\&gt;@ — hex and dashes only, so
+<span class="lineno">  133 </span>-- it is filesystem-safe by construction.
+<span class="lineno">  134 </span>agentMetaCacheKey :: Text -&gt; Text -&gt; Text
+<span class="lineno">  135 </span><span class="decl"><span class="istickedoff">agentMetaCacheKey normalizedUrl contentHash =</span>
+<span class="lineno">  136 </span><span class="spaces">  </span><span class="istickedoff">hexOf normalizedUrl &lt;&gt; &quot;-&quot; &lt;&gt; hexOf contentHash</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  138 </span><span class="spaces">    </span><span class="istickedoff">hexOf :: Text -&gt; Text</span>
+<span class="lineno">  139 </span><span class="spaces">    </span><span class="istickedoff">hexOf = T.toLower . TE.decodeUtf8 . sha256Hash . TE.encodeUtf8</span></span>
+<span class="lineno">  140 </span>
+<span class="lineno">  141 </span>-- | Sanitize a freshly-transferred snapshot directory, in place:
+<span class="lineno">  142 </span>--
+<span class="lineno">  143 </span>--   * dirs  → 0700
+<span class="lineno">  144 </span>--   * files → 0600 (exec bit stripped — the point of the exercise)
+<span class="lineno">  145 </span>--   * symlinks, fifos, devices, sockets → DELETED (never followed). A link
+<span class="lineno">  146 </span>--     pointing outside the snapshot would otherwise hand every parser a
+<span class="lineno">  147 </span>--     readable escape hatch onto the trusted machine.
+<span class="lineno">  148 </span>sanitizeSnapshot :: FilePath -&gt; IO ()
+<span class="lineno">  149 </span><span class="decl"><span class="istickedoff">sanitizeSnapshot = go</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  151 </span><span class="spaces">    </span><span class="istickedoff">go dir = do</span>
+<span class="lineno">  152 </span><span class="spaces">      </span><span class="istickedoff">setFileMode dir 0o700</span>
+<span class="lineno">  153 </span><span class="spaces">      </span><span class="istickedoff">names &lt;- listDirectory dir</span>
+<span class="lineno">  154 </span><span class="spaces">      </span><span class="istickedoff">mapM_ (handleEntry dir) names</span>
+<span class="lineno">  155 </span><span class="spaces">    </span><span class="istickedoff">handleEntry parent name = do</span>
+<span class="lineno">  156 </span><span class="spaces">      </span><span class="istickedoff">let path = parent &lt;/&gt; name</span>
+<span class="lineno">  157 </span><span class="spaces">      </span><span class="istickedoff">-- lstat semantics: judge the entry itself, never what a link points at.</span>
+<span class="lineno">  158 </span><span class="spaces">      </span><span class="istickedoff">st &lt;- getSymbolicLinkStatus path</span>
+<span class="lineno">  159 </span><span class="spaces">      </span><span class="istickedoff">if isSymbolicLink st</span>
+<span class="lineno">  160 </span><span class="spaces">        </span><span class="istickedoff">then ignoreIO (removeFile path)</span>
+<span class="lineno">  161 </span><span class="spaces">        </span><span class="istickedoff">else if isDirectory st</span>
+<span class="lineno">  162 </span><span class="spaces">          </span><span class="istickedoff">then go path</span>
+<span class="lineno">  163 </span><span class="spaces">          </span><span class="istickedoff">else if <span class="tickonlytrue">isRegularFile st</span></span>
+<span class="lineno">  164 </span><span class="spaces">            </span><span class="istickedoff">then setFileMode path 0o600</span>
+<span class="lineno">  165 </span><span class="spaces">            </span><span class="istickedoff">else <span class="nottickedoff">ignoreIO (removeFile path)</span>  -- fifo / device / socket: prune</span>
+<span class="lineno">  166 </span><span class="spaces">    </span><span class="istickedoff">ignoreIO :: IO () -&gt; IO ()</span>
+<span class="lineno">  167 </span><span class="spaces">    </span><span class="istickedoff">ignoreIO action = do</span>
+<span class="lineno">  168 </span><span class="spaces">      </span><span class="istickedoff">_ &lt;- try @IOException action</span>
+<span class="lineno">  169 </span><span class="spaces">      </span><span class="istickedoff">pure <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  170 </span>
+<span class="lineno">  171 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  172 </span>-- Transfer (rsync)
+<span class="lineno">  173 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  174 </span>
+<span class="lineno">  175 </span>-- | Per-file transfer cap (1 MiB). Discovery parsers bound reads far below
+<span class="lineno">  176 </span>-- this; the cap just stops a hostile repo from shipping a multi-gigabyte
+<span class="lineno">  177 </span>-- file inside @.agents/@.
+<span class="lineno">  178 </span>agentMetaMaxFileSize :: Int
+<span class="lineno">  179 </span><span class="decl"><span class="istickedoff">agentMetaMaxFileSize = 1024 * 1024</span></span>
+<span class="lineno">  180 </span>
+<span class="lineno">  181 </span>-- | The local shell string rsync hands @-e@. Built EXCLUSIVELY from our own
+<span class="lineno">  182 </span>-- pinned 'SshConfig' options — host/user/port travel in the destination
+<span class="lineno">  183 </span>-- argument, never here — and every value is single-quoted because rsync
+<span class="lineno">  184 </span>-- runs the rsh program via the local shell.
+<span class="lineno">  185 </span>rsyncRshString :: SshConfig -&gt; String
+<span class="lineno">  186 </span><span class="decl"><span class="istickedoff">rsyncRshString cfg =</span>
+<span class="lineno">  187 </span><span class="spaces">  </span><span class="istickedoff">unwords</span>
+<span class="lineno">  188 </span><span class="spaces">    </span><span class="istickedoff">( [ &quot;ssh&quot;</span>
+<span class="lineno">  189 </span><span class="spaces">      </span><span class="istickedoff">, &quot;-o&quot;, shq &quot;StrictHostKeyChecking=yes&quot;</span>
+<span class="lineno">  190 </span><span class="spaces">      </span><span class="istickedoff">, &quot;-o&quot;, shq &quot;BatchMode=yes&quot;</span>
+<span class="lineno">  191 </span><span class="spaces">      </span><span class="istickedoff">, &quot;-o&quot;, shq (&quot;UserKnownHostsFile=&quot; &lt;&gt; scKnownHosts cfg)</span>
+<span class="lineno">  192 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  193 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; portArgs</span>
+<span class="lineno">  194 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; identityArgs</span>
+<span class="lineno">  195 </span><span class="spaces">    </span><span class="istickedoff">)</span>
+<span class="lineno">  196 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  197 </span><span class="spaces">    </span><span class="istickedoff">shq :: String -&gt; String</span>
+<span class="lineno">  198 </span><span class="spaces">    </span><span class="istickedoff">shq s = &quot;'&quot; &lt;&gt; concatMap esc s &lt;&gt; &quot;'&quot;</span>
+<span class="lineno">  199 </span><span class="spaces">    </span><span class="istickedoff">esc :: Char -&gt; String</span>
+<span class="lineno">  200 </span><span class="spaces">    </span><span class="istickedoff">esc '\'' = <span class="nottickedoff">&quot;'\\''&quot;</span></span>
+<span class="lineno">  201 </span><span class="spaces">    </span><span class="istickedoff">esc c    = [c]</span>
+<span class="lineno">  202 </span><span class="spaces">    </span><span class="istickedoff">portArgs = case scPort cfg of</span>
+<span class="lineno">  203 </span><span class="spaces">      </span><span class="istickedoff">22 -&gt; []</span>
+<span class="lineno">  204 </span><span class="spaces">      </span><span class="istickedoff">p  -&gt; [&quot;-p&quot;, show p]</span>
+<span class="lineno">  205 </span><span class="spaces">    </span><span class="istickedoff">identityArgs = case scIdentity cfg of</span>
+<span class="lineno">  206 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; []</span>
+<span class="lineno">  207 </span><span class="spaces">      </span><span class="istickedoff">Just f  -&gt; [&quot;-i&quot;, shq f]</span></span>
+<span class="lineno">  208 </span>
+<span class="lineno">  209 </span>-- | The fixed rsync argv pulling a remote directory tree into one local
+<span class="lineno">  210 </span>-- dir. Element 0 is the PROGRAM NAME — 'rsyncTransferIO' splits it off
+<span class="lineno">  211 </span>-- before spawning (spawning @proc &quot;rsync&quot; argv@ verbatim would hand rsync
+<span class="lineno">  212 </span>-- a duplicated program name as a bogus source arg).
+<span class="lineno">  213 </span>--
+<span class="lineno">  214 </span>-- Deliberately NOT @-a@: no owner/group/perms/times preservation — every
+<span class="lineno">  215 </span>-- entry arrives with fresh default perms, then 'sanitizeSnapshot' sets the
+<span class="lineno">  216 </span>-- final tight modes.
+<span class="lineno">  217 </span>rsyncArgv :: SshConfig -&gt; FilePath -&gt; FilePath -&gt; [String]
+<span class="lineno">  218 </span><span class="decl"><span class="istickedoff">rsyncArgv cfg srcAbs destDir =</span>
+<span class="lineno">  219 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;rsync&quot;</span>
+<span class="lineno">  220 </span><span class="spaces">  </span><span class="istickedoff">, &quot;-r&quot;</span>
+<span class="lineno">  221 </span><span class="spaces">  </span><span class="istickedoff">, &quot;--max-size=&quot; &lt;&gt; show agentMetaMaxFileSize</span>
+<span class="lineno">  222 </span><span class="spaces">  </span><span class="istickedoff">, &quot;-e&quot;, rsyncRshString cfg</span>
+<span class="lineno">  223 </span><span class="spaces">  </span><span class="istickedoff">, T.unpack (getSshUser (scUser cfg)) &lt;&gt; &quot;@&quot; &lt;&gt; T.unpack (getSshHost (scHost cfg))</span>
+<span class="lineno">  224 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;:&quot; &lt;&gt; srcAbs</span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="istickedoff">, destDir ++ &quot;/&quot;</span>
+<span class="lineno">  226 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">  227 </span>
+<span class="lineno">  228 </span>-- | The remote source for one repo's agent metadata: the CONTENTS of
+<span class="lineno">  229 </span>-- @.agents/@ (trailing slash), so the snapshot root mirrors what discovery
+<span class="lineno">  230 </span>-- reanchors at.
+<span class="lineno">  231 </span>agentsSrcPath :: FilePath -&gt; FilePath
+<span class="lineno">  232 </span><span class="decl"><span class="nottickedoff">agentsSrcPath repoDir = repoDir &lt;/&gt; &quot;.agents/&quot;</span></span>
+<span class="lineno">  233 </span>
+<span class="lineno">  234 </span>-- | Transfer argv for one repo's @.agents/@ tree into a temp dir.
+<span class="lineno">  235 </span>agentMetaTransferArgv :: SshConfig -&gt; FilePath -&gt; FilePath -&gt; [String]
+<span class="lineno">  236 </span><span class="decl"><span class="nottickedoff">agentMetaTransferArgv cfg repoDir = rsyncArgv cfg (agentsSrcPath repoDir)</span></span>
+<span class="lineno">  237 </span>
+<span class="lineno">  238 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  239 </span>-- Integration: probe → key → hit? → rsync → sanitize → atomic publish
+<span class="lineno">  240 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  241 </span>
+<span class="lineno">  242 </span>data AgentMetaOutcome
+<span class="lineno">  243 </span>  = MetaSnapshot FilePath   -- ^ Local sanitized snapshot root for this repo's .agents
+<span class="lineno">  244 </span>  | MetaFallback            -- ^ Anything failed — caller uses the legacy crawl
+<span class="lineno">  245 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  246 </span>
+<span class="lineno">  247 </span>-- | Ensure a content-addressed snapshot exists for @(normalizedUrl, current
+<span class="lineno">  248 </span>-- remote .agents content)@ and return its path, or 'MetaFallback'.
+<span class="lineno">  249 </span>--
+<span class="lineno">  250 </span>-- @runTransfer@ receives the rsync argv and performs it (production: real
+<span class="lineno">  251 </span>-- rsync via 'withManagedProcess'; tests: a fake that records the argv and
+<span class="lineno">  252 </span>-- materializes files) so the flow stays hermetically testable.
+<span class="lineno">  253 </span>ensureAgentMetaSnapshot
+<span class="lineno">  254 </span>  :: RemoteRunner                    -- ^ probe transport (pinned ssh)
+<span class="lineno">  255 </span>  -&gt; SshConfig
+<span class="lineno">  256 </span>  -&gt; FilePath                        -- ^ cache root (&lt;state&gt;/repos/agent-meta-cache)
+<span class="lineno">  257 </span>  -&gt; Text                            -- ^ normalized repo URL (cache key part 1)
+<span class="lineno">  258 </span>  -&gt; FilePath                        -- ^ remote repo dir (absolute, SafePath-derived)
+<span class="lineno">  259 </span>  -&gt; ([String] -&gt; FilePath -&gt; IO (Either ExecError ()))
+<span class="lineno">  260 </span>     -- ^ runTransfer argv destTmpDir
+<span class="lineno">  261 </span>  -&gt; IO AgentMetaOutcome
+<span class="lineno">  262 </span><span class="decl"><span class="istickedoff">ensureAgentMetaSnapshot runner cfg cacheRoot normalizedUrl repoDir runTransfer = do</span>
+<span class="lineno">  263 </span><span class="spaces">  </span><span class="istickedoff">r &lt;- try @IOException $ do</span>
+<span class="lineno">  264 </span><span class="spaces">    </span><span class="istickedoff">mHash &lt;- runProbe</span>
+<span class="lineno">  265 </span><span class="spaces">    </span><span class="istickedoff">case mHash of</span>
+<span class="lineno">  266 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; pure MetaFallback</span>
+<span class="lineno">  267 </span><span class="spaces">      </span><span class="istickedoff">Just contentHash -&gt; do</span>
+<span class="lineno">  268 </span><span class="spaces">        </span><span class="istickedoff">let entry = cacheRoot &lt;/&gt; T.unpack (agentMetaCacheKey normalizedUrl contentHash)</span>
+<span class="lineno">  269 </span><span class="spaces">        </span><span class="istickedoff">hit &lt;- doesFileExist (entry &lt;/&gt; metaFileName)</span>
+<span class="lineno">  270 </span><span class="spaces">        </span><span class="istickedoff">if hit</span>
+<span class="lineno">  271 </span><span class="spaces">          </span><span class="istickedoff">then do</span>
+<span class="lineno">  272 </span><span class="spaces">            </span><span class="istickedoff">amcLog <span class="nottickedoff">(&quot;snapshot: cache HIT &quot; &lt;&gt; T.pack entry)</span></span>
+<span class="lineno">  273 </span><span class="spaces">            </span><span class="istickedoff">pure (MetaSnapshot entry)   -- content-addressed cache hit: no transfer</span>
+<span class="lineno">  274 </span><span class="spaces">          </span><span class="istickedoff">else do</span>
+<span class="lineno">  275 </span><span class="spaces">            </span><span class="istickedoff">amcLog <span class="nottickedoff">(&quot;snapshot: cache MISS, transferring &quot; &lt;&gt; T.pack entry)</span></span>
+<span class="lineno">  276 </span><span class="spaces">            </span><span class="istickedoff">transferAndPublish entry contentHash</span>
+<span class="lineno">  277 </span><span class="spaces">  </span><span class="istickedoff">pure (fromRight <span class="nottickedoff">MetaFallback</span> r)</span>
+<span class="lineno">  278 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  279 </span><span class="spaces">    </span><span class="istickedoff">runProbe = case mkShellCommand (agentMetaProbeCmd repoDir) of</span>
+<span class="lineno">  280 </span><span class="spaces">      </span><span class="istickedoff">Left _    -&gt; <span class="nottickedoff">pure Nothing</span>   -- unreachable: internally-built, no NULs</span>
+<span class="lineno">  281 </span><span class="spaces">      </span><span class="istickedoff">Right cmd -&gt; do</span>
+<span class="lineno">  282 </span><span class="spaces">        </span><span class="istickedoff">eRes &lt;- runRemoteShell runner <span class="nottickedoff">cfg</span> <span class="nottickedoff">cmd</span></span>
+<span class="lineno">  283 </span><span class="spaces">        </span><span class="istickedoff">let mh = either <span class="nottickedoff">(const Nothing)</span> parseProbeHash eRes</span>
+<span class="lineno">  284 </span><span class="spaces">        </span><span class="istickedoff">when (isNothing mh) $</span>
+<span class="lineno">  285 </span><span class="spaces">          </span><span class="istickedoff">amcLog <span class="nottickedoff">(&quot;snapshot: content-hash probe failed for &quot; &lt;&gt; T.pack repoDir</span></span>
+<span class="lineno">  286 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot; raw=&quot; &lt;&gt; either (T.pack . show) id eRes)</span></span>
+<span class="lineno">  287 </span><span class="spaces">        </span><span class="istickedoff">pure mh</span>
+<span class="lineno">  288 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  289 </span><span class="spaces">    </span><span class="istickedoff">transferAndPublish entry contentHash = do</span>
+<span class="lineno">  290 </span><span class="spaces">      </span><span class="istickedoff">createDirectoryIfMissing True cacheRoot</span>
+<span class="lineno">  291 </span><span class="spaces">      </span><span class="istickedoff">let tmp = entry ++ &quot;.tmp&quot;</span>
+<span class="lineno">  292 </span><span class="spaces">      </span><span class="istickedoff">-- A stale .tmp from a crashed prior attempt must not survive.</span>
+<span class="lineno">  293 </span><span class="spaces">      </span><span class="istickedoff">_ &lt;- try @IOException (removeDirectoryRecursive tmp)</span>
+<span class="lineno">  294 </span><span class="spaces">      </span><span class="istickedoff">createDirectoryIfMissing True tmp</span>
+<span class="lineno">  295 </span><span class="spaces">      </span><span class="istickedoff">xfer &lt;- runTransfer <span class="nottickedoff">(agentMetaTransferArgv cfg repoDir tmp)</span> tmp</span>
+<span class="lineno">  296 </span><span class="spaces">      </span><span class="istickedoff">case xfer of</span>
+<span class="lineno">  297 </span><span class="spaces">        </span><span class="istickedoff">Left _ -&gt; do</span>
+<span class="lineno">  298 </span><span class="spaces">          </span><span class="istickedoff">amcLog <span class="nottickedoff">(&quot;snapshot: rsync failed for &quot; &lt;&gt; T.pack repoDir</span></span>
+<span class="lineno">  299 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot; — see [agent-meta rsync] line above if present&quot;)</span></span>
+<span class="lineno">  300 </span><span class="spaces">          </span><span class="istickedoff">_ &lt;- try @IOException (removeDirectoryRecursive tmp)</span>
+<span class="lineno">  301 </span><span class="spaces">          </span><span class="istickedoff">pure MetaFallback</span>
+<span class="lineno">  302 </span><span class="spaces">        </span><span class="istickedoff">Right () -&gt; do</span>
+<span class="lineno">  303 </span><span class="spaces">          </span><span class="istickedoff">sanitizeSnapshot tmp</span>
+<span class="lineno">  304 </span><span class="spaces">          </span><span class="istickedoff">writeMeta tmp contentHash</span>
+<span class="lineno">  305 </span><span class="spaces">          </span><span class="istickedoff">published &lt;- publish entry tmp</span>
+<span class="lineno">  306 </span><span class="spaces">          </span><span class="istickedoff">pure (MetaSnapshot published)</span>
+<span class="lineno">  307 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  308 </span><span class="spaces">    </span><span class="istickedoff">writeMeta dir contentHash = do</span>
+<span class="lineno">  309 </span><span class="spaces">      </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  310 </span><span class="spaces">      </span><span class="istickedoff">let metaPath = dir &lt;/&gt; metaFileName</span>
+<span class="lineno">  311 </span><span class="spaces">      </span><span class="istickedoff">writeFile metaPath (metaJson repoDir contentHash now)</span>
+<span class="lineno">  312 </span><span class="spaces">      </span><span class="istickedoff">setFileMode metaPath 0o600</span>
+<span class="lineno">  313 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  314 </span><span class="spaces">    </span><span class="istickedoff">-- Publish atomically: rename tmp→entry. On a concurrent-writer race,</span>
+<span class="lineno">  315 </span><span class="spaces">    </span><span class="istickedoff">-- keep the winner and drop ours — both are sanitized equivalents of</span>
+<span class="lineno">  316 </span><span class="spaces">    </span><span class="istickedoff">-- the same (url, content-hash).</span>
+<span class="lineno">  317 </span><span class="spaces">    </span><span class="istickedoff">publish entry tmp = do</span>
+<span class="lineno">  318 </span><span class="spaces">      </span><span class="istickedoff">exists &lt;- doesFileExist (entry &lt;/&gt; metaFileName)</span>
+<span class="lineno">  319 </span><span class="spaces">      </span><span class="istickedoff">if <span class="tickonlyfalse">exists</span></span>
+<span class="lineno">  320 </span><span class="spaces">        </span><span class="istickedoff">then <span class="nottickedoff">do removeDirectoryRecursive tmp; pure entry</span></span>
+<span class="lineno">  321 </span><span class="spaces">        </span><span class="istickedoff">else do renameDirectory tmp entry; pure entry</span></span>
+<span class="lineno">  322 </span>
+<span class="lineno">  323 </span>metaFileName :: FilePath
+<span class="lineno">  324 </span><span class="decl"><span class="istickedoff">metaFileName = &quot;seal-meta.json&quot;</span></span>
+<span class="lineno">  325 </span>
+<span class="lineno">  326 </span>-- | The entry's provenance record. Hand-rolled JSON over values we fully
+<span class="lineno">  327 </span>-- control (a validated path, a hex digest, an RFC-3339 timestamp).
+<span class="lineno">  328 </span>metaJson :: FilePath -&gt; Text -&gt; UTCTime -&gt; String
+<span class="lineno">  329 </span><span class="decl"><span class="istickedoff">metaJson repoDir contentHash now =</span>
+<span class="lineno">  330 </span><span class="spaces">  </span><span class="istickedoff">&quot;{\&quot;repo_dir\&quot;:&quot; &lt;&gt; show repoDir</span>
+<span class="lineno">  331 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;,\&quot;content_hash\&quot;:&quot; &lt;&gt; show (T.unpack contentHash)</span>
+<span class="lineno">  332 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;,\&quot;synced_at\&quot;:&quot; &lt;&gt; show (formatTime <span class="nottickedoff">defaultTimeLocale</span> &quot;%Y-%m-%dT%H:%M:%SZ&quot; now)</span>
+<span class="lineno">  333 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;}&quot;</span></span>
+<span class="lineno">  334 </span>
+<span class="lineno">  335 </span>-- | Canonical cache-root location: @&lt;state&gt;/repos/agent-meta-cache@.
+<span class="lineno">  336 </span>agentMetaCacheDir :: SealPaths -&gt; FilePath
+<span class="lineno">  337 </span><span class="decl"><span class="nottickedoff">agentMetaCacheDir paths = spState paths &lt;/&gt; &quot;repos&quot; &lt;/&gt; &quot;agent-meta-cache&quot;</span></span>
+<span class="lineno">  338 </span>
+<span class="lineno">  339 </span>-- | How many entries the startup GC keeps ('gcAgentMetaCache').
+<span class="lineno">  340 </span>agentMetaCacheKeepN :: Int
+<span class="lineno">  341 </span><span class="decl"><span class="nottickedoff">agentMetaCacheKeepN = 20</span></span>
+<span class="lineno">  342 </span>
+<span class="lineno">  343 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  344 </span>-- Discovery wiring: per-repo URL probe + snapshot-routed WorkdirFs
+<span class="lineno">  345 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  346 </span>
+<span class="lineno">  347 </span>-- | Everything the discovery flow needs to route @.agents/@ reads through
+<span class="lineno">  348 </span>-- content-addressed local snapshots. Built once per scan when the untrusted
+<span class="lineno">  349 </span>-- executor is remote; 'Nothing' (local mode, tests) keeps the legacy path.
+<span class="lineno">  350 </span>data MetaCacheEnv = MetaCacheEnv
+<span class="lineno">  351 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">mceRunner</span></span></span>       :: RemoteRunner   -- ^ probe transport (pinned ssh)
+<span class="lineno">  352 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">mceSshCfg</span></span></span>       :: SshConfig      -- ^ destination for rsync + probe anchor
+<span class="lineno">  353 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">mceCacheRoot</span></span></span>    :: FilePath       -- ^ &lt;state&gt;/repos/agent-meta-cache
+<span class="lineno">  354 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">mceRunTransfer</span></span></span>  :: [String] -&gt; FilePath -&gt; IO (Either ExecError ())
+<span class="lineno">  355 </span>    -- ^ Performs one rsync (production: 'rsyncTransferIO'; tests: a fake
+<span class="lineno">  356 </span>    -- that records the argv and materializes files).
+<span class="lineno">  357 </span>  }
+<span class="lineno">  358 </span>
+<span class="lineno">  359 </span>-- | The fixed remote command reading a repo clone's origin URL — the first
+<span class="lineno">  360 </span>-- half of the cache key. One round trip; failure (not a git repo, detached
+<span class="lineno">  361 </span>-- tree) simply excludes that repo from snapshot routing.
+<span class="lineno">  362 </span>probeRepoUrlCmd :: FilePath -&gt; Text
+<span class="lineno">  363 </span><span class="decl"><span class="istickedoff">probeRepoUrlCmd repoDir =</span>
+<span class="lineno">  364 </span><span class="spaces">  </span><span class="istickedoff">&quot;cd &quot; &lt;&gt; shellQuoteDir (T.pack repoDir)</span>
+<span class="lineno">  365 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot; &amp;&amp; git config --get remote.origin.url&quot;</span></span>
+<span class="lineno">  366 </span>
+<span class="lineno">  367 </span>-- | Parse @git config@ output: a single non-empty line, trimmed. Rejects
+<span class="lineno">  368 </span>-- multi-line/garbage output (fail-closed to legacy routing).
+<span class="lineno">  369 </span>parseGitConfigUrl :: Text -&gt; Maybe Text
+<span class="lineno">  370 </span><span class="decl"><span class="istickedoff">parseGitConfigUrl out =</span>
+<span class="lineno">  371 </span><span class="spaces">  </span><span class="istickedoff">case lines (T.unpack out) of</span>
+<span class="lineno">  372 </span><span class="spaces">    </span><span class="istickedoff">[l] -&gt; let t = T.strip (T.pack l)</span>
+<span class="lineno">  373 </span><span class="spaces">           </span><span class="istickedoff">in if T.null t then Nothing else Just t</span>
+<span class="lineno">  374 </span><span class="spaces">    </span><span class="istickedoff">_   -&gt; Nothing</span></span>
+<span class="lineno">  375 </span>
+<span class="lineno">  376 </span>-- | Read ceiling served to parsers from snapshots. Matches the remote arm's
+<span class="lineno">  377 </span>-- bounded-read cap so consumers see identical truncation behavior.
+<span class="lineno">  378 </span>metaReadCeilingBytes :: Int
+<span class="lineno">  379 </span><span class="decl"><span class="istickedoff">metaReadCeilingBytes = 131072</span></span>
+<span class="lineno">  380 </span>
+<span class="lineno">  381 </span>-- | Build a WorkdirFs that routes reads falling under any successfully
+<span class="lineno">  382 </span>-- snapshotted @&lt;repo&gt;/.agents@ subtree to the LOCAL sanitized snapshot,
+<span class="lineno">  383 </span>-- passing everything else through to the underlying (remote) fs.
+<span class="lineno">  384 </span>--
+<span class="lineno">  385 </span>-- Structure truth stays remote: 'wfsSnapshot' is always a passthrough, so
+<span class="lineno">  386 </span>-- SETUP_REPO invalidation and repo enumeration behave exactly as before —
+<span class="lineno">  387 </span>-- only file content reads change lanes. Local serving goes through
+<span class="lineno">  388 </span>-- 'mkLocalWorkdirFs', whose SafePath confinement keeps every read inside
+<span class="lineno">  389 </span>-- its snapshot root (and snapshots contain no symlinks to escape with).
+<span class="lineno">  390 </span>buildRoutingWorkdirFs
+<span class="lineno">  391 </span>  :: MetaCacheEnv          -- ^ probe/transfer deps
+<span class="lineno">  392 </span>  -&gt; WorkdirFs             -- ^ underlying (remote) fs
+<span class="lineno">  393 </span>  -&gt; Text                  -- ^ the SESSION WORKDIR absolute path (the scan's
+<span class="lineno">  394 </span>                           -- own anchor — NOT the ssh workspace; sessions nest
+<span class="lineno">  395 </span>                           -- at &lt;workspace&gt;/workdirs/&lt;sid&gt;/)
+<span class="lineno">  396 </span>  -&gt; [Text]                -- ^ candidate repo top-dir names from wfsSnapshot
+<span class="lineno">  397 </span>  -&gt; IO WorkdirFs
+<span class="lineno">  398 </span><span class="decl"><span class="istickedoff">buildRoutingWorkdirFs env underlying wsRootAbs topDirs = do</span>
+<span class="lineno">  399 </span><span class="spaces">  </span><span class="istickedoff">amcLog <span class="nottickedoff">(&quot;routing: session-workdir=&quot; &lt;&gt; wsRootAbs</span></span>
+<span class="lineno">  400 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot; candidates=&quot; &lt;&gt; T.pack (show topDirs))</span></span>
+<span class="lineno">  401 </span><span class="spaces">  </span><span class="istickedoff">routes &lt;- concat &lt;$&gt; mapM routeOne topDirs</span>
+<span class="lineno">  402 </span><span class="spaces">  </span><span class="istickedoff">if null routes</span>
+<span class="lineno">  403 </span><span class="spaces">    </span><span class="istickedoff">then amcLog <span class="nottickedoff">&quot;routing: no routes established (all repos fell back)&quot;</span></span>
+<span class="lineno">  404 </span><span class="spaces">    </span><span class="istickedoff">else amcLog <span class="nottickedoff">(&quot;routing: &quot; &lt;&gt; T.pack (show (map fst routes)))</span></span>
+<span class="lineno">  405 </span><span class="spaces">  </span><span class="istickedoff">pure (applyRoutes routes underlying)</span>
+<span class="lineno">  406 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  407 </span><span class="spaces">    </span><span class="istickedoff">routeOne topDir = do</span>
+<span class="lineno">  408 </span><span class="spaces">      </span><span class="istickedoff">let repoDirAbs = T.unpack wsRootAbs &lt;/&gt; T.unpack topDir</span>
+<span class="lineno">  409 </span><span class="spaces">      </span><span class="istickedoff">mUrl &lt;- probeUrl repoDirAbs</span>
+<span class="lineno">  410 </span><span class="spaces">      </span><span class="istickedoff">case mUrl of</span>
+<span class="lineno">  411 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  412 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">amcLog (&quot;routing: url probe failed for &quot; &lt;&gt; topDir</span></span>
+<span class="lineno">  413 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot; — falling back to legacy reads&quot;)</span></span>
+<span class="lineno">  414 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">pure []</span></span>
+<span class="lineno">  415 </span><span class="spaces">        </span><span class="istickedoff">Just url -&gt; do</span>
+<span class="lineno">  416 </span><span class="spaces">          </span><span class="istickedoff">amcLog <span class="nottickedoff">(&quot;routing: url=&quot; &lt;&gt; url &lt;&gt; &quot; repo=&quot; &lt;&gt; T.pack repoDirAbs)</span></span>
+<span class="lineno">  417 </span><span class="spaces">          </span><span class="istickedoff">outcome &lt;- ensureAgentMetaSnapshot (mceRunner env) <span class="nottickedoff">(mceSshCfg env)</span></span>
+<span class="lineno">  418 </span><span class="spaces">                       </span><span class="istickedoff">(mceCacheRoot env) url repoDirAbs (mceRunTransfer env)</span>
+<span class="lineno">  419 </span><span class="spaces">          </span><span class="istickedoff">case outcome of</span>
+<span class="lineno">  420 </span><span class="spaces">            </span><span class="istickedoff">MetaSnapshot dir -&gt; do</span>
+<span class="lineno">  421 </span><span class="spaces">              </span><span class="istickedoff">amcLog <span class="nottickedoff">(&quot;routing: snapshot OK for &quot; &lt;&gt; T.pack repoDirAbs)</span></span>
+<span class="lineno">  422 </span><span class="spaces">              </span><span class="istickedoff">pure [(topDir &lt;&gt; &quot;/.agents&quot;, dir)]</span>
+<span class="lineno">  423 </span><span class="spaces">            </span><span class="istickedoff">MetaFallback -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  424 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">amcLog (&quot;routing: snapshot failed for &quot; &lt;&gt; T.pack repoDirAbs</span></span>
+<span class="lineno">  425 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot; — falling back to legacy reads&quot;)</span></span>
+<span class="lineno">  426 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">pure []</span></span>
+<span class="lineno">  427 </span><span class="spaces">    </span><span class="istickedoff">probeUrl rd = case mkShellCommand (probeRepoUrlCmd rd) of</span>
+<span class="lineno">  428 </span><span class="spaces">      </span><span class="istickedoff">Left _    -&gt; <span class="nottickedoff">pure Nothing</span>   -- unreachable: internally built, no NULs</span>
+<span class="lineno">  429 </span><span class="spaces">      </span><span class="istickedoff">Right cmd -&gt; do</span>
+<span class="lineno">  430 </span><span class="spaces">        </span><span class="istickedoff">eRes &lt;- runRemoteShell (mceRunner env) <span class="nottickedoff">(mceSshCfg env)</span> <span class="nottickedoff">cmd</span></span>
+<span class="lineno">  431 </span><span class="spaces">        </span><span class="istickedoff">pure $ either <span class="nottickedoff">(const Nothing)</span> parseGitConfigUrl eRes</span></span>
+<span class="lineno">  432 </span>
+<span class="lineno">  433 </span>-- | Apply prefix→localRoot routing over a WorkdirFs record. Matching reads
+<span class="lineno">  434 </span>-- are served by a SafePath-confined local arm rooted at the snapshot;
+<span class="lineno">  435 </span>-- everything else — including 'wfsSnapshot', the structure source of truth —
+<span class="lineno">  436 </span>-- passes through untouched. An empty route table returns the fs unchanged.
+<span class="lineno">  437 </span>applyRoutes :: [(Text, FilePath)] -&gt; WorkdirFs -&gt; WorkdirFs
+<span class="lineno">  438 </span><span class="decl"><span class="istickedoff">applyRoutes [] fs = <span class="nottickedoff">fs</span></span>
+<span class="lineno">  439 </span><span class="spaces"></span><span class="istickedoff">applyRoutes routes fs = fs</span>
+<span class="lineno">  440 </span><span class="spaces">  </span><span class="istickedoff">{ wfsReadFile           = \rp -&gt;</span>
+<span class="lineno">  441 </span><span class="spaces">      </span><span class="istickedoff">route rp (wfsReadFile fs) serveRead</span>
+<span class="lineno">  442 </span><span class="spaces">  </span><span class="istickedoff">, wfsDoesFileExist      = <span class="nottickedoff">\rp -&gt;</span></span>
+<span class="lineno">  443 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">route rp (wfsDoesFileExist fs) (existsIn wfsDoesFileExist)</span></span>
+<span class="lineno">  444 </span><span class="spaces">  </span><span class="istickedoff">, wfsDoesDirectoryExist = <span class="nottickedoff">\rp -&gt;</span></span>
+<span class="lineno">  445 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">route rp (wfsDoesDirectoryExist fs) (existsIn wfsDoesDirectoryExist)</span></span>
+<span class="lineno">  446 </span><span class="spaces">  </span><span class="istickedoff">, wfsListDirectory      = <span class="nottickedoff">\rp -&gt;</span></span>
+<span class="lineno">  447 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">route rp (wfsListDirectory fs) serveList</span></span>
+<span class="lineno">  448 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">  449 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  450 </span><span class="spaces">    </span><span class="istickedoff">route</span>
+<span class="lineno">  451 </span><span class="spaces">      </span><span class="istickedoff">:: RemotePath</span>
+<span class="lineno">  452 </span><span class="spaces">      </span><span class="istickedoff">-&gt; (RemotePath -&gt; IO a)</span>
+<span class="lineno">  453 </span><span class="spaces">      </span><span class="istickedoff">-&gt; (FilePath -&gt; Text -&gt; IO a)</span>
+<span class="lineno">  454 </span><span class="spaces">      </span><span class="istickedoff">-&gt; IO a</span>
+<span class="lineno">  455 </span><span class="spaces">    </span><span class="istickedoff">route rp onRemote onLocal =</span>
+<span class="lineno">  456 </span><span class="spaces">      </span><span class="istickedoff">case matchRoute (getRemotePath rp) of</span>
+<span class="lineno">  457 </span><span class="spaces">        </span><span class="istickedoff">Nothing          -&gt; onRemote rp</span>
+<span class="lineno">  458 </span><span class="spaces">        </span><span class="istickedoff">Just (root, rel) -&gt; onLocal root rel</span>
+<span class="lineno">  459 </span><span class="spaces">    </span><span class="istickedoff">matchRoute t = foldr</span>
+<span class="lineno">  460 </span><span class="spaces">      </span><span class="istickedoff">(\(prefix, root) acc -&gt;</span>
+<span class="lineno">  461 </span><span class="spaces">        </span><span class="istickedoff">if <span class="tickonlyfalse">t == prefix</span></span>
+<span class="lineno">  462 </span><span class="spaces">          </span><span class="istickedoff">then <span class="nottickedoff">Just (root, &quot;.&quot;)</span></span>
+<span class="lineno">  463 </span><span class="spaces">          </span><span class="istickedoff">else if (prefix &lt;&gt; &quot;/&quot;) `T.isPrefixOf` t</span>
+<span class="lineno">  464 </span><span class="spaces">            </span><span class="istickedoff">then Just (root, T.drop (T.length prefix + 1) t)</span>
+<span class="lineno">  465 </span><span class="spaces">            </span><span class="istickedoff">else acc)</span>
+<span class="lineno">  466 </span><span class="spaces">      </span><span class="istickedoff">Nothing routes</span>
+<span class="lineno">  467 </span><span class="spaces">    </span><span class="istickedoff">localFs root = mkLocalWorkdirFs (WorkspaceRoot root) metaReadCeilingBytes</span>
+<span class="lineno">  468 </span><span class="spaces">    </span><span class="istickedoff">-- The rel paths are internally generated (prefix-stripped snapshot</span>
+<span class="lineno">  469 </span><span class="spaces">    </span><span class="istickedoff">-- paths), so a parse failure here is unreachable; it maps to WfsNotFound</span>
+<span class="lineno">  470 </span><span class="spaces">    </span><span class="istickedoff">-- rather than inventing a PathError.</span>
+<span class="lineno">  471 </span><span class="spaces">    </span><span class="istickedoff">toRp :: Text -&gt; Either WorkdirFsErr RemotePath</span>
+<span class="lineno">  472 </span><span class="spaces">    </span><span class="istickedoff">toRp rel = either <span class="nottickedoff">(const (Left WfsNotFound))</span> Right (mkRemotePath rel)</span>
+<span class="lineno">  473 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  474 </span><span class="spaces">    </span><span class="istickedoff">serveRead root rel =</span>
+<span class="lineno">  475 </span><span class="spaces">      </span><span class="istickedoff">case toRp rel of</span>
+<span class="lineno">  476 </span><span class="spaces">        </span><span class="istickedoff">Left e    -&gt; <span class="nottickedoff">pure (Left e)</span></span>
+<span class="lineno">  477 </span><span class="spaces">        </span><span class="istickedoff">Right rp  -&gt; wfsReadFile (localFs root) rp</span>
+<span class="lineno">  478 </span><span class="spaces">    </span><span class="istickedoff">existsIn</span>
+<span class="lineno">  479 </span><span class="spaces">      </span><span class="istickedoff">:: (WorkdirFs -&gt; RemotePath -&gt; IO Bool)</span>
+<span class="lineno">  480 </span><span class="spaces">      </span><span class="istickedoff">-&gt; FilePath -&gt; Text -&gt; IO Bool</span>
+<span class="lineno">  481 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">existsIn sel root rel =</span></span>
+<span class="lineno">  482 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">case toRp rel of</span></span>
+<span class="lineno">  483 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Left _   -&gt; pure False</span></span>
+<span class="lineno">  484 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Right rp -&gt; sel (localFs root) rp</span></span>
+<span class="lineno">  485 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">serveList root rel =</span></span>
+<span class="lineno">  486 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">case toRp rel of</span></span>
+<span class="lineno">  487 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Left e    -&gt; pure (Left e)</span></span>
+<span class="lineno">  488 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Right rp  -&gt; wfsListDirectory (localFs root) rp</span></span></span>
+<span class="lineno">  489 </span>
+<span class="lineno">  490 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  491 </span>-- GC + production transfer
+<span class="lineno">  492 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  493 </span>
+<span class="lineno">  494 </span>-- | Startup sweep: keep only the newest @keepN@ cache entries (by entry
+<span class="lineno">  495 </span>-- dir mtime). Best-effort — every error is swallowed; a full disk of stale
+<span class="lineno">  496 </span>-- entries is untidy, not unsafe.
+<span class="lineno">  497 </span>gcAgentMetaCache :: FilePath -&gt; Int -&gt; IO ()
+<span class="lineno">  498 </span><span class="decl"><span class="istickedoff">gcAgentMetaCache root keepN = do</span>
+<span class="lineno">  499 </span><span class="spaces">  </span><span class="istickedoff">_ &lt;- try @IOException $ do</span>
+<span class="lineno">  500 </span><span class="spaces">    </span><span class="istickedoff">names &lt;- listDirectory root</span>
+<span class="lineno">  501 </span><span class="spaces">    </span><span class="istickedoff">dated &lt;- forM names $ \n -&gt; do</span>
+<span class="lineno">  502 </span><span class="spaces">      </span><span class="istickedoff">let p = root &lt;/&gt; n</span>
+<span class="lineno">  503 </span><span class="spaces">      </span><span class="istickedoff">mTime &lt;- try @IOException (getModificationTime p)</span>
+<span class="lineno">  504 </span><span class="spaces">      </span><span class="istickedoff">pure (either <span class="nottickedoff">(const [])</span> (\t -&gt; [(t, p)]) mTime)</span>
+<span class="lineno">  505 </span><span class="spaces">    </span><span class="istickedoff">let sorted = sortOn (Down . fst) (concat dated)</span>
+<span class="lineno">  506 </span><span class="spaces">        </span><span class="istickedoff">stale  = drop keepN sorted</span>
+<span class="lineno">  507 </span><span class="spaces">    </span><span class="istickedoff">mapM_ (removeDirectoryRecursive . snd) stale</span>
+<span class="lineno">  508 </span><span class="spaces">  </span><span class="istickedoff">pure <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  509 </span>
+<span class="lineno">  510 </span>-- | Production transfer runner: fixed-argv rsync via the managed-process
+<span class="lineno">  511 </span>-- seam (process-group spawn, bounded output, group kill on cancel).
+<span class="lineno">  512 </span>-- Non-zero exit → 'ExecError' (the caller falls back to the legacy crawl);
+<span class="lineno">  513 </span>-- stderr is logged at debug for diagnosability.
+<span class="lineno">  514 </span>rsyncTransferIO :: SshConfig -&gt; [String] -&gt; FilePath -&gt; IO (Either ExecError ())
+<span class="lineno">  515 </span><span class="decl"><span class="nottickedoff">rsyncTransferIO cfg argv _destTmp = case argv of</span>
+<span class="lineno">  516 </span><span class="spaces">  </span><span class="nottickedoff">-- argv carries the program name at its head; spawn splits it off. An</span>
+<span class="lineno">  517 </span><span class="spaces">  </span><span class="nottickedoff">-- empty argv is unreachable (callers pass 'agentMetaTransferArgv' output).</span>
+<span class="lineno">  518 </span><span class="spaces">  </span><span class="nottickedoff">[]                -&gt; pure (Left ExecRemoteUnreachable)</span>
+<span class="lineno">  519 </span><span class="spaces">  </span><span class="nottickedoff">(prog : progArgs) -&gt;</span>
+<span class="lineno">  520 </span><span class="spaces">    </span><span class="nottickedoff">let cp = (proc prog progArgs)</span>
+<span class="lineno">  521 </span><span class="spaces">               </span><span class="nottickedoff">{ std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe</span>
+<span class="lineno">  522 </span><span class="spaces">               </span><span class="nottickedoff">, create_group = True</span>
+<span class="lineno">  523 </span><span class="spaces">               </span><span class="nottickedoff">}</span>
+<span class="lineno">  524 </span><span class="spaces">    </span><span class="nottickedoff">in runManagedRsync cfg cp</span></span>
+<span class="lineno">  525 </span>
+<span class="lineno">  526 </span>runManagedRsync :: SshConfig -&gt; CreateProcess -&gt; IO (Either ExecError ())
+<span class="lineno">  527 </span><span class="decl"><span class="nottickedoff">runManagedRsync cfg cp = do</span>
+<span class="lineno">  528 </span><span class="spaces">  </span><span class="nottickedoff">res &lt;- try @IOException $</span>
+<span class="lineno">  529 </span><span class="spaces">    </span><span class="nottickedoff">withManagedProcess cp $ \ph _mIn hOut hErr -&gt; do</span>
+<span class="lineno">  530 </span><span class="spaces">      </span><span class="nottickedoff">out &lt;- readBounded hOut agentMetaMaxFileSize</span>
+<span class="lineno">  531 </span><span class="spaces">      </span><span class="nottickedoff">err &lt;- readBounded hErr agentMetaMaxFileSize</span>
+<span class="lineno">  532 </span><span class="spaces">      </span><span class="nottickedoff">ec  &lt;- waitForProcess ph</span>
+<span class="lineno">  533 </span><span class="spaces">      </span><span class="nottickedoff">pure (ec, out, err)</span>
+<span class="lineno">  534 </span><span class="spaces">  </span><span class="nottickedoff">case res of</span>
+<span class="lineno">  535 </span><span class="spaces">    </span><span class="nottickedoff">Left _ioErr -&gt; pure (Left ExecRemoteUnreachable)</span>
+<span class="lineno">  536 </span><span class="spaces">    </span><span class="nottickedoff">Right (ExitSuccess, _, _) -&gt; pure (Right ())</span>
+<span class="lineno">  537 </span><span class="spaces">    </span><span class="nottickedoff">Right (ExitFailure _n, _, err) -&gt; do</span>
+<span class="lineno">  538 </span><span class="spaces">      </span><span class="nottickedoff">globalLogIO K.DebugS (K.ls (T.pack</span>
+<span class="lineno">  539 </span><span class="spaces">        </span><span class="nottickedoff">(&quot;[agent-meta rsync] failed: &quot; &lt;&gt; T.unpack (T.strip (T.takeEnd 400 err))</span>
+<span class="lineno">  540 </span><span class="spaces">         </span><span class="nottickedoff">&lt;&gt; &quot; host=&quot; &lt;&gt; show (getSshHost (scHost cfg)))))</span>
+<span class="lineno">  541 </span><span class="spaces">      </span><span class="nottickedoff">pure (Left ExecRemoteUnreachable)</span></span>
+
+</pre>
+</body>
+</html>

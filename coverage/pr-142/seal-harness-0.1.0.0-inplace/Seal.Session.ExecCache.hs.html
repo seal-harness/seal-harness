@@ -1,0 +1,196 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>-- | The per-process session execution + discovery cache.
+<span class="lineno">    2 </span>--
+<span class="lineno">    3 </span>-- Two memoization layers over the per-session workdir machinery, shared by
+<span class="lineno">    4 </span>-- every surface that touches a session's workspace (turn engine, /call
+<span class="lineno">    5 </span>-- dispatcher, gateway API):
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>--   1. __Session exec__ ('cachedSessionExec') — 'mkSessionExec' runs a
+<span class="lineno">    8 </span>--      remote @mkdir -p@ bootstrap on every construction; in remote mode
+<span class="lineno">    9 </span>--      that is one SSH round trip per turn / per API call. The cache keys
+<span class="lineno">   10 </span>--      the built 'SessionExec' by 'SessionId' and rebuilds only when the
+<span class="lineno">   11 </span>--      security config's untrusted-exec fingerprint changes (a local↔remote
+<span class="lineno">   12 </span>--      or workspace switch) or after an explicit 'invalidateExec'.
+<span class="lineno">   13 </span>--      Fail-closed builds are NEVER cached (a later retry must be able to
+<span class="lineno">   14 </span>--      succeed).
+<span class="lineno">   15 </span>--
+<span class="lineno">   16 </span>--   2. __Workdir discovery__ ('cachedWorkdirScan') — the agent-def +
+<span class="lineno">   17 </span>--      skill scans ('listWorkdirAgentDefs', 'listWorkdirSkills') run once
+<span class="lineno">   18 </span>--      per session within a TTL window and are invalidated explicitly when
+<span class="lineno">   19 </span>--      the workdir's structure changes (@SETUP_REPO@ clone). Each cached
+<span class="lineno">   20 </span>--      entry records its workspace root, so a config switch re-scans even
+<span class="lineno">   21 </span>--      inside the TTL.
+<span class="lineno">   22 </span>--
+<span class="lineno">   23 </span>-- Staleness contract: within the TTL, out-of-band workdir mutations (the
+<span class="lineno">   24 </span>-- model writing files via untrusted opcodes, manual edits on the remote
+<span class="lineno">   25 </span>-- machine) are NOT observed. The TTL bounds that window; SETUP_REPO — the
+<span class="lineno">   26 </span>-- only structural mutation the harness itself drives — invalidates eagerly.
+<span class="lineno">   27 </span>module Seal.Session.ExecCache
+<span class="lineno">   28 </span>  ( SessionExecCache
+<span class="lineno">   29 </span>  , newSessionExecCache
+<span class="lineno">   30 </span>  , newSessionExecCacheWith
+<span class="lineno">   31 </span>  , cachedSessionExec
+<span class="lineno">   32 </span>  , invalidateExec
+<span class="lineno">   33 </span>  , cachedWorkdirScan
+<span class="lineno">   34 </span>  , invalidateWorkdirScan
+<span class="lineno">   35 </span>  ) where
+<span class="lineno">   36 </span>
+<span class="lineno">   37 </span>import Data.IORef
+<span class="lineno">   38 </span>import Data.Map.Strict (Map)
+<span class="lineno">   39 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   40 </span>import Data.Text (Text)
+<span class="lineno">   41 </span>import Data.Text qualified as T
+<span class="lineno">   42 </span>import Data.Time (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>import Seal.Agent.Def.Types (AgentDef)
+<span class="lineno">   45 </span>import Seal.Agent.Def.Workdir (listWorkdirAgentDefsSnap)
+<span class="lineno">   46 </span>import Seal.Config.Paths (SealPaths)
+<span class="lineno">   47 </span>import Seal.Config.Security (SecurityConfig, untrustedExecConfigFromSecurity)
+<span class="lineno">   48 </span>import Seal.Core.Types (SessionId)
+<span class="lineno">   49 </span>import Seal.Security.Path (WorkspaceRoot (..))
+<span class="lineno">   50 </span>import Seal.Session.AgentMetaCache (MetaCacheEnv, buildRoutingWorkdirFs)
+<span class="lineno">   51 </span>import Seal.Session.Workdir
+<span class="lineno">   52 </span>  ( SessionExec (..), isFailClosedSessionExec, mkSessionExec
+<span class="lineno">   53 </span>  )
+<span class="lineno">   54 </span>import Seal.Skills.Backend (listWorkdirSkillsSnap)
+<span class="lineno">   55 </span>import Seal.Skills.Types (Skill)
+<span class="lineno">   56 </span>import Seal.SourceControl.Clone (CloneDeps)
+<span class="lineno">   57 </span>import Seal.Tools.Exec.Remote (RemoteRunner)
+<span class="lineno">   58 </span>import Seal.Tools.Exec.WorkdirFs (WorkdirFs, snapTopDirs, wfsSnapshot)
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>-- | The shared cache handle. Create ONE per process (per gateway /
+<span class="lineno">   61 </span>-- channel loop / CLI invocation) via 'newSessionExecCache'.
+<span class="lineno">   62 </span>data SessionExecCache = SessionExecCache
+<span class="lineno">   63 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">sceExecs</span></span></span> :: IORef (Map SessionId CachedExec)
+<span class="lineno">   64 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sceScans</span></span></span> :: IORef (Map SessionId CachedScan)
+<span class="lineno">   65 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sceNow</span></span></span>   :: IO UTCTime
+<span class="lineno">   66 </span>    -- ^ The clock seam (tests inject a fake).
+<span class="lineno">   67 </span>  }
+<span class="lineno">   68 </span>
+<span class="lineno">   69 </span>data CachedExec = CachedExec
+<span class="lineno">   70 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">ceFingerprint</span></span></span> :: !Text       -- ^ Untrusted-exec config fingerprint at build time
+<span class="lineno">   71 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ceExec</span></span></span>        :: !SessionExec
+<span class="lineno">   72 </span>  }
+<span class="lineno">   73 </span>
+<span class="lineno">   74 </span>data CachedScan = CachedScan
+<span class="lineno">   75 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">csAt</span></span></span>    :: !UTCTime          -- ^ When the scan ran (for the TTL)
+<span class="lineno">   76 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">csRoot</span></span></span>  :: !Text             -- ^ Workspace root text (config-switch guard)
+<span class="lineno">   77 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">csDefs</span></span></span>  :: ![AgentDef]
+<span class="lineno">   78 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">csSkills</span></span></span>:: ![Skill]
+<span class="lineno">   79 </span>  }
+<span class="lineno">   80 </span>
+<span class="lineno">   81 </span>-- | How long a discovery scan stays fresh before the next consumer re-scans.
+<span class="lineno">   82 </span>defaultDiscoveryTTL :: NominalDiffTime
+<span class="lineno">   83 </span><span class="decl"><span class="istickedoff">defaultDiscoveryTTL = 60</span></span>
+<span class="lineno">   84 </span>
+<span class="lineno">   85 </span>-- | Create a cache with the real clock.
+<span class="lineno">   86 </span>newSessionExecCache :: IO SessionExecCache
+<span class="lineno">   87 </span><span class="decl"><span class="istickedoff">newSessionExecCache = newSessionExecCacheWith getCurrentTime</span></span>
+<span class="lineno">   88 </span>
+<span class="lineno">   89 </span>-- | Create a cache with an injected clock (tests).
+<span class="lineno">   90 </span>newSessionExecCacheWith :: IO UTCTime -&gt; IO SessionExecCache
+<span class="lineno">   91 </span><span class="decl"><span class="istickedoff">newSessionExecCacheWith now =</span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="istickedoff">SessionExecCache &lt;$&gt; newIORef Map.empty &lt;*&gt; newIORef Map.empty &lt;*&gt; pure now</span></span>
+<span class="lineno">   93 </span>
+<span class="lineno">   94 </span>-- | A stable fingerprint of the part of the security config that determines
+<span class="lineno">   95 </span>-- session-exec behavior (mode local/remote + SSH coordinates). 'Show'-based:
+<span class="lineno">   96 </span>-- the config types are small, pure records with 'Eq'/'Show' pinned for tests.
+<span class="lineno">   97 </span>execFingerprint :: SecurityConfig -&gt; Text
+<span class="lineno">   98 </span><span class="decl"><span class="istickedoff">execFingerprint = T.pack . show . untrustedExecConfigFromSecurity</span></span>
+<span class="lineno">   99 </span>
+<span class="lineno">  100 </span>-- | Fetch-or-build the session's 'SessionExec'. Successes are memoized by
+<span class="lineno">  101 </span>-- 'SessionId'; rebuilt on a fingerprint mismatch or explicit
+<span class="lineno">  102 </span>-- 'invalidateExec'. Fail-closed builds are never stored.
+<span class="lineno">  103 </span>cachedSessionExec
+<span class="lineno">  104 </span>  :: SessionExecCache -&gt; SealPaths -&gt; SecurityConfig -&gt; SessionId
+<span class="lineno">  105 </span>  -&gt; CloneDeps -&gt; RemoteRunner -&gt; IO SessionExec
+<span class="lineno">  106 </span><span class="decl"><span class="istickedoff">cachedSessionExec cache paths secCfg sid cloneDeps runner = do</span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="istickedoff">execs &lt;- readIORef (sceExecs cache)</span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="istickedoff">let fp = execFingerprint secCfg</span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="istickedoff">case Map.lookup sid execs of</span>
+<span class="lineno">  110 </span><span class="spaces">    </span><span class="istickedoff">Just ce | ceFingerprint ce == fp -&gt; pure <span class="nottickedoff">(ceExec ce)</span></span>
+<span class="lineno">  111 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; do</span>
+<span class="lineno">  112 </span><span class="spaces">      </span><span class="istickedoff">exec &lt;- mkSessionExec paths secCfg sid cloneDeps runner</span>
+<span class="lineno">  113 </span><span class="spaces">      </span><span class="istickedoff">if isFailClosedSessionExec exec</span>
+<span class="lineno">  114 </span><span class="spaces">        </span><span class="istickedoff">then pure exec   -- never cache failures: a later retry must succeed</span>
+<span class="lineno">  115 </span><span class="spaces">        </span><span class="istickedoff">else do</span>
+<span class="lineno">  116 </span><span class="spaces">          </span><span class="istickedoff">modifyIORef' (sceExecs cache) (Map.insert sid (CachedExec fp exec))</span>
+<span class="lineno">  117 </span><span class="spaces">          </span><span class="istickedoff">pure exec</span></span>
+<span class="lineno">  118 </span>
+<span class="lineno">  119 </span>-- | Drop one session's memoized exec (the next 'cachedSessionExec' call
+<span class="lineno">  120 </span>-- rebuilds it). Used when the workdir is known to have been recreated.
+<span class="lineno">  121 </span>invalidateExec :: SessionExecCache -&gt; SessionId -&gt; IO ()
+<span class="lineno">  122 </span><span class="decl"><span class="istickedoff">invalidateExec cache sid =</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">modifyIORef' (sceExecs cache) (Map.delete sid)</span></span>
+<span class="lineno">  124 </span>
+<span class="lineno">  125 </span>-- | Fetch-or-scan the session's workdir discovery results: the agent defs
+<span class="lineno">  126 </span>-- + skills, computed together from ONE 'wfsSnapshot' so a cache miss costs
+<span class="lineno">  127 </span>-- exactly one snapshot round trip. Memoized by 'SessionId' within
+<span class="lineno">  128 </span>-- 'defaultDiscoveryTTL'; a stored entry whose workspace root differs from
+<span class="lineno">  129 </span>-- the caller's re-scans immediately (config-switch guard). A FAILED
+<span class="lineno">  130 </span>-- snapshot is returned fail-soft-to-empty and never cached (the next
+<span class="lineno">  131 </span>-- consumer retries).
+<span class="lineno">  132 </span>cachedWorkdirScan
+<span class="lineno">  133 </span>  :: SessionExecCache -&gt; SessionId -&gt; WorkdirFs -&gt; WorkspaceRoot
+<span class="lineno">  134 </span>  -&gt; Maybe MetaCacheEnv
+<span class="lineno">  135 </span>  -- ^ When 'Just' (remote mode), @.agents/@ reads are served from the
+<span class="lineno">  136 </span>  -- content-addressed local snapshot cache ('Seal.Session.AgentMetaCache')
+<span class="lineno">  137 </span>  -- after a per-repo URL+content probe; repos that fail the snapshot path
+<span class="lineno">  138 </span>  -- keep flowing through the underlying (remote) fs. 'Nothing' is the
+<span class="lineno">  139 </span>  -- legacy all-remote crawl.
+<span class="lineno">  140 </span>  -&gt; IO ([AgentDef], [Skill])
+<span class="lineno">  141 </span><span class="decl"><span class="istickedoff">cachedWorkdirScan cache sid fs wsRoot mMetaEnv = do</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">now &lt;- sceNow cache</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">scans &lt;- readIORef (sceScans cache)</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">let rootText = rootTextOf wsRoot</span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="istickedoff">case Map.lookup sid scans of</span>
+<span class="lineno">  146 </span><span class="spaces">    </span><span class="istickedoff">Just cs | csRoot cs == rootText &amp;&amp; diffUTCTime now (csAt cs) &lt; defaultDiscoveryTTL -&gt;</span>
+<span class="lineno">  147 </span><span class="spaces">      </span><span class="istickedoff">pure (csDefs cs, csSkills cs)</span>
+<span class="lineno">  148 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; do</span>
+<span class="lineno">  149 </span><span class="spaces">      </span><span class="istickedoff">eSnap &lt;- wfsSnapshot fs</span>
+<span class="lineno">  150 </span><span class="spaces">      </span><span class="istickedoff">case eSnap of</span>
+<span class="lineno">  151 </span><span class="spaces">        </span><span class="istickedoff">-- Fail-soft, uncached: don't freeze empty results for the TTL.</span>
+<span class="lineno">  152 </span><span class="spaces">        </span><span class="istickedoff">Left _ -&gt; pure ([], [])</span>
+<span class="lineno">  153 </span><span class="spaces">        </span><span class="istickedoff">Right snap -&gt; do</span>
+<span class="lineno">  154 </span><span class="spaces">          </span><span class="istickedoff">-- Structure comes from the live remote snapshot; only CONTENT</span>
+<span class="lineno">  155 </span><span class="spaces">          </span><span class="istickedoff">-- reads may switch lanes to local snapshots.</span>
+<span class="lineno">  156 </span><span class="spaces">          </span><span class="istickedoff">fs' &lt;- case mMetaEnv of</span>
+<span class="lineno">  157 </span><span class="spaces">            </span><span class="istickedoff">Nothing   -&gt; pure fs</span>
+<span class="lineno">  158 </span><span class="spaces">            </span><span class="istickedoff">Just env  -&gt; buildRoutingWorkdirFs <span class="nottickedoff">env</span> <span class="nottickedoff">fs</span> <span class="nottickedoff">rootText</span> (snapTopDirs snap)</span>
+<span class="lineno">  159 </span><span class="spaces">          </span><span class="istickedoff">defs &lt;- listWorkdirAgentDefsSnap snap fs'</span>
+<span class="lineno">  160 </span><span class="spaces">          </span><span class="istickedoff">skills &lt;- listWorkdirSkillsSnap snap <span class="nottickedoff">fs'</span></span>
+<span class="lineno">  161 </span><span class="spaces">          </span><span class="istickedoff">modifyIORef' (sceScans cache)</span>
+<span class="lineno">  162 </span><span class="spaces">            </span><span class="istickedoff">(Map.insert sid (CachedScan now rootText defs skills))</span>
+<span class="lineno">  163 </span><span class="spaces">          </span><span class="istickedoff">pure (defs, skills)</span></span>
+<span class="lineno">  164 </span>
+<span class="lineno">  165 </span>-- | Drop one session's memoized discovery scan. Called after SETUP_REPO
+<span class="lineno">  166 </span>-- succeeds (the clone changed the workdir's structure) so the next consumer
+<span class="lineno">  167 </span>-- sees the cloned repo's defs/skills.
+<span class="lineno">  168 </span>invalidateWorkdirScan :: SessionExecCache -&gt; SessionId -&gt; IO ()
+<span class="lineno">  169 </span><span class="decl"><span class="istickedoff">invalidateWorkdirScan cache sid =</span>
+<span class="lineno">  170 </span><span class="spaces">  </span><span class="istickedoff">modifyIORef' (sceScans cache) (Map.delete sid)</span></span>
+<span class="lineno">  171 </span>
+<span class="lineno">  172 </span>rootTextOf :: WorkspaceRoot -&gt; Text
+<span class="lineno">  173 </span><span class="decl"><span class="istickedoff">rootTextOf (WorkspaceRoot p) = T.pack p</span></span>
+
+</pre>
+</body>
+</html>

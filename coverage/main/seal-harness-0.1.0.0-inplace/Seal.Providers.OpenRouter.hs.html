@@ -1,0 +1,442 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE DuplicateRecordFields #-}
+<span class="lineno">    2 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    3 </span>{-# LANGUAGE PatternSynonyms #-}
+<span class="lineno">    4 </span>-- | OpenAI-compatible provider using the @openai@ package's *types* (v2.5.4)
+<span class="lineno">    5 </span>-- with our own HTTP round-trip (mirroring 'Seal.Providers.Anthropic' /
+<span class="lineno">    6 </span>-- 'Ollama'). We do NOT use 'OpenAI.V1.makeMethods' (the servant-client
+<span class="lineno">    7 </span>-- convenience wrapper) — that would unwrap the 'ApiKey' to 'Text' and surface
+<span class="lineno">    8 </span>-- 'servant-client' runtime exceptions. Instead the request is built as a
+<span class="lineno">    9 </span>-- 'OpenAI.V1.Chat.Completions.CreateChatCompletion', @encode@d to JSON, and
+<span class="lineno">   10 </span>-- POSTed with 'Network.HTTP.Client'; the response is @eitherDecode@d as a
+<span class="lineno">   11 </span>-- 'OpenAI.V1.Chat.Completions.ChatCompletionObject'. The API key bytes live
+<span class="lineno">   12 </span>-- only on the @Authorization: Bearer@ header built inside the CPS 'withApiKey'
+<span class="lineno">   13 </span>-- accessor — never returned, never logged.
+<span class="lineno">   14 </span>--
+<span class="lineno">   15 </span>-- This module originally began life as a fixed OpenRouter provider, but the
+<span class="lineno">   16 </span>-- 'OpenRouter' type now serves /any/ OpenAI-compatible
+<span class="lineno">   17 </span>-- @\/v1\/chat\/completions@ endpoint — a self-hosted vLLM, LM Studio,
+<span class="lineno">   18 </span>-- api.openai.com, Ollama Cloud, etc. The only difference between instances is
+<span class="lineno">   19 </span>-- the base URL the caller supplies, which is why 'Seal.Providers.Registry'
+<span class="lineno">   20 </span>-- routes both 'OpenRouterProvider' and 'OpenAICompatibleProvider' through
+<span class="lineno">   21 </span>-- here. Error messages include the base URL so a failure at an Ollama Cloud
+<span class="lineno">   22 </span>-- endpoint is not misattributed to OpenRouter.
+<span class="lineno">   23 </span>--
+<span class="lineno">   24 </span>-- OpenRouter-specific defaults: @https://openrouter.ai/api/v1@,
+<span class="lineno">   25 </span>-- @OPENROUTER_API_KEY@.
+<span class="lineno">   26 </span>--
+<span class="lineno">   27 </span>-- Security: capability-based — no opcode touches the agent-immutable home
+<span class="lineno">   28 </span>-- state dir; this module imports only the openai types, the HTTP client
+<span class="lineno">   29 </span>-- library, and the CPS secret accessor. It never spawns a process, never
+<span class="lineno">   30 </span>-- touches the filesystem directly, and never imports the web-client library
+<span class="lineno">   31 </span>-- whose types it borrows (see AGENTS.md §Security).
+<span class="lineno">   32 </span>module Seal.Providers.OpenRouter
+<span class="lineno">   33 </span>  ( OpenRouter (..)
+<span class="lineno">   34 </span>  , mkOpenRouter
+<span class="lineno">   35 </span>  , mkOpenAICompatible
+<span class="lineno">   36 </span>  , defaultOpenRouterBaseUrl
+<span class="lineno">   37 </span>  , openRouterBaseUrl
+<span class="lineno">   38 </span>  , encodeRequest
+<span class="lineno">   39 </span>  , decodeResponse
+<span class="lineno">   40 </span>  , mapFinishReason
+<span class="lineno">   41 </span>  , bearerHeaders
+<span class="lineno">   42 </span>  , sendChatCompletion
+<span class="lineno">   43 </span>  , httpErrorText
+<span class="lineno">   44 </span>  , httpTransportErrorText
+<span class="lineno">   45 </span>  , chatCompletionTimeoutMicro
+<span class="lineno">   46 </span>  , decodeModelIds
+<span class="lineno">   47 </span>  ) where
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>import Control.Exception (try)
+<span class="lineno">   50 </span>import Data.Aeson (Value, Value (Null), eitherDecode, encode, withObject, (.:))
+<span class="lineno">   51 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   52 </span>import Data.ByteString (ByteString)
+<span class="lineno">   53 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   54 </span>import Data.String (fromString)
+<span class="lineno">   55 </span>import Data.Text (Text)
+<span class="lineno">   56 </span>import Data.Text qualified as T
+<span class="lineno">   57 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   58 </span>import Data.Text.Encoding.Error qualified as TEE
+<span class="lineno">   59 </span>import Data.Vector qualified as V
+<span class="lineno">   60 </span>import Network.HTTP.Client
+<span class="lineno">   61 </span>  ( HttpException (..), Manager, RequestBody (RequestBodyLBS), Response
+<span class="lineno">   62 </span>  , httpLbs, parseRequest, requestBody, requestHeaders, responseBody
+<span class="lineno">   63 </span>  , responseStatus, responseTimeout, responseTimeoutMicro
+<span class="lineno">   64 </span>  , HttpExceptionContent (..) )
+<span class="lineno">   65 </span>import Network.HTTP.Types (statusCode)
+<span class="lineno">   66 </span>import Network.HTTP.Types.Header (RequestHeaders)
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>import qualified OpenAI.V1.Chat.Completions as Chat
+<span class="lineno">   69 </span>import qualified OpenAI.V1.Models as OAM
+<span class="lineno">   70 </span>import qualified OpenAI.V1.Tool as OAT
+<span class="lineno">   71 </span>import qualified OpenAI.V1.ToolCall as OATC
+<span class="lineno">   72 </span>import qualified OpenAI.V1.Usage as UAU
+<span class="lineno">   73 </span>
+<span class="lineno">   74 </span>import Seal.Core.Types (ModelId (ModelId), OpName (OpName), ToolCallId (ToolCallId))
+<span class="lineno">   75 </span>import Seal.Providers.Class
+<span class="lineno">   76 </span>  ( CompletionRequest (crMaxTokens, crMessages, crModel, crSystem, crToolChoice, crTools)
+<span class="lineno">   77 </span>  , CompletionResponse (CompletionResponse)
+<span class="lineno">   78 </span>  , ContentBlock (CbText, CbToolResult, CbToolUse)
+<span class="lineno">   79 </span>  , Message
+<span class="lineno">   80 </span>  , pattern Message
+<span class="lineno">   81 </span>  , Provider (complete, listModels)
+<span class="lineno">   82 </span>  , Role (Assistant, User)
+<span class="lineno">   83 </span>  , StopReason (StopEnd, StopMaxTokens, StopOther, StopToolUse)
+<span class="lineno">   84 </span>  , ToolChoice (ToolAuto, ToolNone)
+<span class="lineno">   85 </span>  , ToolDefinition (ToolDefinition)
+<span class="lineno">   86 </span>  , ToolResultPart (TrpText)
+<span class="lineno">   87 </span>  , Usage (Usage, uInput, uOutput)
+<span class="lineno">   88 </span>  )
+<span class="lineno">   89 </span>import Seal.Security.Secrets (ApiKey, withApiKey)
+<span class="lineno">   90 </span>
+<span class="lineno">   91 </span>-- Provider type -------------------------------------------------------------
+<span class="lineno">   92 </span>
+<span class="lineno">   93 </span>-- | Strict fields; 'Text' not 'String'. The 'Manager' is shared with the
+<span class="lineno">   94 </span>-- caller (mirrors 'Seal.Providers.Ollama.olManager' /
+<span class="lineno">   95 </span>-- 'Seal.Providers.Anthropic.anManager') so the TLS context isn't rebuilt per
+<span class="lineno">   96 </span>-- call.
+<span class="lineno">   97 </span>data OpenRouter = OpenRouter
+<span class="lineno">   98 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">orApiKey</span></span></span>       :: !(Maybe ApiKey)
+<span class="lineno">   99 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">orBaseUrl</span></span></span>      :: !Text
+<span class="lineno">  100 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">orDefaultModel</span></span></span> :: !ModelId
+<span class="lineno">  101 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">orManager</span></span></span>      :: !Manager
+<span class="lineno">  102 </span>  }
+<span class="lineno">  103 </span>
+<span class="lineno">  104 </span>-- | Build an 'OpenRouter' with an externally-owned 'Manager' and an optional
+<span class="lineno">  105 </span>-- API key ('Nothing' =&gt; 'complete' returns an actionable error without
+<span class="lineno">  106 </span>-- touching the network).
+<span class="lineno">  107 </span>mkOpenRouter :: Manager -&gt; Maybe ApiKey -&gt; Text -&gt; ModelId -&gt; OpenRouter
+<span class="lineno">  108 </span><span class="decl"><span class="istickedoff">mkOpenRouter mgr key base model = OpenRouter key base model mgr</span></span>
+<span class="lineno">  109 </span>
+<span class="lineno">  110 </span>-- | Build a client for /any/ OpenAI-compatible @\/v1\/chat\/completions@
+<span class="lineno">  111 </span>-- endpoint. This is the same value 'mkOpenRouter' builds: OpenRouter is one
+<span class="lineno">  112 </span>-- instance of the protocol, and so is a self-hosted vLLM, an LM Studio, or
+<span class="lineno">  113 </span>-- api.openai.com. The only difference between them is the base URL the caller
+<span class="lineno">  114 </span>-- supplies, which is why 'Seal.Providers.Registry' routes both
+<span class="lineno">  115 </span>-- 'OpenRouterProvider' and 'OpenAICompatibleProvider' through here.
+<span class="lineno">  116 </span>--
+<span class="lineno">  117 </span>-- The key is still required ('Nothing' returns an actionable error instead of
+<span class="lineno">  118 </span>-- calling out with no credential), which keeps the fail-closed behaviour of
+<span class="lineno">  119 </span>-- 'mkOpenRouter'.
+<span class="lineno">  120 </span>mkOpenAICompatible :: Manager -&gt; Maybe ApiKey -&gt; Text -&gt; ModelId -&gt; OpenRouter
+<span class="lineno">  121 </span><span class="decl"><span class="nottickedoff">mkOpenAICompatible = mkOpenRouter</span></span>
+<span class="lineno">  122 </span>
+<span class="lineno">  123 </span>-- | Default base URL for OpenRouter (OpenAI-compatible endpoint).
+<span class="lineno">  124 </span>defaultOpenRouterBaseUrl :: Text
+<span class="lineno">  125 </span><span class="decl"><span class="istickedoff">defaultOpenRouterBaseUrl = &quot;https://openrouter.ai/api/v1&quot;</span></span>
+<span class="lineno">  126 </span>
+<span class="lineno">  127 </span>-- | Access the configured base URL.
+<span class="lineno">  128 </span>openRouterBaseUrl :: OpenRouter -&gt; Text
+<span class="lineno">  129 </span><span class="decl"><span class="nottickedoff">openRouterBaseUrl = orBaseUrl</span></span>
+<span class="lineno">  130 </span>
+<span class="lineno">  131 </span>-- Pure request mapping ------------------------------------------------------
+<span class="lineno">  132 </span>
+<span class="lineno">  133 </span>-- | Build the OpenAI-compatible chat-completion request from our shape. The
+<span class="lineno">  134 </span>-- system prompt becomes a leading 'Chat.System' message; 'CbThinking' blocks
+<span class="lineno">  135 </span>-- are dropped (no OpenAI equivalent); 'CbToolUse' becomes the assistant's
+<span class="lineno">  136 </span>-- @tool_calls@; 'CbToolResult' becomes a 'Chat.Tool' role message carrying
+<span class="lineno">  137 </span>-- the matching @tool_call_id@.
+<span class="lineno">  138 </span>encodeRequest :: CompletionRequest -&gt; Chat.CreateChatCompletion
+<span class="lineno">  139 </span><span class="decl"><span class="istickedoff">encodeRequest cr = Chat._CreateChatCompletion</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">{ Chat.messages = V.fromList (systemMsgs &lt;&gt; concatMap msgOpenAi (crMessages cr))</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">, Chat.model = OAM.Model (modelIdText (crModel cr))</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">, Chat.max_completion_tokens = Just (fromIntegral (crMaxTokens cr))</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">, Chat.tools = toolsVec</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">, Chat.tool_choice = tc</span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  147 </span><span class="spaces">    </span><span class="istickedoff">systemMsgs = case crSystem cr of</span>
+<span class="lineno">  148 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; []</span>
+<span class="lineno">  149 </span><span class="spaces">      </span><span class="istickedoff">Just s  -&gt; [ Chat.System { Chat.content = V.singleton (txt s), Chat.name = Nothing } ]</span>
+<span class="lineno">  150 </span><span class="spaces">    </span><span class="istickedoff">toolsVec = case crTools cr of</span>
+<span class="lineno">  151 </span><span class="spaces">      </span><span class="istickedoff">[]  -&gt; Nothing</span>
+<span class="lineno">  152 </span><span class="spaces">      </span><span class="istickedoff">ts  -&gt; <span class="nottickedoff">Just (V.fromList (map toolDef ts))</span></span>
+<span class="lineno">  153 </span><span class="spaces">    </span><span class="istickedoff">tc = case crToolChoice cr of</span>
+<span class="lineno">  154 </span><span class="spaces">      </span><span class="istickedoff">ToolAuto  -&gt; Just OAT.ToolChoiceAuto</span>
+<span class="lineno">  155 </span><span class="spaces">      </span><span class="istickedoff">ToolNone  -&gt; <span class="nottickedoff">Just OAT.ToolChoiceNone</span></span>
+<span class="lineno">  156 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  157 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">toolDef (ToolDefinition (OpName n) d sch) =</span></span>
+<span class="lineno">  158 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">OAT.Tool_Function</span></span>
+<span class="lineno">  159 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">( OAT.Function</span></span>
+<span class="lineno">  160 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">{ OAT.description = Just d</span></span>
+<span class="lineno">  161 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, OAT.name = n</span></span>
+<span class="lineno">  162 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, OAT.parameters = Just sch</span></span>
+<span class="lineno">  163 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, OAT.strict = Nothing</span></span>
+<span class="lineno">  164 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">}</span></span>
+<span class="lineno">  165 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">)</span></span></span>
+<span class="lineno">  166 </span>
+<span class="lineno">  167 </span>-- | Map a single Seal 'Message' to one or more OpenAI messages. A Seal
+<span class="lineno">  168 </span>-- assistant message that mixes text + tool calls + tool results splits into a
+<span class="lineno">  169 </span>-- single 'Chat.Assistant' message (text + tool_calls) plus one 'Chat.Tool'
+<span class="lineno">  170 </span>-- message per 'CbToolResult'. (OpenAI has no per-tool-result container; each
+<span class="lineno">  171 </span>-- result is its own @tool@-role message keyed by @tool_call_id@.)
+<span class="lineno">  172 </span>msgOpenAi :: Message -&gt; [Chat.Message (V.Vector Chat.Content)]
+<span class="lineno">  173 </span><span class="decl"><span class="istickedoff">msgOpenAi (Message role blocks) =</span>
+<span class="lineno">  174 </span><span class="spaces">  </span><span class="istickedoff">let textContents   = [ txt t     | CbText t &lt;- blocks ]</span>
+<span class="lineno">  175 </span><span class="spaces">      </span><span class="istickedoff">toolCallVec    = [ mkToolCall i n inp</span>
+<span class="lineno">  176 </span><span class="spaces">                       </span><span class="istickedoff">| CbToolUse (ToolCallId i) (OpName n) inp &lt;- blocks ]</span>
+<span class="lineno">  177 </span><span class="spaces">      </span><span class="istickedoff">toolResultMsgs = [ Chat.Tool</span>
+<span class="lineno">  178 </span><span class="spaces">                          </span><span class="istickedoff">{ Chat.content = V.singleton (txt (joinParts parts))</span>
+<span class="lineno">  179 </span><span class="spaces">                          </span><span class="istickedoff">, Chat.tool_call_id = i</span>
+<span class="lineno">  180 </span><span class="spaces">                          </span><span class="istickedoff">}</span>
+<span class="lineno">  181 </span><span class="spaces">                       </span><span class="istickedoff">| CbToolResult (ToolCallId i) parts _ &lt;- blocks ]</span>
+<span class="lineno">  182 </span><span class="spaces">      </span><span class="istickedoff">mainMsg = case role of</span>
+<span class="lineno">  183 </span><span class="spaces">        </span><span class="istickedoff">User -&gt; Chat.User</span>
+<span class="lineno">  184 </span><span class="spaces">          </span><span class="istickedoff">{ Chat.content = V.fromList textContents</span>
+<span class="lineno">  185 </span><span class="spaces">          </span><span class="istickedoff">, Chat.name = Nothing</span>
+<span class="lineno">  186 </span><span class="spaces">          </span><span class="istickedoff">}</span>
+<span class="lineno">  187 </span><span class="spaces">        </span><span class="istickedoff">Assistant -&gt; Chat.Assistant</span>
+<span class="lineno">  188 </span><span class="spaces">          </span><span class="istickedoff">{ Chat.assistant_content =</span>
+<span class="lineno">  189 </span><span class="spaces">              </span><span class="istickedoff">if <span class="tickonlytrue">null textContents</span> then Nothing else <span class="nottickedoff">Just (V.fromList textContents)</span></span>
+<span class="lineno">  190 </span><span class="spaces">          </span><span class="istickedoff">, Chat.tool_calls =</span>
+<span class="lineno">  191 </span><span class="spaces">              </span><span class="istickedoff">if <span class="tickonlyfalse">null toolCallVec</span> then <span class="nottickedoff">Nothing</span> else Just (V.fromList toolCallVec)</span>
+<span class="lineno">  192 </span><span class="spaces">          </span><span class="istickedoff">, Chat.refusal = Nothing</span>
+<span class="lineno">  193 </span><span class="spaces">          </span><span class="istickedoff">, Chat.name = Nothing</span>
+<span class="lineno">  194 </span><span class="spaces">          </span><span class="istickedoff">, Chat.assistant_audio = Nothing</span>
+<span class="lineno">  195 </span><span class="spaces">          </span><span class="istickedoff">}</span>
+<span class="lineno">  196 </span><span class="spaces">  </span><span class="istickedoff">in mainMsg : toolResultMsgs</span>
+<span class="lineno">  197 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  198 </span><span class="spaces">    </span><span class="istickedoff">mkToolCall i n inp =</span>
+<span class="lineno">  199 </span><span class="spaces">      </span><span class="istickedoff">OATC.ToolCall_Function</span>
+<span class="lineno">  200 </span><span class="spaces">        </span><span class="istickedoff">{ OATC.id = i</span>
+<span class="lineno">  201 </span><span class="spaces">        </span><span class="istickedoff">, OATC.function = OATC.Function</span>
+<span class="lineno">  202 </span><span class="spaces">            </span><span class="istickedoff">{ OATC.name = n</span>
+<span class="lineno">  203 </span><span class="spaces">            </span><span class="istickedoff">, OATC.arguments = TE.decodeUtf8 (BL.toStrict (encode inp))</span>
+<span class="lineno">  204 </span><span class="spaces">            </span><span class="istickedoff">}</span>
+<span class="lineno">  205 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">  206 </span><span class="spaces">    </span><span class="istickedoff">joinParts []     = <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">  207 </span><span class="spaces">    </span><span class="istickedoff">joinParts (p:ps) = T.intercalate <span class="nottickedoff">&quot;\n&quot;</span> (map partText (p:ps))</span>
+<span class="lineno">  208 </span><span class="spaces">    </span><span class="istickedoff">partText (TrpText t) = t</span></span>
+<span class="lineno">  209 </span>
+<span class="lineno">  210 </span>-- Pure response mapping -----------------------------------------------------
+<span class="lineno">  211 </span>
+<span class="lineno">  212 </span>-- | Map a finish-reason string to our 'StopReason'. OpenRouter follows the
+<span class="lineno">  213 </span>-- OpenAI convention (@stop@ / @length@ / @tool_calls@); an unrecognized value
+<span class="lineno">  214 </span>-- (including @content_filter@) maps to 'StopOther' rather than failing — the
+<span class="lineno">  215 </span>-- caller can still use the partial response.
+<span class="lineno">  216 </span>mapFinishReason :: Text -&gt; StopReason
+<span class="lineno">  217 </span><span class="decl"><span class="istickedoff">mapFinishReason r</span>
+<span class="lineno">  218 </span><span class="spaces">  </span><span class="istickedoff">| r == &quot;stop&quot;        = StopEnd</span>
+<span class="lineno">  219 </span><span class="spaces">  </span><span class="istickedoff">| r == &quot;tool_calls&quot;  = StopToolUse</span>
+<span class="lineno">  220 </span><span class="spaces">  </span><span class="istickedoff">| r == &quot;tool_use&quot;     = StopToolUse</span>
+<span class="lineno">  221 </span><span class="spaces">  </span><span class="istickedoff">| r == &quot;length&quot;      = StopMaxTokens</span>
+<span class="lineno">  222 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>          = StopOther r</span></span>
+<span class="lineno">  223 </span>
+<span class="lineno">  224 </span>-- | Decode an OpenAI 'Chat.ChatCompletionObject' into our
+<span class="lineno">  225 </span>-- 'CompletionResponse'. An empty @choices@ array is a graceful 'Left' (some
+<span class="lineno">  226 </span>-- upstream error conditions return no choices). The first choice is taken;
+<span class="lineno">  227 </span>-- its @message@ is an 'Chat.Assistant' carrying optional text + tool calls. The
+<span class="lineno">  228 </span>-- @endpoint@ label is included in error messages so a non-OpenRouter
+<span class="lineno">  229 </span>-- OpenAI-compatible instance (e.g. an Ollama Cloud endpoint) is not
+<span class="lineno">  230 </span>-- misattributed. Tool-call ids are taken verbatim from the upstream (it
+<span class="lineno">  231 </span>-- returns ids); the JSON-encoded @arguments@ text is parsed back to a 'Value'.
+<span class="lineno">  232 </span>decodeResponse :: Text -&gt; Chat.ChatCompletionObject -&gt; Either Text CompletionResponse
+<span class="lineno">  233 </span><span class="decl"><span class="istickedoff">decodeResponse endpoint obj =</span>
+<span class="lineno">  234 </span><span class="spaces">  </span><span class="istickedoff">case V.toList (Chat.choices obj) of</span>
+<span class="lineno">  235 </span><span class="spaces">    </span><span class="istickedoff">[]     -&gt; Left (&quot;the endpoint &quot; &lt;&gt; endpoint &lt;&gt; &quot; returned no choices&quot;)</span>
+<span class="lineno">  236 </span><span class="spaces">    </span><span class="istickedoff">(c:_)  -&gt;</span>
+<span class="lineno">  237 </span><span class="spaces">      </span><span class="istickedoff">let stop  = mapFinishReason (Chat.finish_reason c)</span>
+<span class="lineno">  238 </span><span class="spaces">          </span><span class="istickedoff">blkss = assistantBlocks (Chat.message c)</span>
+<span class="lineno">  239 </span><span class="spaces">          </span><span class="istickedoff">u     = Chat.usage obj</span>
+<span class="lineno">  240 </span><span class="spaces">          </span><span class="istickedoff">usage = Usage</span>
+<span class="lineno">  241 </span><span class="spaces">            </span><span class="istickedoff">{ uInput  = fromIntegral (UAU.prompt_tokens u)</span>
+<span class="lineno">  242 </span><span class="spaces">            </span><span class="istickedoff">, uOutput = fromIntegral (UAU.completion_tokens u)</span>
+<span class="lineno">  243 </span><span class="spaces">            </span><span class="istickedoff">}</span>
+<span class="lineno">  244 </span><span class="spaces">      </span><span class="istickedoff">in Right (CompletionResponse blkss stop usage)</span></span>
+<span class="lineno">  245 </span>
+<span class="lineno">  246 </span>-- | Extract our 'ContentBlock's from an OpenAI assistant message: the text
+<span class="lineno">  247 </span>-- body becomes 'CbText' and each tool call becomes a 'CbToolUse' with the
+<span class="lineno">  248 </span>-- upstream id + name, and the JSON-encoded @arguments@ parsed back to a
+<span class="lineno">  249 </span>-- 'Value' (OpenRouter emits arguments as a JSON object encoded as a 'Text';
+<span class="lineno">  250 </span>-- if it ever fails to parse, we fall back to a placeholder 'Value' so the
+<span class="lineno">  251 </span>-- transcript still records the call).
+<span class="lineno">  252 </span>assistantBlocks :: Chat.Message Text -&gt; [ContentBlock]
+<span class="lineno">  253 </span><span class="decl"><span class="istickedoff">assistantBlocks msg = case msg of</span>
+<span class="lineno">  254 </span><span class="spaces">  </span><span class="istickedoff">Chat.Assistant mText _ _ _ mCalls -&gt;</span>
+<span class="lineno">  255 </span><span class="spaces">    </span><span class="istickedoff">let txts  = maybe [] (\t -&gt; [CbText t]) mText</span>
+<span class="lineno">  256 </span><span class="spaces">        </span><span class="istickedoff">calls = maybe [] (map toolCallBlock . V.toList) mCalls</span>
+<span class="lineno">  257 </span><span class="spaces">    </span><span class="istickedoff">in txts &lt;&gt; calls</span>
+<span class="lineno">  258 </span><span class="spaces">  </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">[]</span></span>
+<span class="lineno">  259 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  260 </span><span class="spaces">    </span><span class="istickedoff">toolCallBlock tc =</span>
+<span class="lineno">  261 </span><span class="spaces">      </span><span class="istickedoff">let OATC.Function n args = OATC.function tc</span>
+<span class="lineno">  262 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">parsed = case eitherDecode (BL.fromStrict (TE.encodeUtf8 args)) :: Either String Value of</span></span>
+<span class="lineno">  263 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Right v  -&gt; v</span></span>
+<span class="lineno">  264 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Left _e  -&gt; Null</span></span>
+<span class="lineno">  265 </span><span class="spaces">      </span><span class="istickedoff">in CbToolUse (ToolCallId (OATC.id tc)) (OpName n) <span class="nottickedoff">parsed</span></span></span>
+<span class="lineno">  266 </span>
+<span class="lineno">  267 </span>-- Headers --------------------------------------------------------------------
+<span class="lineno">  268 </span>
+<span class="lineno">  269 </span>-- | The headers for an OpenAI-compatible chat-completion POST. The API key
+<span class="lineno">  270 </span>-- bytes (@bytes@) live only here, inside the 'withApiKey' continuation.
+<span class="lineno">  271 </span>-- OpenRouter recommends @HTTP-Referer@ / @X-Title@ for app attribution;
+<span class="lineno">  272 </span>-- neither carries a secret.
+<span class="lineno">  273 </span>bearerHeaders :: ByteString -&gt; RequestHeaders
+<span class="lineno">  274 </span><span class="decl"><span class="istickedoff">bearerHeaders bytes =</span>
+<span class="lineno">  275 </span><span class="spaces">  </span><span class="istickedoff">[ (&quot;content-type&quot;, &quot;application/json&quot;)</span>
+<span class="lineno">  276 </span><span class="spaces">  </span><span class="istickedoff">, (&quot;authorization&quot;, &quot;Bearer &quot; &lt;&gt; bytes)</span>
+<span class="lineno">  277 </span><span class="spaces">  </span><span class="istickedoff">, (<span class="nottickedoff">&quot;HTTP-Referer&quot;</span>, &quot;https://github.com/seal-harness&quot;)</span>
+<span class="lineno">  278 </span><span class="spaces">  </span><span class="istickedoff">, (<span class="nottickedoff">&quot;X-Title&quot;</span>, &quot;seal-harness&quot;)</span>
+<span class="lineno">  279 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">  280 </span>
+<span class="lineno">  281 </span>-- HTTP round-trip ------------------------------------------------------------
+<span class="lineno">  282 </span>
+<span class="lineno">  283 </span>-- | Response timeout for chat-completion requests, in microseconds. The
+<span class="lineno">  284 </span>-- @newTlsManager@ default is too short for non-streaming requests to remote
+<span class="lineno">  285 </span>-- cloud models with a large context (49k+ input tokens): the model can take
+<span class="lineno">  286 </span>-- 74+ seconds to generate the full response before returning it in one shot.
+<span class="lineno">  287 </span>-- A 5-minute timeout gives generous headroom, matching the Ollama provider's
+<span class="lineno">  288 </span>-- 'ollamaResponseTimeoutMicro'. This is a per-request override (the manager's
+<span class="lineno">  289 </span>-- default is not changed, so other HTTP clients in the process keep their own
+<span class="lineno">  290 </span>-- timeouts).
+<span class="lineno">  291 </span>chatCompletionTimeoutMicro :: Int
+<span class="lineno">  292 </span><span class="decl"><span class="istickedoff">chatCompletionTimeoutMicro = 300_000_000</span></span>  -- 5 minutes
+<span class="lineno">  293 </span>
+<span class="lineno">  294 </span>-- | Render an 'HttpException' (transport-level failure) as a user-facing
+<span class="lineno">  295 </span>-- error message naming @baseUrl@. A 'ResponseTimeout' gets a distinct
+<span class="lineno">  296 </span>-- message so the user knows the endpoint is reachable but the model was too
+<span class="lineno">  297 </span>-- slow — not that the endpoint is down. Other transport errors use the
+<span class="lineno">  298 </span>-- generic wording.
+<span class="lineno">  299 </span>httpTransportErrorText :: Text -&gt; HttpException -&gt; Text
+<span class="lineno">  300 </span><span class="decl"><span class="istickedoff">httpTransportErrorText baseUrl = \case</span>
+<span class="lineno">  301 </span><span class="spaces">  </span><span class="istickedoff">HttpExceptionRequest _ ResponseTimeout -&gt;</span>
+<span class="lineno">  302 </span><span class="spaces">    </span><span class="istickedoff">&quot;request to &quot; &lt;&gt; baseUrl &lt;&gt; &quot; timed out after &quot;</span>
+<span class="lineno">  303 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; T.pack (show (chatCompletionTimeoutMicro `div` 1_000_000))</span>
+<span class="lineno">  304 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;s — the model likely took too long to respond (large context or \</span>
+<span class="lineno">  305 </span><span class="spaces">        </span><span class="istickedoff">\a slow cloud model). Try reducing the conversation context, \</span>
+<span class="lineno">  306 </span><span class="spaces">        </span><span class="istickedoff">\switching to a faster model, or send \&quot;continue\&quot; to retry.&quot;</span>
+<span class="lineno">  307 </span><span class="spaces">  </span><span class="istickedoff">_ -&gt; &quot;HTTP request to &quot; &lt;&gt; baseUrl</span>
+<span class="lineno">  308 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot; failed (connection or transport error)&quot;</span></span>
+<span class="lineno">  309 </span>
+<span class="lineno">  310 </span>-- | POST @&lt;baseUrl&gt;/chat/completions@ with the given headers + request body,
+<span class="lineno">  311 </span>-- then decode the response. Non-2xx -&gt; 'httpErrorText'; a transport error
+<span class="lineno">  312 </span>-- (connection / TLS) -&gt; a 'Left' string naming @baseUrl@ so the operator can
+<span class="lineno">  313 </span>-- see which endpoint is unreachable (this function serves all
+<span class="lineno">  314 </span>-- OpenAI-compatible providers, not just OpenRouter). The body carries no
+<span class="lineno">  315 </span>-- secret. The @baseUrl@ is the configured one ('orBaseUrl'), so a
+<span class="lineno">  316 </span>-- custom/proxy endpoint is honored.
+<span class="lineno">  317 </span>sendChatCompletion
+<span class="lineno">  318 </span>  :: Manager -&gt; Text -&gt; RequestHeaders -&gt; Chat.CreateChatCompletion
+<span class="lineno">  319 </span>  -&gt; IO (Either Text CompletionResponse)
+<span class="lineno">  320 </span><span class="decl"><span class="istickedoff">sendChatCompletion mgr baseUrl hdrs req = do</span>
+<span class="lineno">  321 </span><span class="spaces">  </span><span class="istickedoff">initReq &lt;- parseRequest (T.unpack (&quot;POST &quot; &lt;&gt; baseUrl &lt;&gt; &quot;/chat/completions&quot;))</span>
+<span class="lineno">  322 </span><span class="spaces">  </span><span class="istickedoff">let httpReq = initReq</span>
+<span class="lineno">  323 </span><span class="spaces">        </span><span class="istickedoff">{ requestBody = <span class="nottickedoff">RequestBodyLBS (encode req)</span></span>
+<span class="lineno">  324 </span><span class="spaces">        </span><span class="istickedoff">, requestHeaders = hdrs</span>
+<span class="lineno">  325 </span><span class="spaces">        </span><span class="istickedoff">, responseTimeout = responseTimeoutMicro chatCompletionTimeoutMicro</span>
+<span class="lineno">  326 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">  327 </span><span class="spaces">  </span><span class="istickedoff">result &lt;- try (httpLbs httpReq mgr) :: IO (Either HttpException (Response BL.ByteString))</span>
+<span class="lineno">  328 </span><span class="spaces">  </span><span class="istickedoff">case result of</span>
+<span class="lineno">  329 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt;</span>
+<span class="lineno">  330 </span><span class="spaces">      </span><span class="istickedoff">pure (Left (httpTransportErrorText baseUrl e))</span>
+<span class="lineno">  331 </span><span class="spaces">    </span><span class="istickedoff">Right resp -&gt;</span>
+<span class="lineno">  332 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">let code = statusCode (responseStatus resp)</span></span>
+<span class="lineno">  333 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">in if code &gt;= 200 &amp;&amp; code &lt;= 299</span></span>
+<span class="lineno">  334 </span><span class="spaces">           </span><span class="istickedoff"><span class="nottickedoff">then case eitherDecode (responseBody resp) of</span></span>
+<span class="lineno">  335 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">Left e    -&gt; pure (Left (T.pack e))</span></span>
+<span class="lineno">  336 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">Right obj -&gt; pure (decodeResponse baseUrl obj)</span></span>
+<span class="lineno">  337 </span><span class="spaces">           </span><span class="istickedoff"><span class="nottickedoff">else pure (Left (httpErrorText code</span></span>
+<span class="lineno">  338 </span><span class="spaces">                             </span><span class="istickedoff"><span class="nottickedoff">(TE.decodeUtf8With TEE.lenientDecode</span></span>
+<span class="lineno">  339 </span><span class="spaces">                               </span><span class="istickedoff"><span class="nottickedoff">(BL.toStrict (responseBody resp)))))</span></span></span>
+<span class="lineno">  340 </span>
+<span class="lineno">  341 </span>-- | Render a non-2xx response into a user-facing message. 429 (rate limit)
+<span class="lineno">  342 </span>-- and 401 (auth) get friendlier, actionable hints; other codes keep the full
+<span class="lineno">  343 </span>-- response body (the body carries no secret).
+<span class="lineno">  344 </span>httpErrorText :: Int -&gt; Text -&gt; Text
+<span class="lineno">  345 </span><span class="decl"><span class="nottickedoff">httpErrorText 429 _ =</span>
+<span class="lineno">  346 </span><span class="spaces">  </span><span class="nottickedoff">&quot;the provider is rate limiting this credential (HTTP 429) — wait a moment \</span>
+<span class="lineno">  347 </span><span class="spaces">  </span><span class="nottickedoff">\and retry, or switch models with /model use.&quot;</span>
+<span class="lineno">  348 </span><span class="spaces"></span><span class="nottickedoff">httpErrorText 401 _ =</span>
+<span class="lineno">  349 </span><span class="spaces">  </span><span class="nottickedoff">&quot;the endpoint rejected the API key (HTTP 401) — re-enter it with \</span>
+<span class="lineno">  350 </span><span class="spaces">  </span><span class="nottickedoff">\/provider remove and /provider add for this provider.&quot;</span>
+<span class="lineno">  351 </span><span class="spaces"></span><span class="nottickedoff">httpErrorText code body =</span>
+<span class="lineno">  352 </span><span class="spaces">  </span><span class="nottickedoff">-- Capped: an endpoint that answers with an HTML error page should not paste</span>
+<span class="lineno">  353 </span><span class="spaces">  </span><span class="nottickedoff">-- the whole page into a CLI line or a wizard hint.</span>
+<span class="lineno">  354 </span><span class="spaces">  </span><span class="nottickedoff">&quot;the provider returned HTTP &quot; &lt;&gt; T.pack (show code) &lt;&gt; &quot;: &quot; &lt;&gt; T.take 300 body</span></span>
+<span class="lineno">  355 </span>
+<span class="lineno">  356 </span>-- Provider instance ---------------------------------------------------------
+<span class="lineno">  357 </span>
+<span class="lineno">  358 </span>instance <span class="decl"><span class="nottickedoff">Provider OpenRouter</span></span> where
+<span class="lineno">  359 </span>  -- The endpoint's live catalogue. Real, not a static guess: for a generic
+<span class="lineno">  360 </span>  -- OpenAI-compatible endpoint &quot;is this URL right?&quot; is answered here, and
+<span class="lineno">  361 </span>  -- OpenRouter's own catalogue changes over time. With no credential the call
+<span class="lineno">  362 </span>  -- is skipped and the configured default is returned, so a keyless caller
+<span class="lineno">  363 </span>  -- still gets an answer without touching the network.
+<span class="lineno">  364 </span>  <span class="decl"><span class="istickedoff">listModels prov = case orApiKey prov of</span>
+<span class="lineno">  365 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure (Right [orDefaultModel prov])</span>
+<span class="lineno">  366 </span><span class="spaces">    </span><span class="istickedoff">Just key -&gt;</span>
+<span class="lineno">  367 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">withApiKey key $ \bytes -&gt;</span></span>
+<span class="lineno">  368 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">listModelsHttp (orManager prov) (orBaseUrl prov) (bearerHeaders bytes)</span></span></span>
+<span class="lineno">  369 </span>
+<span class="lineno">  370 </span>  <span class="decl"><span class="istickedoff">complete prov cr = case orApiKey prov of</span>
+<span class="lineno">  371 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt;</span>
+<span class="lineno">  372 </span><span class="spaces">      </span><span class="istickedoff">pure (Left (&quot;the endpoint &quot; &lt;&gt; orBaseUrl prov</span>
+<span class="lineno">  373 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot; needs an API key \x2014 run /vault setup then /provider add&quot;))</span>
+<span class="lineno">  374 </span><span class="spaces">    </span><span class="istickedoff">Just key -&gt;</span>
+<span class="lineno">  375 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">withApiKey key $ \bytes -&gt;</span></span>
+<span class="lineno">  376 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">sendChatCompletion (orManager prov) (orBaseUrl prov) (bearerHeaders bytes) (encodeRequest cr)</span></span></span>
+<span class="lineno">  377 </span>
+<span class="lineno">  378 </span>-- | @GET {base}\/models@ — the OpenAI-compatible model-list endpoint.
+<span class="lineno">  379 </span>listModelsHttp :: Manager -&gt; Text -&gt; RequestHeaders -&gt; IO (Either Text [ModelId])
+<span class="lineno">  380 </span><span class="decl"><span class="nottickedoff">listModelsHttp mgr baseUrl hdrs = do</span>
+<span class="lineno">  381 </span><span class="spaces">  </span><span class="nottickedoff">initReq &lt;- parseRequest (T.unpack (trimTrailingSlash baseUrl &lt;&gt; &quot;/models&quot;))</span>
+<span class="lineno">  382 </span><span class="spaces">  </span><span class="nottickedoff">let httpReq = initReq { requestHeaders = hdrs }</span>
+<span class="lineno">  383 </span><span class="spaces">  </span><span class="nottickedoff">result &lt;- try (httpLbs httpReq mgr)</span>
+<span class="lineno">  384 </span><span class="spaces">    </span><span class="nottickedoff">:: IO (Either HttpException (Response BL.ByteString))</span>
+<span class="lineno">  385 </span><span class="spaces">  </span><span class="nottickedoff">case result of</span>
+<span class="lineno">  386 </span><span class="spaces">    </span><span class="nottickedoff">Left _e -&gt;</span>
+<span class="lineno">  387 </span><span class="spaces">      </span><span class="nottickedoff">pure (Left &quot;the provider's model-list request failed (connection or transport error)&quot;)</span>
+<span class="lineno">  388 </span><span class="spaces">    </span><span class="nottickedoff">Right resp -&gt;</span>
+<span class="lineno">  389 </span><span class="spaces">      </span><span class="nottickedoff">let code = statusCode (responseStatus resp)</span>
+<span class="lineno">  390 </span><span class="spaces">      </span><span class="nottickedoff">in if code &gt;= 200 &amp;&amp; code &lt;= 299</span>
+<span class="lineno">  391 </span><span class="spaces">           </span><span class="nottickedoff">then pure (decodeModelIds (responseBody resp))</span>
+<span class="lineno">  392 </span><span class="spaces">           </span><span class="nottickedoff">else pure (Left (httpErrorText code</span>
+<span class="lineno">  393 </span><span class="spaces">                             </span><span class="nottickedoff">(TE.decodeUtf8With TEE.lenientDecode</span>
+<span class="lineno">  394 </span><span class="spaces">                               </span><span class="nottickedoff">(BL.toStrict (responseBody resp)))))</span></span>
+<span class="lineno">  395 </span>
+<span class="lineno">  396 </span>trimTrailingSlash :: Text -&gt; Text
+<span class="lineno">  397 </span><span class="decl"><span class="nottickedoff">trimTrailingSlash = T.dropWhileEnd (== '/')</span></span>
+<span class="lineno">  398 </span>
+<span class="lineno">  399 </span>-- | Decode the OpenAI-compatible model list: @{&quot;data&quot;:[{&quot;id&quot;:&quot;…&quot;}]}@.
+<span class="lineno">  400 </span>decodeModelIds :: BL.ByteString -&gt; Either Text [ModelId]
+<span class="lineno">  401 </span><span class="decl"><span class="istickedoff">decodeModelIds body = case eitherDecode body of</span>
+<span class="lineno">  402 </span><span class="spaces">  </span><span class="istickedoff">Left err -&gt; Left <span class="nottickedoff">(&quot;could not read the model list: &quot; &lt;&gt; T.pack err)</span></span>
+<span class="lineno">  403 </span><span class="spaces">  </span><span class="istickedoff">Right value -&gt; case parseMaybe (withObject <span class="nottickedoff">&quot;model list&quot;</span> (.: &quot;data&quot;)) value of</span>
+<span class="lineno">  404 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">Left &quot;the endpoint returned no model list&quot;</span></span>
+<span class="lineno">  405 </span><span class="spaces">    </span><span class="istickedoff">Just entries -&gt; maybe (Left <span class="nottickedoff">&quot;the endpoint's model list has entries without an id&quot;</span>)</span>
+<span class="lineno">  406 </span><span class="spaces">                           </span><span class="istickedoff">Right</span>
+<span class="lineno">  407 </span><span class="spaces">                           </span><span class="istickedoff">(traverse entryId (entries :: [Value]))</span>
+<span class="lineno">  408 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  409 </span><span class="spaces">    </span><span class="istickedoff">entryId v = ModelId &lt;$&gt; parseMaybe (withObject <span class="nottickedoff">&quot;model&quot;</span> (.: &quot;id&quot;)) v</span></span>
+<span class="lineno">  410 </span>
+<span class="lineno">  411 </span>-- Helpers --------------------------------------------------------------------
+<span class="lineno">  412 </span>
+<span class="lineno">  413 </span>modelIdText :: ModelId -&gt; Text
+<span class="lineno">  414 </span><span class="decl"><span class="istickedoff">modelIdText (ModelId t) = t</span></span>
+<span class="lineno">  415 </span>
+<span class="lineno">  416 </span>-- | Build a text 'Chat.Content' from a 'Text'. The 'Content' type exports no
+<span class="lineno">  417 </span>-- (public) constructors, so we go through its 'IsString' instance.
+<span class="lineno">  418 </span>txt :: Text -&gt; Chat.Content
+<span class="lineno">  419 </span><span class="decl"><span class="istickedoff">txt = fromString . T.unpack</span></span>
+
+</pre>
+</body>
+</html>

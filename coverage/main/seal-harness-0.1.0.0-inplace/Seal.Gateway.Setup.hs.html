@@ -1,0 +1,502 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The setup endpoints: status, vault creation, vault reopen, and the
+<span class="lineno">    3 </span>-- provider Test-connection ping.
+<span class="lineno">    4 </span>--
+<span class="lineno">    5 </span>-- == Trust boundary (read this before changing anything here)
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- These are human-driven admin endpoints on the local control plane, in the
+<span class="lineno">    8 </span>-- same class as @\/vault setup@ and @POST \/api\/secrets@. They add no opcode,
+<span class="lineno">    9 </span>-- no 'UntrustedIO', and no ISA path. Two protections apply, both already in
+<span class="lineno">   10 </span>-- place before this module is reached:
+<span class="lineno">   11 </span>--
+<span class="lineno">   12 </span>-- * the mutation origin guard in 'Seal.Gateway.API.apiApp' (cross-origin
+<span class="lineno">   13 </span>--   requests are refused before dispatch, so a hostile page cannot drive a
+<span class="lineno">   14 </span>--   vault creation);
+<span class="lineno">   15 </span>-- * the passkey middleware in &quot;Seal.Gateway.AccessControl&quot;, which is
+<span class="lineno">   16 </span>--   default-deny — every route here answers @403 access_control_required@
+<span class="lineno">   17 </span>--   until access control is configured, and @401@ without a session or
+<span class="lineno">   18 </span>--   service token.
+<span class="lineno">   19 </span>--
+<span class="lineno">   20 </span>-- Residual classes, stated rather than hidden: holders of the per-run service
+<span class="lineno">   21 </span>-- token, an explicit @mode = &quot;none&quot;@ waiver, and same-UID local processes.
+<span class="lineno">   22 </span>-- The last is not a widening: such a process can already write
+<span class="lineno">   23 </span>-- @~\/.seal\/security.toml@ or run @\/vault setup@ in @seal tui@.
+<span class="lineno">   24 </span>--
+<span class="lineno">   25 </span>-- Nothing here ever returns key material. Creation and reopen responses carry
+<span class="lineno">   26 </span>-- the public recipient and the key-type label; errors carry a fixed reason and
+<span class="lineno">   27 </span>-- an actionable hint ('Seal.Vault.Provision.renderProvisionError').
+<span class="lineno">   28 </span>--
+<span class="lineno">   29 </span>-- This module never imports 'Seal.Gateway.API' (that module imports this one),
+<span class="lineno">   30 </span>-- so the helpers and handlers are self-contained.
+<span class="lineno">   31 </span>module Seal.Gateway.Setup
+<span class="lineno">   32 </span>  ( maxSetupBodyBytes
+<span class="lineno">   33 </span>  , collectBodyLimited
+<span class="lineno">   34 </span>  , setupJson
+<span class="lineno">   35 </span>  , setupJsonNoStore
+<span class="lineno">   36 </span>  , setupErr
+<span class="lineno">   37 </span>  , SetupDeps (..)
+<span class="lineno">   38 </span>  , stubSetupDeps
+<span class="lineno">   39 </span>  , SetupEnv (..)
+<span class="lineno">   40 </span>  , handleSetupState
+<span class="lineno">   41 </span>  , handleVaultCreate
+<span class="lineno">   42 </span>  , handleVaultReopen
+<span class="lineno">   43 </span>  , handleProviderTest
+<span class="lineno">   44 </span>  ) where
+<span class="lineno">   45 </span>
+<span class="lineno">   46 </span>import Control.Monad (void, when)
+<span class="lineno">   47 </span>import Data.Aeson (Value, object, (.=))
+<span class="lineno">   48 </span>import Data.Aeson qualified as A
+<span class="lineno">   49 </span>import Data.Aeson.Key qualified as Key
+<span class="lineno">   50 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   51 </span>import Data.ByteString (ByteString)
+<span class="lineno">   52 </span>import Data.ByteString qualified as BS
+<span class="lineno">   53 </span>import Data.ByteString.Char8 qualified as BC
+<span class="lineno">   54 </span>import Data.CaseInsensitive qualified as CI
+<span class="lineno">   55 </span>import Data.IORef (IORef, readIORef, writeIORef)
+<span class="lineno">   56 </span>import Data.Either (fromRight)
+<span class="lineno">   57 </span>import Data.Maybe (fromMaybe, isJust)
+<span class="lineno">   58 </span>import Data.Text (Text)
+<span class="lineno">   59 </span>import Data.Text qualified as T
+<span class="lineno">   60 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   61 </span>import Network.HTTP.Types
+<span class="lineno">   62 </span>  ( Header, HeaderName, Status, hContentType, status200, status201, status400
+<span class="lineno">   63 </span>  , status409, status413, status415, status422, status500 )
+<span class="lineno">   64 </span>import Network.Wai (Request, Response, getRequestBodyChunk, requestHeaders, responseLBS)
+<span class="lineno">   65 </span>import System.Directory (doesFileExist)
+<span class="lineno">   66 </span>import System.FilePath (takeDirectory)
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>import Seal.Config.File
+<span class="lineno">   69 </span>  ( RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig )
+<span class="lineno">   70 </span>import Seal.Config.Paths (SealPaths (..), vaultFilePath)
+<span class="lineno">   71 </span>import Seal.Config.Security
+<span class="lineno">   72 </span>  ( SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig )
+<span class="lineno">   73 </span>import Seal.Core.Types (ModelId (..))
+<span class="lineno">   74 </span>import Seal.Providers.Class (SomeProvider)
+<span class="lineno">   75 </span>import Seal.Providers.Registry
+<span class="lineno">   76 </span>  ( KnownProvider, customProviderNames, listSome, parseProvider
+<span class="lineno">   77 </span>  , resolveDefaultModelForName )
+<span class="lineno">   78 </span>import Seal.Security.Vault
+<span class="lineno">   79 </span>  ( UnlockMode (UnlockStartup), VaultConfig (..), VaultHandle (..), openVault )
+<span class="lineno">   80 </span>import Seal.Security.Vault.Age
+<span class="lineno">   81 </span>  ( AgeIdentity (..), AgeRecipient (..), VaultError (..) )
+<span class="lineno">   82 </span>import Seal.Setup.State
+<span class="lineno">   83 </span>  ( ProviderCard (..), SetupInputs (..), SetupState (..), SetupStep (..)
+<span class="lineno">   84 </span>  , StepStatus (..), deriveSetupState )
+<span class="lineno">   85 </span>import Seal.Vault.Backend (parseUnlockMode)
+<span class="lineno">   86 </span>import Seal.Vault.Provision
+<span class="lineno">   87 </span>  ( ProvisionDeps (..), ProvisionError (..), ProvisionOutcome (..)
+<span class="lineno">   88 </span>  , SetupEncryptor (..), SetupKeygen (..), parseVaultSpec, provisionVault
+<span class="lineno">   89 </span>  , renderProvisionError, withSetupLock )
+<span class="lineno">   90 </span>
+<span class="lineno">   91 </span>-- | The setup endpoints' injected dependencies.
+<span class="lineno">   92 </span>--
+<span class="lineno">   93 </span>-- Two seams, both injected rather than imported so the handlers stay testable
+<span class="lineno">   94 </span>-- and so &quot;Test connection&quot; pings what is on disk now, not what was there at
+<span class="lineno">   95 </span>-- boot: the provisioning core (which shells out to @age-keygen@ /
+<span class="lineno">   96 </span>-- @age-plugin-yubikey@ / @age@) and the provider resolver (which needs a
+<span class="lineno">   97 </span>-- 'Network.HTTP.Client.Manager' and a vault handle).
+<span class="lineno">   98 </span>data SetupDeps = SetupDeps
+<span class="lineno">   99 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">sdProvision</span></span></span>       :: ProvisionDeps
+<span class="lineno">  100 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">sdResolveProvider</span></span></span> :: Text -&gt; ModelId -&gt; IO (Either Text SomeProvider)
+<span class="lineno">  101 </span>    -- ^ Re-reads @config.toml@ and the vault handle on every call, so a
+<span class="lineno">  102 </span>    -- provider saved during setup (including a new ollama base URL or a named
+<span class="lineno">  103 </span>    -- OpenAI-compatible instance) is what &quot;Test connection&quot; actually pings.
+<span class="lineno">  104 </span>  }
+<span class="lineno">  105 </span>
+<span class="lineno">  106 </span>-- | Everything the handlers need from the running gateway. Built at the
+<span class="lineno">  107 </span>-- dispatch site from 'Seal.Gateway.API.ApiDeps'.
+<span class="lineno">  108 </span>data SetupEnv = SetupEnv
+<span class="lineno">  109 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">sePaths</span></span></span>        :: SealPaths
+<span class="lineno">  110 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">seHandleRef</span></span></span>    :: IORef (Maybe VaultHandle)
+<span class="lineno">  111 </span>    -- ^ The vault runtime's ref. Never 'VaultRuntime.vrPaths' — that field is
+<span class="lineno">  112 </span>    -- a test stub, and the state model needs the real 'SealPaths'.
+<span class="lineno">  113 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">seConfigPath</span></span></span>   :: FilePath
+<span class="lineno">  114 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">seSecurityPath</span></span></span> :: FilePath
+<span class="lineno">  115 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">seProviders</span></span></span>    :: IO [KnownProvider]
+<span class="lineno">  116 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">seDeps</span></span></span>         :: SetupDeps
+<span class="lineno">  117 </span>  }
+<span class="lineno">  118 </span>
+<span class="lineno">  119 </span>-- | Inert dependencies for the 'ApiDeps' literals in tests that do not
+<span class="lineno">  120 </span>-- exercise the setup endpoints. Every seam fails closed with a message that
+<span class="lineno">  121 </span>-- names the stub, so a test that accidentally reaches one says so.
+<span class="lineno">  122 </span>stubSetupDeps :: SetupDeps
+<span class="lineno">  123 </span><span class="decl"><span class="nottickedoff">stubSetupDeps = SetupDeps</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="nottickedoff">{ sdProvision = ProvisionDeps</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="nottickedoff">{ pdKeygen = SetupKeygen</span>
+<span class="lineno">  126 </span><span class="spaces">          </span><span class="nottickedoff">{ skLocal = pure (Left stubError)</span>
+<span class="lineno">  127 </span><span class="spaces">          </span><span class="nottickedoff">, skYubi  = \_ _ _ -&gt; pure (Left stubError)</span>
+<span class="lineno">  128 </span><span class="spaces">          </span><span class="nottickedoff">, skUser  = \_ _ -&gt; Left &quot;stub setup deps&quot;</span>
+<span class="lineno">  129 </span><span class="spaces">          </span><span class="nottickedoff">}</span>
+<span class="lineno">  130 </span><span class="spaces">      </span><span class="nottickedoff">, pdEncryptor = SetupEncryptor</span>
+<span class="lineno">  131 </span><span class="spaces">          </span><span class="nottickedoff">{ seMk     = \_ _ -&gt; pure (Left (VaultBackendError &quot;stub setup deps&quot;))</span>
+<span class="lineno">  132 </span><span class="spaces">          </span><span class="nottickedoff">, seVerify = \_ -&gt; pure (Left &quot;stub setup deps&quot;)</span>
+<span class="lineno">  133 </span><span class="spaces">          </span><span class="nottickedoff">}</span>
+<span class="lineno">  134 </span><span class="spaces">      </span><span class="nottickedoff">, pdWriteConfig = \_ -&gt; pure (Left &quot;stub setup deps&quot;)</span>
+<span class="lineno">  135 </span><span class="spaces">      </span><span class="nottickedoff">-- A path that cannot exist: a stub must never take a real setup lock.</span>
+<span class="lineno">  136 </span><span class="spaces">      </span><span class="nottickedoff">, pdLockPath = &quot;/nonexistent/seal-stub-setup.lock&quot;</span>
+<span class="lineno">  137 </span><span class="spaces">      </span><span class="nottickedoff">}</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="nottickedoff">, sdResolveProvider = \_ _ -&gt; pure (Left &quot;stub setup deps&quot;)</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="nottickedoff">}</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  141 </span><span class="spaces">    </span><span class="nottickedoff">stubError = ProvisionInvalidInput &quot;stub setup deps&quot;</span></span>
+<span class="lineno">  142 </span>
+<span class="lineno">  143 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  144 </span>-- GET /api/setup
+<span class="lineno">  145 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  146 </span>
+<span class="lineno">  147 </span>-- | The wizard's state. Never fails: a missing file degrades to &quot;nothing
+<span class="lineno">  148 </span>-- configured&quot;, and an unparseable one becomes the V0 blocked row.
+<span class="lineno">  149 </span>handleSetupState :: SetupEnv -&gt; IO Response
+<span class="lineno">  150 </span><span class="decl"><span class="istickedoff">handleSetupState env = do</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="istickedoff">security &lt;- loadSecurityConfig (seSecurityPath env)</span>
+<span class="lineno">  152 </span><span class="spaces">  </span><span class="istickedoff">runtime &lt;- loadRuntimeConfig (seConfigPath env)</span>
+<span class="lineno">  153 </span><span class="spaces">  </span><span class="istickedoff">mhandle &lt;- readIORef (seHandleRef env)</span>
+<span class="lineno">  154 </span><span class="spaces">  </span><span class="istickedoff">let sec = fromRight defaultSecurityConfig security</span>
+<span class="lineno">  155 </span><span class="spaces">      </span><span class="istickedoff">rt = fromRight defaultRuntimeConfig runtime</span>
+<span class="lineno">  156 </span><span class="spaces">      </span><span class="istickedoff">vaultPath = maybe (vaultFilePath (sePaths env)) <span class="nottickedoff">T.unpack</span> (scVaultPath sec)</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="istickedoff">vaultExists &lt;- doesFileExist vaultPath</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="istickedoff">identityReadable &lt;- case scVaultIdentity sec of</span>
+<span class="lineno">  159 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  160 </span><span class="spaces">    </span><span class="istickedoff">Just raw -&gt; <span class="nottickedoff">Just &lt;$&gt; doesFileExist (T.unpack raw)</span></span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="istickedoff">state &lt;- deriveSetupState SetupInputs</span>
+<span class="lineno">  162 </span><span class="spaces">    </span><span class="istickedoff">{ siPaths = <span class="nottickedoff">sePaths env</span></span>
+<span class="lineno">  163 </span><span class="spaces">    </span><span class="istickedoff">, siRuntime = rt</span>
+<span class="lineno">  164 </span><span class="spaces">    </span><span class="istickedoff">, siSecurity = sec</span>
+<span class="lineno">  165 </span><span class="spaces">    </span><span class="istickedoff">, siSecurityProblem = either (Just . summariseConfigProblem) (const Nothing) security</span>
+<span class="lineno">  166 </span><span class="spaces">    </span><span class="istickedoff">, siHandle = mhandle</span>
+<span class="lineno">  167 </span><span class="spaces">    </span><span class="istickedoff">, siVaultFileExists = vaultExists</span>
+<span class="lineno">  168 </span><span class="spaces">    </span><span class="istickedoff">, siIdentityReadable = <span class="nottickedoff">identityReadable</span></span>
+<span class="lineno">  169 </span><span class="spaces">    </span><span class="istickedoff">, siConfiguredProviders = seProviders env</span>
+<span class="lineno">  170 </span><span class="spaces">    </span><span class="istickedoff">-- The seal home's parent is the user's home for the default ~/.seal</span>
+<span class="lineno">  171 </span><span class="spaces">    </span><span class="istickedoff">-- layout, which is what the tilde form in a detail is measured from.</span>
+<span class="lineno">  172 </span><span class="spaces">    </span><span class="istickedoff">, siHome = <span class="nottickedoff">takeDirectory (spHome (sePaths env))</span></span>
+<span class="lineno">  173 </span><span class="spaces">    </span><span class="istickedoff">}</span>
+<span class="lineno">  174 </span><span class="spaces">  </span><span class="istickedoff">pure (setupJsonNoStore status200 (setupStateJson state))</span></span>
+<span class="lineno">  175 </span>
+<span class="lineno">  176 </span>setupStateJson :: SetupState -&gt; Value
+<span class="lineno">  177 </span><span class="decl"><span class="istickedoff">setupStateJson state = object</span>
+<span class="lineno">  178 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;required_complete&quot; .= ssRequiredComplete state</span>
+<span class="lineno">  179 </span><span class="spaces">  </span><span class="istickedoff">, &quot;steps&quot; .= map stepJson (ssSteps state)</span>
+<span class="lineno">  180 </span><span class="spaces">  </span><span class="istickedoff">, &quot;providers&quot; .= map cardJson (ssProviders state)</span>
+<span class="lineno">  181 </span><span class="spaces">  </span><span class="istickedoff">]</span>
+<span class="lineno">  182 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  183 </span><span class="spaces">    </span><span class="istickedoff">stepJson step = object</span>
+<span class="lineno">  184 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;id&quot; .= stId step</span>
+<span class="lineno">  185 </span><span class="spaces">      </span><span class="istickedoff">, &quot;required&quot; .= stRequired step</span>
+<span class="lineno">  186 </span><span class="spaces">      </span><span class="istickedoff">, &quot;status&quot; .= statusText (stStatus step)</span>
+<span class="lineno">  187 </span><span class="spaces">      </span><span class="istickedoff">, &quot;detail&quot; .= stDetail step</span>
+<span class="lineno">  188 </span><span class="spaces">      </span><span class="istickedoff">, &quot;actions&quot; .= stActions step</span>
+<span class="lineno">  189 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  190 </span><span class="spaces">    </span><span class="istickedoff">cardJson card = object</span>
+<span class="lineno">  191 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;id&quot; .= pcId card</span>
+<span class="lineno">  192 </span><span class="spaces">      </span><span class="istickedoff">, &quot;label&quot; .= pcLabel card</span>
+<span class="lineno">  193 </span><span class="spaces">      </span><span class="istickedoff">, &quot;configured&quot; .= pcConfigured card</span>
+<span class="lineno">  194 </span><span class="spaces">      </span><span class="istickedoff">, &quot;requires_base_url&quot; .= pcRequiresBaseUrl card</span>
+<span class="lineno">  195 </span><span class="spaces">      </span><span class="istickedoff">, &quot;requires_name&quot; .= pcRequiresName card</span>
+<span class="lineno">  196 </span><span class="spaces">      </span><span class="istickedoff">, &quot;isDefault&quot; .= pcIsDefault card</span>
+<span class="lineno">  197 </span><span class="spaces">      </span><span class="istickedoff">, &quot;default_model&quot; .= pcDefaultModel card</span>
+<span class="lineno">  198 </span><span class="spaces">      </span><span class="istickedoff">, &quot;models&quot; .= pcModels card</span>
+<span class="lineno">  199 </span><span class="spaces">      </span><span class="istickedoff">]</span></span>
+<span class="lineno">  200 </span>
+<span class="lineno">  201 </span>statusText :: StepStatus -&gt; Text
+<span class="lineno">  202 </span><span class="decl"><span class="istickedoff">statusText status = case status of</span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="istickedoff">StepReady -&gt; <span class="nottickedoff">&quot;ready&quot;</span></span>
+<span class="lineno">  204 </span><span class="spaces">  </span><span class="istickedoff">StepPending -&gt; &quot;pending&quot;</span>
+<span class="lineno">  205 </span><span class="spaces">  </span><span class="istickedoff">StepBlocked -&gt; &quot;blocked&quot;</span></span>
+<span class="lineno">  206 </span>
+<span class="lineno">  207 </span>-- | A config diagnostic is summarised to its first line and capped: the raw
+<span class="lineno">  208 </span>-- tomland rendering is multi-line, and a detail row is one sentence.
+<span class="lineno">  209 </span>summariseConfigProblem :: Text -&gt; Text
+<span class="lineno">  210 </span><span class="decl"><span class="istickedoff">summariseConfigProblem raw =</span>
+<span class="lineno">  211 </span><span class="spaces">  </span><span class="istickedoff">let firstLine = case T.lines raw of</span>
+<span class="lineno">  212 </span><span class="spaces">        </span><span class="istickedoff">[] -&gt; <span class="nottickedoff">&quot;unparseable&quot;</span></span>
+<span class="lineno">  213 </span><span class="spaces">        </span><span class="istickedoff">(line:_) -&gt; line</span>
+<span class="lineno">  214 </span><span class="spaces">  </span><span class="istickedoff">in T.take 200 (T.strip firstLine)</span></span>
+<span class="lineno">  215 </span>
+<span class="lineno">  216 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  217 </span>-- POST /api/setup/vault
+<span class="lineno">  218 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  219 </span>
+<span class="lineno">  220 </span>handleVaultCreate :: SetupEnv -&gt; Request -&gt; IO Response
+<span class="lineno">  221 </span><span class="decl"><span class="istickedoff">handleVaultCreate env req</span>
+<span class="lineno">  222 </span><span class="spaces">  </span><span class="istickedoff">| not (isJsonRequest req) =</span>
+<span class="lineno">  223 </span><span class="spaces">      </span><span class="istickedoff">pure (setupErr status415 <span class="nottickedoff">&quot;content type must be application/json&quot;</span> <span class="nottickedoff">Nothing</span>)</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = do</span>
+<span class="lineno">  225 </span><span class="spaces">      </span><span class="istickedoff">body &lt;- collectBodyLimited maxSetupBodyBytes req</span>
+<span class="lineno">  226 </span><span class="spaces">      </span><span class="istickedoff">case body of</span>
+<span class="lineno">  227 </span><span class="spaces">        </span><span class="istickedoff">Left () -&gt; pure (setupErr status413 <span class="nottickedoff">&quot;request body exceeds 8 KiB&quot;</span> <span class="nottickedoff">Nothing</span>)</span>
+<span class="lineno">  228 </span><span class="spaces">        </span><span class="istickedoff">Right raw -&gt; case A.eitherDecodeStrict' raw of</span>
+<span class="lineno">  229 </span><span class="spaces">          </span><span class="istickedoff">Left _ -&gt; pure (setupErr status400 <span class="nottickedoff">&quot;request body is not valid JSON&quot;</span> <span class="nottickedoff">Nothing</span>)</span>
+<span class="lineno">  230 </span><span class="spaces">          </span><span class="istickedoff">Right value -&gt; do</span>
+<span class="lineno">  231 </span><span class="spaces">            </span><span class="istickedoff">parsed &lt;- parseVaultSpec value</span>
+<span class="lineno">  232 </span><span class="spaces">            </span><span class="istickedoff">case parsed of</span>
+<span class="lineno">  233 </span><span class="spaces">              </span><span class="istickedoff">Left err -&gt; pure (provisionErrorResponse err)</span>
+<span class="lineno">  234 </span><span class="spaces">              </span><span class="istickedoff">Right spec -&gt; do</span>
+<span class="lineno">  235 </span><span class="spaces">                </span><span class="istickedoff">outcome &lt;- provisionVault</span>
+<span class="lineno">  236 </span><span class="spaces">                  </span><span class="istickedoff">(sePaths env) (seHandleRef env) (sdProvision (seDeps env)) spec</span>
+<span class="lineno">  237 </span><span class="spaces">                </span><span class="istickedoff">pure $ case outcome of</span>
+<span class="lineno">  238 </span><span class="spaces">                  </span><span class="istickedoff">Left err -&gt; provisionErrorResponse err</span>
+<span class="lineno">  239 </span><span class="spaces">                  </span><span class="istickedoff">Right done -&gt; setupJsonNoStore status201 <span class="nottickedoff">(object</span></span>
+<span class="lineno">  240 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">[ &quot;recipient&quot; .= poRecipient done</span></span>
+<span class="lineno">  241 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, &quot;key_type&quot; .= poKeyType done</span></span>
+<span class="lineno">  242 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">])</span></span></span>
+<span class="lineno">  243 </span>
+<span class="lineno">  244 </span>-- | The status mapping the design fixes (§9.2). 409 for &quot;someone else already
+<span class="lineno">  245 </span>-- holds this state&quot;, 422 for &quot;your environment cannot do this&quot;, 500 for &quot;we
+<span class="lineno">  246 </span>-- could not write it&quot;.
+<span class="lineno">  247 </span>provisionErrorResponse :: ProvisionError -&gt; Response
+<span class="lineno">  248 </span><span class="decl"><span class="istickedoff">provisionErrorResponse err =</span>
+<span class="lineno">  249 </span><span class="spaces">  </span><span class="istickedoff">let (reason, mHint) = renderProvisionError err</span>
+<span class="lineno">  250 </span><span class="spaces">  </span><span class="istickedoff">in setupErr (statusForProvisionError err) reason mHint</span></span>
+<span class="lineno">  251 </span>
+<span class="lineno">  252 </span>statusForProvisionError :: ProvisionError -&gt; Status
+<span class="lineno">  253 </span><span class="decl"><span class="istickedoff">statusForProvisionError err = case err of</span>
+<span class="lineno">  254 </span><span class="spaces">  </span><span class="istickedoff">ProvisionInvalidInput _      -&gt; status400</span>
+<span class="lineno">  255 </span><span class="spaces">  </span><span class="istickedoff">ProvisionAlreadyExists       -&gt; status409</span>
+<span class="lineno">  256 </span><span class="spaces">  </span><span class="istickedoff">ProvisionInProgress          -&gt; status409</span>
+<span class="lineno">  257 </span><span class="spaces">  </span><span class="istickedoff">ProvisionKeygenMissing _     -&gt; <span class="nottickedoff">status422</span></span>
+<span class="lineno">  258 </span><span class="spaces">  </span><span class="istickedoff">ProvisionNeedsTty _          -&gt; status422</span>
+<span class="lineno">  259 </span><span class="spaces">  </span><span class="istickedoff">ProvisionRoundTripFailed _   -&gt; status422</span>
+<span class="lineno">  260 </span><span class="spaces">  </span><span class="istickedoff">ProvisionKeygenFailed _      -&gt; <span class="nottickedoff">status422</span></span>
+<span class="lineno">  261 </span><span class="spaces">  </span><span class="istickedoff">ProvisionVaultInitFailed     -&gt; <span class="nottickedoff">status500</span></span>
+<span class="lineno">  262 </span><span class="spaces">  </span><span class="istickedoff">ProvisionVaultUnreadable     -&gt; <span class="nottickedoff">status500</span></span>
+<span class="lineno">  263 </span><span class="spaces">  </span><span class="istickedoff">ProvisionConfigWriteFailed _ -&gt; status500</span></span>
+<span class="lineno">  264 </span>
+<span class="lineno">  265 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  266 </span>-- POST /api/setup/vault/reopen
+<span class="lineno">  267 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  268 </span>
+<span class="lineno">  269 </span>-- | Open (and, in @startup@ mode, unlock) the vault that is already configured
+<span class="lineno">  270 </span>-- on disk, under the same setup lock provisioning uses — a reopen racing a
+<span class="lineno">  271 </span>-- create would otherwise open a half-written file.
+<span class="lineno">  272 </span>--
+<span class="lineno">  273 </span>-- It cannot call @Seal.Command.Serve@'s @tryOpenVault@ (import cycle), so this
+<span class="lineno">  274 </span>-- is the same short composition spelled out: load → resolveEncryptor →
+<span class="lineno">  275 </span>-- openVault → vhUnlock (startup) → writeIORef.
+<span class="lineno">  276 </span>handleVaultReopen :: SetupEnv -&gt; IO Response
+<span class="lineno">  277 </span><span class="decl"><span class="istickedoff">handleVaultReopen env = do</span>
+<span class="lineno">  278 </span><span class="spaces">  </span><span class="istickedoff">let lockPath = pdLockPath (sdProvision (seDeps env))</span>
+<span class="lineno">  279 </span><span class="spaces">  </span><span class="istickedoff">result &lt;- withSetupLock lockPath (reopenAction env)</span>
+<span class="lineno">  280 </span><span class="spaces">  </span><span class="istickedoff">pure (either <span class="nottickedoff">provisionErrorResponse</span> id result)</span></span>
+<span class="lineno">  281 </span>
+<span class="lineno">  282 </span>reopenAction :: SetupEnv -&gt; IO (Either ProvisionError Response)
+<span class="lineno">  283 </span><span class="decl"><span class="istickedoff">reopenAction env = do</span>
+<span class="lineno">  284 </span><span class="spaces">  </span><span class="istickedoff">security &lt;- loadSecurityConfig (seSecurityPath env)</span>
+<span class="lineno">  285 </span><span class="spaces">  </span><span class="istickedoff">case security of</span>
+<span class="lineno">  286 </span><span class="spaces">    </span><span class="istickedoff">Left _ -&gt;</span>
+<span class="lineno">  287 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">pure (Left (ProvisionConfigWriteFailed &quot;security.toml could not be read&quot;))</span></span>
+<span class="lineno">  288 </span><span class="spaces">    </span><span class="istickedoff">Right sec -&gt; case (scVaultRecipient sec, scVaultIdentity sec) of</span>
+<span class="lineno">  289 </span><span class="spaces">      </span><span class="istickedoff">(Just recipient, Just identity) -&gt;</span>
+<span class="lineno">  290 </span><span class="spaces">        </span><span class="istickedoff">reopenConfigured env sec <span class="nottickedoff">recipient</span> <span class="nottickedoff">identity</span></span>
+<span class="lineno">  291 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; pure (Right (setupErr status409</span>
+<span class="lineno">  292 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">&quot;no vault key is recorded&quot;</span></span>
+<span class="lineno">  293 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">(Just &quot;run /vault setup in `seal tui`, then Re-check&quot;)</span>))</span></span>
+<span class="lineno">  294 </span>
+<span class="lineno">  295 </span>reopenConfigured
+<span class="lineno">  296 </span>  :: SetupEnv -&gt; SecurityConfig -&gt; Text -&gt; Text
+<span class="lineno">  297 </span>  -&gt; IO (Either ProvisionError Response)
+<span class="lineno">  298 </span><span class="decl"><span class="istickedoff">reopenConfigured env sec recipient identity = do</span>
+<span class="lineno">  299 </span><span class="spaces">  </span><span class="istickedoff">let vaultPath = maybe (vaultFilePath (sePaths env)) <span class="nottickedoff">T.unpack</span> (scVaultPath sec)</span>
+<span class="lineno">  300 </span><span class="spaces">      </span><span class="istickedoff">keyType = fromMaybe <span class="nottickedoff">&quot;unknown&quot;</span> (scVaultKeyType sec)</span>
+<span class="lineno">  301 </span><span class="spaces">      </span><span class="istickedoff">mode = parseUnlockMode (scVaultUnlock sec)</span>
+<span class="lineno">  302 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist vaultPath</span>
+<span class="lineno">  303 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  304 </span><span class="spaces">    </span><span class="istickedoff">then pure (Right (setupErr status409</span>
+<span class="lineno">  305 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">&quot;the vault file does not exist yet&quot;</span></span>
+<span class="lineno">  306 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">(Just &quot;use the \&quot;resume\&quot; backend to create it&quot;)</span>))</span>
+<span class="lineno">  307 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  308 </span><span class="spaces">      </span><span class="istickedoff">-- The same seam production resolves through ('mkAgeEncryptor'): it</span>
+<span class="lineno">  309 </span><span class="spaces">      </span><span class="istickedoff">-- validates both credentials and stays injectable in tests.</span>
+<span class="lineno">  310 </span><span class="spaces">      </span><span class="istickedoff">encryptor &lt;- seMk (pdEncryptor (sdProvision (seDeps env)))</span>
+<span class="lineno">  311 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">(AgeRecipient recipient)</span> <span class="nottickedoff">(AgeIdentity identity)</span></span>
+<span class="lineno">  312 </span><span class="spaces">      </span><span class="istickedoff">case encryptor of</span>
+<span class="lineno">  313 </span><span class="spaces">        </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">pure (Right (setupErr status422</span></span>
+<span class="lineno">  314 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">&quot;the recorded vault key cannot be loaded&quot;</span></span>
+<span class="lineno">  315 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(Just &quot;restore the identity file named in ~/.seal/security.toml, or re-run /vault setup in `seal tui`&quot;)))</span></span>
+<span class="lineno">  316 </span><span class="spaces">        </span><span class="istickedoff">Right enc -&gt; do</span>
+<span class="lineno">  317 </span><span class="spaces">          </span><span class="istickedoff">handle &lt;- openVault</span>
+<span class="lineno">  318 </span><span class="spaces">            </span><span class="istickedoff">(VaultConfig { vcPath = vaultPath, vcKeyType = <span class="nottickedoff">keyType</span>, vcUnlock = mode })</span>
+<span class="lineno">  319 </span><span class="spaces">            </span><span class="istickedoff">enc</span>
+<span class="lineno">  320 </span><span class="spaces">          </span><span class="istickedoff">-- startup mode is the only one that is genuinely locked in-process.</span>
+<span class="lineno">  321 </span><span class="spaces">          </span><span class="istickedoff">when (mode == UnlockStartup) (void (vhUnlock handle))</span>
+<span class="lineno">  322 </span><span class="spaces">          </span><span class="istickedoff">listResult &lt;- vhList handle</span>
+<span class="lineno">  323 </span><span class="spaces">          </span><span class="istickedoff">case listResult of</span>
+<span class="lineno">  324 </span><span class="spaces">            </span><span class="istickedoff">Left _ -&gt; pure (Right (setupErr status422</span>
+<span class="lineno">  325 </span><span class="spaces">              </span><span class="istickedoff">&quot;the vault file cannot be opened with the recorded key&quot;</span>
+<span class="lineno">  326 </span><span class="spaces">              </span><span class="istickedoff">(Just &quot;if it holds no secrets yet: mv ~/.seal/config/vault/vault.age \</span>
+<span class="lineno">  327 </span><span class="spaces">                    </span><span class="istickedoff">\~/.seal/config/vault/vault.age.bak, then Re-check; otherwise \</span>
+<span class="lineno">  328 </span><span class="spaces">                    </span><span class="istickedoff">\restore the matching identity file&quot;)))</span>
+<span class="lineno">  329 </span><span class="spaces">            </span><span class="istickedoff">Right _ -&gt; do</span>
+<span class="lineno">  330 </span><span class="spaces">              </span><span class="istickedoff">writeIORef (seHandleRef env) (Just <span class="nottickedoff">handle</span>)</span>
+<span class="lineno">  331 </span><span class="spaces">              </span><span class="istickedoff">pure (Right (setupJson status200 (object</span>
+<span class="lineno">  332 </span><span class="spaces">                </span><span class="istickedoff">[ &quot;opened&quot; .= True</span>
+<span class="lineno">  333 </span><span class="spaces">                </span><span class="istickedoff">, &quot;key_type&quot; .= keyType</span>
+<span class="lineno">  334 </span><span class="spaces">                </span><span class="istickedoff">, &quot;locked&quot; .= (False :: Bool)</span>
+<span class="lineno">  335 </span><span class="spaces">                </span><span class="istickedoff">])))</span></span>
+<span class="lineno">  336 </span>
+<span class="lineno">  337 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  338 </span>-- POST /api/providers/:name/test
+<span class="lineno">  339 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  340 </span>
+<span class="lineno">  341 </span>-- | Ping the provider's *stored* configuration. A failed ping is not an HTTP
+<span class="lineno">  342 </span>-- error (the browser renders it next to the field); only an unknown provider
+<span class="lineno">  343 </span>-- (400) or a vault that is not open (500) is.
+<span class="lineno">  344 </span>handleProviderTest :: SetupEnv -&gt; Text -&gt; Request -&gt; IO Response
+<span class="lineno">  345 </span><span class="decl"><span class="istickedoff">handleProviderTest env rawName req = do</span>
+<span class="lineno">  346 </span><span class="spaces">  </span><span class="istickedoff">runtime &lt;- loadRuntimeConfig (seConfigPath env)</span>
+<span class="lineno">  347 </span><span class="spaces">  </span><span class="istickedoff">let cfg = fromRight <span class="nottickedoff">defaultRuntimeConfig</span> runtime</span>
+<span class="lineno">  348 </span><span class="spaces">      </span><span class="istickedoff">known = isJust (parseProvider rawName)</span>
+<span class="lineno">  349 </span><span class="spaces">                </span><span class="istickedoff">|| <span class="nottickedoff">rawName</span> `elem` customProviderNames cfg</span>
+<span class="lineno">  350 </span><span class="spaces">  </span><span class="istickedoff">if not known</span>
+<span class="lineno">  351 </span><span class="spaces">    </span><span class="istickedoff">then pure (setupErr status400</span>
+<span class="lineno">  352 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">(&quot;unknown provider: &quot; &lt;&gt; rawName)</span></span>
+<span class="lineno">  353 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">(Just &quot;known providers: anthropic, openrouter, ollama, or a configured OpenAI-compatible instance&quot;)</span>)</span>
+<span class="lineno">  354 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  355 </span><span class="spaces">      </span><span class="istickedoff">mhandle &lt;- readIORef (seHandleRef env)</span>
+<span class="lineno">  356 </span><span class="spaces">      </span><span class="istickedoff">case mhandle of</span>
+<span class="lineno">  357 </span><span class="spaces">        </span><span class="istickedoff">-- The design decides the vault-unavailable case by reading the handle</span>
+<span class="lineno">  358 </span><span class="spaces">        </span><span class="istickedoff">-- first, never by matching on the resolver's error text.</span>
+<span class="lineno">  359 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; pure (setupErr status500</span>
+<span class="lineno">  360 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">&quot;the vault is not open&quot;</span></span>
+<span class="lineno">  361 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(Just &quot;create the vault (or reopen it) before testing a provider&quot;)</span>)</span>
+<span class="lineno">  362 </span><span class="spaces">        </span><span class="istickedoff">Just _ -&gt; do</span>
+<span class="lineno">  363 </span><span class="spaces">          </span><span class="istickedoff">model &lt;- testModel env rawName req</span>
+<span class="lineno">  364 </span><span class="spaces">          </span><span class="istickedoff">resolved &lt;- sdResolveProvider (seDeps env) <span class="nottickedoff">rawName</span> model</span>
+<span class="lineno">  365 </span><span class="spaces">          </span><span class="istickedoff">case resolved of</span>
+<span class="lineno">  366 </span><span class="spaces">            </span><span class="istickedoff">Left err -&gt; pure (pingFailed err)</span>
+<span class="lineno">  367 </span><span class="spaces">            </span><span class="istickedoff">Right provider -&gt; do</span>
+<span class="lineno">  368 </span><span class="spaces">              </span><span class="istickedoff">-- What this can prove, precisely: the credential resolves into</span>
+<span class="lineno">  369 </span><span class="spaces">              </span><span class="istickedoff">-- a working provider object, and (for providers whose</span>
+<span class="lineno">  370 </span><span class="spaces">              </span><span class="istickedoff">-- listModels actually calls the network — Ollama does,</span>
+<span class="lineno">  371 </span><span class="spaces">              </span><span class="istickedoff">-- Anthropic returns its static catalogue) that call succeeded.</span>
+<span class="lineno">  372 </span><span class="spaces">              </span><span class="istickedoff">-- It is not a completion round-trip: that would spend tokens and</span>
+<span class="lineno">  373 </span><span class="spaces">              </span><span class="istickedoff">-- take seconds on every click. The copy says &quot;credentials</span>
+<span class="lineno">  374 </span><span class="spaces">              </span><span class="istickedoff">-- resolved&quot; rather than &quot;reachable&quot; for that reason.</span>
+<span class="lineno">  375 </span><span class="spaces">              </span><span class="istickedoff">listed &lt;- listSome provider</span>
+<span class="lineno">  376 </span><span class="spaces">              </span><span class="istickedoff">pure $ case listed of</span>
+<span class="lineno">  377 </span><span class="spaces">                </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pingFailed err</span></span>
+<span class="lineno">  378 </span><span class="spaces">                </span><span class="istickedoff">Right models -&gt; setupJson status200 (object</span>
+<span class="lineno">  379 </span><span class="spaces">                  </span><span class="istickedoff">[ &quot;ok&quot; .= True</span>
+<span class="lineno">  380 </span><span class="spaces">                  </span><span class="istickedoff">, &quot;detail&quot; .= (&quot;credentials resolved&quot; :: Text)</span>
+<span class="lineno">  381 </span><span class="spaces">                  </span><span class="istickedoff">, &quot;models&quot; .= length models</span>
+<span class="lineno">  382 </span><span class="spaces">                  </span><span class="istickedoff">])</span></span>
+<span class="lineno">  383 </span>
+<span class="lineno">  384 </span>-- | A failed ping is not an HTTP error: the wizard renders it inline next to
+<span class="lineno">  385 </span>-- the field (design §9.4).
+<span class="lineno">  386 </span>pingFailed :: Text -&gt; Response
+<span class="lineno">  387 </span><span class="decl"><span class="istickedoff">pingFailed err = setupJson status200 (object</span>
+<span class="lineno">  388 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;ok&quot; .= False</span>
+<span class="lineno">  389 </span><span class="spaces">  </span><span class="istickedoff">, &quot;error&quot; .= err</span>
+<span class="lineno">  390 </span><span class="spaces">  </span><span class="istickedoff">])</span></span>
+<span class="lineno">  391 </span>
+<span class="lineno">  392 </span>-- | The model the ping uses: the request's @model@ when given, else what a new
+<span class="lineno">  393 </span>-- session would use (global default, then the provider's configured default,
+<span class="lineno">  394 </span>-- then the provider's hardcoded default).
+<span class="lineno">  395 </span>testModel :: SetupEnv -&gt; Text -&gt; Request -&gt; IO ModelId
+<span class="lineno">  396 </span><span class="decl"><span class="istickedoff">testModel env name req = do</span>
+<span class="lineno">  397 </span><span class="spaces">  </span><span class="istickedoff">raw &lt;- collectBodyLimited maxSetupBodyBytes req</span>
+<span class="lineno">  398 </span><span class="spaces">  </span><span class="istickedoff">let fromBody = case raw of</span>
+<span class="lineno">  399 </span><span class="spaces">        </span><span class="istickedoff">Right bytes -&gt; case A.eitherDecodeStrict' bytes of</span>
+<span class="lineno">  400 </span><span class="spaces">          </span><span class="istickedoff">Right (A.Object o) -&gt; case KeyMap.lookup (Key.fromText &quot;model&quot;) o of</span>
+<span class="lineno">  401 </span><span class="spaces">            </span><span class="istickedoff">Just (A.String m) | <span class="nottickedoff">not (T.null (T.strip m))</span> -&gt; <span class="nottickedoff">Just (T.strip m)</span></span>
+<span class="lineno">  402 </span><span class="spaces">            </span><span class="istickedoff">_ -&gt; Nothing</span>
+<span class="lineno">  403 </span><span class="spaces">          </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  404 </span><span class="spaces">        </span><span class="istickedoff">Left () -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  405 </span><span class="spaces">  </span><span class="istickedoff">case fromBody of</span>
+<span class="lineno">  406 </span><span class="spaces">    </span><span class="istickedoff">Just m -&gt; <span class="nottickedoff">pure (ModelId m)</span></span>
+<span class="lineno">  407 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  408 </span><span class="spaces">      </span><span class="istickedoff">runtime &lt;- loadRuntimeConfig (seConfigPath env)</span>
+<span class="lineno">  409 </span><span class="spaces">      </span><span class="istickedoff">let cfg = fromRight <span class="nottickedoff">defaultRuntimeConfig</span> runtime</span>
+<span class="lineno">  410 </span><span class="spaces">          </span><span class="istickedoff">ModelId fallback = resolveDefaultModelForName cfg name</span>
+<span class="lineno">  411 </span><span class="spaces">      </span><span class="istickedoff">pure $ ModelId $ fromMaybe fallback (rcDefaultModel cfg)</span></span>
+<span class="lineno">  412 </span>
+<span class="lineno">  413 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  414 </span>-- Plumbing
+<span class="lineno">  415 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  416 </span>
+<span class="lineno">  417 </span>-- | Setup request bodies are small JSON documents (a backend tag, a recipient,
+<span class="lineno">  418 </span>-- a path). 8 KiB is two orders of magnitude above the largest legitimate body
+<span class="lineno">  419 </span>-- and keeps a hostile peer from buffering a gigabyte.
+<span class="lineno">  420 </span>maxSetupBodyBytes :: Int
+<span class="lineno">  421 </span><span class="decl"><span class="istickedoff">maxSetupBodyBytes = 8192</span></span>
+<span class="lineno">  422 </span>
+<span class="lineno">  423 </span>-- | Read a request body, counting bytes as they arrive.
+<span class="lineno">  424 </span>--
+<span class="lineno">  425 </span>-- 'Left' means the body exceeded the limit; the caller answers @413@. Reading
+<span class="lineno">  426 </span>-- stops at the cap, so the excess is never buffered (the reason to prefer this
+<span class="lineno">  427 </span>-- over a @Content-Length@ check alone, which a chunked request can omit).
+<span class="lineno">  428 </span>collectBodyLimited :: Int -&gt; Request -&gt; IO (Either () ByteString)
+<span class="lineno">  429 </span><span class="decl"><span class="istickedoff">collectBodyLimited limit req = go 0 []</span>
+<span class="lineno">  430 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  431 </span><span class="spaces">    </span><span class="istickedoff">go !bytes acc = do</span>
+<span class="lineno">  432 </span><span class="spaces">      </span><span class="istickedoff">chunk &lt;- getRequestBodyChunk req</span>
+<span class="lineno">  433 </span><span class="spaces">      </span><span class="istickedoff">if BC.null chunk</span>
+<span class="lineno">  434 </span><span class="spaces">        </span><span class="istickedoff">then pure (Right (BS.concat (reverse acc)))</span>
+<span class="lineno">  435 </span><span class="spaces">        </span><span class="istickedoff">else</span>
+<span class="lineno">  436 </span><span class="spaces">          </span><span class="istickedoff">let bytes' = bytes + BS.length chunk</span>
+<span class="lineno">  437 </span><span class="spaces">          </span><span class="istickedoff">in if bytes' &gt; limit</span>
+<span class="lineno">  438 </span><span class="spaces">               </span><span class="istickedoff">then pure (Left ())</span>
+<span class="lineno">  439 </span><span class="spaces">               </span><span class="istickedoff">else go bytes' (chunk : acc)</span></span>
+<span class="lineno">  440 </span>
+<span class="lineno">  441 </span>isJsonRequest :: Request -&gt; Bool
+<span class="lineno">  442 </span><span class="decl"><span class="istickedoff">isJsonRequest req = case lookup hContentType (requestHeaders req) of</span>
+<span class="lineno">  443 </span><span class="spaces">  </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">False</span></span>
+<span class="lineno">  444 </span><span class="spaces">  </span><span class="istickedoff">Just raw -&gt;</span>
+<span class="lineno">  445 </span><span class="spaces">    </span><span class="istickedoff">let mediaType = T.toCaseFold (T.strip (T.takeWhile (/= ';') (decodeHeader raw)))</span>
+<span class="lineno">  446 </span><span class="spaces">    </span><span class="istickedoff">in mediaType == &quot;application/json&quot;</span>
+<span class="lineno">  447 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  448 </span><span class="spaces">    </span><span class="istickedoff">decodeHeader = TE.decodeUtf8Lenient</span></span>
+<span class="lineno">  449 </span>
+<span class="lineno">  450 </span>-- | A JSON response for a setup handler (no CORS grant, matching the rest of
+<span class="lineno">  451 </span>-- the mutation surface after the guard landed).
+<span class="lineno">  452 </span>setupJson :: Status -&gt; Value -&gt; Response
+<span class="lineno">  453 </span><span class="decl"><span class="istickedoff">setupJson st = responseLBS st <span class="nottickedoff">[jsonHeader]</span> . A.encode</span></span>
+<span class="lineno">  454 </span>
+<span class="lineno">  455 </span>-- | A JSON response that must never be cached, and never sniffed: the wizard's
+<span class="lineno">  456 </span>-- state describes system configuration, and a stale copy would tell the user to
+<span class="lineno">  457 </span>-- redo a finished step.
+<span class="lineno">  458 </span>setupJsonNoStore :: Status -&gt; Value -&gt; Response
+<span class="lineno">  459 </span><span class="decl"><span class="istickedoff">setupJsonNoStore st =</span>
+<span class="lineno">  460 </span><span class="spaces">  </span><span class="istickedoff">responseLBS st [jsonHeader, noStoreHeader, <span class="nottickedoff">noSniffHeader</span>] . A.encode</span></span>
+<span class="lineno">  461 </span>
+<span class="lineno">  462 </span>-- | The shared error envelope: @{&quot;error&quot;: …, &quot;hint&quot;: …?}@. The hint is a
+<span class="lineno">  463 </span>-- copy-pasteable next step (a command, a path to repair); it never carries key
+<span class="lineno">  464 </span>-- material or an identity file's contents.
+<span class="lineno">  465 </span>setupErr :: Status -&gt; Text -&gt; Maybe Text -&gt; Response
+<span class="lineno">  466 </span><span class="decl"><span class="istickedoff">setupErr st err mHint = setupJson st $ object $</span>
+<span class="lineno">  467 </span><span class="spaces">  </span><span class="istickedoff">[&quot;error&quot; .= err] &lt;&gt; maybe <span class="nottickedoff">[]</span> (\h -&gt; [&quot;hint&quot; .= h]) mHint</span></span>
+<span class="lineno">  468 </span>
+<span class="lineno">  469 </span>jsonHeader :: Header
+<span class="lineno">  470 </span><span class="decl"><span class="istickedoff">jsonHeader = (mkHN &quot;Content-Type&quot;, <span class="nottickedoff">&quot;application/json&quot;</span>)</span></span>
+<span class="lineno">  471 </span>
+<span class="lineno">  472 </span>noStoreHeader :: Header
+<span class="lineno">  473 </span><span class="decl"><span class="istickedoff">noStoreHeader = (mkHN &quot;Cache-Control&quot;, &quot;no-store&quot;)</span></span>
+<span class="lineno">  474 </span>
+<span class="lineno">  475 </span>noSniffHeader :: Header
+<span class="lineno">  476 </span><span class="decl"><span class="nottickedoff">noSniffHeader = (mkHN &quot;X-Content-Type-Options&quot;, &quot;nosniff&quot;)</span></span>
+<span class="lineno">  477 </span>
+<span class="lineno">  478 </span>mkHN :: String -&gt; HeaderName
+<span class="lineno">  479 </span><span class="decl"><span class="istickedoff">mkHN = CI.mk . BC.pack</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,281 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The @[channels.\&lt;id\&gt;]@ config model + bidirectional TOML codec + pure
+<span class="lineno">    3 </span>-- channel resolution. This is the leaf module for multi-instance chat channel
+<span class="lineno">    4 </span>-- management (design §3.1, §3.2, §3.4, §3.5).
+<span class="lineno">    5 </span>--
+<span class="lineno">    6 </span>-- It exports only the leaf types + codec + resolution — no 'RuntimeConfig'
+<span class="lineno">    7 </span>-- import, keeping the module acyclic (migration lives in &quot;Seal.Config.File&quot;).
+<span class="lineno">    8 </span>module Seal.Channels.Config
+<span class="lineno">    9 </span>  ( -- * Channel id
+<span class="lineno">   10 </span>    ChannelId (..)
+<span class="lineno">   11 </span>  , mkChannelId
+<span class="lineno">   12 </span>  , channelIdText
+<span class="lineno">   13 </span>  , isValidChannelId
+<span class="lineno">   14 </span>    -- * Channel config
+<span class="lineno">   15 </span>  , ChannelConfig (..)
+<span class="lineno">   16 </span>    -- * Resolved channel
+<span class="lineno">   17 </span>  , ResolvedChannel (..)
+<span class="lineno">   18 </span>    -- * TOML codec
+<span class="lineno">   19 </span>  , channelConfigCodec
+<span class="lineno">   20 </span>  , keyChannelIdBiMap
+<span class="lineno">   21 </span>  , restrictChannelKind
+<span class="lineno">   22 </span>    -- * Vault keys
+<span class="lineno">   23 </span>  , telegramVaultKeyFor
+<span class="lineno">   24 </span>    -- * Resolution (pure)
+<span class="lineno">   25 </span>  , resolveChannelConfig
+<span class="lineno">   26 </span>    -- * Migration helpers
+<span class="lineno">   27 </span>  , fromSignalConfig
+<span class="lineno">   28 </span>  , fromTelegramConfig
+<span class="lineno">   29 </span>  ) where
+<span class="lineno">   30 </span>import Data.Bifunctor (first)
+<span class="lineno">   31 </span>
+<span class="lineno">   32 </span>import Data.Set (Set)
+<span class="lineno">   33 </span>import Data.Set qualified as Set
+<span class="lineno">   34 </span>import Data.Text (Text)
+<span class="lineno">   35 </span>import Data.Text qualified as T
+<span class="lineno">   36 </span>import Toml ((.=))
+<span class="lineno">   37 </span>import Toml qualified
+<span class="lineno">   38 </span>import Toml.Codec.BiMap (BiMap (..), TomlBiMap, TomlBiMapError (..))
+<span class="lineno">   39 </span>import Toml.Parser (parseKey, unTomlParseError)
+<span class="lineno">   40 </span>import Toml.Type.Key (Key)
+<span class="lineno">   41 </span>import Toml.Type.Printer (prettyKey)
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>import Seal.Core.AllowList (AllowList (..), allowListCodec)
+<span class="lineno">   44 </span>import Seal.Core.ChannelKind (ChannelKind (..), channelKindFromText, channelKindToText)
+<span class="lineno">   45 </span>import Seal.Core.MessageSource (UserId)
+<span class="lineno">   46 </span>import Seal.Signal.Config
+<span class="lineno">   47 </span>  ( SignalAccount
+<span class="lineno">   48 </span>  , SignalConfig (..)
+<span class="lineno">   49 </span>  , defaultSignalConfig
+<span class="lineno">   50 </span>  , resolveSignalConfig
+<span class="lineno">   51 </span>  )
+<span class="lineno">   52 </span>import Seal.Telegram.Config
+<span class="lineno">   53 </span>  ( TelegramConfig (..)
+<span class="lineno">   54 </span>  , TelegramToken
+<span class="lineno">   55 </span>  , defaultTelegramConfig
+<span class="lineno">   56 </span>  , resolveTelegramConfig
+<span class="lineno">   57 </span>  )
+<span class="lineno">   58 </span>
+<span class="lineno">   59 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   60 </span>-- ChannelId — the validated [channels.&lt;id&gt;] key + URL capture + vault-key
+<span class="lineno">   61 </span>-- component. Smart-constructed: non-empty, no leading dash (option-injection
+<span class="lineno">   62 </span>-- defense), charset [A-Za-z0-9_-]. Constructor exported (like RepoId);
+<span class="lineno">   63 </span>-- mkChannelId is used at trust boundaries (POST body, URL capture, TOML key
+<span class="lineno">   64 </span>-- decode via keyChannelIdBiMap).
+<span class="lineno">   65 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   66 </span>
+<span class="lineno">   67 </span>newtype ChannelId = ChannelId Text
+<span class="lineno">   68 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   69 </span>
+<span class="lineno">   70 </span>-- | @[A-Za-z0-9_-]+@, non-empty, no leading dash. Mirrors the 'RepoId'
+<span class="lineno">   71 </span>-- charset but forbids a leading @-@ (option-injection defense).
+<span class="lineno">   72 </span>isValidChannelId :: Text -&gt; Bool
+<span class="lineno">   73 </span><span class="decl"><span class="istickedoff">isValidChannelId t =</span>
+<span class="lineno">   74 </span><span class="spaces">  </span><span class="istickedoff">not (T.null t)</span>
+<span class="lineno">   75 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; T.head t /= '-'</span>
+<span class="lineno">   76 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; T.all validIdChar t</span>
+<span class="lineno">   77 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   78 </span><span class="spaces">    </span><span class="istickedoff">validIdChar :: Char -&gt; Bool</span>
+<span class="lineno">   79 </span><span class="spaces">    </span><span class="istickedoff">validIdChar c = c `Set.member` idChars</span>
+<span class="lineno">   80 </span><span class="spaces">    </span><span class="istickedoff">idChars :: Set Char</span>
+<span class="lineno">   81 </span><span class="spaces">    </span><span class="istickedoff">idChars = Set.fromList</span>
+<span class="lineno">   82 </span><span class="spaces">      </span><span class="istickedoff">$ ['A'..'Z'] &lt;&gt; ['a'..'z'] &lt;&gt; ['0'..'9'] &lt;&gt; &quot;_-&quot;</span></span>
+<span class="lineno">   83 </span>
+<span class="lineno">   84 </span>-- | Smart-construct a 'ChannelId'. Rejects empty, leading dash, and any
+<span class="lineno">   85 </span>-- character outside @[A-Za-z0-9_-]@.
+<span class="lineno">   86 </span>mkChannelId :: Text -&gt; Either Text ChannelId
+<span class="lineno">   87 </span><span class="decl"><span class="istickedoff">mkChannelId t</span>
+<span class="lineno">   88 </span><span class="spaces">  </span><span class="istickedoff">| isValidChannelId t = Right (ChannelId t)</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>          = Left <span class="nottickedoff">(&quot;invalid channel id: &quot; &lt;&gt; T.pack (show t))</span></span></span>
+<span class="lineno">   90 </span>
+<span class="lineno">   91 </span>channelIdText :: ChannelId -&gt; Text
+<span class="lineno">   92 </span><span class="decl"><span class="istickedoff">channelIdText (ChannelId t) = t</span></span>
+<span class="lineno">   93 </span>
+<span class="lineno">   94 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   95 </span>-- ChannelConfig — the [channels.&lt;id&gt;] config section
+<span class="lineno">   96 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>-- | The @[channels.\&lt;id\&gt;]@ config section. All fields optional at the file
+<span class="lineno">   99 </span>-- level except 'ccKind' (required, restricted to Signal/Telegram by the
+<span class="lineno">  100 </span>-- codec). 'ccAccount' is Signal-specific; 'ccToken' is the Telegram
+<span class="lineno">  101 </span>-- config-level token fallback (mirrors 'tcToken' in the legacy
+<span class="lineno">  102 </span>-- 'TelegramConfig'); the vault token takes precedence at resolution time.
+<span class="lineno">  103 </span>data ChannelConfig = ChannelConfig
+<span class="lineno">  104 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">ccKind</span></span></span>           :: ChannelKind
+<span class="lineno">  105 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ccLabel</span></span></span>          :: Maybe Text
+<span class="lineno">  106 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ccAccount</span></span></span>        :: Maybe Text
+<span class="lineno">  107 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ccToken</span></span></span>          :: Maybe Text
+<span class="lineno">  108 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ccTextChunkLimit</span></span></span> :: Maybe Int
+<span class="lineno">  109 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ccAllowFrom</span></span></span>      :: AllowList Text
+<span class="lineno">  110 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  111 </span>
+<span class="lineno">  112 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  113 </span>-- ResolvedChannel — the validated, ready-to-fork channel
+<span class="lineno">  114 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  115 </span>
+<span class="lineno">  116 </span>-- | A channel config that has been validated and smart-constructed into a
+<span class="lineno">  117 </span>-- ready-to-fork form. 'ResolvedSignal' carries the validated 'SignalAccount';
+<span class="lineno">  118 </span>-- 'ResolvedTelegram' carries the validated 'TelegramToken'. Both carry the
+<span class="lineno">  119 </span>-- chunk limit and 'AllowList' 'UserId' for the sender check.
+<span class="lineno">  120 </span>data ResolvedChannel
+<span class="lineno">  121 </span>  = ResolvedSignal SignalAccount Int (AllowList UserId)
+<span class="lineno">  122 </span>  | ResolvedTelegram TelegramToken Int (AllowList UserId)
+<span class="lineno">  123 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  124 </span>
+<span class="lineno">  125 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  126 </span>-- TOML codec (bidirectional, restricted kind)
+<span class="lineno">  127 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  128 </span>
+<span class="lineno">  129 </span>-- | Restrict a TOML @kind@ text value to only @signal@ or @telegram@. All
+<span class="lineno">  130 </span>-- other 'ChannelKind' constructors (Cli, Web, Background, Other) and unknown
+<span class="lineno">  131 </span>-- strings are rejected — 'ResolvedChannel' only has Signal/Telegram arms.
+<span class="lineno">  132 </span>restrictChannelKind :: Text -&gt; Either Text ChannelKind
+<span class="lineno">  133 </span><span class="decl"><span class="istickedoff">restrictChannelKind t = case channelKindFromText t of</span>
+<span class="lineno">  134 </span><span class="spaces">  </span><span class="istickedoff">Just Signal   -&gt; Right Signal</span>
+<span class="lineno">  135 </span><span class="spaces">  </span><span class="istickedoff">Just Telegram -&gt; Right Telegram</span>
+<span class="lineno">  136 </span><span class="spaces">  </span><span class="istickedoff">Just _        -&gt; Left <span class="nottickedoff">(&quot;invalid channel kind: &quot; &lt;&gt; t &lt;&gt; &quot; (only signal/telegram allowed)&quot;)</span></span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="istickedoff">Nothing       -&gt; Left <span class="nottickedoff">(&quot;unknown channel kind: &quot; &lt;&gt; t)</span></span></span>
+<span class="lineno">  138 </span>
+<span class="lineno">  139 </span>-- | Bidirectional tomland codec for a single @[channels.\&lt;id\&gt;]@ table. The
+<span class="lineno">  140 </span>-- @kind@ field is restricted to @signal@/@telegram@ via 'restrictChannelKind'
+<span class="lineno">  141 </span>-- (fail-closed on cli/web/background/other). @allow_from@ uses the shared
+<span class="lineno">  142 </span>-- 'allowListCodec' from 'Seal.Core.AllowList'.
+<span class="lineno">  143 </span>channelConfigCodec :: Toml.TomlCodec ChannelConfig
+<span class="lineno">  144 </span><span class="decl"><span class="istickedoff">channelConfigCodec = ChannelConfig</span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="istickedoff">&lt;$&gt; Toml.textBy channelKindToText restrictChannelKind &quot;kind&quot;  .= ccKind</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;label&quot;)                      .= ccLabel</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;account&quot;)                    .= ccAccount</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;token&quot;)                      .= ccToken</span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.int &quot;text_chunk_limit&quot;)            .= ccTextChunkLimit</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; allowListCodec                                            .= ccAllowFrom</span></span>
+<span class="lineno">  151 </span>
+<span class="lineno">  152 </span>-- | Bidirectional 'TomlBiMap' between TOML 'Key's and 'ChannelId's. @forward@
+<span class="lineno">  153 </span>-- (Key → ChannelId) runs 'mkChannelId' on the rendered key text; a bad id is
+<span class="lineno">  154 </span>-- a 'Failure' (fail-closed). @backward@ (ChannelId → Key) re-parses the id
+<span class="lineno">  155 </span>-- text (guaranteed valid by 'mkChannelId'). Mirrors 'keyRepoBiMap'.
+<span class="lineno">  156 </span>keyChannelIdBiMap :: TomlBiMap Key ChannelId
+<span class="lineno">  157 </span><span class="decl"><span class="istickedoff">keyChannelIdBiMap = BiMap</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="istickedoff">{ forward  = first <span class="nottickedoff">(ArbitraryError . (&quot;invalid channel id key: &quot; &lt;&gt;) . T.pack . show)</span></span>
+<span class="lineno">  159 </span><span class="spaces">                </span><span class="istickedoff">. mkChannelId . prettyKey</span>
+<span class="lineno">  160 </span><span class="spaces">  </span><span class="istickedoff">, backward = first <span class="nottickedoff">(ArbitraryError . unTomlParseError)</span> . parseKey . channelIdText</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  162 </span>
+<span class="lineno">  163 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  164 </span>-- Vault keys for multi-channel Telegram
+<span class="lineno">  165 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  166 </span>
+<span class="lineno">  167 </span>-- | The vault key for a Telegram channel's bot token. The legacy id
+<span class="lineno">  168 </span>-- @telegram@ maps to the unsuffixed key @TELEGRAM_BOT_TOKEN@ (the key the
+<span class="lineno">  169 </span>-- CLI wizard writes), preserving zero-migration. All other ids use the
+<span class="lineno">  170 </span>-- suffixed form @TELEGRAM_BOT_TOKEN_\&lt;id\&gt;@.
+<span class="lineno">  171 </span>telegramVaultKeyFor :: ChannelId -&gt; Text
+<span class="lineno">  172 </span><span class="decl"><span class="istickedoff">telegramVaultKeyFor cid =</span>
+<span class="lineno">  173 </span><span class="spaces">  </span><span class="istickedoff">if channelIdText cid == &quot;telegram&quot;</span>
+<span class="lineno">  174 </span><span class="spaces">    </span><span class="istickedoff">then &quot;TELEGRAM_BOT_TOKEN&quot;</span>
+<span class="lineno">  175 </span><span class="spaces">    </span><span class="istickedoff">else &quot;TELEGRAM_BOT_TOKEN_&quot; &lt;&gt; channelIdText cid</span></span>
+<span class="lineno">  176 </span>
+<span class="lineno">  177 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  178 </span>-- Resolution (pure) — config section + pre-fetched vault token -&gt; ResolvedChannel
+<span class="lineno">  179 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  180 </span>
+<span class="lineno">  181 </span>-- | Resolve a 'ChannelConfig' into a 'ResolvedChannel'. Pure — takes a
+<span class="lineno">  182 </span>-- pre-fetched vault token (if any) rather than a 'VaultHandle', so it is
+<span class="lineno">  183 </span>-- unit-testable without vault I/O. The caller does the @vhGet@ and passes
+<span class="lineno">  184 </span>-- the result here.
+<span class="lineno">  185 </span>--
+<span class="lineno">  186 </span>-- * Signal: delegates to 'resolveSignalConfig' with the account from
+<span class="lineno">  187 </span>--   'ccAccount'. No vault (account is in config). Fails if 'ccAccount' is
+<span class="lineno">  188 </span>--   unset.
+<span class="lineno">  189 </span>-- * Telegram: the vault token (pre-fetched by the caller) takes precedence;
+<span class="lineno">  190 </span>--   if absent, falls back to 'ccToken' (the config-level token, preserved
+<span class="lineno">  191 </span>--   from legacy 'tcToken'); if both absent, fails. Delegates to
+<span class="lineno">  192 </span>--   'resolveTelegramConfig'.
+<span class="lineno">  193 </span>-- * Other kinds: rejected (only Signal/Telegram are valid channel types).
+<span class="lineno">  194 </span>resolveChannelConfig
+<span class="lineno">  195 </span>  :: ChannelId
+<span class="lineno">  196 </span>  -&gt; ChannelConfig
+<span class="lineno">  197 </span>  -&gt; Maybe Text
+<span class="lineno">  198 </span>  -&gt; Either Text ResolvedChannel
+<span class="lineno">  199 </span><span class="decl"><span class="istickedoff">resolveChannelConfig _ cc mVaultToken =</span>
+<span class="lineno">  200 </span><span class="spaces">  </span><span class="istickedoff">case ccKind cc of</span>
+<span class="lineno">  201 </span><span class="spaces">    </span><span class="istickedoff">Signal -&gt; do</span>
+<span class="lineno">  202 </span><span class="spaces">      </span><span class="istickedoff">(acct, limit, allow) &lt;- resolveSignalConfig (Just (signalConfigFromChannel cc)) Nothing</span>
+<span class="lineno">  203 </span><span class="spaces">      </span><span class="istickedoff">Right (ResolvedSignal acct <span class="nottickedoff">limit</span> <span class="nottickedoff">allow</span>)</span>
+<span class="lineno">  204 </span><span class="spaces">    </span><span class="istickedoff">Telegram -&gt; do</span>
+<span class="lineno">  205 </span><span class="spaces">      </span><span class="istickedoff">(token, limit, allow) &lt;- resolveTelegramConfig (Just (telegramConfigFromChannel cc)) mVaultToken</span>
+<span class="lineno">  206 </span><span class="spaces">      </span><span class="istickedoff">Right (ResolvedTelegram token <span class="nottickedoff">limit</span> <span class="nottickedoff">allow</span>)</span>
+<span class="lineno">  207 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; Left <span class="nottickedoff">&quot;unsupported channel kind (only signal/telegram allowed)&quot;</span></span></span>
+<span class="lineno">  208 </span>
+<span class="lineno">  209 </span>-- | Build a 'SignalConfig' from a 'ChannelConfig' for delegation to
+<span class="lineno">  210 </span>-- 'resolveSignalConfig'. Maps 'ccAccount'/'ccTextChunkLimit'/'ccAllowFrom'
+<span class="lineno">  211 </span>-- onto the legacy section shape.
+<span class="lineno">  212 </span>signalConfigFromChannel :: ChannelConfig -&gt; SignalConfig
+<span class="lineno">  213 </span><span class="decl"><span class="istickedoff">signalConfigFromChannel cc = defaultSignalConfig</span>
+<span class="lineno">  214 </span><span class="spaces">  </span><span class="istickedoff">{ scAccount        = ccAccount cc</span>
+<span class="lineno">  215 </span><span class="spaces">  </span><span class="istickedoff">, scTextChunkLimit = <span class="nottickedoff">ccTextChunkLimit cc</span></span>
+<span class="lineno">  216 </span><span class="spaces">  </span><span class="istickedoff">, scAllowFrom      = ccAllowFrom cc</span>
+<span class="lineno">  217 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  218 </span>
+<span class="lineno">  219 </span>-- | Build a 'TelegramConfig' from a 'ChannelConfig' for delegation to
+<span class="lineno">  220 </span>-- 'resolveTelegramConfig'. Maps 'ccToken'/'ccTextChunkLimit'/'ccAllowFrom'
+<span class="lineno">  221 </span>-- onto the legacy section shape.
+<span class="lineno">  222 </span>telegramConfigFromChannel :: ChannelConfig -&gt; TelegramConfig
+<span class="lineno">  223 </span><span class="decl"><span class="istickedoff">telegramConfigFromChannel cc = defaultTelegramConfig</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="istickedoff">{ tcToken         = ccToken cc</span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="istickedoff">, tcTextChunkLimit = <span class="nottickedoff">ccTextChunkLimit cc</span></span>
+<span class="lineno">  226 </span><span class="spaces">  </span><span class="istickedoff">, tcAllowFrom     = ccAllowFrom cc</span>
+<span class="lineno">  227 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  228 </span>
+<span class="lineno">  229 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  230 </span>-- Migration helpers — legacy [signal]/[telegram] -&gt; ChannelConfig
+<span class="lineno">  231 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  232 </span>
+<span class="lineno">  233 </span>-- | Convert a legacy 'SignalConfig' (@[signal]@ section) into a
+<span class="lineno">  234 </span>-- 'ChannelConfig' with @kind=Signal@. 'ccToken' is 'Nothing' (Signal has no
+<span class="lineno">  235 </span>-- token). Used by 'migrateLegacyChannels' in &quot;Seal.Config.File&quot;.
+<span class="lineno">  236 </span>fromSignalConfig :: SignalConfig -&gt; ChannelConfig
+<span class="lineno">  237 </span><span class="decl"><span class="istickedoff">fromSignalConfig sc = ChannelConfig</span>
+<span class="lineno">  238 </span><span class="spaces">  </span><span class="istickedoff">{ ccKind           = Signal</span>
+<span class="lineno">  239 </span><span class="spaces">  </span><span class="istickedoff">, ccLabel          = Nothing</span>
+<span class="lineno">  240 </span><span class="spaces">  </span><span class="istickedoff">, ccAccount        = scAccount sc</span>
+<span class="lineno">  241 </span><span class="spaces">  </span><span class="istickedoff">, ccToken          = Nothing</span>
+<span class="lineno">  242 </span><span class="spaces">  </span><span class="istickedoff">, ccTextChunkLimit = scTextChunkLimit sc</span>
+<span class="lineno">  243 </span><span class="spaces">  </span><span class="istickedoff">, ccAllowFrom      = scAllowFrom sc</span>
+<span class="lineno">  244 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  245 </span>
+<span class="lineno">  246 </span>-- | Convert a legacy 'TelegramConfig' (@[telegram]@ section) into a
+<span class="lineno">  247 </span>-- 'ChannelConfig' with @kind=Telegram@. 'ccToken' preserves 'tcToken' so
+<span class="lineno">  248 </span>-- token-in-config setups survive migration. Used by 'migrateLegacyChannels'
+<span class="lineno">  249 </span>-- in &quot;Seal.Config.File&quot;.
+<span class="lineno">  250 </span>fromTelegramConfig :: TelegramConfig -&gt; ChannelConfig
+<span class="lineno">  251 </span><span class="decl"><span class="istickedoff">fromTelegramConfig tc = ChannelConfig</span>
+<span class="lineno">  252 </span><span class="spaces">  </span><span class="istickedoff">{ ccKind           = Telegram</span>
+<span class="lineno">  253 </span><span class="spaces">  </span><span class="istickedoff">, ccLabel          = Nothing</span>
+<span class="lineno">  254 </span><span class="spaces">  </span><span class="istickedoff">, ccAccount        = Nothing</span>
+<span class="lineno">  255 </span><span class="spaces">  </span><span class="istickedoff">, ccToken          = tcToken tc</span>
+<span class="lineno">  256 </span><span class="spaces">  </span><span class="istickedoff">, ccTextChunkLimit = tcTextChunkLimit tc</span>
+<span class="lineno">  257 </span><span class="spaces">  </span><span class="istickedoff">, ccAllowFrom      = tcAllowFrom tc</span>
+<span class="lineno">  258 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+
+</pre>
+</body>
+</html>

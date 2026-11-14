@@ -1,0 +1,446 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE LambdaCase #-}
+<span class="lineno">    2 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    3 </span>-- | The code-level provider registry: the set of providers Seal knows how to
+<span class="lineno">    4 </span>-- build, and the mapping from each to its display label, vault credential key,
+<span class="lineno">    5 </span>-- and default model. Credential resolution (reading the key from the vault and
+<span class="lineno">    6 </span>-- constructing a live 'SomeProvider') is added on top of this vocabulary.
+<span class="lineno">    7 </span>module Seal.Providers.Registry
+<span class="lineno">    8 </span>  ( KnownProvider (..)
+<span class="lineno">    9 </span>  , knownProviders
+<span class="lineno">   10 </span>  , configuredProviders
+<span class="lineno">   11 </span>  , providerLabel
+<span class="lineno">   12 </span>  , anthropicOAuthKey
+<span class="lineno">   13 </span>  , providerId
+<span class="lineno">   14 </span>  , parseProvider
+<span class="lineno">   15 </span>  , validateProviderName
+<span class="lineno">   16 </span>  , isProviderName
+<span class="lineno">   17 </span>  , providerTypeForName
+<span class="lineno">   18 </span>  , vaultKeyName
+<span class="lineno">   19 </span>  , vaultKeyNameForName
+<span class="lineno">   20 </span>  , defaultModelFor
+<span class="lineno">   21 </span>  , resolveDefaultModel
+<span class="lineno">   22 </span>  , resolveDefaultModelForName
+<span class="lineno">   23 </span>  , resolveProvider
+<span class="lineno">   24 </span>  , resolveProviderByName
+<span class="lineno">   25 </span>  , providerBaseUrlFor
+<span class="lineno">   26 </span>  , providerBaseUrlForName
+<span class="lineno">   27 </span>  , customProviderNames
+<span class="lineno">   28 </span>  , configuredCustomProviderNames
+<span class="lineno">   29 </span>  , configuredProviderNames
+<span class="lineno">   30 </span>  , completeSome
+<span class="lineno">   31 </span>  , listSome
+<span class="lineno">   32 </span>  , vaultErrText
+<span class="lineno">   33 </span>  ) where
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>import Control.Monad (void, filterM)
+<span class="lineno">   36 </span>import Data.Char (isAsciiLower, isDigit, toUpper)
+<span class="lineno">   37 </span>import Data.IORef (IORef, newIORef)
+<span class="lineno">   38 </span>import Data.List (sort)
+<span class="lineno">   39 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   40 </span>import Data.Maybe (fromMaybe, isJust, isNothing)
+<span class="lineno">   41 </span>import Data.Text (Text)
+<span class="lineno">   42 </span>import Data.Text qualified as T
+<span class="lineno">   43 </span>import Network.HTTP.Client (Manager)
+<span class="lineno">   44 </span>
+<span class="lineno">   45 </span>import Seal.Config.File (RuntimeConfig (..), providerBaseUrl, providerDefaultModel)
+<span class="lineno">   46 </span>import Seal.Core.Types (ModelId (..), ProviderId (..))
+<span class="lineno">   47 </span>import Seal.Providers.Anthropic
+<span class="lineno">   48 </span>  ( OAuthSession (..), ensureFresh, mkAnthropic, mkAnthropicOAuth )
+<span class="lineno">   49 </span>import Seal.Providers.Anthropic.OAuth
+<span class="lineno">   50 </span>  ( deserializeTokens, refreshTokens, serializeTokens )
+<span class="lineno">   51 </span>import Seal.Providers.Class
+<span class="lineno">   52 </span>  ( CompletionRequest, CompletionResponse, Provider (..), SomeProvider (..) )
+<span class="lineno">   53 </span>import Seal.Providers.Ollama (defaultOllamaBaseUrl, mkOllama, ollamaNeedsKey)
+<span class="lineno">   54 </span>import Seal.Providers.OpenRouter
+<span class="lineno">   55 </span>  ( defaultOpenRouterBaseUrl, mkOpenAICompatible, mkOpenRouter )
+<span class="lineno">   56 </span>import Seal.Security.Secrets (mkApiKey)
+<span class="lineno">   57 </span>import Seal.Security.Vault (VaultHandle (..))
+<span class="lineno">   58 </span>import Seal.Security.Vault.Age (VaultError (..))
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>-- | The Anthropic OAuth token vault key (mirrors
+<span class="lineno">   61 </span>-- 'Seal.Command.Provider.anthropicOAuthKey'; duplicated here to avoid a
+<span class="lineno">   62 </span>-- circular import).
+<span class="lineno">   63 </span>anthropicOAuthKey :: Text
+<span class="lineno">   64 </span><span class="decl"><span class="istickedoff">anthropicOAuthKey = &quot;ANTHROPIC_OAUTH_TOKENS&quot;</span></span>
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>-- | Every provider Seal can build. M1 ships Anthropic only; later milestones
+<span class="lineno">   67 </span>-- extend this sum (the totality of the functions below forces each addition to
+<span class="lineno">   68 </span>-- be handled everywhere).
+<span class="lineno">   69 </span>data KnownProvider
+<span class="lineno">   70 </span>  = AnthropicProvider
+<span class="lineno">   71 </span>  | OllamaProvider
+<span class="lineno">   72 </span>  | OpenRouterProvider
+<span class="lineno">   73 </span>  | OpenAICompatibleProvider
+<span class="lineno">   74 </span>    -- ^ Any OpenAI-compatible @/v1/chat/completions@ endpoint the operator
+<span class="lineno">   75 </span>    -- names (a self-hosted vLLM, LM Studio, api.openai.com, …). Same client as
+<span class="lineno">   76 </span>    -- OpenRouter ('mkOpenAICompatible'); the difference is that it has **no**
+<span class="lineno">   77 </span>    -- built-in base URL — the endpoint is required input, not a default.
+<span class="lineno">   78 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Enum</span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Bounded</span></span></span></span>)
+<span class="lineno">   79 </span>
+<span class="lineno">   80 </span>knownProviders :: [KnownProvider]
+<span class="lineno">   81 </span><span class="decl"><span class="istickedoff">knownProviders = [minBound .. maxBound]</span></span>
+<span class="lineno">   82 </span>
+<span class="lineno">   83 </span>-- | The user-facing id typed at the @/provider@ prompt.
+<span class="lineno">   84 </span>providerLabel :: KnownProvider -&gt; Text
+<span class="lineno">   85 </span><span class="decl"><span class="istickedoff">providerLabel AnthropicProvider = &quot;anthropic&quot;</span>
+<span class="lineno">   86 </span><span class="spaces"></span><span class="istickedoff">providerLabel OllamaProvider    = &quot;ollama&quot;</span>
+<span class="lineno">   87 </span><span class="spaces"></span><span class="istickedoff">providerLabel OpenRouterProvider = &quot;openrouter&quot;</span>
+<span class="lineno">   88 </span><span class="spaces"></span><span class="istickedoff">providerLabel OpenAICompatibleProvider = &quot;openai&quot;</span></span>
+<span class="lineno">   89 </span>
+<span class="lineno">   90 </span>providerId :: KnownProvider -&gt; ProviderId
+<span class="lineno">   91 </span><span class="decl"><span class="istickedoff">providerId = ProviderId . providerLabel</span></span>
+<span class="lineno">   92 </span>
+<span class="lineno">   93 </span>-- | Parse a label (case-insensitive) back to a 'KnownProvider'.
+<span class="lineno">   94 </span>parseProvider :: Text -&gt; Maybe KnownProvider
+<span class="lineno">   95 </span><span class="decl"><span class="istickedoff">parseProvider t =</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">let needle = T.toCaseFold (T.strip t)</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">in lookup needle [(T.toCaseFold (providerLabel p), p) | p &lt;- knownProviders]</span></span>
+<span class="lineno">   98 </span>
+<span class="lineno">   99 </span>-- | Validate a provider instance name. An instance name is the config table
+<span class="lineno">  100 </span>-- key (@[providers.\&lt;name\&gt;]@), the value sessions and agent defs store, and
+<span class="lineno">  101 </span>-- the stem of the instance's vault key. The grammar is an allow-list applied
+<span class="lineno">  102 </span>-- to the raw text (no normalisation): 1-32 characters of @a-z@, @0-9@ and
+<span class="lineno">  103 </span>-- @-@, no leading/trailing @-@, and no @--@. @all@ and @default@ are
+<span class="lineno">  104 </span>-- reserved because they are literal @\/api\/providers\/...@ routes.
+<span class="lineno">  105 </span>validateProviderName :: Text -&gt; Either Text ()
+<span class="lineno">  106 </span><span class="decl"><span class="istickedoff">validateProviderName name</span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="istickedoff">| T.null name = Left <span class="nottickedoff">&quot;provider name must not be empty&quot;</span></span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">T.length name &gt; 32</span> =</span>
+<span class="lineno">  109 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">Left &quot;provider name must be at most 32 characters&quot;</span></span>
+<span class="lineno">  110 </span><span class="spaces">  </span><span class="istickedoff">| name `elem` [&quot;all&quot;, &quot;default&quot;] =</span>
+<span class="lineno">  111 </span><span class="spaces">      </span><span class="istickedoff">Left <span class="nottickedoff">&quot;\&quot;all\&quot; and \&quot;default\&quot; are reserved provider names&quot;</span></span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="istickedoff">| T.any badChar name =</span>
+<span class="lineno">  113 </span><span class="spaces">      </span><span class="istickedoff">Left <span class="nottickedoff">&quot;provider names may contain only a-z, 0-9 and \&quot;-\&quot;&quot;</span></span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="istickedoff">| &quot;-&quot; `T.isPrefixOf` name || &quot;-&quot; `T.isSuffixOf` name =</span>
+<span class="lineno">  115 </span><span class="spaces">      </span><span class="istickedoff">Left <span class="nottickedoff">&quot;provider name must not start or end with \&quot;-\&quot;&quot;</span></span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="istickedoff">| &quot;--&quot; `T.isInfixOf` name =</span>
+<span class="lineno">  117 </span><span class="spaces">      </span><span class="istickedoff">Left <span class="nottickedoff">&quot;provider name must not contain \&quot;--\&quot;&quot;</span></span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">| name `elem` [&quot;anthropic&quot;, &quot;ollama&quot;, &quot;openrouter&quot;] =</span>
+<span class="lineno">  119 </span><span class="spaces">      </span><span class="istickedoff">Left <span class="nottickedoff">(name &lt;&gt; &quot; is a built-in provider type; choose another name&quot;)</span></span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Right ()</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  122 </span><span class="spaces">    </span><span class="istickedoff">badChar c =</span>
+<span class="lineno">  123 </span><span class="spaces">      </span><span class="istickedoff">not (isAsciiLower c || isDigit c || c == '-')</span></span>
+<span class="lineno">  124 </span>
+<span class="lineno">  125 </span>-- | Is @name@ either a built-in provider id or a syntactically valid custom
+<span class="lineno">  126 </span>-- instance name?
+<span class="lineno">  127 </span>isProviderName :: Text -&gt; Bool
+<span class="lineno">  128 </span><span class="decl"><span class="nottickedoff">isProviderName name =</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="nottickedoff">isJust (parseProvider name)</span>
+<span class="lineno">  130 </span><span class="spaces">    </span><span class="nottickedoff">|| either (const False) (const True) (validateProviderName name)</span></span>
+<span class="lineno">  131 </span>
+<span class="lineno">  132 </span>-- | The implementation a name resolves to. An unknown (custom) name is an
+<span class="lineno">  133 </span>-- OpenAI-compatible endpoint: that is the only provider type whose endpoint
+<span class="lineno">  134 </span>-- and name are operator-supplied.
+<span class="lineno">  135 </span>providerTypeForName :: Text -&gt; KnownProvider
+<span class="lineno">  136 </span><span class="decl"><span class="istickedoff">providerTypeForName name = fromMaybe OpenAICompatibleProvider (parseProvider name)</span></span>
+<span class="lineno">  137 </span>
+<span class="lineno">  138 </span>-- | The vault secret name under which this provider's API key is stored.
+<span class="lineno">  139 </span>vaultKeyName :: KnownProvider -&gt; Text
+<span class="lineno">  140 </span><span class="decl"><span class="istickedoff">vaultKeyName AnthropicProvider = &quot;ANTHROPIC_API_KEY&quot;</span>
+<span class="lineno">  141 </span><span class="spaces"></span><span class="istickedoff">vaultKeyName OllamaProvider    = &quot;OLLAMA_API_KEY&quot;</span>
+<span class="lineno">  142 </span><span class="spaces"></span><span class="istickedoff">vaultKeyName OpenRouterProvider = &quot;OPENROUTER_API_KEY&quot;</span>
+<span class="lineno">  143 </span><span class="spaces"></span><span class="istickedoff">vaultKeyName OpenAICompatibleProvider = &quot;OPENAI_API_KEY&quot;</span></span>
+<span class="lineno">  144 </span>
+<span class="lineno">  145 </span>-- | The vault key for a provider name. Built-ins keep their legacy key; a
+<span class="lineno">  146 </span>-- custom OpenAI-compatible instance uses a name-derived key so two instances
+<span class="lineno">  147 </span>-- never share one secret.
+<span class="lineno">  148 </span>vaultKeyNameForName :: Text -&gt; Text
+<span class="lineno">  149 </span><span class="decl"><span class="istickedoff">vaultKeyNameForName name = case parseProvider name of</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="istickedoff">Just kp -&gt; vaultKeyName kp</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="istickedoff">Nothing -&gt; &quot;PROVIDER_APIKEY_&quot; &lt;&gt; shoutySnake name</span>
+<span class="lineno">  152 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  153 </span><span class="spaces">    </span><span class="istickedoff">shoutySnake = T.map (\c -&gt; if c == '-' then '_' else toUpper c)</span></span>
+<span class="lineno">  154 </span>
+<span class="lineno">  155 </span>-- | The model used when the user has not chosen one.
+<span class="lineno">  156 </span>defaultModelFor :: KnownProvider -&gt; ModelId
+<span class="lineno">  157 </span><span class="decl"><span class="istickedoff">defaultModelFor AnthropicProvider = ModelId &quot;claude-opus-4-8&quot;</span>
+<span class="lineno">  158 </span><span class="spaces"></span><span class="istickedoff">defaultModelFor OllamaProvider    = ModelId &quot;llama3.2&quot;</span>
+<span class="lineno">  159 </span><span class="spaces"></span><span class="istickedoff">defaultModelFor OpenRouterProvider = <span class="nottickedoff">ModelId &quot;deepseek/deepseek-v4.1-flash-1017&quot;</span></span>
+<span class="lineno">  160 </span><span class="spaces"></span><span class="istickedoff">-- | A starting point only: a generic endpoint's real model ids are its own, so</span>
+<span class="lineno">  161 </span><span class="spaces"></span><span class="istickedoff">-- the operator overrides this in @[providers.openai] default_model@ or in the</span>
+<span class="lineno">  162 </span><span class="spaces"></span><span class="istickedoff">-- setup wizard.</span>
+<span class="lineno">  163 </span><span class="spaces"></span><span class="istickedoff">defaultModelFor OpenAICompatibleProvider = ModelId &quot;gpt-4o-mini&quot;</span></span>
+<span class="lineno">  164 </span>
+<span class="lineno">  165 </span>-- | A provider's default model: the configured value if given, else the
+<span class="lineno">  166 </span>-- provider's hardcoded default (Anthropic's for an unrecognized label).
+<span class="lineno">  167 </span>resolveDefaultModel :: Maybe Text -&gt; Text -&gt; ModelId
+<span class="lineno">  168 </span><span class="decl"><span class="istickedoff">resolveDefaultModel (Just m) _   = ModelId m</span>
+<span class="lineno">  169 </span><span class="spaces"></span><span class="istickedoff">resolveDefaultModel Nothing  lbl =</span>
+<span class="lineno">  170 </span><span class="spaces">  </span><span class="istickedoff">maybe (defaultModelFor AnthropicProvider) defaultModelFor (parseProvider lbl)</span></span>
+<span class="lineno">  171 </span>
+<span class="lineno">  172 </span>-- | The default model for a provider *name*: the configured value if given,
+<span class="lineno">  173 </span>-- else the implementation's hardcoded default. Custom names are
+<span class="lineno">  174 </span>-- OpenAI-compatible instances.
+<span class="lineno">  175 </span>resolveDefaultModelForName :: RuntimeConfig -&gt; Text -&gt; ModelId
+<span class="lineno">  176 </span><span class="decl"><span class="istickedoff">resolveDefaultModelForName cfg name =</span>
+<span class="lineno">  177 </span><span class="spaces">  </span><span class="istickedoff">case providerDefaultModel cfg name of</span>
+<span class="lineno">  178 </span><span class="spaces">    </span><span class="istickedoff">Just m  -&gt; ModelId m</span>
+<span class="lineno">  179 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; defaultModelFor (providerTypeForName name)</span></span>
+<span class="lineno">  180 </span>
+<span class="lineno">  181 </span>-- | Build a live provider. For Anthropic, stored OAuth tokens take precedence
+<span class="lineno">  182 </span>-- over an API key; a present-but-corrupt OAuth blob fails loudly (the user must
+<span class="lineno">  183 </span>-- re-run @\/provider login@) rather than silently falling back. The @callCounter@
+<span class="lineno">  184 </span>-- is shared across turns so Ollama-synthesized tool-call ids stay unique across
+<span class="lineno">  185 </span>-- a whole session (Ollama responses carry no id, so Seal synthesizes
+<span class="lineno">  186 </span>-- @call_&lt;i&gt;@; the counter must outlive any single 'Ollama' value, which is
+<span class="lineno">  187 </span>-- rebuilt each turn — see 'ProviderRuntime.prCallCounter').
+<span class="lineno">  188 </span>resolveProvider
+<span class="lineno">  189 </span>  :: Maybe VaultHandle -&gt; Manager -&gt; RuntimeConfig -&gt; KnownProvider -&gt; ModelId
+<span class="lineno">  190 </span>  -&gt; IORef Int -&gt; IO (Either Text SomeProvider)
+<span class="lineno">  191 </span><span class="decl"><span class="istickedoff">resolveProvider Nothing _ _ AnthropicProvider _ _ =</span>
+<span class="lineno">  192 </span><span class="spaces">  </span><span class="istickedoff">pure (Left &quot;vault not configured \x2014 run /vault setup&quot;)</span>
+<span class="lineno">  193 </span><span class="spaces"></span><span class="istickedoff">resolveProvider (Just vh) mgr _cfg AnthropicProvider model _ = do</span>
+<span class="lineno">  194 </span><span class="spaces">  </span><span class="istickedoff">eOAuth &lt;- vhGet vh &quot;ANTHROPIC_OAUTH_TOKENS&quot;</span>
+<span class="lineno">  195 </span><span class="spaces">  </span><span class="istickedoff">case eOAuth of</span>
+<span class="lineno">  196 </span><span class="spaces">    </span><span class="istickedoff">Right blob -&gt; case deserializeTokens blob of</span>
+<span class="lineno">  197 </span><span class="spaces">      </span><span class="istickedoff">Left e     -&gt; pure (Left (&quot;stored Anthropic OAuth tokens are unreadable (&quot;</span>
+<span class="lineno">  198 </span><span class="spaces">                                  </span><span class="istickedoff">&lt;&gt; e &lt;&gt; &quot;) — run /provider login anthropic&quot;))</span>
+<span class="lineno">  199 </span><span class="spaces">      </span><span class="istickedoff">Right toks -&gt; do</span>
+<span class="lineno">  200 </span><span class="spaces">        </span><span class="istickedoff">ref &lt;- newIORef toks</span>
+<span class="lineno">  201 </span><span class="spaces">        </span><span class="istickedoff">let sess = OAuthSession</span>
+<span class="lineno">  202 </span><span class="spaces">              </span><span class="istickedoff">{ osTokens  = ref</span>
+<span class="lineno">  203 </span><span class="spaces">              </span><span class="istickedoff">, osRefresh = <span class="nottickedoff">refreshTokens mgr</span></span>
+<span class="lineno">  204 </span><span class="spaces">              </span><span class="istickedoff">, osPersist = <span class="nottickedoff">void . vhPut vh &quot;ANTHROPIC_OAUTH_TOKENS&quot; . serializeTokens</span></span>
+<span class="lineno">  205 </span><span class="spaces">              </span><span class="istickedoff">}</span>
+<span class="lineno">  206 </span><span class="spaces">        </span><span class="istickedoff">_ &lt;- ensureFresh sess</span>
+<span class="lineno">  207 </span><span class="spaces">        </span><span class="istickedoff">pure (Right <span class="nottickedoff">(SomeProvider (mkAnthropicOAuth mgr sess model))</span>)</span>
+<span class="lineno">  208 </span><span class="spaces">    </span><span class="istickedoff">Left _ -&gt; do</span>
+<span class="lineno">  209 </span><span class="spaces">      </span><span class="istickedoff">eKey &lt;- vhGet vh (vaultKeyName AnthropicProvider)</span>
+<span class="lineno">  210 </span><span class="spaces">      </span><span class="istickedoff">pure $ case eKey of</span>
+<span class="lineno">  211 </span><span class="spaces">        </span><span class="istickedoff">Left e         -&gt; Left (credErr AnthropicProvider e)</span>
+<span class="lineno">  212 </span><span class="spaces">        </span><span class="istickedoff">Right keyBytes -&gt; Right (SomeProvider (mkAnthropic <span class="nottickedoff">mgr</span> <span class="nottickedoff">(mkApiKey keyBytes)</span> model))</span>
+<span class="lineno">  213 </span><span class="spaces"></span><span class="istickedoff">resolveProvider mvh mgr cfg OllamaProvider model callCounter</span>
+<span class="lineno">  214 </span><span class="spaces">  </span><span class="istickedoff">| not (ollamaNeedsKey baseUrl) =</span>
+<span class="lineno">  215 </span><span class="spaces">      </span><span class="istickedoff">-- local/custom host: keyless, never touch the vault</span>
+<span class="lineno">  216 </span><span class="spaces">      </span><span class="istickedoff">Right . SomeProvider &lt;$&gt; mkOllama mgr baseUrl Nothing <span class="nottickedoff">model</span> <span class="nottickedoff">callCounter</span></span>
+<span class="lineno">  217 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case mvh of</span>
+<span class="lineno">  218 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt;</span>
+<span class="lineno">  219 </span><span class="spaces">        </span><span class="istickedoff">pure (Left &quot;Ollama Cloud needs an API key \x2014 run /vault setup then /provider add ollama&quot;)</span>
+<span class="lineno">  220 </span><span class="spaces">      </span><span class="istickedoff">Just vh -&gt; do</span>
+<span class="lineno">  221 </span><span class="spaces">        </span><span class="istickedoff">eKey &lt;- vhGet vh (vaultKeyName OllamaProvider)</span>
+<span class="lineno">  222 </span><span class="spaces">        </span><span class="istickedoff">case eKey of</span>
+<span class="lineno">  223 </span><span class="spaces">          </span><span class="istickedoff">Right kb -&gt; Right . <span class="nottickedoff">SomeProvider</span> &lt;$&gt; mkOllama <span class="nottickedoff">mgr</span> <span class="nottickedoff">baseUrl</span> <span class="nottickedoff">(Just (mkApiKey kb))</span> <span class="nottickedoff">model</span> <span class="nottickedoff">callCounter</span></span>
+<span class="lineno">  224 </span><span class="spaces">          </span><span class="istickedoff">Left e   -&gt; pure (Left (vaultErrText e))</span>
+<span class="lineno">  225 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  226 </span><span class="spaces">    </span><span class="istickedoff">baseUrl = providerBaseUrlFor cfg OllamaProvider</span>
+<span class="lineno">  227 </span><span class="spaces"></span><span class="istickedoff">resolveProvider mvh mgr cfg OpenRouterProvider model _ =</span>
+<span class="lineno">  228 </span><span class="spaces">  </span><span class="istickedoff">-- OpenRouter requires a vault-stored API key; no keyless mode.</span>
+<span class="lineno">  229 </span><span class="spaces">  </span><span class="istickedoff">case mvh of</span>
+<span class="lineno">  230 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt;</span>
+<span class="lineno">  231 </span><span class="spaces">      </span><span class="istickedoff">pure (Left &quot;OpenRouter needs an API key \x2014 run /vault setup then /provider add openrouter&quot;)</span>
+<span class="lineno">  232 </span><span class="spaces">    </span><span class="istickedoff">Just vh -&gt; do</span>
+<span class="lineno">  233 </span><span class="spaces">      </span><span class="istickedoff">eKey &lt;- vhGet vh (vaultKeyName OpenRouterProvider)</span>
+<span class="lineno">  234 </span><span class="spaces">      </span><span class="istickedoff">case eKey of</span>
+<span class="lineno">  235 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; pure (Left (credErr OpenRouterProvider e))</span>
+<span class="lineno">  236 </span><span class="spaces">        </span><span class="istickedoff">Right kb -&gt;</span>
+<span class="lineno">  237 </span><span class="spaces">          </span><span class="istickedoff">pure (Right <span class="nottickedoff">(SomeProvider (mkOpenRouter mgr (Just (mkApiKey kb)) baseUrl model))</span>)</span>
+<span class="lineno">  238 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  239 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">baseUrl = providerBaseUrlFor cfg OpenRouterProvider</span></span>
+<span class="lineno">  240 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  241 </span><span class="spaces"></span><span class="istickedoff">resolveProvider mvh mgr cfg OpenAICompatibleProvider model _ =</span>
+<span class="lineno">  242 </span><span class="spaces">  </span><span class="istickedoff">resolveOpenAICompatible mvh <span class="nottickedoff">mgr</span> &quot;openai&quot;</span>
+<span class="lineno">  243 </span><span class="spaces">    </span><span class="istickedoff">(providerBaseUrlFor cfg OpenAICompatibleProvider)</span>
+<span class="lineno">  244 </span><span class="spaces">    </span><span class="istickedoff">(vaultKeyName OpenAICompatibleProvider) <span class="nottickedoff">model</span></span></span>
+<span class="lineno">  245 </span>
+<span class="lineno">  246 </span>-- | Build a provider for an operator-named instance. Built-ins resolve
+<span class="lineno">  247 </span>-- exactly as before; an unknown name is an OpenAI-compatible endpoint whose
+<span class="lineno">  248 </span>-- base URL and credential live under that instance's config/vault names.
+<span class="lineno">  249 </span>resolveProviderByName
+<span class="lineno">  250 </span>  :: Maybe VaultHandle -&gt; Manager -&gt; RuntimeConfig -&gt; Text -&gt; ModelId
+<span class="lineno">  251 </span>  -&gt; IORef Int -&gt; IO (Either Text SomeProvider)
+<span class="lineno">  252 </span><span class="decl"><span class="istickedoff">resolveProviderByName mvh mgr cfg name model counter =</span>
+<span class="lineno">  253 </span><span class="spaces">  </span><span class="istickedoff">case parseProvider name of</span>
+<span class="lineno">  254 </span><span class="spaces">    </span><span class="istickedoff">Just kp -&gt; resolveProvider mvh <span class="nottickedoff">mgr</span> <span class="nottickedoff">cfg</span> kp <span class="nottickedoff">model</span> <span class="nottickedoff">counter</span></span>
+<span class="lineno">  255 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; resolveOpenAICompatible mvh <span class="nottickedoff">mgr</span> name</span>
+<span class="lineno">  256 </span><span class="spaces">      </span><span class="istickedoff">(fromMaybe &quot;&quot; (providerBaseUrl cfg name))</span>
+<span class="lineno">  257 </span><span class="spaces">      </span><span class="istickedoff">(vaultKeyNameForName name) <span class="nottickedoff">model</span></span></span>
+<span class="lineno">  258 </span>
+<span class="lineno">  259 </span>-- | The shared OpenAI-compatible resolution. No built-in endpoint: the
+<span class="lineno">  260 </span>-- operator names it. Fail closed rather than silently reaching out to
+<span class="lineno">  261 </span>-- api.openai.com on their behalf, which would send a key meant for a
+<span class="lineno">  262 </span>-- self-hosted server to a third party.
+<span class="lineno">  263 </span>resolveOpenAICompatible
+<span class="lineno">  264 </span>  :: Maybe VaultHandle -&gt; Manager -&gt; Text -&gt; Text -&gt; Text -&gt; ModelId
+<span class="lineno">  265 </span>  -&gt; IO (Either Text SomeProvider)
+<span class="lineno">  266 </span><span class="decl"><span class="istickedoff">resolveOpenAICompatible mvh mgr name baseUrl keyName model</span>
+<span class="lineno">  267 </span><span class="spaces">  </span><span class="istickedoff">| T.null baseUrl =</span>
+<span class="lineno">  268 </span><span class="spaces">      </span><span class="istickedoff">pure (Left (&quot;the OpenAI-compatible provider \&quot;&quot; &lt;&gt; name</span>
+<span class="lineno">  269 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot;\&quot; needs a base URL — set [providers.&quot; &lt;&gt; name</span>
+<span class="lineno">  270 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot;] base_url (the setup wizard asks for it)&quot;))</span>
+<span class="lineno">  271 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case mvh of</span>
+<span class="lineno">  272 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt;</span>
+<span class="lineno">  273 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">pure (Left (&quot;the OpenAI-compatible provider \&quot;&quot; &lt;&gt; name</span></span>
+<span class="lineno">  274 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;\&quot; needs an API key — run /vault setup then /provider add &quot;</span></span>
+<span class="lineno">  275 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; name))</span></span>
+<span class="lineno">  276 </span><span class="spaces">      </span><span class="istickedoff">Just vh -&gt; do</span>
+<span class="lineno">  277 </span><span class="spaces">        </span><span class="istickedoff">eKey &lt;- vhGet vh keyName</span>
+<span class="lineno">  278 </span><span class="spaces">        </span><span class="istickedoff">case eKey of</span>
+<span class="lineno">  279 </span><span class="spaces">          </span><span class="istickedoff">Left e -&gt; pure (Left (credErrForName name e))</span>
+<span class="lineno">  280 </span><span class="spaces">          </span><span class="istickedoff">Right kb -&gt;</span>
+<span class="lineno">  281 </span><span class="spaces">            </span><span class="istickedoff">-- The same client OpenRouter uses: that protocol is the whole</span>
+<span class="lineno">  282 </span><span class="spaces">            </span><span class="istickedoff">-- point of the generic option.</span>
+<span class="lineno">  283 </span><span class="spaces">            </span><span class="istickedoff">pure (Right <span class="nottickedoff">(SomeProvider</span></span>
+<span class="lineno">  284 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">(mkOpenAICompatible mgr (Just (mkApiKey kb)) baseUrl model))</span>)</span></span>
+<span class="lineno">  285 </span>
+<span class="lineno">  286 </span>-- | The effective base URL for a provider: the configured
+<span class="lineno">  287 </span>-- @[providers.&amp;lt;label&amp;gt;] base_url@ when set, else that provider's own
+<span class="lineno">  288 </span>-- built-in default. Each provider reads its OWN config section — Ollama's URL
+<span class="lineno">  289 </span>-- is never used for another provider. Anthropic's endpoint is fixed inside the
+<span class="lineno">  290 </span>-- provider, so its value here is only a placeholder.
+<span class="lineno">  291 </span>providerBaseUrlFor :: RuntimeConfig -&gt; KnownProvider -&gt; Text
+<span class="lineno">  292 </span><span class="decl"><span class="istickedoff">providerBaseUrlFor cfg kp =</span>
+<span class="lineno">  293 </span><span class="spaces">  </span><span class="istickedoff">fromMaybe (builtInBaseUrl kp) (providerBaseUrl cfg (providerLabel kp))</span>
+<span class="lineno">  294 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  295 </span><span class="spaces">    </span><span class="istickedoff">builtInBaseUrl OllamaProvider     = defaultOllamaBaseUrl</span>
+<span class="lineno">  296 </span><span class="spaces">    </span><span class="istickedoff">builtInBaseUrl OpenRouterProvider = defaultOpenRouterBaseUrl</span>
+<span class="lineno">  297 </span><span class="spaces">    </span><span class="istickedoff">builtInBaseUrl AnthropicProvider  = <span class="nottickedoff">&quot;https://api.anthropic.com&quot;</span></span>
+<span class="lineno">  298 </span><span class="spaces">    </span><span class="istickedoff">-- Deliberately empty: a generic endpoint has no default (see</span>
+<span class="lineno">  299 </span><span class="spaces">    </span><span class="istickedoff">-- 'resolveProvider'), and callers treat &quot;&quot; as &quot;not configured&quot;.</span>
+<span class="lineno">  300 </span><span class="spaces">    </span><span class="istickedoff">builtInBaseUrl OpenAICompatibleProvider = &quot;&quot;</span></span>
+<span class="lineno">  301 </span>
+<span class="lineno">  302 </span>-- | The effective base URL for a provider name. Custom names have no
+<span class="lineno">  303 </span>-- built-in default: the empty string means &quot;not configured&quot;.
+<span class="lineno">  304 </span>providerBaseUrlForName :: RuntimeConfig -&gt; Text -&gt; Text
+<span class="lineno">  305 </span><span class="decl"><span class="nottickedoff">providerBaseUrlForName cfg name</span>
+<span class="lineno">  306 </span><span class="spaces">  </span><span class="nottickedoff">| Just kp &lt;- parseProvider name = providerBaseUrlFor cfg kp</span>
+<span class="lineno">  307 </span><span class="spaces">  </span><span class="nottickedoff">| otherwise = fromMaybe &quot;&quot; (providerBaseUrl cfg name)</span></span>
+<span class="lineno">  308 </span>
+<span class="lineno">  309 </span>-- | Run a completion through an existentially-wrapped provider.
+<span class="lineno">  310 </span>completeSome :: SomeProvider -&gt; CompletionRequest -&gt; IO (Either Text CompletionResponse)
+<span class="lineno">  311 </span><span class="decl"><span class="istickedoff">completeSome (SomeProvider p) = complete p</span></span>
+<span class="lineno">  312 </span>
+<span class="lineno">  313 </span>-- | List a provider's models through an existentially-wrapped provider.
+<span class="lineno">  314 </span>listSome :: SomeProvider -&gt; IO (Either Text [ModelId])
+<span class="lineno">  315 </span><span class="decl"><span class="istickedoff">listSome (SomeProvider p) = listModels p</span></span>
+<span class="lineno">  316 </span>
+<span class="lineno">  317 </span>-- | Provider-aware credential error: a missing key points the user at the
+<span class="lineno">  318 </span>-- exact @/provider add@ they need.
+<span class="lineno">  319 </span>credErr :: KnownProvider -&gt; VaultError -&gt; Text
+<span class="lineno">  320 </span><span class="decl"><span class="istickedoff">credErr kp = \case</span>
+<span class="lineno">  321 </span><span class="spaces">  </span><span class="istickedoff">VaultKeyNotFound _ -&gt;</span>
+<span class="lineno">  322 </span><span class="spaces">    </span><span class="istickedoff">&quot;no credential for &quot; &lt;&gt; providerLabel kp</span>
+<span class="lineno">  323 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot; — run /provider add &quot; &lt;&gt; providerLabel kp</span>
+<span class="lineno">  324 </span><span class="spaces">  </span><span class="istickedoff">e -&gt; vaultErrText e</span></span>
+<span class="lineno">  325 </span>
+<span class="lineno">  326 </span>-- | Provider-aware credential error for an instance name.
+<span class="lineno">  327 </span>credErrForName :: Text -&gt; VaultError -&gt; Text
+<span class="lineno">  328 </span><span class="decl"><span class="istickedoff">credErrForName name = \case</span>
+<span class="lineno">  329 </span><span class="spaces">  </span><span class="istickedoff">VaultKeyNotFound _ -&gt;</span>
+<span class="lineno">  330 </span><span class="spaces">    </span><span class="istickedoff">&quot;no credential for &quot; &lt;&gt; name &lt;&gt; &quot; — run /provider add &quot; &lt;&gt; name</span>
+<span class="lineno">  331 </span><span class="spaces">  </span><span class="istickedoff">e -&gt; <span class="nottickedoff">vaultErrText e</span></span></span>
+<span class="lineno">  332 </span>
+<span class="lineno">  333 </span>-- | Human-readable rendering of a vault error.
+<span class="lineno">  334 </span>vaultErrText :: VaultError -&gt; Text
+<span class="lineno">  335 </span><span class="decl"><span class="istickedoff">vaultErrText = \case</span>
+<span class="lineno">  336 </span><span class="spaces">  </span><span class="istickedoff">VaultLocked         -&gt; &quot;vault is locked — run /vault unlock&quot;</span>
+<span class="lineno">  337 </span><span class="spaces">  </span><span class="istickedoff">VaultNotFound       -&gt; <span class="nottickedoff">&quot;vault not found — run /vault setup&quot;</span></span>
+<span class="lineno">  338 </span><span class="spaces">  </span><span class="istickedoff">VaultAlreadyExists  -&gt; <span class="nottickedoff">&quot;vault already exists&quot;</span></span>
+<span class="lineno">  339 </span><span class="spaces">  </span><span class="istickedoff">VaultKeyNotFound k  -&gt; <span class="nottickedoff">&quot;no such secret: &quot; &lt;&gt; k</span></span>
+<span class="lineno">  340 </span><span class="spaces">  </span><span class="istickedoff">VaultBackendError t -&gt; <span class="nottickedoff">&quot;backend error: &quot; &lt;&gt; t</span></span></span>
+<span class="lineno">  341 </span>
+<span class="lineno">  342 </span>-- | The set of providers that are *configured* (have a usable credential or
+<span class="lineno">  343 </span>-- are usable keyless). A provider appears in @/provider list@ and in the
+<span class="lineno">  344 </span>-- frontend's provider select only when this returns 'True'. The rules mirror
+<span class="lineno">  345 </span>-- the auth labels in 'Seal.Command.Provider.listCmd':
+<span class="lineno">  346 </span>--
+<span class="lineno">  347 </span>--   * __Ollama__ is configured when its base URL needs no key (local daemon)
+<span class="lineno">  348 </span>--     OR an API key / OAuth blob is stored in the vault. A cloud URL
+<span class="lineno">  349 </span>--     (@ollama.com@) without a key is NOT configured.
+<span class="lineno">  350 </span>--   * __Anthropic__ is configured when either an OAuth blob or an API key is
+<span class="lineno">  351 </span>--     stored in the vault.
+<span class="lineno">  352 </span>--
+<span class="lineno">  353 </span>-- A missing vault ('Nothing') means no provider has credentials, so only a
+<span class="lineno">  354 </span>-- keyless local Ollama would survive the filter (and only when its base URL
+<span class="lineno">  355 </span>-- is the default local URL).
+<span class="lineno">  356 </span>configuredProviders :: Maybe VaultHandle -&gt; RuntimeConfig -&gt; IO [KnownProvider]
+<span class="lineno">  357 </span><span class="decl"><span class="istickedoff">configuredProviders mvh cfg = filterM isConfigured knownProviders</span>
+<span class="lineno">  358 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  359 </span><span class="spaces">    </span><span class="istickedoff">isConfigured kp = case kp of</span>
+<span class="lineno">  360 </span><span class="spaces">      </span><span class="istickedoff">OllamaProvider -&gt; do</span>
+<span class="lineno">  361 </span><span class="spaces">        </span><span class="istickedoff">let baseUrl = fromMaybe defaultOllamaBaseUrl (providerBaseUrl cfg &quot;ollama&quot;)</span>
+<span class="lineno">  362 </span><span class="spaces">        </span><span class="istickedoff">if not (ollamaNeedsKey baseUrl)</span>
+<span class="lineno">  363 </span><span class="spaces">          </span><span class="istickedoff">then pure True</span>
+<span class="lineno">  364 </span><span class="spaces">          </span><span class="istickedoff">else hasVaultKey mvh (vaultKeyName OllamaProvider)</span>
+<span class="lineno">  365 </span><span class="spaces">      </span><span class="istickedoff">AnthropicProvider -&gt;</span>
+<span class="lineno">  366 </span><span class="spaces">        </span><span class="istickedoff">hasVaultKey mvh (vaultKeyName AnthropicProvider)</span>
+<span class="lineno">  367 </span><span class="spaces">          </span><span class="istickedoff">||^ hasVaultKey mvh anthropicOAuthKey</span>
+<span class="lineno">  368 </span><span class="spaces">      </span><span class="istickedoff">OpenRouterProvider -&gt;</span>
+<span class="lineno">  369 </span><span class="spaces">        </span><span class="istickedoff">hasVaultKey mvh (vaultKeyName OpenRouterProvider)</span>
+<span class="lineno">  370 </span><span class="spaces">      </span><span class="istickedoff">OpenAICompatibleProvider -&gt; do</span>
+<span class="lineno">  371 </span><span class="spaces">        </span><span class="istickedoff">-- BOTH halves are required: a base URL with no credential fails on the</span>
+<span class="lineno">  372 </span><span class="spaces">        </span><span class="istickedoff">-- first call, and a credential with no base URL has nowhere to go.</span>
+<span class="lineno">  373 </span><span class="spaces">        </span><span class="istickedoff">keyed &lt;- hasVaultKey mvh (vaultKeyName OpenAICompatibleProvider)</span>
+<span class="lineno">  374 </span><span class="spaces">        </span><span class="istickedoff">pure (keyed &amp;&amp; not (T.null</span>
+<span class="lineno">  375 </span><span class="spaces">          </span><span class="istickedoff">(fromMaybe &quot;&quot; (providerBaseUrl cfg (providerLabel OpenAICompatibleProvider)))))</span></span>
+<span class="lineno">  376 </span>
+<span class="lineno">  377 </span>-- | Every custom (operator-named) provider instance in the config, sorted.
+<span class="lineno">  378 </span>-- A custom instance is any @[providers.\&lt;name\&gt;]@ section whose key is not a
+<span class="lineno">  379 </span>-- built-in provider id and passes the instance-name grammar.
+<span class="lineno">  380 </span>customProviderNames :: RuntimeConfig -&gt; [Text]
+<span class="lineno">  381 </span><span class="decl"><span class="istickedoff">customProviderNames cfg =</span>
+<span class="lineno">  382 </span><span class="spaces">  </span><span class="istickedoff">sort</span>
+<span class="lineno">  383 </span><span class="spaces">    </span><span class="istickedoff">[ name</span>
+<span class="lineno">  384 </span><span class="spaces">    </span><span class="istickedoff">| name &lt;- Map.keys (rcProviders cfg)</span>
+<span class="lineno">  385 </span><span class="spaces">    </span><span class="istickedoff">, <span class="tickonlytrue">isNothing (parseProvider name)</span></span>
+<span class="lineno">  386 </span><span class="spaces">    </span><span class="istickedoff">, <span class="tickonlytrue">either <span class="nottickedoff">(const False)</span> (const True) (validateProviderName name)</span></span>
+<span class="lineno">  387 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">  388 </span>
+<span class="lineno">  389 </span>-- | Custom OpenAI-compatible instances that are configured: they have both a
+<span class="lineno">  390 </span>-- base URL and a stored credential.
+<span class="lineno">  391 </span>configuredCustomProviderNames :: Maybe VaultHandle -&gt; RuntimeConfig -&gt; IO [Text]
+<span class="lineno">  392 </span><span class="decl"><span class="istickedoff">configuredCustomProviderNames mvh cfg =</span>
+<span class="lineno">  393 </span><span class="spaces">  </span><span class="istickedoff">filterM isConfigured (customProviderNames cfg)</span>
+<span class="lineno">  394 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  395 </span><span class="spaces">    </span><span class="istickedoff">isConfigured name = do</span>
+<span class="lineno">  396 </span><span class="spaces">      </span><span class="istickedoff">keyed &lt;- hasVaultKey mvh (vaultKeyNameForName name)</span>
+<span class="lineno">  397 </span><span class="spaces">      </span><span class="istickedoff">pure (keyed &amp;&amp; not (T.null</span>
+<span class="lineno">  398 </span><span class="spaces">        </span><span class="istickedoff">(fromMaybe &quot;&quot; (providerBaseUrl cfg name))))</span></span>
+<span class="lineno">  399 </span>
+<span class="lineno">  400 </span>-- | Every configured provider, built-in and custom, as instance names.
+<span class="lineno">  401 </span>configuredProviderNames :: Maybe VaultHandle -&gt; RuntimeConfig -&gt; IO [Text]
+<span class="lineno">  402 </span><span class="decl"><span class="nottickedoff">configuredProviderNames mvh cfg = do</span>
+<span class="lineno">  403 </span><span class="spaces">  </span><span class="nottickedoff">builtins &lt;- map providerLabel &lt;$&gt; configuredProviders mvh cfg</span>
+<span class="lineno">  404 </span><span class="spaces">  </span><span class="nottickedoff">customs &lt;- configuredCustomProviderNames mvh cfg</span>
+<span class="lineno">  405 </span><span class="spaces">  </span><span class="nottickedoff">pure (builtins &lt;&gt; customs)</span></span>
+<span class="lineno">  406 </span>
+<span class="lineno">  407 </span>-- | Does the vault hold a value for @k@? 'Nothing' (no vault) or a vault error
+<span class="lineno">  408 </span>-- (locked / key missing) → 'False'; a present key → 'True'.
+<span class="lineno">  409 </span>hasVaultKey :: Maybe VaultHandle -&gt; Text -&gt; IO Bool
+<span class="lineno">  410 </span><span class="decl"><span class="istickedoff">hasVaultKey Nothing _ = pure False</span>
+<span class="lineno">  411 </span><span class="spaces"></span><span class="istickedoff">hasVaultKey (Just vh) k = do</span>
+<span class="lineno">  412 </span><span class="spaces">  </span><span class="istickedoff">r &lt;- vhGet vh k</span>
+<span class="lineno">  413 </span><span class="spaces">  </span><span class="istickedoff">pure $ case r of</span>
+<span class="lineno">  414 </span><span class="spaces">    </span><span class="istickedoff">Right _ -&gt; True</span>
+<span class="lineno">  415 </span><span class="spaces">    </span><span class="istickedoff">Left _  -&gt; False</span></span>
+<span class="lineno">  416 </span>
+<span class="lineno">  417 </span>-- | Short-circuit OR for two 'IO' booleans (so the second is only run when the
+<span class="lineno">  418 </span>-- first is 'False'). Avoids touching OAuth when an API key is already present.
+<span class="lineno">  419 </span>infixr 2 ||^
+<span class="lineno">  420 </span>(||^) :: IO Bool -&gt; IO Bool -&gt; IO Bool
+<span class="lineno">  421 </span><span class="decl"><span class="istickedoff">a ||^ b = do</span>
+<span class="lineno">  422 </span><span class="spaces">  </span><span class="istickedoff">x &lt;- a</span>
+<span class="lineno">  423 </span><span class="spaces">  </span><span class="istickedoff">if x then pure True else b</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,192 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>{-# LANGUAGE TemplateHaskell #-}
+<span class="lineno">    3 </span>-- | First-run scaffolding for the two operator-editable configuration files.
+<span class="lineno">    4 </span>--
+<span class="lineno">    5 </span>-- A fresh install has no @config.toml@ and no @security.toml@, and both loaders
+<span class="lineno">    6 </span>-- treat an absent file as &quot;use the built-in defaults&quot;. Seal works that way, but
+<span class="lineno">    7 </span>-- the option surface is then invisible until someone reads the source. This
+<span class="lineno">    8 </span>-- module ships the surface: each template lists the keys its codec accepts,
+<span class="lineno">    9 </span>-- with the value Seal would use — written out where a written value resolves to
+<span class="lineno">   10 </span>-- the same behaviour as an absent key, commented out where it does not (the
+<span class="lineno">   11 </span>-- default is &quot;unset&quot;, the value names something only the operator knows, or the
+<span class="lineno">   12 </span>-- value is machine-absolute).
+<span class="lineno">   13 </span>--
+<span class="lineno">   14 </span>-- The templates are embedded with 'file-embed', the mechanism
+<span class="lineno">   15 </span>-- 'Seal.Skills.Builtins' already uses for built-in skills, so a binary always
+<span class="lineno">   16 </span>-- carries the version of the file it shipped with: no install-layout
+<span class="lineno">   17 </span>-- dependency, no first-run download, no staleness across upgrades.
+<span class="lineno">   18 </span>--
+<span class="lineno">   19 </span>-- Two invariants, both load-bearing:
+<span class="lineno">   20 </span>--
+<span class="lineno">   21 </span>-- * __Never overwrite.__ An existing file is the operator's (or an earlier
+<span class="lineno">   22 </span>--   run's, or a program's). A scaffold that clobbered it would undo hand edits
+<span class="lineno">   23 </span>--   on every boot.
+<span class="lineno">   24 </span>-- * __Never change behaviour.__ Writing a template has to resolve to exactly
+<span class="lineno">   25 </span>--   the configuration of leaving both files absent.
+<span class="lineno">   26 </span>--   @Seal.Config.TemplatesSpec@ asserts both. The @security.toml@ half is also
+<span class="lineno">   27 </span>--   skipped while @config.toml@ still carries pre-split security fields:
+<span class="lineno">   28 </span>--   creating the file there would make 'Seal.Config.Migrate' read the install as
+<span class="lineno">   29 </span>--   already migrated — its &quot;security.toml wins&quot; branch — and drop the operator's
+<span class="lineno">   30 </span>--   vault settings.
+<span class="lineno">   31 </span>module Seal.Config.Templates
+<span class="lineno">   32 </span>  ( configTomlTemplate
+<span class="lineno">   33 </span>  , securityTomlTemplate
+<span class="lineno">   34 </span>  , ensureConfigTemplates
+<span class="lineno">   35 </span>  ) where
+<span class="lineno">   36 </span>
+<span class="lineno">   37 </span>import Control.Exception (IOException, bracketOnError, displayException, try)
+<span class="lineno">   38 </span>import Control.Monad (void)
+<span class="lineno">   39 </span>import Data.ByteString qualified as BS
+<span class="lineno">   40 </span>import Data.Either (lefts, rights)
+<span class="lineno">   41 </span>import Data.Maybe (catMaybes)
+<span class="lineno">   42 </span>import Data.FileEmbed (embedFile)
+<span class="lineno">   43 </span>import Data.Text (Text)
+<span class="lineno">   44 </span>import Data.Text qualified as T
+<span class="lineno">   45 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   46 </span>import Data.Text.IO qualified as TIO
+<span class="lineno">   47 </span>import Language.Haskell.TH.Syntax (qAddDependentFile)
+<span class="lineno">   48 </span>import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
+<span class="lineno">   49 </span>import System.FilePath (takeDirectory)
+<span class="lineno">   50 </span>import System.IO (hClose)
+<span class="lineno">   51 </span>import System.IO.Error (isAlreadyExistsError)
+<span class="lineno">   52 </span>import System.Posix.Files (createLink, setFileMode)
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>import Seal.Config.Migrate (configHasLegacySecurityFields)
+<span class="lineno">   55 </span>import Seal.Config.Paths
+<span class="lineno">   56 </span>  ( SealPaths, configFilePath, securityFilePath )
+<span class="lineno">   57 </span>import Seal.Config.Security (openUniqueTemp)
+<span class="lineno">   58 </span>
+<span class="lineno">   59 </span>-- | The bytes of @config\/templates\/config.toml@, embedded at compile time.
+<span class="lineno">   60 </span>configTomlTemplate :: Text
+<span class="lineno">   61 </span><span class="decl"><span class="istickedoff">configTomlTemplate = TE.decodeUtf8 $(do</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">qAddDependentFile &quot;config/templates/config.toml&quot;</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="istickedoff">embedFile &quot;config/templates/config.toml&quot;)</span></span>
+<span class="lineno">   64 </span>
+<span class="lineno">   65 </span>-- | The bytes of @config\/templates\/security.toml@, embedded at compile time.
+<span class="lineno">   66 </span>securityTomlTemplate :: Text
+<span class="lineno">   67 </span><span class="decl"><span class="istickedoff">securityTomlTemplate = TE.decodeUtf8 $(do</span>
+<span class="lineno">   68 </span><span class="spaces">  </span><span class="istickedoff">qAddDependentFile &quot;config/templates/security.toml&quot;</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">embedFile &quot;config/templates/security.toml&quot;)</span></span>
+<span class="lineno">   70 </span>
+<span class="lineno">   71 </span>-- | How a template is written.
+<span class="lineno">   72 </span>--
+<span class="lineno">   73 </span>-- @security.toml@ holds boot-critical state, so it is created @0600@ with
+<span class="lineno">   74 </span>-- @O_NOFOLLOW@ through 'writeSecretFile' — the same primitive its other writers
+<span class="lineno">   75 </span>-- use. The runtime config is ordinary data and is written like
+<span class="lineno">   76 </span>-- 'Seal.Config.File.saveRuntimeConfig' writes it.
+<span class="lineno">   77 </span>data FileSensitivity = SecretFile | PlainFile
+<span class="lineno">   78 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   79 </span>
+<span class="lineno">   80 </span>-- | Write whichever of the two templates is missing.
+<span class="lineno">   81 </span>--
+<span class="lineno">   82 </span>-- Returns the files it created and the problems it hit. A failure is per-file:
+<span class="lineno">   83 </span>-- an unwritable @config.toml@ does not stop @security.toml@ from being written,
+<span class="lineno">   84 </span>-- and neither failure is thrown at the caller — a missing template must never
+<span class="lineno">   85 </span>-- stop the harness from booting.
+<span class="lineno">   86 </span>ensureConfigTemplates :: SealPaths -&gt; IO ([FilePath], [Text])
+<span class="lineno">   87 </span><span class="decl"><span class="istickedoff">ensureConfigTemplates paths = do</span>
+<span class="lineno">   88 </span><span class="spaces">  </span><span class="istickedoff">cfgOutcome &lt;- seedFile (configFilePath paths) configTomlTemplate PlainFile</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="istickedoff">secOutcome &lt;- seedSecurity paths</span>
+<span class="lineno">   90 </span><span class="spaces">  </span><span class="istickedoff">let created = catMaybes (rights [cfgOutcome, secOutcome])</span>
+<span class="lineno">   91 </span><span class="spaces">      </span><span class="istickedoff">problems = lefts [cfgOutcome, secOutcome]</span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="istickedoff">pure (created, problems)</span></span>
+<span class="lineno">   93 </span>
+<span class="lineno">   94 </span>-- | @security.toml@, unless a migration still owns the operator's settings.
+<span class="lineno">   95 </span>seedSecurity :: SealPaths -&gt; IO (Either Text (Maybe FilePath))
+<span class="lineno">   96 </span><span class="decl"><span class="istickedoff">seedSecurity paths = do</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">carries &lt;- configCarriesLegacyFields (configFilePath paths)</span>
+<span class="lineno">   98 </span><span class="spaces">  </span><span class="istickedoff">case carries of</span>
+<span class="lineno">   99 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (Left err)</span></span>
+<span class="lineno">  100 </span><span class="spaces">    </span><span class="istickedoff">-- Defer. `seal serve` and `seal tui` run 'Seal.Config.Migrate.migrateSecurityConfig'</span>
+<span class="lineno">  101 </span><span class="spaces">    </span><span class="istickedoff">-- before this, and the migration moves those fields into security.toml.</span>
+<span class="lineno">  102 </span><span class="spaces">    </span><span class="istickedoff">-- Creating the file first would flip the migration's file-existence test to</span>
+<span class="lineno">  103 </span><span class="spaces">    </span><span class="istickedoff">-- its &quot;security.toml wins&quot; branch and silently drop them.</span>
+<span class="lineno">  104 </span><span class="spaces">    </span><span class="istickedoff">Right True  -&gt; pure (Right Nothing)</span>
+<span class="lineno">  105 </span><span class="spaces">    </span><span class="istickedoff">Right False -&gt; seedFile (securityFilePath paths) securityTomlTemplate SecretFile</span></span>
+<span class="lineno">  106 </span>
+<span class="lineno">  107 </span>-- | Does the existing @config.toml@ still carry pre-split security fields?
+<span class="lineno">  108 </span>configCarriesLegacyFields :: FilePath -&gt; IO (Either Text Bool)
+<span class="lineno">  109 </span><span class="decl"><span class="istickedoff">configCarriesLegacyFields path = do</span>
+<span class="lineno">  110 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  112 </span><span class="spaces">    </span><span class="istickedoff">then pure (Right False)</span>
+<span class="lineno">  113 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  114 </span><span class="spaces">      </span><span class="istickedoff">read' &lt;- try (TIO.readFile path) :: IO (Either IOException Text)</span>
+<span class="lineno">  115 </span><span class="spaces">      </span><span class="istickedoff">pure $ case read' of</span>
+<span class="lineno">  116 </span><span class="spaces">        </span><span class="istickedoff">Left err       -&gt; <span class="nottickedoff">Left (describeReadError path err)</span></span>
+<span class="lineno">  117 </span><span class="spaces">        </span><span class="istickedoff">Right contents -&gt; Right (configHasLegacySecurityFields contents)</span></span>
+<span class="lineno">  118 </span>
+<span class="lineno">  119 </span>-- | Create @path@ with @contents@ if nothing is there. 'Nothing' means there
+<span class="lineno">  120 </span>-- was already a file; 'Left' means the write failed.
+<span class="lineno">  121 </span>seedFile :: FilePath -&gt; Text -&gt; FileSensitivity -&gt; IO (Either Text (Maybe FilePath))
+<span class="lineno">  122 </span><span class="decl"><span class="istickedoff">seedFile path contents sensitivity = do</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">outcome &lt;- try go :: IO (Either IOException (Maybe FilePath))</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">pure $ case outcome of</span>
+<span class="lineno">  125 </span><span class="spaces">    </span><span class="istickedoff">Left err      -&gt; Left <span class="nottickedoff">(describeWriteError path err)</span></span>
+<span class="lineno">  126 </span><span class="spaces">    </span><span class="istickedoff">Right created -&gt; Right created</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  128 </span><span class="spaces">    </span><span class="istickedoff">go :: IO (Maybe FilePath)</span>
+<span class="lineno">  129 </span><span class="spaces">    </span><span class="istickedoff">go = do</span>
+<span class="lineno">  130 </span><span class="spaces">      </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  131 </span><span class="spaces">      </span><span class="istickedoff">if exists</span>
+<span class="lineno">  132 </span><span class="spaces">        </span><span class="istickedoff">then pure Nothing</span>
+<span class="lineno">  133 </span><span class="spaces">        </span><span class="istickedoff">else do</span>
+<span class="lineno">  134 </span><span class="spaces">          </span><span class="istickedoff">-- The parent directory normally exists by now ('Seal.Config.Paths.ensureSealDirs'</span>
+<span class="lineno">  135 </span><span class="spaces">          </span><span class="istickedoff">-- runs first at every call site); creating it here keeps the whole</span>
+<span class="lineno">  136 </span><span class="spaces">          </span><span class="istickedoff">-- write inside one handler, so a missing directory is a reported</span>
+<span class="lineno">  137 </span><span class="spaces">          </span><span class="istickedoff">-- failure rather than an exception.</span>
+<span class="lineno">  138 </span><span class="spaces">          </span><span class="istickedoff">createDirectoryIfMissing True (takeDirectory path)</span>
+<span class="lineno">  139 </span><span class="spaces">          </span><span class="istickedoff">-- Never rename over the destination: a file created between the</span>
+<span class="lineno">  140 </span><span class="spaces">          </span><span class="istickedoff">-- existence check above and this install must survive. Write a</span>
+<span class="lineno">  141 </span><span class="spaces">          </span><span class="istickedoff">-- unique temp, then hard-link it into place; EEXIST is a benign lost</span>
+<span class="lineno">  142 </span><span class="spaces">          </span><span class="istickedoff">-- race, not a write failure.</span>
+<span class="lineno">  143 </span><span class="spaces">          </span><span class="istickedoff">bracketOnError (openUniqueTemp path) <span class="nottickedoff">cleanup</span> $ \(tmp, h) -&gt; do</span>
+<span class="lineno">  144 </span><span class="spaces">            </span><span class="istickedoff">BS.hPutStr h (TE.encodeUtf8 contents)</span>
+<span class="lineno">  145 </span><span class="spaces">            </span><span class="istickedoff">hClose h</span>
+<span class="lineno">  146 </span><span class="spaces">            </span><span class="istickedoff">case sensitivity of</span>
+<span class="lineno">  147 </span><span class="spaces">              </span><span class="istickedoff">SecretFile -&gt; setFileMode tmp 0o600</span>
+<span class="lineno">  148 </span><span class="spaces">              </span><span class="istickedoff">PlainFile  -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  149 </span><span class="spaces">            </span><span class="istickedoff">installed &lt;- try (createLink tmp path) :: IO (Either IOException ())</span>
+<span class="lineno">  150 </span><span class="spaces">            </span><span class="istickedoff">ignoreIO (removeFile tmp)</span>
+<span class="lineno">  151 </span><span class="spaces">            </span><span class="istickedoff">case installed of</span>
+<span class="lineno">  152 </span><span class="spaces">              </span><span class="istickedoff">Right () -&gt; pure (Just path)</span>
+<span class="lineno">  153 </span><span class="spaces">              </span><span class="istickedoff">Left err</span>
+<span class="lineno">  154 </span><span class="spaces">                </span><span class="istickedoff">| <span class="nottickedoff">isAlreadyExistsError err</span> -&gt; <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">  155 </span><span class="spaces">                </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span>               -&gt; <span class="nottickedoff">ioError err</span></span>
+<span class="lineno">  156 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  157 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">cleanup (tmp, h) = do</span></span>
+<span class="lineno">  158 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">ignoreIO (hClose h)</span></span>
+<span class="lineno">  159 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">ignoreIO (removeFile tmp)</span></span>
+<span class="lineno">  160 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  161 </span><span class="spaces">    </span><span class="istickedoff">ignoreIO action = void (try action :: IO (Either IOException ()))</span></span>
+<span class="lineno">  162 </span>
+<span class="lineno">  163 </span>describeWriteError :: FilePath -&gt; IOException -&gt; Text
+<span class="lineno">  164 </span><span class="decl"><span class="nottickedoff">describeWriteError path err =</span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="nottickedoff">&quot;could not write &quot; &lt;&gt; T.pack path &lt;&gt; &quot;: &quot; &lt;&gt; T.pack (displayException err)</span></span>
+<span class="lineno">  166 </span>
+<span class="lineno">  167 </span>describeReadError :: FilePath -&gt; IOException -&gt; Text
+<span class="lineno">  168 </span><span class="decl"><span class="nottickedoff">describeReadError path err =</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="nottickedoff">&quot;could not read &quot; &lt;&gt; T.pack path &lt;&gt; &quot;: &quot; &lt;&gt; T.pack (displayException err)</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,525 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | WebAuthn (passkey) ceremony verification — the security core of the
+<span class="lineno">    3 </span>-- gateway's access control. Pure: every function here takes bytes and returns
+<span class="lineno">    4 </span>-- 'Either', so the whole surface is testable without a browser, a socket or a
+<span class="lineno">    5 </span>-- clock.
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- Scope (design §9):
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- * registration accepts @fmt = \&quot;none\&quot;@ only and checks the client data,
+<span class="lineno">   10 </span>--   the rpId hash, the presence and user-verification flags, and the attested
+<span class="lineno">   11 </span>--   credential data (id length, @rawId@ agreement, COSE key shape);
+<span class="lineno">   12 </span>-- * assertion checks the same client-data / rpId / flag invariants and
+<span class="lineno">   13 </span>--   verifies the ECDSA P-256 signature over
+<span class="lineno">   14 </span>--   @authData || SHA-256(clientDataJSON)@;
+<span class="lineno">   15 </span>-- * the sign-counter rule lives in 'checkSignCount' so the caller can run it
+<span class="lineno">   16 </span>--   under the same lock that persists the new value.
+<span class="lineno">   17 </span>--
+<span class="lineno">   18 </span>-- Attestation statements are deliberately not verified: we request
+<span class="lineno">   19 </span>-- @attestation: \&quot;none\&quot;@, and the WebAuthn spec does not require an RP to
+<span class="lineno">   20 </span>-- validate an attestation it did not ask for.
+<span class="lineno">   21 </span>module Seal.Security.WebAuthn
+<span class="lineno">   22 </span>  ( WebAuthnError (..)
+<span class="lineno">   23 </span>  , webAuthnErrorText
+<span class="lineno">   24 </span>  , webAuthnErrorCode
+<span class="lineno">   25 </span>  , Ceremony (..)
+<span class="lineno">   26 </span>  , ceremonyText
+<span class="lineno">   27 </span>  , RegistrationInput (..)
+<span class="lineno">   28 </span>  , RegistrationResult (..)
+<span class="lineno">   29 </span>  , AssertionInput (..)
+<span class="lineno">   30 </span>  , ClientData (..)
+<span class="lineno">   31 </span>  , verifyRegistration
+<span class="lineno">   32 </span>  , verifyAssertion
+<span class="lineno">   33 </span>  , checkSignCount
+<span class="lineno">   34 </span>  , normalizeOrigin
+<span class="lineno">   35 </span>  , parseClientData
+<span class="lineno">   36 </span>  , AuthenticatorData (..)
+<span class="lineno">   37 </span>  , parseAuthenticatorData
+<span class="lineno">   38 </span>  , adUserPresent
+<span class="lineno">   39 </span>  , adUserVerified
+<span class="lineno">   40 </span>  , adHasAttestedCredential
+<span class="lineno">   41 </span>  , cosePublicKeyToPoint
+<span class="lineno">   42 </span>  ) where
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>import Data.Aeson (Value (..))
+<span class="lineno">   45 </span>import Data.Aeson qualified as A
+<span class="lineno">   46 </span>import Data.Aeson.Key qualified as Key
+<span class="lineno">   47 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   48 </span>import Data.Bits (shiftL, (.&amp;.))
+<span class="lineno">   49 </span>import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
+<span class="lineno">   50 </span>import Data.ByteString (ByteString)
+<span class="lineno">   51 </span>import Data.ByteString qualified as BS
+<span class="lineno">   52 </span>import Data.ByteString.Base64.URL qualified as B64Url
+<span class="lineno">   53 </span>import Data.Text (Text)
+<span class="lineno">   54 </span>import Data.Text qualified as T
+<span class="lineno">   55 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   56 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   57 </span>import Data.Word (Word8)
+<span class="lineno">   58 </span>
+<span class="lineno">   59 </span>import Crypto.Hash (Digest, SHA256 (..), hash)
+<span class="lineno">   60 </span>import Crypto.PubKey.ECC.ECDSA (PublicKey (..), Signature (..), verify)
+<span class="lineno">   61 </span>import Crypto.PubKey.ECC.Prim (isPointValid)
+<span class="lineno">   62 </span>import Crypto.PubKey.ECC.Types
+<span class="lineno">   63 </span>  ( CurveName (SEC_p256r1), Point (Point), getCurveByName )
+<span class="lineno">   64 </span>import Data.ByteArray (convert)
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>import Seal.Security.WebAuthn.Cbor
+<span class="lineno">   67 </span>import Seal.Security.WebAuthn.Der (decodeEcdsaSignature)
+<span class="lineno">   68 </span>import Seal.Security.WebAuthn.Types (CosePublicKey (..))
+<span class="lineno">   69 </span>
+<span class="lineno">   70 </span>-- | Everything that can make a ceremony fail. Callers map these to HTTP error
+<span class="lineno">   71 </span>-- codes via 'webAuthnErrorCode'; the constructors exist so the program can
+<span class="lineno">   72 </span>-- pattern-match on the failure class rather than parse a string.
+<span class="lineno">   73 </span>data WebAuthnError
+<span class="lineno">   74 </span>  = WnMalformedClientData Text
+<span class="lineno">   75 </span>  | WnWrongCeremony Text
+<span class="lineno">   76 </span>  | WnChallengeMismatch
+<span class="lineno">   77 </span>  | WnOriginMismatch Text
+<span class="lineno">   78 </span>  | WnCrossOrigin
+<span class="lineno">   79 </span>  | WnMalformedAuthenticatorData Text
+<span class="lineno">   80 </span>  | WnRpIdMismatch
+<span class="lineno">   81 </span>  | WnUserPresenceMissing
+<span class="lineno">   82 </span>  | WnUserVerificationMissing
+<span class="lineno">   83 </span>  | WnAttestedCredentialMissing
+<span class="lineno">   84 </span>  | WnCredentialIdMismatch
+<span class="lineno">   85 </span>  | WnCredentialIdLength Int
+<span class="lineno">   86 </span>  | WnUnsupportedAttestation Text
+<span class="lineno">   87 </span>  | WnMalformedCoseKey Text
+<span class="lineno">   88 </span>  | WnSignatureInvalid
+<span class="lineno">   89 </span>  | WnSignCountRegression Int Int
+<span class="lineno">   90 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   91 </span>
+<span class="lineno">   92 </span>-- | A human-readable sentence (goes in the API's @error@ field).
+<span class="lineno">   93 </span>webAuthnErrorText :: WebAuthnError -&gt; Text
+<span class="lineno">   94 </span><span class="decl"><span class="istickedoff">webAuthnErrorText err = case err of</span>
+<span class="lineno">   95 </span><span class="spaces">  </span><span class="istickedoff">WnMalformedClientData d        -&gt; <span class="nottickedoff">&quot;malformed clientDataJSON: &quot; &lt;&gt; d</span></span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">WnWrongCeremony t              -&gt; <span class="nottickedoff">&quot;unexpected ceremony type \&quot;&quot; &lt;&gt; t &lt;&gt; &quot;\&quot;&quot;</span></span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">WnChallengeMismatch            -&gt; <span class="nottickedoff">&quot;the challenge does not match the one this server issued&quot;</span></span>
+<span class="lineno">   98 </span><span class="spaces">  </span><span class="istickedoff">WnOriginMismatch o             -&gt; <span class="nottickedoff">&quot;the request origin (&quot; &lt;&gt; o &lt;&gt; &quot;) does not match this gateway's configured origin&quot;</span></span>
+<span class="lineno">   99 </span><span class="spaces">  </span><span class="istickedoff">WnCrossOrigin                  -&gt; <span class="nottickedoff">&quot;cross-origin ceremonies are not accepted&quot;</span></span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">WnMalformedAuthenticatorData d -&gt; <span class="nottickedoff">&quot;malformed authenticator data: &quot; &lt;&gt; d</span></span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="istickedoff">WnRpIdMismatch                 -&gt; &quot;the credential was registered for a different relying-party id&quot;</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">WnUserPresenceMissing          -&gt; <span class="nottickedoff">&quot;the authenticator did not assert user presence&quot;</span></span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">WnUserVerificationMissing      -&gt; <span class="nottickedoff">&quot;the authenticator did not verify the user (PIN or biometric required)&quot;</span></span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="istickedoff">WnAttestedCredentialMissing    -&gt; <span class="nottickedoff">&quot;the registration response carried no credential&quot;</span></span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="istickedoff">WnCredentialIdMismatch         -&gt; <span class="nottickedoff">&quot;the credential id does not match the attested credential&quot;</span></span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="istickedoff">WnCredentialIdLength n         -&gt; <span class="nottickedoff">&quot;the credential id length (&quot; &lt;&gt; tshow n &lt;&gt; &quot;) is out of range&quot;</span></span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="istickedoff">WnUnsupportedAttestation f     -&gt; <span class="nottickedoff">&quot;unsupported attestation format \&quot;&quot; &lt;&gt; f &lt;&gt; &quot;\&quot;&quot;</span></span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="istickedoff">WnMalformedCoseKey d           -&gt; <span class="nottickedoff">&quot;malformed public key: &quot; &lt;&gt; d</span></span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="istickedoff">WnSignatureInvalid             -&gt; <span class="nottickedoff">&quot;the signature does not verify&quot;</span></span>
+<span class="lineno">  110 </span><span class="spaces">  </span><span class="istickedoff">WnSignCountRegression old new  -&gt;</span>
+<span class="lineno">  111 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">&quot;the signature counter went backwards (&quot; &lt;&gt; tshow new &lt;&gt; &quot; after &quot;</span></span>
+<span class="lineno">  112 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; tshow old &lt;&gt; &quot;), which indicates a replayed assertion&quot;</span></span></span>
+<span class="lineno">  113 </span>
+<span class="lineno">  114 </span>-- | A stable machine token for the API's @code@ field (design §8). The UI
+<span class="lineno">  115 </span>-- switches on this, never on the sentence.
+<span class="lineno">  116 </span>webAuthnErrorCode :: WebAuthnError -&gt; Text
+<span class="lineno">  117 </span><span class="decl"><span class="istickedoff">webAuthnErrorCode err = case err of</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">WnMalformedClientData _        -&gt; <span class="nottickedoff">&quot;malformed_client_data&quot;</span></span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">WnWrongCeremony _              -&gt; <span class="nottickedoff">&quot;wrong_ceremony&quot;</span></span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">WnChallengeMismatch            -&gt; &quot;challenge_invalid&quot;</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">WnOriginMismatch _             -&gt; &quot;origin_mismatch&quot;</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">WnCrossOrigin                  -&gt; <span class="nottickedoff">&quot;origin_mismatch&quot;</span></span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">WnMalformedAuthenticatorData _ -&gt; <span class="nottickedoff">&quot;malformed_authenticator_data&quot;</span></span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">WnRpIdMismatch                 -&gt; <span class="nottickedoff">&quot;rp_mismatch&quot;</span></span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="istickedoff">WnUserPresenceMissing          -&gt; <span class="nottickedoff">&quot;user_presence_required&quot;</span></span>
+<span class="lineno">  126 </span><span class="spaces">  </span><span class="istickedoff">WnUserVerificationMissing      -&gt; &quot;user_verification_required&quot;</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="istickedoff">WnAttestedCredentialMissing    -&gt; <span class="nottickedoff">&quot;attested_credential_missing&quot;</span></span>
+<span class="lineno">  128 </span><span class="spaces">  </span><span class="istickedoff">WnCredentialIdMismatch         -&gt; <span class="nottickedoff">&quot;credential_id_mismatch&quot;</span></span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="istickedoff">WnCredentialIdLength _         -&gt; <span class="nottickedoff">&quot;credential_id_invalid&quot;</span></span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">WnUnsupportedAttestation _     -&gt; <span class="nottickedoff">&quot;unsupported_attestation&quot;</span></span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">WnMalformedCoseKey _           -&gt; <span class="nottickedoff">&quot;malformed_key&quot;</span></span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">WnSignatureInvalid             -&gt; &quot;signature_invalid&quot;</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="istickedoff">WnSignCountRegression _ _      -&gt; &quot;sign_count_regression&quot;</span></span>
+<span class="lineno">  134 </span>
+<span class="lineno">  135 </span>-- | Which ceremony a challenge was issued for. A challenge is bound to its
+<span class="lineno">  136 </span>-- ceremony so a @create@ challenge cannot be redeemed at the @get@ endpoint.
+<span class="lineno">  137 </span>data Ceremony = CerCreate | CerGet | CerAdd
+<span class="lineno">  138 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  139 </span>
+<span class="lineno">  140 </span>ceremonyText :: Ceremony -&gt; Text
+<span class="lineno">  141 </span><span class="decl"><span class="istickedoff">ceremonyText c = case c of</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">CerCreate -&gt; &quot;webauthn.create&quot;</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">CerGet    -&gt; &quot;webauthn.get&quot;</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">CerAdd    -&gt; <span class="nottickedoff">&quot;webauthn.create&quot;</span></span></span>
+<span class="lineno">  145 </span>
+<span class="lineno">  146 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  147 </span>-- clientDataJSON
+<span class="lineno">  148 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  149 </span>
+<span class="lineno">  150 </span>-- | The fields of @clientDataJSON@ we act on.
+<span class="lineno">  151 </span>data ClientData = ClientData
+<span class="lineno">  152 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">cdType</span></span></span>        :: Text
+<span class="lineno">  153 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdChallenge</span></span></span>   :: Text
+<span class="lineno">  154 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdOrigin</span></span></span>      :: Text
+<span class="lineno">  155 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cdCrossOrigin</span></span></span> :: Bool
+<span class="lineno">  156 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  157 </span>
+<span class="lineno">  158 </span>-- | Parse @clientDataJSON@ with aeson (never by string matching).
+<span class="lineno">  159 </span>parseClientData :: ByteString -&gt; Either WebAuthnError ClientData
+<span class="lineno">  160 </span><span class="decl"><span class="istickedoff">parseClientData raw =</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="istickedoff">case A.eitherDecodeStrict' raw :: Either String Value of</span>
+<span class="lineno">  162 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">Left (WnMalformedClientData (T.pack e))</span></span>
+<span class="lineno">  163 </span><span class="spaces">    </span><span class="istickedoff">Right (Object o) -&gt; ClientData</span>
+<span class="lineno">  164 </span><span class="spaces">      </span><span class="istickedoff">&lt;$&gt; field o &quot;type&quot;</span>
+<span class="lineno">  165 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; field o &quot;challenge&quot;</span>
+<span class="lineno">  166 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; field o &quot;origin&quot;</span>
+<span class="lineno">  167 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; pure (case KeyMap.lookup (Key.fromText &quot;crossOrigin&quot;) o of</span>
+<span class="lineno">  168 </span><span class="spaces">                  </span><span class="istickedoff">Just (Bool b) -&gt; b</span>
+<span class="lineno">  169 </span><span class="spaces">                  </span><span class="istickedoff">_             -&gt; <span class="nottickedoff">False</span>)</span>
+<span class="lineno">  170 </span><span class="spaces">    </span><span class="istickedoff">Right _ -&gt; <span class="nottickedoff">Left (WnMalformedClientData &quot;not a JSON object&quot;)</span></span>
+<span class="lineno">  171 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  172 </span><span class="spaces">    </span><span class="istickedoff">field o k = case KeyMap.lookup (Key.fromText k) o of</span>
+<span class="lineno">  173 </span><span class="spaces">      </span><span class="istickedoff">Just (String s) -&gt; Right s</span>
+<span class="lineno">  174 </span><span class="spaces">      </span><span class="istickedoff">Just _          -&gt; <span class="nottickedoff">Left (WnMalformedClientData (&quot;field \&quot;&quot; &lt;&gt; k &lt;&gt; &quot;\&quot; is not a string&quot;))</span></span>
+<span class="lineno">  175 </span><span class="spaces">      </span><span class="istickedoff">Nothing         -&gt; <span class="nottickedoff">Left (WnMalformedClientData (&quot;missing field \&quot;&quot; &lt;&gt; k &lt;&gt; &quot;\&quot;&quot;))</span></span></span>
+<span class="lineno">  176 </span>
+<span class="lineno">  177 </span>-- | Check the ceremony type, the challenge and the origin.
+<span class="lineno">  178 </span>--
+<span class="lineno">  179 </span>-- Both sides of the challenge comparison are base64url-decoded, so a
+<span class="lineno">  180 </span>-- re-encoded (but equivalent) challenge cannot be used to smuggle a mismatch
+<span class="lineno">  181 </span>-- past an exact text comparison — and a different challenge never compares
+<span class="lineno">  182 </span>-- equal by accident.
+<span class="lineno">  183 </span>checkClientData :: Ceremony -&gt; Text -&gt; Text -&gt; ClientData -&gt; Either WebAuthnError ()
+<span class="lineno">  184 </span><span class="decl"><span class="istickedoff">checkClientData ceremony expectedChallenge expectedOrigin cd = do</span>
+<span class="lineno">  185 </span><span class="spaces">  </span><span class="istickedoff">if cdType cd /= ceremonyText ceremony</span>
+<span class="lineno">  186 </span><span class="spaces">    </span><span class="istickedoff">then Left (WnWrongCeremony (cdType cd))</span>
+<span class="lineno">  187 </span><span class="spaces">    </span><span class="istickedoff">else Right <span class="nottickedoff">()</span></span>
+<span class="lineno">  188 </span><span class="spaces">  </span><span class="istickedoff">if cdCrossOrigin cd</span>
+<span class="lineno">  189 </span><span class="spaces">    </span><span class="istickedoff">then Left WnCrossOrigin</span>
+<span class="lineno">  190 </span><span class="spaces">    </span><span class="istickedoff">else Right <span class="nottickedoff">()</span></span>
+<span class="lineno">  191 </span><span class="spaces">  </span><span class="istickedoff">case (decodeB64Url (cdChallenge cd), decodeB64Url expectedChallenge) of</span>
+<span class="lineno">  192 </span><span class="spaces">    </span><span class="istickedoff">(Right a, Right b) | <span class="tickonlytrue">a == b</span> -&gt; Right <span class="nottickedoff">()</span></span>
+<span class="lineno">  193 </span><span class="spaces">    </span><span class="istickedoff">(Right _, Right _)          -&gt; <span class="nottickedoff">Left WnChallengeMismatch</span></span>
+<span class="lineno">  194 </span><span class="spaces">    </span><span class="istickedoff">-- One side is not valid base64url: fall back to a padding-insensitive</span>
+<span class="lineno">  195 </span><span class="spaces">    </span><span class="istickedoff">-- text comparison so a browser that only re-pads still verifies.</span>
+<span class="lineno">  196 </span><span class="spaces">    </span><span class="istickedoff">_ | <span class="tickonlyfalse">stripPadding (cdChallenge cd) == stripPadding expectedChallenge</span> -&gt; <span class="nottickedoff">Right ()</span></span>
+<span class="lineno">  197 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; Left WnChallengeMismatch</span>
+<span class="lineno">  198 </span><span class="spaces">  </span><span class="istickedoff">case normalizeOrigin (cdOrigin cd) of</span>
+<span class="lineno">  199 </span><span class="spaces">    </span><span class="istickedoff">Just o | o == normalizeOrigin' expectedOrigin -&gt; Right <span class="nottickedoff">()</span></span>
+<span class="lineno">  200 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; Left (WnOriginMismatch (cdOrigin cd))</span>
+<span class="lineno">  201 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  202 </span><span class="spaces">    </span><span class="istickedoff">normalizeOrigin' = fromMaybe <span class="nottickedoff">expectedOrigin</span> . normalizeOrigin</span></span>
+<span class="lineno">  203 </span>
+<span class="lineno">  204 </span>-- | Normalise an origin to @scheme://host[:port]@ with scheme and host
+<span class="lineno">  205 </span>-- lower-cased, a trailing slash removed, and the scheme's default port
+<span class="lineno">  206 </span>-- elided. Returns 'Nothing' for anything that is not an absolute
+<span class="lineno">  207 </span>-- @scheme://host@ URL.
+<span class="lineno">  208 </span>normalizeOrigin :: Text -&gt; Maybe Text
+<span class="lineno">  209 </span><span class="decl"><span class="istickedoff">normalizeOrigin t0 =</span>
+<span class="lineno">  210 </span><span class="spaces">  </span><span class="istickedoff">case T.breakOn &quot;://&quot; (T.dropWhileEnd (== '/') (T.strip t0)) of</span>
+<span class="lineno">  211 </span><span class="spaces">    </span><span class="istickedoff">(scheme, rest)</span>
+<span class="lineno">  212 </span><span class="spaces">      </span><span class="istickedoff">| T.null rest || T.null scheme -&gt; Nothing</span>
+<span class="lineno">  213 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">not (T.all validSchemeChar scheme)</span> -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  214 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt;</span>
+<span class="lineno">  215 </span><span class="spaces">          </span><span class="istickedoff">let (authority, path) = T.break (== '/') (T.drop 3 rest)</span>
+<span class="lineno">  216 </span><span class="spaces">          </span><span class="istickedoff">in if not (T.null path) || T.null authority</span>
+<span class="lineno">  217 </span><span class="spaces">               </span><span class="istickedoff">then Nothing</span>
+<span class="lineno">  218 </span><span class="spaces">               </span><span class="istickedoff">else</span>
+<span class="lineno">  219 </span><span class="spaces">                 </span><span class="istickedoff">let schemeL = T.toLower scheme</span>
+<span class="lineno">  220 </span><span class="spaces">                     </span><span class="istickedoff">(host, port) = splitHostPort authority</span>
+<span class="lineno">  221 </span><span class="spaces">                     </span><span class="istickedoff">hostL = T.toLower host</span>
+<span class="lineno">  222 </span><span class="spaces">                     </span><span class="istickedoff">defaultPort = case schemeL of</span>
+<span class="lineno">  223 </span><span class="spaces">                       </span><span class="istickedoff">&quot;https&quot; -&gt; Just &quot;443&quot;</span>
+<span class="lineno">  224 </span><span class="spaces">                       </span><span class="istickedoff">&quot;http&quot;  -&gt; Just &quot;80&quot;</span>
+<span class="lineno">  225 </span><span class="spaces">                       </span><span class="istickedoff">_       -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  226 </span><span class="spaces">                 </span><span class="istickedoff">in if <span class="tickonlyfalse">T.null hostL</span></span>
+<span class="lineno">  227 </span><span class="spaces">                      </span><span class="istickedoff">then <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  228 </span><span class="spaces">                      </span><span class="istickedoff">else Just $ case port of</span>
+<span class="lineno">  229 </span><span class="spaces">                        </span><span class="istickedoff">Just p | Just p /= defaultPort -&gt; schemeL &lt;&gt; &quot;://&quot; &lt;&gt; hostL &lt;&gt; &quot;:&quot; &lt;&gt; p</span>
+<span class="lineno">  230 </span><span class="spaces">                        </span><span class="istickedoff">_                              -&gt; schemeL &lt;&gt; &quot;://&quot; &lt;&gt; hostL</span>
+<span class="lineno">  231 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  232 </span><span class="spaces">    </span><span class="istickedoff">validSchemeChar c =</span>
+<span class="lineno">  233 </span><span class="spaces">      </span><span class="istickedoff">isAsciiLower c || isAsciiUpper c || <span class="nottickedoff">isDigit c || c == '+' || c == '-' || c == '.'</span></span></span>
+<span class="lineno">  234 </span>
+<span class="lineno">  235 </span>-- | Split @host[:port]@. A bare IPv6 literal is returned unchanged with no
+<span class="lineno">  236 </span>-- port (the gateway never derives an IPv6 origin; a wildcard bind has no
+<span class="lineno">  237 </span>-- derivable origin at all).
+<span class="lineno">  238 </span>splitHostPort :: Text -&gt; (Text, Maybe Text)
+<span class="lineno">  239 </span><span class="decl"><span class="istickedoff">splitHostPort authority =</span>
+<span class="lineno">  240 </span><span class="spaces">  </span><span class="istickedoff">case T.breakOnEnd &quot;:&quot; authority of</span>
+<span class="lineno">  241 </span><span class="spaces">    </span><span class="istickedoff">(withColon, port)</span>
+<span class="lineno">  242 </span><span class="spaces">      </span><span class="istickedoff">| T.null withColon -&gt; (authority, Nothing)</span>
+<span class="lineno">  243 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">T.any (== ':') (T.dropEnd 1 withColon)</span> -&gt; <span class="nottickedoff">(authority, Nothing)</span></span>
+<span class="lineno">  244 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">T.null port</span> -&gt; <span class="nottickedoff">(authority, Nothing)</span></span>
+<span class="lineno">  245 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">T.all isDigit port</span> -&gt; (T.dropEnd 1 withColon, Just port)</span>
+<span class="lineno">  246 </span><span class="spaces">      </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span> -&gt; <span class="nottickedoff">(authority, Nothing)</span></span></span>
+<span class="lineno">  247 </span>
+<span class="lineno">  248 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  249 </span>-- authenticatorData
+<span class="lineno">  250 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  251 </span>
+<span class="lineno">  252 </span>-- | The parsed fixed header of @authenticatorData@ plus the attested
+<span class="lineno">  253 </span>-- credential data when the @AT@ flag is set.
+<span class="lineno">  254 </span>data AuthenticatorData = AuthenticatorData
+<span class="lineno">  255 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">adRpIdHash</span></span></span>   :: ByteString
+<span class="lineno">  256 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adFlags</span></span></span>      :: Word8
+<span class="lineno">  257 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adSignCount</span></span></span>  :: Int
+<span class="lineno">  258 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">adCredential</span></span></span> :: Maybe (ByteString, CosePublicKey)
+<span class="lineno">  259 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">adRaw</span></span></span>        :: ByteString
+<span class="lineno">  260 </span>    -- ^ The exact bytes, needed verbatim for signature verification.
+<span class="lineno">  261 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  262 </span>
+<span class="lineno">  263 </span>flagUserPresent, flagUserVerified, flagAttested :: Word8
+<span class="lineno">  264 </span><span class="decl"><span class="istickedoff">flagUserPresent  = 0x01</span></span>
+<span class="lineno">  265 </span><span class="decl"><span class="istickedoff">flagUserVerified = 0x04</span></span>
+<span class="lineno">  266 </span><span class="decl"><span class="istickedoff">flagAttested     = 0x40</span></span>
+<span class="lineno">  267 </span>
+<span class="lineno">  268 </span>adUserPresent :: AuthenticatorData -&gt; Bool
+<span class="lineno">  269 </span><span class="decl"><span class="istickedoff">adUserPresent ad = adFlags ad .&amp;. flagUserPresent /= 0</span></span>
+<span class="lineno">  270 </span>
+<span class="lineno">  271 </span>adUserVerified :: AuthenticatorData -&gt; Bool
+<span class="lineno">  272 </span><span class="decl"><span class="istickedoff">adUserVerified ad = adFlags ad .&amp;. flagUserVerified /= 0</span></span>
+<span class="lineno">  273 </span>
+<span class="lineno">  274 </span>adHasAttestedCredential :: AuthenticatorData -&gt; Bool
+<span class="lineno">  275 </span><span class="decl"><span class="nottickedoff">adHasAttestedCredential ad = adFlags ad .&amp;. flagAttested /= 0</span></span>
+<span class="lineno">  276 </span>
+<span class="lineno">  277 </span>-- | Parse @authenticatorData@. Requires at least the 37-byte fixed header;
+<span class="lineno">  278 </span>-- when @AT@ is set, parses @aaguid(16) || credIdLen(2) || credId || COSE key@.
+<span class="lineno">  279 </span>parseAuthenticatorData :: ByteString -&gt; Either WebAuthnError AuthenticatorData
+<span class="lineno">  280 </span><span class="decl"><span class="istickedoff">parseAuthenticatorData raw</span>
+<span class="lineno">  281 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">BS.length raw &lt; 37</span> =</span>
+<span class="lineno">  282 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">Left (WnMalformedAuthenticatorData &quot;shorter than the 37-byte header&quot;)</span></span>
+<span class="lineno">  283 </span><span class="spaces">  </span><span class="istickedoff">| flags .&amp;. flagAttested == 0 =</span>
+<span class="lineno">  284 </span><span class="spaces">      </span><span class="istickedoff">Right AuthenticatorData</span>
+<span class="lineno">  285 </span><span class="spaces">        </span><span class="istickedoff">{ adRpIdHash = rpIdHash, adFlags = flags, adSignCount = signCount</span>
+<span class="lineno">  286 </span><span class="spaces">        </span><span class="istickedoff">, adCredential = Nothing, adRaw = <span class="nottickedoff">raw</span> }</span>
+<span class="lineno">  287 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = do</span>
+<span class="lineno">  288 </span><span class="spaces">      </span><span class="istickedoff">(credId, credIdLen, keyBytes) &lt;- parseAttested rest</span>
+<span class="lineno">  289 </span><span class="spaces">      </span><span class="istickedoff">if <span class="tickonlyfalse">credIdLen &lt; 1 || credIdLen &gt; 1023</span></span>
+<span class="lineno">  290 </span><span class="spaces">        </span><span class="istickedoff">then <span class="nottickedoff">Left (WnCredentialIdLength credIdLen)</span></span>
+<span class="lineno">  291 </span><span class="spaces">        </span><span class="istickedoff">else do</span>
+<span class="lineno">  292 </span><span class="spaces">          </span><span class="istickedoff">cose &lt;- case decodeCborPrefix keyBytes of</span>
+<span class="lineno">  293 </span><span class="spaces">            </span><span class="istickedoff">Left e           -&gt; <span class="nottickedoff">Left (WnMalformedCoseKey e)</span></span>
+<span class="lineno">  294 </span><span class="spaces">            </span><span class="istickedoff">Right (value, _) -&gt; Right value</span>
+<span class="lineno">  295 </span><span class="spaces">          </span><span class="istickedoff">key &lt;- parseCoseKey cose</span>
+<span class="lineno">  296 </span><span class="spaces">          </span><span class="istickedoff">Right AuthenticatorData</span>
+<span class="lineno">  297 </span><span class="spaces">            </span><span class="istickedoff">{ adRpIdHash = rpIdHash, adFlags = flags, adSignCount = signCount</span>
+<span class="lineno">  298 </span><span class="spaces">            </span><span class="istickedoff">, adCredential = Just (credId, key), adRaw = <span class="nottickedoff">raw</span> }</span>
+<span class="lineno">  299 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  300 </span><span class="spaces">    </span><span class="istickedoff">rpIdHash  = BS.take 32 raw</span>
+<span class="lineno">  301 </span><span class="spaces">    </span><span class="istickedoff">flags     = BS.index raw 32</span>
+<span class="lineno">  302 </span><span class="spaces">    </span><span class="istickedoff">signCount = be32 (BS.take 4 (BS.drop 33 raw))</span>
+<span class="lineno">  303 </span><span class="spaces">    </span><span class="istickedoff">rest      = BS.drop 37 raw</span></span>
+<span class="lineno">  304 </span>
+<span class="lineno">  305 </span>-- | Split @aaguid(16) || credIdLen(2) || credId@ off the front, returning the
+<span class="lineno">  306 </span>-- id, its declared length and the remaining (COSE key + optional extensions)
+<span class="lineno">  307 </span>-- bytes.
+<span class="lineno">  308 </span>parseAttested :: ByteString -&gt; Either WebAuthnError (ByteString, Int, ByteString)
+<span class="lineno">  309 </span><span class="decl"><span class="istickedoff">parseAttested r</span>
+<span class="lineno">  310 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">BS.length r &lt; 18</span> =</span>
+<span class="lineno">  311 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">Left (WnMalformedAuthenticatorData &quot;truncated attested credential data&quot;)</span></span>
+<span class="lineno">  312 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> =</span>
+<span class="lineno">  313 </span><span class="spaces">      </span><span class="istickedoff">let afterAaguid = BS.drop 16 r</span>
+<span class="lineno">  314 </span><span class="spaces">          </span><span class="istickedoff">len = be16 (BS.take 2 afterAaguid)</span>
+<span class="lineno">  315 </span><span class="spaces">          </span><span class="istickedoff">credId = BS.take len (BS.drop 2 afterAaguid)</span>
+<span class="lineno">  316 </span><span class="spaces">      </span><span class="istickedoff">in if <span class="tickonlyfalse">BS.length credId /= len</span></span>
+<span class="lineno">  317 </span><span class="spaces">           </span><span class="istickedoff">then <span class="nottickedoff">Left (WnMalformedAuthenticatorData &quot;truncated credential id&quot;)</span></span>
+<span class="lineno">  318 </span><span class="spaces">           </span><span class="istickedoff">else Right (credId, len, BS.drop (2 + len) afterAaguid)</span></span>
+<span class="lineno">  319 </span>
+<span class="lineno">  320 </span>-- | Parse a COSE @EC2@ public key: @{1: 2, 3: -7, -1: 1, -2: x, -3: y}@.
+<span class="lineno">  321 </span>parseCoseKey :: Cbor -&gt; Either WebAuthnError CosePublicKey
+<span class="lineno">  322 </span><span class="decl"><span class="istickedoff">parseCoseKey cose = do</span>
+<span class="lineno">  323 </span><span class="spaces">  </span><span class="istickedoff">kty &lt;- intField 1</span>
+<span class="lineno">  324 </span><span class="spaces">  </span><span class="istickedoff">alg &lt;- intField 3</span>
+<span class="lineno">  325 </span><span class="spaces">  </span><span class="istickedoff">crv &lt;- intField (-1)</span>
+<span class="lineno">  326 </span><span class="spaces">  </span><span class="istickedoff">x   &lt;- bytesField (-2)</span>
+<span class="lineno">  327 </span><span class="spaces">  </span><span class="istickedoff">y   &lt;- bytesField (-3)</span>
+<span class="lineno">  328 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">kty /= 2</span></span>
+<span class="lineno">  329 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">Left (WnMalformedCoseKey &quot;kty is not EC2 (2)&quot;)</span></span>
+<span class="lineno">  330 </span><span class="spaces">    </span><span class="istickedoff">else if <span class="tickonlyfalse">alg /= -7</span></span>
+<span class="lineno">  331 </span><span class="spaces">      </span><span class="istickedoff">then <span class="nottickedoff">Left (WnMalformedCoseKey &quot;alg is not ES256 (-7)&quot;)</span></span>
+<span class="lineno">  332 </span><span class="spaces">      </span><span class="istickedoff">else if <span class="tickonlyfalse">crv /= 1</span></span>
+<span class="lineno">  333 </span><span class="spaces">        </span><span class="istickedoff">then <span class="nottickedoff">Left (WnMalformedCoseKey &quot;crv is not P-256 (1)&quot;)</span></span>
+<span class="lineno">  334 </span><span class="spaces">        </span><span class="istickedoff">else if <span class="tickonlyfalse">BS.length x /= 32 || BS.length y /= 32</span></span>
+<span class="lineno">  335 </span><span class="spaces">          </span><span class="istickedoff">then <span class="nottickedoff">Left (WnMalformedCoseKey &quot;x/y are not 32 bytes each&quot;)</span></span>
+<span class="lineno">  336 </span><span class="spaces">          </span><span class="istickedoff">else do</span>
+<span class="lineno">  337 </span><span class="spaces">            </span><span class="istickedoff">let key = CosePublicKey (x &lt;&gt; y)</span>
+<span class="lineno">  338 </span><span class="spaces">            </span><span class="istickedoff">_ &lt;- cosePublicKeyToPoint key</span>
+<span class="lineno">  339 </span><span class="spaces">            </span><span class="istickedoff">Right key</span>
+<span class="lineno">  340 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  341 </span><span class="spaces">    </span><span class="istickedoff">intField k = case cborLookupInt k cose of</span>
+<span class="lineno">  342 </span><span class="spaces">      </span><span class="istickedoff">Just (CborInt n) -&gt; Right n</span>
+<span class="lineno">  343 </span><span class="spaces">      </span><span class="istickedoff">Just _           -&gt; <span class="nottickedoff">Left (WnMalformedCoseKey (&quot;field &quot; &lt;&gt; tshow k &lt;&gt; &quot; is not an integer&quot;))</span></span>
+<span class="lineno">  344 </span><span class="spaces">      </span><span class="istickedoff">Nothing          -&gt; <span class="nottickedoff">Left (WnMalformedCoseKey (&quot;missing field &quot; &lt;&gt; tshow k))</span></span>
+<span class="lineno">  345 </span><span class="spaces">    </span><span class="istickedoff">bytesField k = case cborLookupInt k cose of</span>
+<span class="lineno">  346 </span><span class="spaces">      </span><span class="istickedoff">Just (CborBytes b) -&gt; Right b</span>
+<span class="lineno">  347 </span><span class="spaces">      </span><span class="istickedoff">Just _             -&gt; <span class="nottickedoff">Left (WnMalformedCoseKey (&quot;field &quot; &lt;&gt; tshow k &lt;&gt; &quot; is not a byte string&quot;))</span></span>
+<span class="lineno">  348 </span><span class="spaces">      </span><span class="istickedoff">Nothing            -&gt; <span class="nottickedoff">Left (WnMalformedCoseKey (&quot;missing field &quot; &lt;&gt; tshow k))</span></span></span>
+<span class="lineno">  349 </span>
+<span class="lineno">  350 </span>-- | Convert a 64-byte @x || y@ key into a crypton 'PublicKey', rejecting a
+<span class="lineno">  351 </span>-- point that is not on the curve.
+<span class="lineno">  352 </span>cosePublicKeyToPoint :: CosePublicKey -&gt; Either WebAuthnError PublicKey
+<span class="lineno">  353 </span><span class="decl"><span class="istickedoff">cosePublicKeyToPoint (CosePublicKey bytes)</span>
+<span class="lineno">  354 </span><span class="spaces">  </span><span class="istickedoff">| BS.length bytes /= 64 = Left (WnMalformedCoseKey &quot;key is not 64 bytes&quot;)</span>
+<span class="lineno">  355 </span><span class="spaces">  </span><span class="istickedoff">| not (isPointValid curve point) = Left (WnMalformedCoseKey &quot;point is not on P-256&quot;)</span>
+<span class="lineno">  356 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Right (PublicKey curve point)</span>
+<span class="lineno">  357 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  358 </span><span class="spaces">    </span><span class="istickedoff">(xb, yb) = BS.splitAt 32 bytes</span>
+<span class="lineno">  359 </span><span class="spaces">    </span><span class="istickedoff">point = Point (beInteger xb) (beInteger yb)</span>
+<span class="lineno">  360 </span><span class="spaces">    </span><span class="istickedoff">curve = getCurveByName SEC_p256r1</span></span>
+<span class="lineno">  361 </span>
+<span class="lineno">  362 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  363 </span>-- Registration
+<span class="lineno">  364 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  365 </span>
+<span class="lineno">  366 </span>data RegistrationInput = RegistrationInput
+<span class="lineno">  367 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">riClientDataJSON</span></span></span>    :: ByteString
+<span class="lineno">  368 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">riAttestationObject</span></span></span> :: ByteString
+<span class="lineno">  369 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">riRawId</span></span></span>             :: ByteString
+<span class="lineno">  370 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">riExpectedChallenge</span></span></span> :: Text
+<span class="lineno">  371 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">riExpectedOrigin</span></span></span>    :: Text
+<span class="lineno">  372 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">riExpectedRpId</span></span></span>      :: Text
+<span class="lineno">  373 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  374 </span>
+<span class="lineno">  375 </span>data RegistrationResult = RegistrationResult
+<span class="lineno">  376 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">rrCredentialId</span></span></span> :: ByteString
+<span class="lineno">  377 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrPublicKey</span></span></span>    :: CosePublicKey
+<span class="lineno">  378 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rrSignCount</span></span></span>    :: Int
+<span class="lineno">  379 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  380 </span>
+<span class="lineno">  381 </span>-- | Verify a @navigator.credentials.create()@ response.
+<span class="lineno">  382 </span>verifyRegistration :: RegistrationInput -&gt; Either WebAuthnError RegistrationResult
+<span class="lineno">  383 </span><span class="decl"><span class="istickedoff">verifyRegistration ri = do</span>
+<span class="lineno">  384 </span><span class="spaces">  </span><span class="istickedoff">cd &lt;- parseClientData (riClientDataJSON ri)</span>
+<span class="lineno">  385 </span><span class="spaces">  </span><span class="istickedoff">checkClientData CerCreate (riExpectedChallenge ri) (riExpectedOrigin ri) cd</span>
+<span class="lineno">  386 </span><span class="spaces">  </span><span class="istickedoff">authData &lt;- attestationAuthData (riAttestationObject ri)</span>
+<span class="lineno">  387 </span><span class="spaces">  </span><span class="istickedoff">ad &lt;- parseAuthenticatorData authData</span>
+<span class="lineno">  388 </span><span class="spaces">  </span><span class="istickedoff">checkHeader (riExpectedRpId ri) ad</span>
+<span class="lineno">  389 </span><span class="spaces">  </span><span class="istickedoff">(credId, key) &lt;- case adCredential ad of</span>
+<span class="lineno">  390 </span><span class="spaces">    </span><span class="istickedoff">Just pair -&gt; Right pair</span>
+<span class="lineno">  391 </span><span class="spaces">    </span><span class="istickedoff">Nothing   -&gt; Left WnAttestedCredentialMissing</span>
+<span class="lineno">  392 </span><span class="spaces">  </span><span class="istickedoff">if credId /= riRawId ri</span>
+<span class="lineno">  393 </span><span class="spaces">    </span><span class="istickedoff">then Left WnCredentialIdMismatch</span>
+<span class="lineno">  394 </span><span class="spaces">    </span><span class="istickedoff">else if <span class="tickonlyfalse">BS.length credId &lt; 1 || BS.length credId &gt; 1023</span></span>
+<span class="lineno">  395 </span><span class="spaces">      </span><span class="istickedoff">then <span class="nottickedoff">Left (WnCredentialIdLength (BS.length credId))</span></span>
+<span class="lineno">  396 </span><span class="spaces">      </span><span class="istickedoff">else Right RegistrationResult</span>
+<span class="lineno">  397 </span><span class="spaces">             </span><span class="istickedoff">{ rrCredentialId = credId</span>
+<span class="lineno">  398 </span><span class="spaces">             </span><span class="istickedoff">, rrPublicKey = key</span>
+<span class="lineno">  399 </span><span class="spaces">             </span><span class="istickedoff">, rrSignCount = adSignCount ad</span>
+<span class="lineno">  400 </span><span class="spaces">             </span><span class="istickedoff">}</span></span>
+<span class="lineno">  401 </span>
+<span class="lineno">  402 </span>-- | Pull @authData@ out of the attestation object, requiring
+<span class="lineno">  403 </span>-- @fmt = \&quot;none\&quot;@.
+<span class="lineno">  404 </span>attestationAuthData :: ByteString -&gt; Either WebAuthnError ByteString
+<span class="lineno">  405 </span><span class="decl"><span class="istickedoff">attestationAuthData raw = do</span>
+<span class="lineno">  406 </span><span class="spaces">  </span><span class="istickedoff">cose &lt;- either (Left . <span class="nottickedoff">WnUnsupportedAttestation</span>) Right (decodeCbor raw)</span>
+<span class="lineno">  407 </span><span class="spaces">  </span><span class="istickedoff">pairs &lt;- case cose of</span>
+<span class="lineno">  408 </span><span class="spaces">    </span><span class="istickedoff">CborMap ps -&gt; Right ps</span>
+<span class="lineno">  409 </span><span class="spaces">    </span><span class="istickedoff">_          -&gt; <span class="nottickedoff">Left (WnUnsupportedAttestation &quot;attestation object is not a map&quot;)</span></span>
+<span class="lineno">  410 </span><span class="spaces">  </span><span class="istickedoff">fmt &lt;- case lookup (CborText &quot;fmt&quot;) pairs of</span>
+<span class="lineno">  411 </span><span class="spaces">    </span><span class="istickedoff">Just (CborText f) -&gt; Right f</span>
+<span class="lineno">  412 </span><span class="spaces">    </span><span class="istickedoff">_                 -&gt; <span class="nottickedoff">Left (WnUnsupportedAttestation &quot;missing fmt&quot;)</span></span>
+<span class="lineno">  413 </span><span class="spaces">  </span><span class="istickedoff">if fmt /= &quot;none&quot;</span>
+<span class="lineno">  414 </span><span class="spaces">    </span><span class="istickedoff">then Left (WnUnsupportedAttestation fmt)</span>
+<span class="lineno">  415 </span><span class="spaces">    </span><span class="istickedoff">else case lookup (CborText &quot;authData&quot;) pairs of</span>
+<span class="lineno">  416 </span><span class="spaces">      </span><span class="istickedoff">Just (CborBytes b) -&gt; Right b</span>
+<span class="lineno">  417 </span><span class="spaces">      </span><span class="istickedoff">_                  -&gt; <span class="nottickedoff">Left (WnUnsupportedAttestation &quot;missing authData&quot;)</span></span></span>
+<span class="lineno">  418 </span>
+<span class="lineno">  419 </span>-- | The invariants shared by both ceremonies.
+<span class="lineno">  420 </span>checkHeader :: Text -&gt; AuthenticatorData -&gt; Either WebAuthnError ()
+<span class="lineno">  421 </span><span class="decl"><span class="istickedoff">checkHeader expectedRpId ad = do</span>
+<span class="lineno">  422 </span><span class="spaces">  </span><span class="istickedoff">if adRpIdHash ad /= sha256 (TE.encodeUtf8 expectedRpId)</span>
+<span class="lineno">  423 </span><span class="spaces">    </span><span class="istickedoff">then Left WnRpIdMismatch</span>
+<span class="lineno">  424 </span><span class="spaces">    </span><span class="istickedoff">else Right <span class="nottickedoff">()</span></span>
+<span class="lineno">  425 </span><span class="spaces">  </span><span class="istickedoff">if not (adUserPresent ad)</span>
+<span class="lineno">  426 </span><span class="spaces">    </span><span class="istickedoff">then Left WnUserPresenceMissing</span>
+<span class="lineno">  427 </span><span class="spaces">    </span><span class="istickedoff">else Right <span class="nottickedoff">()</span></span>
+<span class="lineno">  428 </span><span class="spaces">  </span><span class="istickedoff">if not (adUserVerified ad)</span>
+<span class="lineno">  429 </span><span class="spaces">    </span><span class="istickedoff">then Left WnUserVerificationMissing</span>
+<span class="lineno">  430 </span><span class="spaces">    </span><span class="istickedoff">else Right <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  431 </span>
+<span class="lineno">  432 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  433 </span>-- Assertion
+<span class="lineno">  434 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  435 </span>
+<span class="lineno">  436 </span>data AssertionInput = AssertionInput
+<span class="lineno">  437 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">aiClientDataJSON</span></span></span>    :: ByteString
+<span class="lineno">  438 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">aiAuthenticatorData</span></span></span> :: ByteString
+<span class="lineno">  439 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">aiSignature</span></span></span>         :: ByteString
+<span class="lineno">  440 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">aiExpectedChallenge</span></span></span> :: Text
+<span class="lineno">  441 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">aiExpectedOrigin</span></span></span>    :: Text
+<span class="lineno">  442 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">aiExpectedRpId</span></span></span>      :: Text
+<span class="lineno">  443 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">aiStoredSignCount</span></span></span>   :: Int
+<span class="lineno">  444 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  445 </span>
+<span class="lineno">  446 </span>-- | Verify a @navigator.credentials.get()@ response. Returns the new sign
+<span class="lineno">  447 </span>-- counter; the caller persists it under the same lock, so the
+<span class="lineno">  448 </span>-- read-check-write cannot interleave with a replayed assertion.
+<span class="lineno">  449 </span>verifyAssertion :: CosePublicKey -&gt; AssertionInput -&gt; Either WebAuthnError Int
+<span class="lineno">  450 </span><span class="decl"><span class="istickedoff">verifyAssertion key ai = do</span>
+<span class="lineno">  451 </span><span class="spaces">  </span><span class="istickedoff">cd &lt;- parseClientData (aiClientDataJSON ai)</span>
+<span class="lineno">  452 </span><span class="spaces">  </span><span class="istickedoff">checkClientData CerGet (aiExpectedChallenge ai) (aiExpectedOrigin ai) cd</span>
+<span class="lineno">  453 </span><span class="spaces">  </span><span class="istickedoff">ad &lt;- parseAuthenticatorData (aiAuthenticatorData ai)</span>
+<span class="lineno">  454 </span><span class="spaces">  </span><span class="istickedoff">checkHeader (aiExpectedRpId ai) ad</span>
+<span class="lineno">  455 </span><span class="spaces">  </span><span class="istickedoff">newCount &lt;- checkSignCount (aiStoredSignCount ai) (adSignCount ad)</span>
+<span class="lineno">  456 </span><span class="spaces">  </span><span class="istickedoff">(r, s) &lt;- either</span>
+<span class="lineno">  457 </span><span class="spaces">    </span><span class="istickedoff">(Left . <span class="nottickedoff">WnMalformedAuthenticatorData . (&quot;signature: &quot; &lt;&gt;)</span>)</span>
+<span class="lineno">  458 </span><span class="spaces">    </span><span class="istickedoff">Right</span>
+<span class="lineno">  459 </span><span class="spaces">    </span><span class="istickedoff">(decodeEcdsaSignature (aiSignature ai))</span>
+<span class="lineno">  460 </span><span class="spaces">  </span><span class="istickedoff">pub &lt;- cosePublicKeyToPoint key</span>
+<span class="lineno">  461 </span><span class="spaces">  </span><span class="istickedoff">let message = aiAuthenticatorData ai &lt;&gt; sha256 (aiClientDataJSON ai)</span>
+<span class="lineno">  462 </span><span class="spaces">  </span><span class="istickedoff">if verify <span class="nottickedoff">SHA256</span> pub (Signature r s) message</span>
+<span class="lineno">  463 </span><span class="spaces">    </span><span class="istickedoff">then Right newCount</span>
+<span class="lineno">  464 </span><span class="spaces">    </span><span class="istickedoff">else Left WnSignatureInvalid</span></span>
+<span class="lineno">  465 </span>
+<span class="lineno">  466 </span>-- | The WebAuthn sign-counter rule, stated exactly:
+<span class="lineno">  467 </span>--
+<span class="lineno">  468 </span>-- * a stored counter of 0 and a reported counter of 0 means the authenticator
+<span class="lineno">  469 </span>--   does not implement one — accept (the spec allows this for platform
+<span class="lineno">  470 </span>--   authenticators);
+<span class="lineno">  471 </span>-- * a reported counter of 0 when we stored a non-zero one is a regression;
+<span class="lineno">  472 </span>-- * otherwise the reported counter must be strictly greater.
+<span class="lineno">  473 </span>checkSignCount :: Int -&gt; Int -&gt; Either WebAuthnError Int
+<span class="lineno">  474 </span><span class="decl"><span class="istickedoff">checkSignCount stored new</span>
+<span class="lineno">  475 </span><span class="spaces">  </span><span class="istickedoff">| stored == 0 &amp;&amp; new == 0 = Right 0</span>
+<span class="lineno">  476 </span><span class="spaces">  </span><span class="istickedoff">| new &lt;= stored           = Left (WnSignCountRegression stored new)</span>
+<span class="lineno">  477 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>               = Right new</span></span>
+<span class="lineno">  478 </span>
+<span class="lineno">  479 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  480 </span>-- Byte helpers
+<span class="lineno">  481 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  482 </span>
+<span class="lineno">  483 </span>sha256 :: ByteString -&gt; ByteString
+<span class="lineno">  484 </span><span class="decl"><span class="istickedoff">sha256 bs = convert (hash bs :: Digest SHA256)</span></span>
+<span class="lineno">  485 </span>
+<span class="lineno">  486 </span>be16 :: ByteString -&gt; Int
+<span class="lineno">  487 </span><span class="decl"><span class="istickedoff">be16 = fromIntegral . beInteger</span></span>
+<span class="lineno">  488 </span>
+<span class="lineno">  489 </span>be32 :: ByteString -&gt; Int
+<span class="lineno">  490 </span><span class="decl"><span class="istickedoff">be32 = fromIntegral . beInteger</span></span>
+<span class="lineno">  491 </span>
+<span class="lineno">  492 </span>beInteger :: ByteString -&gt; Integer
+<span class="lineno">  493 </span><span class="decl"><span class="istickedoff">beInteger = BS.foldl' (\acc w -&gt; acc `shiftL` 8 + fromIntegral w) 0</span></span>
+<span class="lineno">  494 </span>
+<span class="lineno">  495 </span>decodeB64Url :: Text -&gt; Either Text ByteString
+<span class="lineno">  496 </span><span class="decl"><span class="istickedoff">decodeB64Url = either (Left . <span class="nottickedoff">T.pack</span>) Right . B64Url.decodeUnpadded . TE.encodeUtf8</span></span>
+<span class="lineno">  497 </span>
+<span class="lineno">  498 </span>stripPadding :: Text -&gt; Text
+<span class="lineno">  499 </span><span class="decl"><span class="istickedoff">stripPadding = T.dropWhileEnd (== '=')</span></span>
+<span class="lineno">  500 </span>
+<span class="lineno">  501 </span>tshow :: Show a =&gt; a -&gt; Text
+<span class="lineno">  502 </span><span class="decl"><span class="nottickedoff">tshow = T.pack . show</span></span>
+
+</pre>
+</body>
+</html>

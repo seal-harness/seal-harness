@@ -1,0 +1,57 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The reusable allow-list family used by sender allow-listing (channels)
+<span class="lineno">    3 </span>-- and opcode-exposure gating (agent defs). Extracted from
+<span class="lineno">    4 </span>-- 'Seal.Security.Policy' so the cross-channel layer can depend on this leaf
+<span class="lineno">    5 </span>-- without pulling in the whole security policy.
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- This module is now a thin re-export from 'Seal.Gateway.Types.AllowList'
+<span class="lineno">    8 </span>-- (the canonical home in the 'seal-gateway-types' library stanza), plus the
+<span class="lineno">    9 </span>-- shared 'allowListCodec' used by 'Seal.Signal.Config', 'Seal.Telegram.Config',
+<span class="lineno">   10 </span>-- and 'Seal.Channels.Config'.
+<span class="lineno">   11 </span>module Seal.Core.AllowList
+<span class="lineno">   12 </span>  ( AllowList (..)
+<span class="lineno">   13 </span>  , isAllowed
+<span class="lineno">   14 </span>  , allowListCodec
+<span class="lineno">   15 </span>  ) where
+<span class="lineno">   16 </span>
+<span class="lineno">   17 </span>import Data.Set qualified as Set
+<span class="lineno">   18 </span>import Data.Text (Text)
+<span class="lineno">   19 </span>import Toml qualified
+<span class="lineno">   20 </span>
+<span class="lineno">   21 </span>import Seal.Gateway.Types.AllowList
+<span class="lineno">   22 </span>
+<span class="lineno">   23 </span>-- | Codec for the @allow_from@ array: 'AllowAll' when absent, 'AllowOnly'
+<span class="lineno">   24 </span>-- of the listed strings when present. Shared by all channel config codecs
+<span class="lineno">   25 </span>-- (Signal, Telegram, Channels) to avoid triplication.
+<span class="lineno">   26 </span>allowListCodec :: Toml.TomlCodec (AllowList Text)
+<span class="lineno">   27 </span><span class="decl"><span class="istickedoff">allowListCodec = Toml.dimap toList fromList (Toml.dioptional (Toml.arrayOf Toml._Text &quot;allow_from&quot;))</span>
+<span class="lineno">   28 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   29 </span><span class="spaces">    </span><span class="istickedoff">toList :: AllowList Text -&gt; Maybe [Text]</span>
+<span class="lineno">   30 </span><span class="spaces">    </span><span class="istickedoff">toList AllowAll       = Nothing</span>
+<span class="lineno">   31 </span><span class="spaces">    </span><span class="istickedoff">toList (AllowOnly xs) = Just (Set.toList xs)</span>
+<span class="lineno">   32 </span><span class="spaces">    </span><span class="istickedoff">fromList :: Maybe [Text] -&gt; AllowList Text</span>
+<span class="lineno">   33 </span><span class="spaces">    </span><span class="istickedoff">fromList Nothing   = AllowAll</span>
+<span class="lineno">   34 </span><span class="spaces">    </span><span class="istickedoff">fromList (Just xs) = AllowOnly (Set.fromList xs)</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,740 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Enrollment grants: the authority a client presents to add a credential.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- This module currently holds the shared vocabulary only. The grant record,
+<span class="lineno">    5 </span>-- its file codec and the claim protocol land with the grant machinery; the
+<span class="lineno">    6 </span>-- type lives here from the start because both the credential store's
+<span class="lineno">    7 </span>-- @added_via@ and the boot plan's &quot;should I mint a grant, and how&quot; have to name
+<span class="lineno">    8 </span>-- the same set of sources. Two copies of that enum would drift.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- Why this is not in &quot;Seal.Security.AccessControl&quot;: @Grant@'s phases name
+<span class="lineno">   11 </span>-- challenge ids, which are gateway-local. Keeping the grant types out of the
+<span class="lineno">   12 </span>-- credential-availability code is what lets the latter stay a pure function of
+<span class="lineno">   13 </span>-- a credential map (design §7.1).
+<span class="lineno">   14 </span>module Seal.Security.EnrollmentGrant
+<span class="lineno">   15 </span>  ( GrantSource (..)
+<span class="lineno">   16 </span>  , grantSourceText
+<span class="lineno">   17 </span>  , parseGrantSource
+<span class="lineno">   18 </span>  , GrantPhase (..)
+<span class="lineno">   19 </span>  , GrantId (..)
+<span class="lineno">   20 </span>  , ChallengeId (..)
+<span class="lineno">   21 </span>  , Grant (..)
+<span class="lineno">   22 </span>  , EnrollmentAuthority
+<span class="lineno">   23 </span>  , GrantDenied (..)
+<span class="lineno">   24 </span>  , GrantContext (..)
+<span class="lineno">   25 </span>  , enrollmentAuthority
+<span class="lineno">   26 </span>  , findAuthority
+<span class="lineno">   27 </span>  , grantToJson
+<span class="lineno">   28 </span>  , grantFromJson
+<span class="lineno">   29 </span>  , grantBody
+<span class="lineno">   30 </span>  , grantBodyText
+<span class="lineno">   31 </span>  , MintedGrant (..)
+<span class="lineno">   32 </span>  , enrollGrant
+<span class="lineno">   33 </span>  , cancelGrant
+<span class="lineno">   34 </span>  , parseTtl
+<span class="lineno">   35 </span>  , defaultTtlFor
+<span class="lineno">   36 </span>  , GrantClaim (..)
+<span class="lineno">   37 </span>  , claimExclusively
+<span class="lineno">   38 </span>  , claimLiveAt
+<span class="lineno">   39 </span>  , effectiveDeadline
+<span class="lineno">   40 </span>  , grantRedeems
+<span class="lineno">   41 </span>  , loadClaimFile
+<span class="lineno">   42 </span>  , releaseClaim
+<span class="lineno">   43 </span>  , bindClaimSuperseding
+<span class="lineno">   44 </span>  , grantLiveAt
+<span class="lineno">   45 </span>  , loadGrantFile
+<span class="lineno">   46 </span>  , saveGrantFile
+<span class="lineno">   47 </span>  , deleteGrantFile
+<span class="lineno">   48 </span>  , tokenDigest
+<span class="lineno">   49 </span>  ) where
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>import Data.Aeson (Value, eitherDecode, encode, object, withObject, (.:), (.:?), (.=))
+<span class="lineno">   52 </span>import Data.Aeson.Types (Parser, parseMaybe)
+<span class="lineno">   53 </span>import Data.ByteString (ByteString)
+<span class="lineno">   54 </span>import Data.Maybe (isJust)
+<span class="lineno">   55 </span>import Data.Text (Text)
+<span class="lineno">   56 </span>import Data.Text qualified as T
+<span class="lineno">   57 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   58 </span>import Data.Char (isDigit)
+<span class="lineno">   59 </span>import Data.Time (NominalDiffTime, UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
+<span class="lineno">   60 </span>import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
+<span class="lineno">   61 </span>import Control.Exception (IOException, try)
+<span class="lineno">   62 </span>import Control.Monad (forM_, when)
+<span class="lineno">   63 </span>import System.Directory
+<span class="lineno">   64 </span>  ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist, listDirectory
+<span class="lineno">   65 </span>  , removeFile, renameFile )
+<span class="lineno">   66 </span>import System.FilePath ((&lt;/&gt;), takeBaseName, takeDirectory)
+<span class="lineno">   67 </span>import System.IO (hClose, openBinaryTempFile)
+<span class="lineno">   68 </span>import System.Posix.Files (setFileMode)
+<span class="lineno">   69 </span>import System.Posix.IO
+<span class="lineno">   70 </span>  ( OpenFileFlags (creat, exclusive), OpenMode (WriteOnly), defaultFileFlags
+<span class="lineno">   71 </span>  , fdToHandle, openFd )
+<span class="lineno">   72 </span>
+<span class="lineno">   73 </span>import Data.ByteString qualified as BS
+<span class="lineno">   74 </span>import Data.ByteString.Lazy qualified as LBS
+<span class="lineno">   75 </span>import Data.ByteString.Base64.URL qualified as B64Url
+<span class="lineno">   76 </span>
+<span class="lineno">   77 </span>import Seal.Security.Crypto (constantTimeEq, generateToken, sha256Hash)
+<span class="lineno">   78 </span>import Seal.Config.Paths
+<span class="lineno">   79 </span>  ( SealPaths (..), enrollmentGrantPath, enrollmentTokenPath )
+<span class="lineno">   80 </span>import Seal.Security.AccessControl (CredentialAvailability (..))
+<span class="lineno">   81 </span>import Seal.Security.WebAuthn.Types (AccessMode (..))
+<span class="lineno">   82 </span>
+<span class="lineno">   83 </span>-- | How a grant was minted — and, for an enrolled credential, how it was added
+<span class="lineno">   84 </span>-- (@added_via@ plus @legacy@, which no grant can produce).
+<span class="lineno">   85 </span>--
+<span class="lineno">   86 </span>-- The distinction is load-bearing, not descriptive: a 'CliWindow' grant is
+<span class="lineno">   87 </span>-- authority with no secret at all, so it exists only in the bootstrap state
+<span class="lineno">   88 </span>-- (nothing enrolled, loopback bind, loopback origin). Any other combination is
+<span class="lineno">   89 </span>-- a refusal, which is why the type flows into both the boot plan and the
+<span class="lineno">   90 </span>-- resolver rather than being flattened to a boolean.
+<span class="lineno">   91 </span>data GrantSource
+<span class="lineno">   92 </span>  = CliToken
+<span class="lineno">   93 </span>    -- ^ Minted by @seal access-control enroll@ or by boot; presented as a
+<span class="lineno">   94 </span>    -- request header.
+<span class="lineno">   95 </span>  | CliWindow
+<span class="lineno">   96 </span>    -- ^ @enroll --no-token@: loopback-confined, bootstrap-only, no secret
+<span class="lineno">   97 </span>    -- presented.
+<span class="lineno">   98 </span>  | Assertion
+<span class="lineno">   99 </span>    -- ^ Minted by a successful assertion from an already-enrolled credential;
+<span class="lineno">  100 </span>    -- the authority for adding a second passkey.
+<span class="lineno">  101 </span>  | UiToken
+<span class="lineno">  102 </span>    -- ^ Minted by an authenticated browser session that has just completed a
+<span class="lineno">  103 </span>    -- step-up assertion (@POST /api/auth/enroll/verify@ with
+<span class="lineno">  104 </span>    -- @grant: portable@), so the operator can open the link on a *different*
+<span class="lineno">  105 </span>    -- device. Token-presented, file-backed, exactly like 'CliToken' — it
+<span class="lineno">  106 </span>    -- differs only in provenance, which the audit log and @minted_via@ report.
+<span class="lineno">  107 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  108 </span>
+<span class="lineno">  109 </span>-- | The wire/TOML spelling (@minted_via@, @added_via@).
+<span class="lineno">  110 </span>grantSourceText :: GrantSource -&gt; Text
+<span class="lineno">  111 </span><span class="decl"><span class="istickedoff">grantSourceText source = case source of</span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="istickedoff">CliToken  -&gt; &quot;cli_token&quot;</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">CliWindow -&gt; &quot;cli_window&quot;</span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="istickedoff">Assertion -&gt; &quot;assertion&quot;</span>
+<span class="lineno">  115 </span><span class="spaces">  </span><span class="istickedoff">UiToken   -&gt; &quot;ui_token&quot;</span></span>
+<span class="lineno">  116 </span>
+<span class="lineno">  117 </span>-- | Parse the stored spelling. 'Nothing' for anything unrecognised — callers
+<span class="lineno">  118 </span>-- decide whether that is a refusal (grants) or a fallback to @legacy@
+<span class="lineno">  119 </span>-- (credentials, where claiming nothing about the enrolling authority is safe).
+<span class="lineno">  120 </span>parseGrantSource :: Text -&gt; Maybe GrantSource
+<span class="lineno">  121 </span><span class="decl"><span class="istickedoff">parseGrantSource raw = case raw of</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">&quot;cli_token&quot;  -&gt; Just CliToken</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">&quot;cli_window&quot; -&gt; Just CliWindow</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">&quot;assertion&quot;  -&gt; Just Assertion</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="istickedoff">&quot;ui_token&quot;   -&gt; Just UiToken</span>
+<span class="lineno">  126 </span><span class="spaces">  </span><span class="istickedoff">_            -&gt; Nothing</span></span>
+<span class="lineno">  127 </span>
+<span class="lineno">  128 </span>-- | Where a grant is in its lifecycle (design §7.3).
+<span class="lineno">  129 </span>--
+<span class="lineno">  130 </span>-- @Minted@ may be bound to exactly one challenge; @GrantBound@ records which,
+<span class="lineno">  131 </span>-- so a grant bound to challenge A cannot redeem B.
+<span class="lineno">  132 </span>data GrantPhase
+<span class="lineno">  133 </span>  = GrantMinted
+<span class="lineno">  134 </span>  | GrantBound !ChallengeId
+<span class="lineno">  135 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  136 </span>
+<span class="lineno">  137 </span>newtype GrantId = GrantId Text
+<span class="lineno">  138 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  139 </span>
+<span class="lineno">  140 </span>-- | The challenge text (the map key the gateway issues under), so the phase
+<span class="lineno">  141 </span>-- compares directly with what a verify request presents.
+<span class="lineno">  142 </span>newtype ChallengeId = ChallengeId Text
+<span class="lineno">  143 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  144 </span>
+<span class="lineno">  145 </span>-- | An outstanding enrollment grant.
+<span class="lineno">  146 </span>--
+<span class="lineno">  147 </span>-- @grTokenSha@ is the SHA-256 of the token the client will present — never the
+<span class="lineno">  148 </span>-- token itself, so a copy of the state directory does not hand over enrollment
+<span class="lineno">  149 </span>-- authority. It is 'Nothing' only for 'CliWindow', which presents no secret at
+<span class="lineno">  150 </span>-- all and is confined to a loopback-bound, credential-free bootstrap.
+<span class="lineno">  151 </span>data Grant = Grant
+<span class="lineno">  152 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">grId</span></span></span>        :: !GrantId
+<span class="lineno">  153 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">grExpiresAt</span></span></span> :: !UTCTime
+<span class="lineno">  154 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">grSource</span></span></span>    :: !GrantSource
+<span class="lineno">  155 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">grPhase</span></span></span>     :: !GrantPhase
+<span class="lineno">  156 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">grTokenSha</span></span></span>  :: !(Maybe ByteString)
+<span class="lineno">  157 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  158 </span>
+<span class="lineno">  159 </span>-- | One ceremony's exclusive hold on a grant (design §7.3).
+<span class="lineno">  160 </span>--
+<span class="lineno">  161 </span>-- Created @O_CREAT|O_EXCL@ when @options@ binds, so the /create/ result decides
+<span class="lineno">  162 </span>-- which of two racing verifies wins — a prior read cannot, because two readers
+<span class="lineno">  163 </span>-- can both see &quot;no claim&quot; before either writes.
+<span class="lineno">  164 </span>--
+<span class="lineno">  165 </span>-- @clDeadline@ is 'effectiveDeadline': the claim may never outlive the grant it
+<span class="lineno">  166 </span>-- belongs to.
+<span class="lineno">  167 </span>data GrantClaim = GrantClaim
+<span class="lineno">  168 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">clGrantId</span></span></span>     :: !GrantId
+<span class="lineno">  169 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">clChallengeId</span></span></span> :: !ChallengeId
+<span class="lineno">  170 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">clDeadline</span></span></span>    :: !UTCTime
+<span class="lineno">  171 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  172 </span>
+<span class="lineno">  173 </span>-- | The authority a request proved it holds. Same vocabulary as
+<span class="lineno">  174 </span>-- 'GrantSource' by design: the resolver decides /whether/ a source is
+<span class="lineno">  175 </span>-- acceptable for this boot, not a second enum.
+<span class="lineno">  176 </span>type EnrollmentAuthority = GrantSource
+<span class="lineno">  177 </span>
+<span class="lineno">  178 </span>-- | Why enrollment authority was refused. The constructors select the HTTP
+<span class="lineno">  179 </span>-- status, the wire code and the UI branch, which is why this is an ADT and not
+<span class="lineno">  180 </span>-- @Either Text@.
+<span class="lineno">  181 </span>data GrantDenied
+<span class="lineno">  182 </span>  = GrantRequired
+<span class="lineno">  183 </span>    -- ^ No authority was presented and none may be inherited.
+<span class="lineno">  184 </span>  | StepUpRequired
+<span class="lineno">  185 </span>    -- ^ A session exists but presented no token: prove the device, then retry.
+<span class="lineno">  186 </span>  | GrantInvalid
+<span class="lineno">  187 </span>    -- ^ A token was presented and does not match a live grant.
+<span class="lineno">  188 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  189 </span>
+<span class="lineno">  190 </span>-- | Resolve the authority a request holds (design §7.2).
+<span class="lineno">  191 </span>--
+<span class="lineno">  192 </span>-- Order: a presented token is matched against the file grant's digest, then the
+<span class="lineno">  193 </span>-- session grant's digest — the latter only if the requesting session is the one
+<span class="lineno">  194 </span>-- the grant was minted for.
+<span class="lineno">  195 </span>--
+<span class="lineno">  196 </span>-- __The load-bearing rule__ (gate round 4, B-1): /authority is presented, not
+<span class="lineno">  197 </span>-- inherited/. An absent token is acceptable only for 'CliWindow', which by
+<span class="lineno">  198 </span>-- construction carries no secret. Rev 4 let 'Nothing' fall through to a
+<span class="lineno">  199 </span>-- session-held grant, so a stolen cookie could redeem the victim's live
+<span class="lineno">  200 </span>-- assertion grant merely by omitting the header. There is now no path from a
+<span class="lineno">  201 </span>-- cookie alone to enrollment authority.
+<span class="lineno">  202 </span>--
+<span class="lineno">  203 </span>-- This is a pure read: a mismatch never rebinds, consumes or extends anything,
+<span class="lineno">  204 </span>-- so a stale token cannot shadow a live grant and cannot be used to probe the
+<span class="lineno">  205 </span>-- grant's state.
+<span class="lineno">  206 </span>findAuthority
+<span class="lineno">  207 </span>  :: Maybe Text        -- ^ presented token (@X-Seal-Enroll-Token@)
+<span class="lineno">  208 </span>  -&gt; Maybe Grant       -- ^ the file-backed grant
+<span class="lineno">  209 </span>  -&gt; Maybe Grant       -- ^ the grant carried by the requesting session
+<span class="lineno">  210 </span>  -&gt; Bool              -- ^ does the requesting session match that session grant?
+<span class="lineno">  211 </span>  -&gt; Either GrantDenied Grant
+<span class="lineno">  212 </span><span class="decl"><span class="istickedoff">findAuthority presented fileGrant sessionGrant sessionMatches =</span>
+<span class="lineno">  213 </span><span class="spaces">  </span><span class="istickedoff">case presented of</span>
+<span class="lineno">  214 </span><span class="spaces">    </span><span class="istickedoff">-- A token was presented, so it must resolve. Nothing is inherited.</span>
+<span class="lineno">  215 </span><span class="spaces">    </span><span class="istickedoff">Just raw -&gt;</span>
+<span class="lineno">  216 </span><span class="spaces">      </span><span class="istickedoff">case matchesToken raw fileGrant of</span>
+<span class="lineno">  217 </span><span class="spaces">        </span><span class="istickedoff">Just grant -&gt; Right grant</span>
+<span class="lineno">  218 </span><span class="spaces">        </span><span class="istickedoff">-- The same token is tried against the session grant, and only when the</span>
+<span class="lineno">  219 </span><span class="spaces">        </span><span class="istickedoff">-- requesting session is the one it was minted for. A token that matches</span>
+<span class="lineno">  220 </span><span class="spaces">        </span><span class="istickedoff">-- neither is GrantInvalid: it must not inherit the session grant, which</span>
+<span class="lineno">  221 </span><span class="spaces">        </span><span class="istickedoff">-- would make a wrong token as good as an absent one.</span>
+<span class="lineno">  222 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; case matchesToken raw (if sessionMatches then sessionGrant else Nothing) of</span>
+<span class="lineno">  223 </span><span class="spaces">          </span><span class="istickedoff">Just grant -&gt; Right grant</span>
+<span class="lineno">  224 </span><span class="spaces">          </span><span class="istickedoff">Nothing    -&gt; Left GrantInvalid</span>
+<span class="lineno">  225 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; case fileGrant of</span>
+<span class="lineno">  226 </span><span class="spaces">      </span><span class="istickedoff">Just grant@Grant { grSource = CliWindow } -&gt; Right grant</span>
+<span class="lineno">  227 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; Left (if sessionMatches &amp;&amp; isJust sessionGrant</span>
+<span class="lineno">  228 </span><span class="spaces">                   </span><span class="istickedoff">then StepUpRequired</span>
+<span class="lineno">  229 </span><span class="spaces">                   </span><span class="istickedoff">else GrantRequired)</span>
+<span class="lineno">  230 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  231 </span><span class="spaces">    </span><span class="istickedoff">matchesToken raw mGrant = mGrant &gt;&gt;= \grant -&gt;</span>
+<span class="lineno">  232 </span><span class="spaces">      </span><span class="istickedoff">case grTokenSha grant of</span>
+<span class="lineno">  233 </span><span class="spaces">        </span><span class="istickedoff">Just digest | <span class="tickonlytrue">not (BS.null digest)</span></span>
+<span class="lineno">  234 </span><span class="spaces">                    </span><span class="istickedoff">, constantTimeEq digest (tokenDigest raw) -&gt; Just grant</span>
+<span class="lineno">  235 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; Nothing</span></span>
+<span class="lineno">  236 </span>
+<span class="lineno">  237 </span>-- | SHA-256 of a token, as stored. The token itself is never persisted.
+<span class="lineno">  238 </span>tokenDigest :: Text -&gt; ByteString
+<span class="lineno">  239 </span><span class="decl"><span class="istickedoff">tokenDigest = sha256Hash . TE.encodeUtf8</span></span>
+<span class="lineno">  240 </span>
+<span class="lineno">  241 </span>--------------------------------------------------------------------------------
+<span class="lineno">  242 </span>-- JSON
+<span class="lineno">  243 </span>--------------------------------------------------------------------------------
+<span class="lineno">  244 </span>
+<span class="lineno">  245 </span>grantToJson :: Grant -&gt; Value
+<span class="lineno">  246 </span><span class="decl"><span class="istickedoff">grantToJson grant = object</span>
+<span class="lineno">  247 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;grant_id&quot; .= grantIdText (grId grant)</span>
+<span class="lineno">  248 </span><span class="spaces">  </span><span class="istickedoff">, &quot;minted_via&quot; .= grantSourceText (grSource grant)</span>
+<span class="lineno">  249 </span><span class="spaces">  </span><span class="istickedoff">, &quot;expires_at&quot; .= isoTime (grExpiresAt grant)</span>
+<span class="lineno">  250 </span><span class="spaces">  </span><span class="istickedoff">, &quot;bound_challenge&quot; .= boundChallenge</span>
+<span class="lineno">  251 </span><span class="spaces">  </span><span class="istickedoff">, &quot;token_sha256&quot; .= fmap base64Text (grTokenSha grant)</span>
+<span class="lineno">  252 </span><span class="spaces">  </span><span class="istickedoff">]</span>
+<span class="lineno">  253 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  254 </span><span class="spaces">    </span><span class="istickedoff">boundChallenge = case grPhase grant of</span>
+<span class="lineno">  255 </span><span class="spaces">      </span><span class="istickedoff">GrantBound cid -&gt; Just (challengeIdText cid)</span>
+<span class="lineno">  256 </span><span class="spaces">      </span><span class="istickedoff">GrantMinted    -&gt; Nothing</span></span>
+<span class="lineno">  257 </span>
+<span class="lineno">  258 </span>-- | Decode a stored grant.
+<span class="lineno">  259 </span>--
+<span class="lineno">  260 </span>-- Deliberately total in the permissive direction: an unreadable field is
+<span class="lineno">  261 </span>-- treated as /absent/, never as a boot refusal. Absent is never more
+<span class="lineno">  262 </span>-- permissive than present (design §7.3) — the caller deletes a grant it cannot
+<span class="lineno">  263 </span>-- read, and a missing grant is just &quot;no authority&quot;.
+<span class="lineno">  264 </span>grantFromJson :: Value -&gt; Maybe Grant
+<span class="lineno">  265 </span><span class="decl"><span class="istickedoff">grantFromJson = parseMaybe parseGrant</span></span>
+<span class="lineno">  266 </span>
+<span class="lineno">  267 </span>parseGrant :: Value -&gt; Parser Grant
+<span class="lineno">  268 </span><span class="decl"><span class="istickedoff">parseGrant = withObject <span class="nottickedoff">&quot;Grant&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">  269 </span><span class="spaces">  </span><span class="istickedoff">ident@(GrantId rawId) &lt;- GrantId &lt;$&gt; o .: &quot;grant_id&quot;</span>
+<span class="lineno">  270 </span><span class="spaces">  </span><span class="istickedoff">-- The id names the claim file, so a separator in it would move the file.</span>
+<span class="lineno">  271 </span><span class="spaces">  </span><span class="istickedoff">-- Grant ids are minted as hex, so this only rejects a hand-edited or</span>
+<span class="lineno">  272 </span><span class="spaces">  </span><span class="istickedoff">-- corrupted document.</span>
+<span class="lineno">  273 </span><span class="spaces">  </span><span class="istickedoff">when (any (`elem` (&quot;/\\&quot; :: String)) (T.unpack rawId)</span>
+<span class="lineno">  274 </span><span class="spaces">          </span><span class="istickedoff">|| &quot;..&quot; `T.isInfixOf` rawId)</span>
+<span class="lineno">  275 </span><span class="spaces">    </span><span class="istickedoff">(fail <span class="nottickedoff">&quot;grant_id must not contain a path separator&quot;</span>)</span>
+<span class="lineno">  276 </span><span class="spaces">  </span><span class="istickedoff">source &lt;- o .: &quot;minted_via&quot; &gt;&gt;= requireSource</span>
+<span class="lineno">  277 </span><span class="spaces">  </span><span class="istickedoff">expires &lt;- o .: &quot;expires_at&quot; &gt;&gt;= requireTime</span>
+<span class="lineno">  278 </span><span class="spaces">  </span><span class="istickedoff">phase &lt;- maybe GrantMinted (GrantBound . ChallengeId) &lt;$&gt; o .:? &quot;bound_challenge&quot;</span>
+<span class="lineno">  279 </span><span class="spaces">  </span><span class="istickedoff">digest &lt;- (o .:? &quot;token_sha256&quot;) &gt;&gt;= traverse requireDigest</span>
+<span class="lineno">  280 </span><span class="spaces">  </span><span class="istickedoff">-- CliWindow carries no secret; every other source must.</span>
+<span class="lineno">  281 </span><span class="spaces">  </span><span class="istickedoff">case (source, digest) of</span>
+<span class="lineno">  282 </span><span class="spaces">    </span><span class="istickedoff">(CliWindow, _)     -&gt; pure (Grant ident expires source phase Nothing)</span>
+<span class="lineno">  283 </span><span class="spaces">    </span><span class="istickedoff">(_, Just d)        -&gt; pure (Grant ident expires source phase (Just d))</span>
+<span class="lineno">  284 </span><span class="spaces">    </span><span class="istickedoff">(_, Nothing)       -&gt; fail <span class="nottickedoff">&quot;a token-backed grant must carry token_sha256&quot;</span></span>
+<span class="lineno">  285 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  286 </span><span class="spaces">    </span><span class="istickedoff">requireSource raw = case parseGrantSource raw of</span>
+<span class="lineno">  287 </span><span class="spaces">      </span><span class="istickedoff">Just source -&gt; pure source</span>
+<span class="lineno">  288 </span><span class="spaces">      </span><span class="istickedoff">Nothing     -&gt; fail <span class="nottickedoff">(&quot;unknown minted_via: &quot; &lt;&gt; T.unpack raw)</span></span>
+<span class="lineno">  289 </span><span class="spaces">    </span><span class="istickedoff">requireTime raw = case parseIsoTimeMaybe raw of</span>
+<span class="lineno">  290 </span><span class="spaces">      </span><span class="istickedoff">Just t  -&gt; pure t</span>
+<span class="lineno">  291 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">fail (&quot;unparseable expires_at: &quot; &lt;&gt; T.unpack raw)</span></span>
+<span class="lineno">  292 </span><span class="spaces">    </span><span class="istickedoff">-- The digest is stored base64url, because JSON has no byte string.</span>
+<span class="lineno">  293 </span><span class="spaces">    </span><span class="istickedoff">requireDigest raw = case B64Url.decodeUnpadded (TE.encodeUtf8 raw) of</span>
+<span class="lineno">  294 </span><span class="spaces">      </span><span class="istickedoff">Left e   -&gt; <span class="nottickedoff">fail (&quot;token_sha256 is not base64url: &quot; &lt;&gt; e)</span></span>
+<span class="lineno">  295 </span><span class="spaces">      </span><span class="istickedoff">Right bs -&gt; pure bs</span></span>
+<span class="lineno">  296 </span>
+<span class="lineno">  297 </span>-- | The grant as one line of JSON, for the state file.
+<span class="lineno">  298 </span>grantBody :: Grant -&gt; LBS.ByteString
+<span class="lineno">  299 </span><span class="decl"><span class="istickedoff">grantBody = encode . grantToJson</span></span>
+<span class="lineno">  300 </span>
+<span class="lineno">  301 </span>grantBodyText :: Grant -&gt; Text
+<span class="lineno">  302 </span><span class="decl"><span class="nottickedoff">grantBodyText = TE.decodeUtf8 . LBS.toStrict . grantBody</span></span>
+<span class="lineno">  303 </span>
+<span class="lineno">  304 </span>--------------------------------------------------------------------------------
+<span class="lineno">  305 </span>-- Rendering helpers
+<span class="lineno">  306 </span>--------------------------------------------------------------------------------
+<span class="lineno">  307 </span>
+<span class="lineno">  308 </span>grantIdText :: GrantId -&gt; Text
+<span class="lineno">  309 </span><span class="decl"><span class="istickedoff">grantIdText (GrantId raw) = raw</span></span>
+<span class="lineno">  310 </span>
+<span class="lineno">  311 </span>challengeIdText :: ChallengeId -&gt; Text
+<span class="lineno">  312 </span><span class="decl"><span class="istickedoff">challengeIdText (ChallengeId raw) = raw</span></span>
+<span class="lineno">  313 </span>
+<span class="lineno">  314 </span>base64Text :: ByteString -&gt; Text
+<span class="lineno">  315 </span><span class="decl"><span class="istickedoff">base64Text = TE.decodeUtf8 . B64Url.encodeUnpadded</span></span>
+<span class="lineno">  316 </span>
+<span class="lineno">  317 </span>isoTime :: UTCTime -&gt; Text
+<span class="lineno">  318 </span><span class="decl"><span class="istickedoff">isoTime = T.pack . formatTime <span class="nottickedoff">defaultTimeLocale</span> &quot;%Y-%m-%dT%H:%M:%SZ&quot;</span></span>
+<span class="lineno">  319 </span>
+<span class="lineno">  320 </span>parseIsoTimeMaybe :: Text -&gt; Maybe UTCTime
+<span class="lineno">  321 </span><span class="decl"><span class="istickedoff">parseIsoTimeMaybe raw =</span>
+<span class="lineno">  322 </span><span class="spaces">  </span><span class="istickedoff">parseTimeM True <span class="nottickedoff">defaultTimeLocale</span> &quot;%Y-%m-%dT%H:%M:%SZ&quot; (T.unpack raw)</span></span>
+<span class="lineno">  323 </span>
+<span class="lineno">  324 </span>--------------------------------------------------------------------------------
+<span class="lineno">  325 </span>-- Which authorities this boot accepts
+<span class="lineno">  326 </span>--------------------------------------------------------------------------------
+<span class="lineno">  327 </span>
+<span class="lineno">  328 </span>-- | Everything the enrollment decision depends on.
+<span class="lineno">  329 </span>--
+<span class="lineno">  330 </span>-- There is no clock here on purpose. A grant's expiry is decided when it is
+<span class="lineno">  331 </span>-- read ('findAuthority' returns a grant that is already known live, and the
+<span class="lineno">  332 </span>-- claim protocol re-checks the deadline), so this function cannot decide it and
+<span class="lineno">  333 </span>-- a @gcNow@ field would suggest otherwise. Design §7.2 lists one; it is
+<span class="lineno">  334 </span>-- deliberately omitted rather than carried unused.
+<span class="lineno">  335 </span>data GrantContext = GrantContext
+<span class="lineno">  336 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">gcMode</span></span></span>         :: !AccessMode
+<span class="lineno">  337 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">gcAvailability</span></span></span> :: !CredentialAvailability
+<span class="lineno">  338 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">gcAuthorized</span></span></span>   :: !(Maybe EnrollmentAuthority)
+<span class="lineno">  339 </span>    -- ^ What 'findAuthority' resolved. 'Nothing' means no authority was
+<span class="lineno">  340 </span>    -- presented, which is a state this function must still answer for: the
+<span class="lineno">  341 </span>    -- status endpoint asks it without a request.
+<span class="lineno">  342 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">gcHasSession</span></span></span>   :: !Bool
+<span class="lineno">  343 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  344 </span>
+<span class="lineno">  345 </span>-- | Which authorities are acceptable in this boot state.
+<span class="lineno">  346 </span>--
+<span class="lineno">  347 </span>-- Total over 3 modes x 3 availabilities x 5 authorities. Two rules do most of
+<span class="lineno">  348 </span>-- the work:
+<span class="lineno">  349 </span>--
+<span class="lineno">  350 </span>-- * __The loopback window exists only with nothing enrolled.__ It is authority
+<span class="lineno">  351 </span>--   that presents no secret, so allowing it once a credential exists — or in
+<span class="lineno">  352 </span>--   @UnusableOnly@, which is the state an attacker who can change
+<span class="lineno">  353 </span>--   @origin@\\/@rp_id@ aims to create — would hand enrollment to anyone who
+<span class="lineno">  354 </span>--   can reach the port. That is gate round 4's B-2, and the reason
+<span class="lineno">  355 </span>--   @cli_window@ outside @NoCredentials@ is @GrantRequired@ rather than
+<span class="lineno">  356 </span>--   @GrantInvalid@: the token is well-formed, the state no longer permits it.
+<span class="lineno">  357 </span>-- * __Enrolling always needs authority, even in @open@ mode.__ A public gateway
+<span class="lineno">  358 </span>--   that let a network client enroll would be flipped from open to locked with
+<span class="lineno">  359 </span>--   a key the operator does not hold.
+<span class="lineno">  360 </span>enrollmentAuthority :: GrantContext -&gt; Either GrantDenied EnrollmentAuthority
+<span class="lineno">  361 </span><span class="decl"><span class="istickedoff">enrollmentAuthority ctx</span>
+<span class="lineno">  362 </span><span class="spaces">  </span><span class="istickedoff">-- Bootstrap. Nothing is enrolled, so a token (or the confined window) is the</span>
+<span class="lineno">  363 </span><span class="spaces">  </span><span class="istickedoff">-- only thing that can authorize; an assertion cannot exist yet.</span>
+<span class="lineno">  364 </span><span class="spaces">  </span><span class="istickedoff">| gcAvailability ctx == NoCredentials = case gcAuthorized ctx of</span>
+<span class="lineno">  365 </span><span class="spaces">      </span><span class="istickedoff">Just CliToken  -&gt; Right CliToken</span>
+<span class="lineno">  366 </span><span class="spaces">      </span><span class="istickedoff">Just CliWindow -&gt; Right CliWindow</span>
+<span class="lineno">  367 </span><span class="spaces">      </span><span class="istickedoff">_              -&gt; Left GrantRequired</span>
+<span class="lineno">  368 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case (gcMode ctx, gcAuthorized ctx) of</span>
+<span class="lineno">  369 </span><span class="spaces">      </span><span class="istickedoff">-- Open mode is fully open to *use*, not to enroll.</span>
+<span class="lineno">  370 </span><span class="spaces">      </span><span class="istickedoff">(AccessOpen, Just CliToken) -&gt; Right CliToken</span>
+<span class="lineno">  371 </span><span class="spaces">      </span><span class="istickedoff">(AccessOpen, Just UiToken)  -&gt; Right UiToken</span>
+<span class="lineno">  372 </span><span class="spaces">      </span><span class="istickedoff">(AccessOpen, _)             -&gt; Left GrantRequired</span>
+<span class="lineno">  373 </span><span class="spaces">      </span><span class="istickedoff">-- passkey + UnusableOnly is rp_mismatch: token only, never the window.</span>
+<span class="lineno">  374 </span><span class="spaces">      </span><span class="istickedoff">(AccessPasskey, Just CliToken) -&gt; Right CliToken</span>
+<span class="lineno">  375 </span><span class="spaces">      </span><span class="istickedoff">-- A browser-minted token is a peer of a terminal-minted one everywhere a</span>
+<span class="lineno">  376 </span><span class="spaces">      </span><span class="istickedoff">-- token is accepted, *except* bootstrap (@NoCredentials@, above) and</span>
+<span class="lineno">  377 </span><span class="spaces">      </span><span class="istickedoff">-- @unconfigured@ (below): those slots are reserved for authority minted</span>
+<span class="lineno">  378 </span><span class="spaces">      </span><span class="istickedoff">-- with local access, because they are what stops a reachable network</span>
+<span class="lineno">  379 </span><span class="spaces">      </span><span class="istickedoff">-- client enrolling a key the operator does not hold. Placed after the</span>
+<span class="lineno">  380 </span><span class="spaces">      </span><span class="istickedoff">-- CliToken clause so @UnusableOnly@ accepts it too, matching CliToken.</span>
+<span class="lineno">  381 </span><span class="spaces">      </span><span class="istickedoff">(AccessPasskey, Just UiToken) -&gt; Right UiToken</span>
+<span class="lineno">  382 </span><span class="spaces">      </span><span class="istickedoff">(AccessPasskey, _) | gcAvailability ctx == UnusableOnly -&gt; Left GrantRequired</span>
+<span class="lineno">  383 </span><span class="spaces">      </span><span class="istickedoff">-- passkey + Usable: an existing credential's assertion can add another,</span>
+<span class="lineno">  384 </span><span class="spaces">      </span><span class="istickedoff">-- and a token still works.</span>
+<span class="lineno">  385 </span><span class="spaces">      </span><span class="istickedoff">(AccessPasskey, Just Assertion) -&gt; Right Assertion</span>
+<span class="lineno">  386 </span><span class="spaces">      </span><span class="istickedoff">-- Only &quot;no authority presented at all&quot; can ask for a step-up. A window</span>
+<span class="lineno">  387 </span><span class="spaces">      </span><span class="istickedoff">-- that arrives in the wrong state is well-formed but not permitted, so it</span>
+<span class="lineno">  388 </span><span class="spaces">      </span><span class="istickedoff">-- is GrantRequired: telling that client to prove its device would be a</span>
+<span class="lineno">  389 </span><span class="spaces">      </span><span class="istickedoff">-- dead end.</span>
+<span class="lineno">  390 </span><span class="spaces">      </span><span class="istickedoff">(AccessPasskey, Nothing)</span>
+<span class="lineno">  391 </span><span class="spaces">        </span><span class="istickedoff">| gcHasSession ctx -&gt; Left StepUpRequired</span>
+<span class="lineno">  392 </span><span class="spaces">        </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>        -&gt; Left GrantRequired</span>
+<span class="lineno">  393 </span><span class="spaces">      </span><span class="istickedoff">(AccessPasskey, Just _) -&gt; Left GrantRequired</span>
+<span class="lineno">  394 </span><span class="spaces">      </span><span class="istickedoff">-- Unconfigured with credentials present is not a state boot produces</span>
+<span class="lineno">  395 </span><span class="spaces">      </span><span class="istickedoff">-- (it resolves to passkey or open); answering it keeps the function total</span>
+<span class="lineno">  396 </span><span class="spaces">      </span><span class="istickedoff">-- without granting anything.</span>
+<span class="lineno">  397 </span><span class="spaces">      </span><span class="istickedoff">(AccessUnconfigured, Just CliToken) -&gt; Right CliToken</span>
+<span class="lineno">  398 </span><span class="spaces">      </span><span class="istickedoff">(AccessUnconfigured, _)             -&gt; Left GrantRequired</span></span>
+<span class="lineno">  399 </span>
+<span class="lineno">  400 </span>--------------------------------------------------------------------------------
+<span class="lineno">  401 </span>-- Persistence
+<span class="lineno">  402 </span>--------------------------------------------------------------------------------
+<span class="lineno">  403 </span>
+<span class="lineno">  404 </span>-- | Is the grant still within its lifetime?
+<span class="lineno">  405 </span>--
+<span class="lineno">  406 </span>-- Expiry is an upper bound, never a quota: a grant that has expired is
+<span class="lineno">  407 </span>-- indistinguishable from no grant at all, which is why every reader treats it
+<span class="lineno">  408 </span>-- that way instead of refusing.
+<span class="lineno">  409 </span>grantLiveAt :: UTCTime -&gt; Grant -&gt; Bool
+<span class="lineno">  410 </span><span class="decl"><span class="istickedoff">grantLiveAt now grant = now &lt; grExpiresAt grant</span></span>
+<span class="lineno">  411 </span>
+<span class="lineno">  412 </span>-- | Read the outstanding grant.
+<span class="lineno">  413 </span>--
+<span class="lineno">  414 </span>-- Three states collapse to @Nothing@, deliberately:
+<span class="lineno">  415 </span>--
+<span class="lineno">  416 </span>-- * absent — the normal state;
+<span class="lineno">  417 </span>-- * unparseable — treated as absent /and deleted/, because a file the gateway
+<span class="lineno">  418 </span>--   cannot read must never be more permissive than no file (design §7.3);
+<span class="lineno">  419 </span>-- * expired — treated as absent, but left on disk for the reaper. Reaping on a
+<span class="lineno">  420 </span>--   polled read would turn @GET \/status@ into a writer.
+<span class="lineno">  421 </span>--
+<span class="lineno">  422 </span>-- Never cached: the CLI mints grants while the daemon runs, so a cached copy
+<span class="lineno">  423 </span>-- would be invisible until restart.
+<span class="lineno">  424 </span>loadGrantFile :: FilePath -&gt; IO (Maybe Grant)
+<span class="lineno">  425 </span><span class="decl"><span class="istickedoff">loadGrantFile path = do</span>
+<span class="lineno">  426 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  427 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  428 </span><span class="spaces">    </span><span class="istickedoff">then pure Nothing</span>
+<span class="lineno">  429 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  430 </span><span class="spaces">      </span><span class="istickedoff">raw &lt;- LBS.readFile path</span>
+<span class="lineno">  431 </span><span class="spaces">      </span><span class="istickedoff">case eitherDecode raw of</span>
+<span class="lineno">  432 </span><span class="spaces">        </span><span class="istickedoff">Right value -&gt; case grantFromJson value of</span>
+<span class="lineno">  433 </span><span class="spaces">          </span><span class="istickedoff">Just grant -&gt; pure (Just grant)</span>
+<span class="lineno">  434 </span><span class="spaces">          </span><span class="istickedoff">Nothing    -&gt; reap path</span>
+<span class="lineno">  435 </span><span class="spaces">        </span><span class="istickedoff">Left _ -&gt; reap path</span>
+<span class="lineno">  436 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  437 </span><span class="spaces">    </span><span class="istickedoff">reap p = removeFile p &gt;&gt; pure Nothing</span></span>
+<span class="lineno">  438 </span>
+<span class="lineno">  439 </span>-- | Write the grant atomically, mode @0600@.
+<span class="lineno">  440 </span>--
+<span class="lineno">  441 </span>-- A unique temp name and an atomic rename are the only cross-process
+<span class="lineno">  442 </span>-- guarantees available here: the write lock is process-local, and the CLI writes
+<span class="lineno">  443 </span>-- this file while the daemon reads it.
+<span class="lineno">  444 </span>saveGrantFile :: FilePath -&gt; Grant -&gt; IO (Either Text ())
+<span class="lineno">  445 </span><span class="decl"><span class="istickedoff">saveGrantFile path grant = do</span>
+<span class="lineno">  446 </span><span class="spaces">  </span><span class="istickedoff">let dir = takeDirectory path</span>
+<span class="lineno">  447 </span><span class="spaces">  </span><span class="istickedoff">(tmp, h) &lt;- openBinaryTempFile dir (takeBaseName path &lt;&gt; &quot;.tmp&quot;)</span>
+<span class="lineno">  448 </span><span class="spaces">  </span><span class="istickedoff">LBS.hPut h (grantBody grant)</span>
+<span class="lineno">  449 </span><span class="spaces">  </span><span class="istickedoff">hClose h</span>
+<span class="lineno">  450 </span><span class="spaces">  </span><span class="istickedoff">setFileMode tmp 0o600</span>
+<span class="lineno">  451 </span><span class="spaces">  </span><span class="istickedoff">renameFile tmp path</span>
+<span class="lineno">  452 </span><span class="spaces">  </span><span class="istickedoff">pure (Right ())</span></span>
+<span class="lineno">  453 </span>
+<span class="lineno">  454 </span>deleteGrantFile :: FilePath -&gt; IO ()
+<span class="lineno">  455 </span><span class="decl"><span class="istickedoff">deleteGrantFile path = do</span>
+<span class="lineno">  456 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  457 </span><span class="spaces">  </span><span class="istickedoff">when exists (removeFile path)</span></span>
+<span class="lineno">  458 </span>
+<span class="lineno">  459 </span>--------------------------------------------------------------------------------
+<span class="lineno">  460 </span>-- Claims
+<span class="lineno">  461 </span>--------------------------------------------------------------------------------
+<span class="lineno">  462 </span>
+<span class="lineno">  463 </span>-- | The one deadline rule: a claim expires at whichever comes first, the
+<span class="lineno">  464 </span>-- grant's own expiry or the challenge's TTL from now.
+<span class="lineno">  465 </span>--
+<span class="lineno">  466 </span>-- Both bounds are needed. Only the challenge TTL would let a claim outlive a
+<span class="lineno">  467 </span>-- grant with a shorter TTL; only the grant expiry would let a ceremony keep a
+<span class="lineno">  468 </span>-- bound claim alive for the grant's whole lifetime after its prompt was
+<span class="lineno">  469 </span>-- abandoned.
+<span class="lineno">  470 </span>effectiveDeadline :: Grant -&gt; UTCTime -&gt; NominalDiffTime -&gt; UTCTime
+<span class="lineno">  471 </span><span class="decl"><span class="istickedoff">effectiveDeadline grant now challengeTtl =</span>
+<span class="lineno">  472 </span><span class="spaces">  </span><span class="istickedoff">min (grExpiresAt grant) (addUTCTime challengeTtl now)</span></span>
+<span class="lineno">  473 </span>
+<span class="lineno">  474 </span>-- | Is the claim still within its deadline?
+<span class="lineno">  475 </span>--
+<span class="lineno">  476 </span>-- @now == deadline@ is expired: the deadline is the first instant at which the
+<span class="lineno">  477 </span>-- claim may no longer be used.
+<span class="lineno">  478 </span>claimLiveAt :: UTCTime -&gt; GrantClaim -&gt; Bool
+<span class="lineno">  479 </span><span class="decl"><span class="istickedoff">claimLiveAt now claim = now &lt; clDeadline claim</span></span>
+<span class="lineno">  480 </span>
+<span class="lineno">  481 </span>-- | May this grant redeem @challenge@?
+<span class="lineno">  482 </span>--
+<span class="lineno">  483 </span>-- Only a grant that @options@ bound to this exact challenge can. A grant still
+<span class="lineno">  484 </span>-- in 'GrantMinted' means the client skipped @options@, and a grant bound
+<span class="lineno">  485 </span>-- elsewhere is a race or a forgery — both refuse, and neither silently rebinds.
+<span class="lineno">  486 </span>grantRedeems :: ChallengeId -&gt; Grant -&gt; Bool
+<span class="lineno">  487 </span><span class="decl"><span class="istickedoff">grantRedeems challenge grant = grPhase grant == GrantBound challenge</span></span>
+<span class="lineno">  488 </span>
+<span class="lineno">  489 </span>-- | Take the exclusive claim for a grant, or lose the race.
+<span class="lineno">  490 </span>--
+<span class="lineno">  491 </span>-- @True@ means this caller holds it. The file is created @O_CREAT|O_EXCL@ and
+<span class="lineno">  492 </span>-- written directly: there is no temp-and-rename here, because the atomicity
+<span class="lineno">  493 </span>-- this needs is over /existence/, not over content. A crash mid-write leaves a
+<span class="lineno">  494 </span>-- claim the reader cannot parse, which is treated as no claim — the next
+<span class="lineno">  495 </span>-- @options@ rebinds.
+<span class="lineno">  496 </span>claimExclusively :: FilePath -&gt; GrantClaim -&gt; IO Bool
+<span class="lineno">  497 </span><span class="decl"><span class="istickedoff">claimExclusively path claim = do</span>
+<span class="lineno">  498 </span><span class="spaces">  </span><span class="istickedoff">opened &lt;- try (openFd path WriteOnly defaultFileFlags</span>
+<span class="lineno">  499 </span><span class="spaces">                   </span><span class="istickedoff">{ creat = Just 0o600, exclusive = True })</span>
+<span class="lineno">  500 </span><span class="spaces">  </span><span class="istickedoff">case opened of</span>
+<span class="lineno">  501 </span><span class="spaces">    </span><span class="istickedoff">Left (_ :: IOException) -&gt; pure False</span>
+<span class="lineno">  502 </span><span class="spaces">    </span><span class="istickedoff">Right fd -&gt; do</span>
+<span class="lineno">  503 </span><span class="spaces">      </span><span class="istickedoff">h &lt;- fdToHandle fd</span>
+<span class="lineno">  504 </span><span class="spaces">      </span><span class="istickedoff">LBS.hPut h (claimBody claim)</span>
+<span class="lineno">  505 </span><span class="spaces">      </span><span class="istickedoff">hClose h</span>
+<span class="lineno">  506 </span><span class="spaces">      </span><span class="istickedoff">setFileMode path 0o600</span>
+<span class="lineno">  507 </span><span class="spaces">      </span><span class="istickedoff">pure True</span></span>
+<span class="lineno">  508 </span>
+<span class="lineno">  509 </span>-- | Give the claim back, but only if it is still /this/ ceremony's claim.
+<span class="lineno">  510 </span>--
+<span class="lineno">  511 </span>-- Compare-and-delete: a failed verify must not delete a claim that a newer
+<span class="lineno">  512 </span>-- @options@ has already replaced, or the retry would find the grant claimed by
+<span class="lineno">  513 </span>-- nobody and the loser of that race would win the next one.
+<span class="lineno">  514 </span>releaseClaim :: FilePath -&gt; ChallengeId -&gt; IO ()
+<span class="lineno">  515 </span><span class="decl"><span class="istickedoff">releaseClaim path challenge = do</span>
+<span class="lineno">  516 </span><span class="spaces">  </span><span class="istickedoff">held &lt;- loadClaimFile path</span>
+<span class="lineno">  517 </span><span class="spaces">  </span><span class="istickedoff">case held of</span>
+<span class="lineno">  518 </span><span class="spaces">    </span><span class="istickedoff">Just claim | clChallengeId claim == challenge -&gt; deleteGrantFile path</span>
+<span class="lineno">  519 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; pure <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  520 </span>
+<span class="lineno">  521 </span>-- | Bind a claim, superseding one left behind by an abandoned ceremony.
+<span class="lineno">  522 </span>--
+<span class="lineno">  523 </span>-- The ordinary case is 'claimExclusively'. The exception is a claim nobody
+<span class="lineno">  524 </span>-- finished: the operator dismissed the OS passkey prompt, or the tab died, so
+<span class="lineno">  525 </span>-- no @verify@ ever arrives and the marker sits there for the whole challenge
+<span class="lineno">  526 </span>-- window. Refusing every retry in that window makes the first accidental
+<span class="lineno">  527 </span>-- dismissal burn the link — and since the SPA treats @grant_invalid@ as &quot;this
+<span class="lineno">  528 </span>-- token is spent&quot;, it also throws the token away.
+<span class="lineno">  529 </span>--
+<span class="lineno">  530 </span>-- A fresh bind therefore wins: last bind wins. Exactly-once does not depend on
+<span class="lineno">  531 </span>-- this function. It is carried one level up by the single-use challenge
+<span class="lineno">  532 </span>-- (consumed before verification) and by 'grantRedeems', which refuses a grant
+<span class="lineno">  533 </span>-- bound to a different challenge — so of two ceremonies only the one the grant
+<span class="lineno">  534 </span>-- is currently bound to can complete. A third party that also holds the link
+<span class="lineno">  535 </span>-- can make the operator's ceremony lose, which is a denial, not an escalation:
+<span class="lineno">  536 </span>-- it already has the link.
+<span class="lineno">  537 </span>bindClaimSuperseding :: FilePath -&gt; GrantClaim -&gt; IO Bool
+<span class="lineno">  538 </span><span class="decl"><span class="istickedoff">bindClaimSuperseding path claim = do</span>
+<span class="lineno">  539 </span><span class="spaces">  </span><span class="istickedoff">won &lt;- claimExclusively path claim</span>
+<span class="lineno">  540 </span><span class="spaces">  </span><span class="istickedoff">if won</span>
+<span class="lineno">  541 </span><span class="spaces">    </span><span class="istickedoff">then pure True</span>
+<span class="lineno">  542 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  543 </span><span class="spaces">      </span><span class="istickedoff">deleteGrantFile path</span>
+<span class="lineno">  544 </span><span class="spaces">      </span><span class="istickedoff">claimExclusively path claim</span></span>
+<span class="lineno">  545 </span>
+<span class="lineno">  546 </span>-- | Read a claim. Unparseable or absent both mean &quot;nobody holds it&quot;.
+<span class="lineno">  547 </span>loadClaimFile :: FilePath -&gt; IO (Maybe GrantClaim)
+<span class="lineno">  548 </span><span class="decl"><span class="istickedoff">loadClaimFile path = do</span>
+<span class="lineno">  549 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  550 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  551 </span><span class="spaces">    </span><span class="istickedoff">then pure Nothing</span>
+<span class="lineno">  552 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  553 </span><span class="spaces">      </span><span class="istickedoff">raw &lt;- LBS.readFile path</span>
+<span class="lineno">  554 </span><span class="spaces">      </span><span class="istickedoff">pure (either (const Nothing) claimFromJson (eitherDecode raw))</span></span>
+<span class="lineno">  555 </span>
+<span class="lineno">  556 </span>claimBody :: GrantClaim -&gt; LBS.ByteString
+<span class="lineno">  557 </span><span class="decl"><span class="istickedoff">claimBody claim = encode (object</span>
+<span class="lineno">  558 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;grant_id&quot; .= grantIdText (clGrantId claim)</span>
+<span class="lineno">  559 </span><span class="spaces">  </span><span class="istickedoff">, &quot;challenge_id&quot; .= challengeIdText (clChallengeId claim)</span>
+<span class="lineno">  560 </span><span class="spaces">  </span><span class="istickedoff">, &quot;deadline&quot; .= isoTime (clDeadline claim)</span>
+<span class="lineno">  561 </span><span class="spaces">  </span><span class="istickedoff">])</span></span>
+<span class="lineno">  562 </span>
+<span class="lineno">  563 </span>claimFromJson :: Value -&gt; Maybe GrantClaim
+<span class="lineno">  564 </span><span class="decl"><span class="istickedoff">claimFromJson = parseMaybe $ withObject <span class="nottickedoff">&quot;GrantClaim&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">  565 </span><span class="spaces">  </span><span class="istickedoff">ident     &lt;- GrantId &lt;$&gt; o .: &quot;grant_id&quot;</span>
+<span class="lineno">  566 </span><span class="spaces">  </span><span class="istickedoff">challenge &lt;- ChallengeId &lt;$&gt; o .: &quot;challenge_id&quot;</span>
+<span class="lineno">  567 </span><span class="spaces">  </span><span class="istickedoff">deadline  &lt;- o .: &quot;deadline&quot; &gt;&gt;= requireTime</span>
+<span class="lineno">  568 </span><span class="spaces">  </span><span class="istickedoff">pure (GrantClaim ident challenge deadline)</span>
+<span class="lineno">  569 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  570 </span><span class="spaces">    </span><span class="istickedoff">requireTime raw = case parseIsoTimeMaybe raw of</span>
+<span class="lineno">  571 </span><span class="spaces">      </span><span class="istickedoff">Just t  -&gt; pure t</span>
+<span class="lineno">  572 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">fail (&quot;unparseable deadline: &quot; &lt;&gt; T.unpack raw)</span></span></span>
+<span class="lineno">  573 </span>
+<span class="lineno">  574 </span>--------------------------------------------------------------------------------
+<span class="lineno">  575 </span>-- Minting
+<span class="lineno">  576 </span>--------------------------------------------------------------------------------
+<span class="lineno">  577 </span>
+<span class="lineno">  578 </span>-- | A grant that was just written to @state/@, plus the plaintext token the
+<span class="lineno">  579 </span>-- client must present.
+<span class="lineno">  580 </span>--
+<span class="lineno">  581 </span>-- The token is the only copy: the file stores its digest. Losing it means
+<span class="lineno">  582 </span>-- @--force@ (or @--cancel@), which is why the command prints it to stdout.
+<span class="lineno">  583 </span>-- 'Nothing' for a 'CliWindow' grant, which presents no secret at all.
+<span class="lineno">  584 </span>data MintedGrant = MintedGrant
+<span class="lineno">  585 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">mgGrant</span></span></span> :: !Grant
+<span class="lineno">  586 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">mgToken</span></span></span> :: !(Maybe Text)
+<span class="lineno">  587 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  588 </span>
+<span class="lineno">  589 </span>-- | The default lifetime of a grant minted from the terminal (design §7.1).
+<span class="lineno">  590 </span>defaultGrantTtl :: GrantSource -&gt; NominalDiffTime
+<span class="lineno">  591 </span><span class="decl"><span class="istickedoff">defaultGrantTtl CliWindow = 5 * 60</span>
+<span class="lineno">  592 </span><span class="spaces"></span><span class="istickedoff">-- Five minutes, not ten: a link minted in a browser is exposed in the DOM, in</span>
+<span class="lineno">  593 </span><span class="spaces"></span><span class="istickedoff">-- clipboard managers and cloud clipboard sync, and on a screen share, which a</span>
+<span class="lineno">  594 </span><span class="spaces"></span><span class="istickedoff">-- token printed to a terminal is not. Nothing in the flow needs longer.</span>
+<span class="lineno">  595 </span><span class="spaces"></span><span class="istickedoff">defaultGrantTtl UiToken   = 5 * 60</span>
+<span class="lineno">  596 </span><span class="spaces"></span><span class="istickedoff">defaultGrantTtl _         = 10 * 60</span></span>
+<span class="lineno">  597 </span>
+<span class="lineno">  598 </span>-- | Mint a grant, unless one is already outstanding.
+<span class="lineno">  599 </span>--
+<span class="lineno">  600 </span>-- Refusing rather than overwriting is what makes a lost token recoverable: the
+<span class="lineno">  601 </span>-- refusal names the outstanding grant's source and remaining lifetime, and
+<span class="lineno">  602 </span>-- @--force@ is the deliberate way to replace it. Minting also reaps every stale
+<span class="lineno">  603 </span>-- claim marker and the previous token file, because a new grant invalidates all
+<span class="lineno">  604 </span>-- of them.
+<span class="lineno">  605 </span>enrollGrant
+<span class="lineno">  606 </span>  :: SealPaths
+<span class="lineno">  607 </span>  -&gt; GrantSource
+<span class="lineno">  608 </span>  -&gt; NominalDiffTime
+<span class="lineno">  609 </span>  -&gt; Bool              -- ^ force: replace an outstanding grant
+<span class="lineno">  610 </span>  -&gt; IO (Either Text MintedGrant)
+<span class="lineno">  611 </span><span class="decl"><span class="istickedoff">enrollGrant paths source ttl force = do</span>
+<span class="lineno">  612 </span><span class="spaces">  </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  613 </span><span class="spaces">  </span><span class="istickedoff">-- The grant lives in state/, which boot creates; a CLI invocation may be the</span>
+<span class="lineno">  614 </span><span class="spaces">  </span><span class="istickedoff">-- first thing to touch it (a fresh SEAL_HOME, or state/ removed by hand).</span>
+<span class="lineno">  615 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True (spState paths)</span>
+<span class="lineno">  616 </span><span class="spaces">  </span><span class="istickedoff">existing &lt;- loadGrantFile (enrollmentGrantPath paths)</span>
+<span class="lineno">  617 </span><span class="spaces">  </span><span class="istickedoff">case existing of</span>
+<span class="lineno">  618 </span><span class="spaces">    </span><span class="istickedoff">Just grant | <span class="tickonlytrue">grantLiveAt now grant</span>, not force -&gt;</span>
+<span class="lineno">  619 </span><span class="spaces">      </span><span class="istickedoff">pure (Left (outstandingRefusal now grant))</span>
+<span class="lineno">  620 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; do</span>
+<span class="lineno">  621 </span><span class="spaces">      </span><span class="istickedoff">token &lt;- case source of</span>
+<span class="lineno">  622 </span><span class="spaces">        </span><span class="istickedoff">CliWindow -&gt; pure Nothing</span>
+<span class="lineno">  623 </span><span class="spaces">        </span><span class="istickedoff">_         -&gt; Just &lt;$&gt; generateToken 32</span>
+<span class="lineno">  624 </span><span class="spaces">      </span><span class="istickedoff">ident &lt;- GrantId &lt;$&gt; generateToken 16</span>
+<span class="lineno">  625 </span><span class="spaces">      </span><span class="istickedoff">let grant = Grant</span>
+<span class="lineno">  626 </span><span class="spaces">            </span><span class="istickedoff">{ grId        = ident</span>
+<span class="lineno">  627 </span><span class="spaces">            </span><span class="istickedoff">, grExpiresAt = addUTCTime ttl now</span>
+<span class="lineno">  628 </span><span class="spaces">            </span><span class="istickedoff">, grSource    = source</span>
+<span class="lineno">  629 </span><span class="spaces">            </span><span class="istickedoff">, grPhase     = GrantMinted</span>
+<span class="lineno">  630 </span><span class="spaces">            </span><span class="istickedoff">, grTokenSha  = tokenDigest &lt;$&gt; token</span>
+<span class="lineno">  631 </span><span class="spaces">            </span><span class="istickedoff">}</span>
+<span class="lineno">  632 </span><span class="spaces">      </span><span class="istickedoff">reapClaims paths</span>
+<span class="lineno">  633 </span><span class="spaces">      </span><span class="istickedoff">reapTokenFile paths</span>
+<span class="lineno">  634 </span><span class="spaces">      </span><span class="istickedoff">saved &lt;- saveGrantFile (enrollmentGrantPath paths) grant</span>
+<span class="lineno">  635 </span><span class="spaces">      </span><span class="istickedoff">pure $ case saved of</span>
+<span class="lineno">  636 </span><span class="spaces">        </span><span class="istickedoff">Left err  -&gt; <span class="nottickedoff">Left err</span></span>
+<span class="lineno">  637 </span><span class="spaces">        </span><span class="istickedoff">Right ()  -&gt; Right (MintedGrant grant token)</span></span>
+<span class="lineno">  638 </span>
+<span class="lineno">  639 </span>-- | Drop every trace of the outstanding grant: the grant file, every claim
+<span class="lineno">  640 </span>-- marker and the plaintext token.
+<span class="lineno">  641 </span>--
+<span class="lineno">  642 </span>-- Idempotent and silent when nothing is outstanding — @--cancel@ with nothing
+<span class="lineno">  643 </span>-- to cancel is a success, not an error.
+<span class="lineno">  644 </span>cancelGrant :: SealPaths -&gt; IO ()
+<span class="lineno">  645 </span><span class="decl"><span class="istickedoff">cancelGrant paths = do</span>
+<span class="lineno">  646 </span><span class="spaces">  </span><span class="istickedoff">deleteGrantFile (enrollmentGrantPath paths)</span>
+<span class="lineno">  647 </span><span class="spaces">  </span><span class="istickedoff">reapClaims paths</span>
+<span class="lineno">  648 </span><span class="spaces">  </span><span class="istickedoff">reapTokenFile paths</span></span>
+<span class="lineno">  649 </span>
+<span class="lineno">  650 </span>-- | Delete every claim marker. A new grant (or a cancel) invalidates all of
+<span class="lineno">  651 </span>-- them: they name grants that no longer exist.
+<span class="lineno">  652 </span>reapClaims :: SealPaths -&gt; IO ()
+<span class="lineno">  653 </span><span class="decl"><span class="istickedoff">reapClaims paths = do</span>
+<span class="lineno">  654 </span><span class="spaces">  </span><span class="istickedoff">-- A fresh SEAL_HOME has no state/ yet; nothing to reap is not an error.</span>
+<span class="lineno">  655 </span><span class="spaces">  </span><span class="istickedoff">present &lt;- doesDirectoryExist (spState paths)</span>
+<span class="lineno">  656 </span><span class="spaces">  </span><span class="istickedoff">when present $ do</span>
+<span class="lineno">  657 </span><span class="spaces">    </span><span class="istickedoff">entries &lt;- listDirectory (spState paths)</span>
+<span class="lineno">  658 </span><span class="spaces">    </span><span class="istickedoff">forM_ entries $ \entry -&gt; when (claimPrefix `T.isPrefixOf` T.pack entry) $</span>
+<span class="lineno">  659 </span><span class="spaces">      </span><span class="istickedoff">removeFile (spState paths &lt;/&gt; entry)</span>
+<span class="lineno">  660 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  661 </span><span class="spaces">    </span><span class="istickedoff">claimPrefix = &quot;enrollment-grant.claimed-&quot;</span></span>
+<span class="lineno">  662 </span>
+<span class="lineno">  663 </span>reapTokenFile :: SealPaths -&gt; IO ()
+<span class="lineno">  664 </span><span class="decl"><span class="istickedoff">reapTokenFile paths = do</span>
+<span class="lineno">  665 </span><span class="spaces">  </span><span class="istickedoff">let path = enrollmentTokenPath paths</span>
+<span class="lineno">  666 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  667 </span><span class="spaces">  </span><span class="istickedoff">when exists (removeFile path)</span></span>
+<span class="lineno">  668 </span>
+<span class="lineno">  669 </span>-- | How long the grant has left. Negative once expired.
+<span class="lineno">  670 </span>grantRemaining :: UTCTime -&gt; Grant -&gt; NominalDiffTime
+<span class="lineno">  671 </span><span class="decl"><span class="istickedoff">grantRemaining now grant = diffUTCTime (grExpiresAt grant) now</span></span>
+<span class="lineno">  672 </span>
+<span class="lineno">  673 </span>outstandingRefusal :: UTCTime -&gt; Grant -&gt; Text
+<span class="lineno">  674 </span><span class="decl"><span class="istickedoff">outstandingRefusal now grant =</span>
+<span class="lineno">  675 </span><span class="spaces">  </span><span class="istickedoff">&quot;an enrollment grant is already outstanding (minted via &quot;</span>
+<span class="lineno">  676 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; grantSourceText (grSource grant) &lt;&gt; &quot;, &quot;</span>
+<span class="lineno">  677 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; tshowSeconds (grantRemaining now grant) &lt;&gt; &quot; left).\n&quot;</span>
+<span class="lineno">  678 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; &quot;  Use the token you were given, or re-run with --force to replace it,\n&quot;</span>
+<span class="lineno">  679 </span><span class="spaces">    </span><span class="istickedoff">&lt;&gt; &quot;  or run `seal access-control enroll --cancel` to drop it.&quot;</span></span>
+<span class="lineno">  680 </span>
+<span class="lineno">  681 </span>tshowSeconds :: NominalDiffTime -&gt; Text
+<span class="lineno">  682 </span><span class="decl"><span class="istickedoff">tshowSeconds delta =</span>
+<span class="lineno">  683 </span><span class="spaces">  </span><span class="istickedoff">T.pack (show (max 0 (ceiling (realToFrac delta :: Double) :: Int))) &lt;&gt; &quot;s&quot;</span></span>
+<span class="lineno">  684 </span>
+<span class="lineno">  685 </span>-- | Parse a @--ttl@ value: @\&lt;N\&gt;\&lt;s|m|h\&gt;@.
+<span class="lineno">  686 </span>--
+<span class="lineno">  687 </span>-- A bare number is a usage error, not a default unit: &quot;10&quot; meaning ten minutes
+<span class="lineno">  688 </span>-- and &quot;10&quot; meaning ten seconds are both plausible, so guessing is how an
+<span class="lineno">  689 </span>-- operator ends up with a window that closed before they used it. The result is
+<span class="lineno">  690 </span>-- clamped to 30 s – 24 h, the range the design allows.
+<span class="lineno">  691 </span>parseTtl :: Text -&gt; Either Text NominalDiffTime
+<span class="lineno">  692 </span><span class="decl"><span class="istickedoff">parseTtl raw =</span>
+<span class="lineno">  693 </span><span class="spaces">  </span><span class="istickedoff">case T.unsnoc (T.strip raw) of</span>
+<span class="lineno">  694 </span><span class="spaces">    </span><span class="istickedoff">Just (digits, unit) | <span class="tickonlytrue">not (T.null digits)</span>, <span class="tickonlytrue">T.all isAsciiDigit digits</span> -&gt;</span>
+<span class="lineno">  695 </span><span class="spaces">      </span><span class="istickedoff">let multiplier = case unit of</span>
+<span class="lineno">  696 </span><span class="spaces">            </span><span class="istickedoff">'s' -&gt; 1</span>
+<span class="lineno">  697 </span><span class="spaces">            </span><span class="istickedoff">'m' -&gt; <span class="nottickedoff">60</span></span>
+<span class="lineno">  698 </span><span class="spaces">            </span><span class="istickedoff">'h' -&gt; 3600</span>
+<span class="lineno">  699 </span><span class="spaces">            </span><span class="istickedoff">_   -&gt; 0</span>
+<span class="lineno">  700 </span><span class="spaces">      </span><span class="istickedoff">in if multiplier == 0</span>
+<span class="lineno">  701 </span><span class="spaces">           </span><span class="istickedoff">then Left (badTtl raw)</span>
+<span class="lineno">  702 </span><span class="spaces">           </span><span class="istickedoff">else Right (fromIntegral (max 30 (min 86400 (digitsToSeconds digits * multiplier))))</span>
+<span class="lineno">  703 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Left (badTtl raw)</span></span>
+<span class="lineno">  704 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  705 </span><span class="spaces">    </span><span class="istickedoff">badTtl value =</span>
+<span class="lineno">  706 </span><span class="spaces">      </span><span class="istickedoff">&quot;--ttl \&quot;&quot; &lt;&gt; value &lt;&gt; &quot;\&quot; is not a duration.\n&quot;</span>
+<span class="lineno">  707 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot;  Use a number followed by s, m or h — for example 90s, 10m or 1h.&quot;</span></span>
+<span class="lineno">  708 </span>
+<span class="lineno">  709 </span>isAsciiDigit :: Char -&gt; Bool
+<span class="lineno">  710 </span><span class="decl"><span class="istickedoff">isAsciiDigit = isDigit</span></span>
+<span class="lineno">  711 </span>
+<span class="lineno">  712 </span>digitsToSeconds :: Text -&gt; Integer
+<span class="lineno">  713 </span><span class="decl"><span class="istickedoff">digitsToSeconds = T.foldl' (\acc c -&gt; acc * 10 + toInteger (fromEnum c - fromEnum '0')) 0</span></span>
+<span class="lineno">  714 </span>
+<span class="lineno">  715 </span>-- | The lifetime the command should use when @--ttl@ is absent.
+<span class="lineno">  716 </span>defaultTtlFor :: GrantSource -&gt; NominalDiffTime
+<span class="lineno">  717 </span><span class="decl"><span class="istickedoff">defaultTtlFor = defaultGrantTtl</span></span>
+
+</pre>
+</body>
+</html>
