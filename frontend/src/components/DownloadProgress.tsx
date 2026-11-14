@@ -84,8 +84,8 @@ export function DownloadProgressUI({ progress, onCancel, onRetry }: DownloadProg
     )
   }
 
-  // Fetching / verifying — show percent + ETA, no chunk counts
-  const statusText = `${formatBytes(bytesDone)} / ${formatBytes(bytesTotal)}`
+  // Fetching / verifying — split status across two lines
+  const line1 = `${formatBytes(bytesDone)} / ${formatBytes(bytesTotal)}`
   const speedText = formatSpeed(bytesPerSecond)
   const etaText = formatEta(etaSeconds)
 
@@ -96,7 +96,7 @@ export function DownloadProgressUI({ progress, onCancel, onRetry }: DownloadProg
         aria-valuenow={pct}
         aria-valuemin={0}
         aria-valuemax={100}
-        aria-valuetext={`${pct}%, ${formatBytes(bytesDone)} of ${formatBytes(bytesTotal)}`}
+        aria-valuetext={`${pct}%`}
         style={{
           width: '100%', height: 8, borderRadius: 4,
           background: 'var(--border)', overflow: 'hidden',
@@ -109,8 +109,13 @@ export function DownloadProgressUI({ progress, onCancel, onRetry }: DownloadProg
           }}
         />
       </div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, fontSize: '0.85em', color: 'var(--text-muted)' }}>
-        <span>{statusText}{speedText ? ` · ${speedText}` : ''}</span>
+      {/* Line 1: bytes downloaded / total · speed */}
+      <div style={{ fontSize: '0.85em', color: 'var(--text-muted)', marginTop: 4 }}>
+        {line1}{speedText ? ` · ${speedText}` : ''}
+      </div>
+      {/* Line 2: percentage · ETA */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85em', color: 'var(--text-muted)', marginTop: 2 }}>
+        <span>{pct}%</span>
         <span>{etaText}</span>
       </div>
       <div style={{ marginTop: 4 }}>

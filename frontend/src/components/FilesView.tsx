@@ -340,15 +340,16 @@ function FileRow({
         </span>
       </button>
       {!entry.isDir && (
-        <button
-          type="button"
+        <a
           className="icon-btn"
+          href={`/api/files/download?path=${encodeURIComponent(fullPath)}`}
           data-testid={`download-${entry.name}`}
           aria-label={`Download ${entry.name}`}
           title={`Download ${entry.name}`}
           style={{ marginRight: 12 }}
           onClick={(e) => {
             e.stopPropagation()
+            e.preventDefault()
             onDownload(entry)
           }}
         >
@@ -357,7 +358,7 @@ function FileRow({
             <path d="M4.5 7 L8 10.5 L11.5 7" />
             <path d="M3 13 h10" />
           </svg>
-        </button>
+        </a>
       )}
       <span style={{ display: 'none' }}>{fullPath}</span>
     </div>
@@ -391,9 +392,15 @@ function FileContentView({
         </div>
       )}
       <div style={{ ...headerStyle }}>
-        <button type="button" className="btn btn-ghost" data-testid="content-download" style={{ fontSize: 12, padding: '3px 8px' }} onClick={onDownload}>
+        <a
+          className="btn btn-ghost"
+          href={`/api/files/download?path=${encodeURIComponent(content.path)}`}
+          data-testid="content-download"
+          style={{ fontSize: 12, padding: '3px 8px' }}
+          onClick={(e) => { e.preventDefault(); onDownload() }}
+        >
           Download
-        </button>
+        </a>
         <button type="button" className="btn btn-ghost" data-testid="content-back" style={{ fontSize: 12, padding: '3px 8px' }} onClick={onBack}>
           Back to directory
         </button>
