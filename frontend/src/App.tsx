@@ -547,9 +547,16 @@ export default function App() {
 
   const syncSection = useCallback((s: TopSection) => {
     if (typeof window !== 'undefined') {
-      window.history.pushState(null, '', pathFromSection(s))
+      // When switching back to the sessions section, preserve the
+      // currently-focused session/tab in the URL instead of resetting
+      // to '/'. This prevents the session header buttons (Copy ID,
+      // Open workdir) from disappearing when toggling Files → Sessions.
+      const target = s === 'sessions' && selectedId
+        ? pathFromSelectedId(selectedId)
+        : pathFromSection(s)
+      window.history.pushState(null, '', target)
     }
-  }, [])
+  }, [selectedId])
 
   const handleSectionChange = useCallback((s: TopSection) => {
     setSection(s)
