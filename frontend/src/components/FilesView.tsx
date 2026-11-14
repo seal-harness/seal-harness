@@ -259,13 +259,16 @@ function DirectoryListing({
   onOpen,
   onDownload,
   downloadTruncated,
+  showHidden,
 }: {
   listing: FileListing
   onOpen: (entry: FileEntry) => void
   onDownload: (entry: FileEntry) => void
   downloadTruncated: boolean
+  showHidden: boolean
 }) {
-  const sorted = sortEntries(listing.entries)
+  const filtered = showHidden ? listing.entries : listing.entries.filter(e => !e.name.startsWith('.'))
+  const sorted = sortEntries(filtered)
   return (
     <div>
       {listing.warning && (
@@ -455,6 +458,7 @@ export function FilesView() {
   const [contentLoading, setContentLoading] = useState(false)
   const [downloadTruncated] = useState(false)
   const [viewerDownloadTruncated] = useState(false)
+  const [showHidden, setShowHidden] = useState(false)
   const [confirmDialog, setConfirmDialog] = useState<{ path: string; size: number } | null>(null)
   const fileDownload = useFileDownload()
   const [railError, setRailError] = useState<Map<string, number>>(new Map())
@@ -859,6 +863,18 @@ export function FilesView() {
 
       <div className="flex-1 overflow-y-auto" style={{ minWidth: 0 }}>
         <Breadcrumbs path={path ?? rootListing?.path ?? '/'} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 0', fontSize: '0.85em', color: 'var(--text-muted)' }}>
+          <input
+            type="checkbox"
+            id="show-hidden"
+            checked={showHidden}
+            onChange={(e) => setShowHidden(e.target.checked)}
+            style={{ margin: 0 }}
+          />
+          <label htmlFor="show-hidden" style={{ cursor: 'pointer', userSelect: 'none' }}>
+            Show hidden files
+          </label>
+        </div>
         {loading || contentLoading ? (
           <LoadingState />
         ) : error !== null ? (
@@ -876,6 +892,7 @@ export function FilesView() {
             onOpen={handleOpen}
             onDownload={handleDownload}
             downloadTruncated={downloadTruncated}
+            showHidden={showHidden}
           />
         ) : null}
       </div>
