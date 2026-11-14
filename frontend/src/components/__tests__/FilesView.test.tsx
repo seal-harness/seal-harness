@@ -583,7 +583,7 @@ describe('FilesView', () => {
     render(<FilesView />)
     await waitFor(() => expect(screen.getByTestId('file-entry-readme.txt')).toBeTruthy())
     const row = screen.getByTestId('file-entry-readme.txt')
-    expect(row.tagName).toBe('BUTTON')
+    expect(row.tagName).toBe('A')
     expect(row.getAttribute('aria-label')).toBeTruthy()
     const pushSpy = vi.spyOn(window.history, 'pushState')
     fireEvent.click(row)

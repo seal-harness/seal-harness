@@ -315,13 +315,15 @@ function FileRow({
   const fullPath = joinPath(listing.path, entry.name)
   return (
     <div style={{ display: 'flex', alignItems: 'center' }}>
-      <button
-        type="button"
+      <a
+        href={entry.isDir
+          ? `/files?path=${encodeURIComponent(fullPath)}`
+          : `/api/files/content?path=${encodeURIComponent(fullPath)}`}
         data-testid={`file-entry-${entry.name}`}
         className="files-row"
         aria-label={`${entry.isDir ? 'Open directory' : 'Open file'} ${entry.name}`}
         style={{ ...rowStyle, borderBottom: 'none', flex: 1 }}
-        onClick={() => onOpen(entry)}
+        onClick={(e) => { e.preventDefault(); onOpen(entry) }}
       >
         <span style={{ color: 'var(--text-faint)', width: 14, display: 'inline-flex' }}>
           {entry.isDir || entry.isSymlink ? (
@@ -342,7 +344,7 @@ function FileRow({
         <span style={{ color: 'var(--text-faint)', fontSize: 12, width: 160 }}>
           {formatMtime(entry.mtime)}
         </span>
-      </button>
+      </a>
       {!entry.isDir && (
         <a
           className="icon-btn"
