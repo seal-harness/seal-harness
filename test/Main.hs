@@ -22,6 +22,7 @@ import qualified Seal.Command.AccessControlSpec
 import qualified Seal.Gateway.ApiIntegrationSpec
 import qualified Seal.Gateway.AgentIntegrationSpec
 import qualified Seal.Gateway.ApiSpec
+import qualified Seal.Gateway.ApiFilesSpec
 import qualified Seal.Gateway.BroadcastSpec
 import qualified Seal.Gateway.EntryCursorSpec
 import qualified Seal.Gateway.OpenApiSpec
@@ -49,6 +50,7 @@ import qualified Seal.Tools.Exec.UntrustedIORemoteSpec
 import qualified Seal.Tools.Exec.LocalSpec
 import qualified Seal.Tools.Exec.LogRedactionSpec
 import qualified Seal.Tools.Exec.RemoteSpec
+import qualified Seal.Tools.Exec.FileExplorerSpec
 import qualified Seal.Tools.ArgsSpec
 import qualified Seal.Tools.Ssh.AgentSpec
 import qualified Seal.Tools.Exec.CapabilityScopingFailSpec
@@ -239,6 +241,7 @@ specs = do
   Seal.Gateway.AuditSpec.spec
   Seal.Command.AccessControlSpec.spec
   Seal.Gateway.ApiSpec.spec
+  Seal.Gateway.ApiFilesSpec.spec
   Seal.Gateway.ApiIntegrationSpec.spec
   Seal.Gateway.AgentIntegrationSpec.spec
   Seal.Gateway.BroadcastSpec.spec
@@ -274,6 +277,7 @@ specs = do
   Seal.Tools.Exec.UIOSpec.spec
   Seal.Tools.Exec.UIOParitySpec.spec
   Seal.Tools.Exec.WorkdirFsSpec.spec
+  Seal.Tools.Exec.FileExplorerSpec.spec
   Seal.ISA.Ops.UIOUnrestrictedFailSpec.spec
   Seal.ISA.Ops.UIOConstructionFailSpec.spec
   Seal.Web.SearchSpec.spec

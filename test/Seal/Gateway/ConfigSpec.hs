@@ -70,7 +70,7 @@ spec = describe "Seal.Gateway.Config" $ do
 
   describe "withGatewayDefaults" $ do
     it "fills in defaults for missing fields" $ do
-      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcHost = Just "0.0.0.0", pgcStaticDir = Nothing, pgcAllowedOrigins = [], pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing, pgcTlsHosts = [] }
+      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcHost = Just "0.0.0.0", pgcStaticDir = Nothing, pgcAllowedOrigins = [], pgcFileExplorerEnabled = Nothing, pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing, pgcTlsHosts = [] }
           full = withGatewayDefaults partial
       gcPort full `shouldBe` 9090
       gcHost full `shouldBe` "0.0.0.0"
@@ -78,7 +78,7 @@ spec = describe "Seal.Gateway.Config" $ do
       gcAllowedOrigins full `shouldBe` ["http://localhost:8080"]  -- default (empty → safe default)
 
     it "preserves all set fields" $ do
-      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcHost = Just "0.0.0.0", pgcStaticDir = Just "/srv/seal", pgcAllowedOrigins = ["http://example.com"], pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing, pgcTlsHosts = [] }
+      let partial = PartialGatewayConfig { pgcPort = Just 9090, pgcHost = Just "0.0.0.0", pgcStaticDir = Just "/srv/seal", pgcAllowedOrigins = ["http://example.com"], pgcFileExplorerEnabled = Nothing, pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing, pgcTlsHosts = [] }
           full = withGatewayDefaults partial
       gcPort full `shouldBe` 9090
       gcHost full `shouldBe` "0.0.0.0"
@@ -93,6 +93,7 @@ spec = describe "Seal.Gateway.Config" $ do
           , pgcHost = Just "0.0.0.0"
           , pgcStaticDir = Just "/srv/seal"
           , pgcAllowedOrigins = ["http://example.com", "http://localhost:8080"]
+          , pgcFileExplorerEnabled = Just True
           , pgcTlsCert = Just "/srv/seal/fullchain.pem"
           , pgcTlsKey = Just "/srv/seal/privkey.pem"
           , pgcTls = Just True

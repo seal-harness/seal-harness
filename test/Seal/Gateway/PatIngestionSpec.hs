@@ -81,6 +81,7 @@ import Seal.Tabs (newTabsHandle)
 import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
 import Seal.Tools.Args (textBinArg, textBinName)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
 import Seal.Tools.Exec.Types (getRemotePath)
 import Seal.Tools.Exec.UIO (runUIOWithEnv)
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
@@ -274,6 +275,8 @@ mkVaultDeps vr tmp = do
         
         , adWsHealth = pure (StreamHealth "up" 8081)
         , adAbortReg         = testAbortReg
+        , adFileExplorer = mkFailClosedFileExplorer
+        , adFileExplorerEnabled = False
         , adSecurityConfig   = defaultSecurityConfig
         , adMkSessionExec    = Nothing
         }

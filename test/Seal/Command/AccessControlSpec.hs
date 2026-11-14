@@ -176,6 +176,7 @@ spec = describe "seal access-control" $ do
       writeGateway paths (PartialGatewayConfig
         { pgcPort = Just 8443, pgcHost = Just "0.0.0.0"
         , pgcStaticDir = Nothing, pgcAllowedOrigins = []
+        , pgcFileExplorerEnabled = Nothing
         , pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing
         , pgcTlsHosts = [] })
       runAccessControlWith paths (AcEnroll enrollWindow) `shouldReturn` ExitFailure 1
@@ -186,6 +187,7 @@ spec = describe "seal access-control" $ do
       writeGateway paths (PartialGatewayConfig
         { pgcPort = Nothing, pgcHost = Just "localhost"
         , pgcStaticDir = Nothing, pgcAllowedOrigins = []
+        , pgcFileExplorerEnabled = Nothing
         , pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing
         , pgcTlsHosts = [] })
       runAccessControlWith paths (AcEnroll enrollWindow) `shouldReturn` ExitSuccess
@@ -249,7 +251,7 @@ spec = describe "seal access-control" $ do
       saveSecurityConfig (securityFilePath paths)
         defaultSecurityConfig
           { scGateway = Just (PartialGatewayConfig Nothing Nothing Nothing
-                               ["https://old.example.com"] Nothing Nothing Nothing [])
+                               ["https://old.example.com"] Nothing Nothing Nothing Nothing [])
           , scAccessControl = Just (AccessControlFileConfig Nothing
                                      (Just "https://old.example.com")
                                      (Just "old.example.com"))
@@ -275,7 +277,7 @@ spec = describe "seal access-control" $ do
       saveSecurityConfig (securityFilePath paths)
         defaultSecurityConfig
           { scGateway = Just (PartialGatewayConfig (Just 443) (Just "localhost") Nothing
-                               [] (Just "/tmp/cert.pem") (Just "/tmp/key.pem")
+                               [] Nothing (Just "/tmp/cert.pem") (Just "/tmp/key.pem")
                                (Just True) ["seal.example.com"])
           } PreserveCredentials
         `shouldReturn` Right ()

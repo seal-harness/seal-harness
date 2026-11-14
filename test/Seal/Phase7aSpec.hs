@@ -40,6 +40,7 @@ import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
 import Seal.Skills.Backend qualified as Skill (noneBackend)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
@@ -119,6 +120,8 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
+    , adFileExplorer = mkFailClosedFileExplorer
+    , adFileExplorerEnabled = False
           }
         app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
@@ -180,6 +183,8 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
+    , adFileExplorer = mkFailClosedFileExplorer
+    , adFileExplorerEnabled = False
           }
         app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })

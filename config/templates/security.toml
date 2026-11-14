@@ -107,6 +107,9 @@ tls = false
 # tls_key  = "/etc/ssl/privkey.pem"
 # tls_hosts = ["seal.lan"]   # extra names for a generated certificate's SAN
 
+# Enable the machine-level file explorer in the web UI (default true).
+# file_explorer_enabled = true
+
 # ---------------------------------------------------------------------------
 # Passkey access control for the web gateway
 # ---------------------------------------------------------------------------

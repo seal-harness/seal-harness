@@ -50,6 +50,7 @@ import Data.IORef
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import System.Directory (createDirectoryIfMissing, getHomeDirectory)
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
@@ -62,7 +63,7 @@ import System.Process
   )
 
 import Seal.Tools.Args (ShellCommand, textShellCommand)
-import Seal.Tools.Exec.Local (readBounded, withManagedProcess)
+import Seal.Tools.Exec.Local (readBounded, readBoundedBytes, withManagedProcess)
 import Seal.Tools.Exec.Types
 import Seal.Logging.Global (globalLogIO)
 
@@ -199,6 +200,10 @@ data RemoteRunner = RemoteRunner
     -- environment. Used by the deploy-key remote clone path: the local
     -- @ssh -A@ process needs the SEAL agent's @SSH_AUTH_SOCK@ (not the
     -- ambient one) so the forwarded agent has the deploy key loaded.
+  , runRemoteBytes :: [String] -> IO (Either ExecError (ByteString, Bool))
+    -- ^ Like 'runRemote' but returns raw 'ByteString' (no UTF-8 decode).
+    -- Used by the file explorer's download endpoint so binary files are
+    -- served without UTF-8 corruption from the transport's lenient decode.
   }
 
 -- | The real SSH runner via 'System.Process'. Fail-closed: any IOError or
@@ -210,6 +215,7 @@ mkRealRemoteRunner = RemoteRunner
   { runRemote      = runReal Nothing []
   , runRemoteStdin = \argv stdinBytes -> runReal (Just stdinBytes) [] argv
   , runRemoteEnv   = runReal Nothing
+  , runRemoteBytes = runRealBytes Nothing []
   }
   where
     runReal :: Maybe ByteString -> [(String, String)] -> [String] -> IO (Either ExecError Text)
@@ -277,6 +283,52 @@ mkRealRemoteRunner = RemoteRunner
           logRemoteResult (Right formatted)
           pure (Right formatted)  -- remote command's own exit code, propagated by ssh
 
+    -- | Like 'runReal' but returns raw 'ByteString' (no UTF-8 decode).
+    -- Used by the file explorer's download endpoint so binary files are
+    -- served without corruption. Error handling mirrors 'runReal' but
+    -- on non-zero exit the formatted error text is discarded (the file
+    -- explorer maps all exec failures to 'FeExec' regardless).
+    runRealBytes :: Maybe ByteString -> [(String, String)] -> [String]
+                 -> IO (Either ExecError (ByteString, Bool))
+    runRealBytes mStdin envExtras argv = do
+      ensureMuxDirAt sshMuxBaseDir
+      let (program, args) = case argv of
+            (p : as) -> (p, as)
+            []       -> error "runRealBytes: empty argv (unreachable)"
+          cp0 = (proc program args)
+                  { std_out = CreatePipe, std_err = CreatePipe
+                  , create_group = True
+                  }
+          cp1 = case mStdin of
+            Nothing -> cp0 { std_in = NoStream }
+            Just _  -> cp0 { std_in = CreatePipe }
+      mEnv <- case envExtras of
+        [] -> pure Nothing
+        xs -> Just <$> mergeEnvReal xs
+      let cp = cp1 { env = mEnv }
+          maxOutput = 50_000
+      res <- try @IOError
+             (withManagedProcess cp $ \ph mIn hOut hErr -> do
+                case (mIn, mStdin) of
+                  (Just hIn, Just bs) -> do
+                    BS.hPut hIn bs
+                    hClose hIn
+                  _ -> pure ()
+                (outBytes, outTruncated) <- readBoundedBytes hOut maxOutput
+                _errText <- readBounded hErr maxOutput
+                ec <- waitForProcess ph
+                pure (ec, outBytes, outTruncated, _errText))
+      case res of
+        Left _ioErr -> do
+          logRemoteResult (Left ExecRemoteUnreachable)
+          pure (Left ExecRemoteUnreachable)
+        Right (ExitSuccess, out, trunc, _) -> pure (Right (out, trunc))
+        Right (ExitFailure 255, _, _, _) -> do
+          logRemoteResult (Left ExecRemoteUnreachable)
+          pure (Left ExecRemoteUnreachable)
+        Right (ExitFailure _, _, _, _) ->
+          pure (Left ExecRemoteUnreachable)
+
 -- | Emit a katip log line for the result of a remote SSH exec. Transport
 -- failures (launch fail, exit 255, exit 127) log at 'WarningS' so
 -- operators see SSH connectivity issues in the server console. A
@@ -343,6 +395,9 @@ mkFakeRemoteRunner canned = RemoteRunner
   { runRemote      = \_argv -> pure canned
   , runRemoteStdin = \_argv _stdin -> pure canned
   , runRemoteEnv   = \_env _argv -> pure canned
+  , runRemoteBytes = \_argv -> pure $ case canned of
+      Left e  -> Left e
+      Right t -> Right (TE.encodeUtf8 t, False)
   }
 
 -- | A fake 'RemoteRunner' that records every call's argv + stdin into an
@@ -365,6 +420,11 @@ mkFakeRemoteRunnerRecording ref canned = RemoteRunner
   , runRemoteEnv = \_env argv -> do
       modifyIORef' ref (++ [(argv, Nothing)])
       pure canned
+  , runRemoteBytes = \argv -> do
+      modifyIORef' ref (++ [(argv, Nothing)])
+      pure $ case canned of
+        Left e  -> Left e
+        Right t -> Right (TE.encodeUtf8 t, False)
   }
 
 -- | Merge env overrides over the inherited environment (overrides win).

@@ -120,6 +120,7 @@ import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
 import Seal.ISA.RepeatDetect (newSessionRepeatRegistry)
 import Seal.Tools.Exec.Remote (RemoteRunner (..))
 import Seal.Tools.Exec.Types (ExecError)
+import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
 import Seal.Tools.Exec.Untrusted (UntrustedExecMode (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.Web.UiState (newUiStateHandle)
@@ -543,6 +544,8 @@ buildTestEnv tmp mode mRepo opts = do
         , adAbortReg = testAbortReg
         , adSecurityConfig = secCfg
         , adMkSessionExec = Nothing
+        , adFileExplorer = mkFailClosedFileExplorer
+        , adFileExplorerEnabled = False
         }
       app = apiApp deps
   pure ApiTestEnv
@@ -611,6 +614,7 @@ mkSetupRepoFakeRunner markerPath ref = do
     { runRemote      = (`record` Nothing)
     , runRemoteStdin = \argv stdin -> record argv (Just stdin)
     , runRemoteEnv   = \_env argv -> record argv Nothing
+    , runRemoteBytes = \argv -> record argv Nothing >> pure (Right ("", False))
     }
 
 -- | Respond to one recorded ssh invocation (see 'mkSetupRepoFakeRunner').

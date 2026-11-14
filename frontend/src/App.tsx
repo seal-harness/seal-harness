@@ -11,6 +11,7 @@ import { ReposView } from './components/ReposView'
 import { SecretsView } from './components/SecretsView'
 import { AccessView } from './components/AccessView'
 import { ChannelsView } from './components/ChannelsView'
+import { FilesView } from './components/FilesView'
 import { PerfOverlay } from './components/PerfOverlay'
 import { startMemoryMonitor, rateLimitedLog, detectLoop } from './lib/diag'
 import { useTranscriptMessages } from './hooks/useTranscriptMessages'
@@ -71,6 +72,7 @@ function sectionFromPath(): TopSection {
   if (path === '/skills' || path.startsWith('/skills/')) return 'skills'
   if (path === '/repos' || path.startsWith('/repos/')) return 'repos'
   if (path === '/secrets' || path.startsWith('/secrets/')) return 'secrets'
+  if (path === '/files' || path.startsWith('/files/')) return 'files'
   if (path === '/access' || path.startsWith('/access/')) return 'access'
   return 'sessions'
 }
@@ -1044,6 +1046,8 @@ export default function App() {
         <ReposView />
       ) : section === 'secrets' ? (
         <SecretsView />
+      ) : section === 'files' ? (
+        <FilesView />
       ) : section === 'access' ? (
         <AccessView />
       ) : (

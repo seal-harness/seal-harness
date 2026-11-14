@@ -72,6 +72,7 @@ import Seal.Tabs (newTabsHandle)
 import Seal.TestHelpers.FakeVault (makeFakeVault)
 import Seal.TestHelpers.ScriptProvider (ScriptProvider (..))
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
 import Seal.Vault.Backend (ResolvedKey (..))
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Vault.Provision
@@ -415,6 +416,8 @@ harnessAppWith config paths ref calls = do
         , adSecurityConfig = defaultSecurityConfig
         , adMkSessionExec = Nothing
         , adAbortReg = testAbortReg
+        , adFileExplorer = mkFailClosedFileExplorer
+        , adFileExplorerEnabled = False
         }
   pure (apiApp deps)
 

@@ -92,6 +92,8 @@ import Seal.Gateway.Config
   ( GatewayConfig (..), gatewayHostError
   , gatewayHostResolutionError, hostResolves, tlsConfigError, tlsEnabled, tlsOriginError
   , effectiveTlsPaths )
+import Seal.Tools.Exec.FileExplorer (mkLocalFileExplorer, mkRemoteFileExplorer, mkFailClosedFileExplorer)
+import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Gateway.Server (runGateway)
 import Seal.Gateway.Setup (SetupDeps (..))
 
@@ -124,6 +126,7 @@ import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
 import Seal.Tabs (newPersistingTabsHandle, insertTabH, seedTabsHandle)
 import Seal.Tabs.Persist (loadTabList)
+import Seal.Text.LineFile (maxScanBytes)
 import Seal.Tabs.Types (Tab (..), TabList (..), TabRef (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Memory.EngramBackend (resolveEmbeddingBackend)
@@ -500,6 +503,18 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
   -- (port already in use) still advertised the dead port, so the frontend
   -- connected to a non-WebSocket port and its transcript froze.
   wsHealthRef <- newIORef (StreamHealth "starting" (gcPort gwCfg))
+  -- File explorer: enabled by default (file_explorer_enabled = true).
+  -- The operator can disable it via [gateway] file_explorer_enabled = false.
+  -- The handle is built from the security
+  -- config: local mode → mkLocalFileExplorer, remote mode with SSH →
+  -- mkRemoteFileExplorer, remote mode without SSH → mkFailClosedFileExplorer
+  -- (fail-closed — NOT a local fallback, per architect review).
+  let fileExplorerEnabled = fromMaybe True (gcFileExplorerEnabled gwCfg)
+  fileExplorer <- case untrustedExecConfigFromSecurity secCfg of
+    Nothing -> pure (mkLocalFileExplorer maxScanBytes)
+    Just uec -> case uecRemote uec of
+      Nothing -> pure mkFailClosedFileExplorer
+      Just sshCfg -> mkRemoteFileExplorer sshCfg mkRealRemoteRunner maxScanBytes
   let deps = ApiDeps
         { adSessionRuntime  = sr
         , adTabsHandle      = tabsH
@@ -546,6 +561,8 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
         , adSecurityConfig   = secCfg
         , adMkSessionExec    = Nothing
         , adAbortReg         = cdAbortReg chanDeps
+        , adFileExplorer     = fileExplorer
+        , adFileExplorerEnabled = fileExplorerEnabled
         }
   -- The WS stream server is MOUNTED in the HTTP application (same port),
   -- so there is no second listener and no second port to collide with.

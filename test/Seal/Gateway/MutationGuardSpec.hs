@@ -53,6 +53,7 @@ import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
 import Seal.Web.UiState (newUiStateHandle)
 
 spec :: Spec
@@ -232,6 +233,8 @@ mkApp canonicalOrigin = do
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
+    , adFileExplorer = mkFailClosedFileExplorer
+    , adFileExplorerEnabled = False
     }
 
 testAbortReg :: SessionAbortRegistry

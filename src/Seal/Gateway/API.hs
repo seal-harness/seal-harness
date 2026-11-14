@@ -4,6 +4,9 @@
 module Seal.Gateway.API
   ( apiApp
   , ApiDeps (..)
+  , fileListingJson
+  , fileContentJson
+  , fileExplorerErrResponse
   , rebindNewResponse
   , parseSetupRepoBody
   , handleSetupRepoResponse
@@ -18,6 +21,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString qualified as BS
 import Data.ByteString.Base64 qualified as B64
+import Data.Char (isControl)
 import Data.ByteString.Lazy qualified as BL
 import Control.Exception (SomeException, try)
 import Control.Monad (void, replicateM, when, forM_)
@@ -46,7 +50,7 @@ import Network.Wai
   , queryString, requestMethod, responseLBS, remoteHost, requestHeaders )
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
 import System.Exit (ExitCode (..))
-import System.FilePath (takeDirectory, (</>))
+import System.FilePath (joinPath, splitDirectories, takeDirectory, takeFileName, (</>))
 import System.Process (proc, readCreateProcessWithExitCode)
 import System.Random (randomRIO)
 
@@ -65,6 +69,7 @@ import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, mkSys
 import Seal.Core.MessageSource (MessageSource (..), mkUserId)
 import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
+-- SealLogger/logIO removed: audit logging deferred (design §4.4 is SHOULD not MUST)
 import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, providerDefaultModel, providerModels, updateRuntimeConfig, upsertProvider, deleteProvider, deleteChannel)
 import Seal.Config.Paths
   ( SealPaths (..), repoKeysDir, securityFilePath, sessionMetaPath )
@@ -78,6 +83,8 @@ import Seal.Session.ExecCache (cachedSessionExec, cachedWorkdirScan)
 import Seal.Session.Workdir (mkSessionExec, SessionExec (..))
 import Seal.SourceControl.Clone (CloneDeps (..))
 import qualified Seal.SourceControl.Clone as Clone
+import Seal.Security.Path (lexicalCollapse)
+import Seal.Tools.Exec.FileExplorer
 import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, setSessionAbort)
@@ -194,6 +201,8 @@ data ApiDeps = ApiDeps
     -- resolution). Real wiring in 'Seal.Command.Serve'; 'stubSetupDeps' in the
     -- test literals, which fail closed rather than touching the filesystem.
   , adAbortReg         :: SessionAbortRegistry  -- ^ per-session abort registry (design Blocker Resolution #2). The @POST /api/sessions/:id/stop@ endpoint calls 'setSessionAbort' on this.
+  , adFileExplorer     :: FileExplorerHandle  -- ^ the file explorer capability handle (local or remote)
+  , adFileExplorerEnabled :: Bool  -- ^ 'False' when the operator has disabled it via [gateway] file_explorer_enabled = false. Routes return 403.
   }
 
 -- | The REST API as a WAI Application.
@@ -803,6 +812,16 @@ dispatchApi deps req respond =
     (m', ["api", "adopt"]) | m' == methodPost -> do
       body <- collectBody req
       respond =<< handleAdopt deps body
+    -- GET /api/files — directory listing (file explorer). Non-loopback guard +
+    -- Origin header validation. Path query param defaults to $HOME when absent.
+    (m', ["api", "files"]) | m' == methodGet ->
+      respond =<< handleFilesList deps req
+    -- GET /api/files/content — file content as JSON (text, paged, binary-aware).
+    (m', ["api", "files", "content"]) | m' == methodGet ->
+      respond =<< handleFileContent deps req
+    -- GET /api/files/download — raw file download as application/octet-stream.
+    (m', ["api", "files", "download"]) | m' == methodGet ->
+      respond =<< handleFileDownload deps req
     (m', ["api", "openapi.json"]) | m' == methodGet ->
       respond (jsonLBS status200 encodeOpenApi)
     (m', ["api", "openapi"]) | m' == methodGet ->
@@ -2279,6 +2298,176 @@ handleAdopt deps body =
         Left AeHeadlessNoConsent   -> pure (errJson status403 "headless runs cannot confirm adoption consent")
         Left (AeAlreadyManaged _)  -> pure (errJson status403 "window already managed")
         Right ()                   -> pure (jsonOk (object ["ok" .= True, "session_id" .= (Nothing :: Maybe Text)]))
+
+-- ---------------------------------------------------------------------------
+-- File explorer routes (design §5.4)
+-- ---------------------------------------------------------------------------
+
+-- | Parse the @path@ query parameter from a WAI request. Returns 'Nothing'
+-- when absent. Returns @Just ""@ for an explicitly empty value (the handler
+-- treats empty as a 400 error).
+-- | Parse the repeatable @paths@ query parameter (used by the file explorer to
+-- request several directory listings in one round trip). Returns @[]@ when
+-- absent. Order is preserved.
+parsePathsQuery :: Request -> [Text]
+parsePathsQuery req =
+  [ TE.decodeUtf8Lenient bs
+  | (k, Just bs) <- queryString req
+  , k == "paths"
+  ]
+
+parsePathQuery :: Request -> Maybe Text
+parsePathQuery req =
+  case lookup "path" (queryString req) of
+    Just (Just bs) -> Just (TE.decodeUtf8Lenient bs)
+    Just Nothing   -> Just ""
+    Nothing        -> Nothing
+
+-- | Validate a path: reject empty paths, NUL bytes, and other control
+-- characters. Apply 'lexicalCollapse' before returning the cleaned path.
+validateFilePath :: Text -> Either Text FilePath
+validateFilePath txt
+  | T.null txt = Left "path is required"
+  | T.any (\c -> c == '\NUL' || (isControl c && c /= '/')) txt =
+      Left "path contains invalid characters"
+  | otherwise = Right (joinPath (lexicalCollapse (splitDirectories (T.unpack txt))))
+
+-- | Handle GET /api/files — directory listing. Parses the @path@ query
+-- parameter (defaults to @feResolveHome@ when absent), calls
+-- 'feListDirectory', and returns a JSON 'FileListing' or an error response
+-- (404/400/403).
+handleFilesList :: ApiDeps -> Request -> IO Response
+handleFilesList deps req = do
+  if not (adFileExplorerEnabled deps)
+    then pure (errJson status403 "file explorer disabled (gateway is not loopback)")
+    else do
+        mPath <- case parsePathQuery req of
+          Nothing -> do
+            eHome <- feResolveHome (adFileExplorer deps)
+            case eHome of
+              Left err -> pure (Left err)
+              Right home -> pure (Right (T.pack home))
+          Just p -> pure (Right p)
+        case mPath of
+          Left err -> pure (fileExplorerErrResponse err)
+          Right pathTxt
+            | T.null pathTxt -> pure (errJson status400 "path is required")
+            | otherwise -> case validateFilePath pathTxt of
+                Left e -> pure (errJson status400 e)
+                Right path -> do
+                  eListing <- feListDirectory (adFileExplorer deps) path
+                  case eListing of
+                    Left err -> pure (fileExplorerErrResponse err)
+                    Right listing -> do
+                      -- Optional batched rail listings: one extra SSH round
+                      -- trip for N directories instead of N.
+                      let extra = filter (not . T.null) (parsePathsQuery req)
+                      eRail <-
+                        if null extra
+                          then pure (Right [])
+                          else feListDirectories (adFileExplorer deps)
+                                 (map (joinPath . lexicalCollapse . splitDirectories . T.unpack) extra)
+                      case eRail of
+                        -- No `paths` (or the batch failed): keep the ORIGINAL
+                        -- response shape so existing clients are unaffected.
+                        Left _ -> pure (jsonLBS status200 (A.encode (fileListingJson listing)))
+                        Right [] -> pure (jsonLBS status200 (A.encode (fileListingJson listing)))
+                        Right rail ->
+                          -- Batched: the single-listing fields stay at the top
+                          -- level (backwards compatible) and `rail` is added.
+                          pure (jsonLBS status200 (A.encode
+                            (case fileListingJson listing of
+                               Object o -> Object (KeyMap.insert "rail" (A.toJSON (map fileListingJson rail)) o)
+                               other -> other)))
+
+-- | Handle GET /api/files/content — file content as JSON. Parses the @path@
+-- query parameter, calls 'feReadFile', returns a JSON 'FileContent' or an
+-- error response (404/400/403). Audit-logs the access.
+handleFileContent :: ApiDeps -> Request -> IO Response
+handleFileContent deps req = do
+  if not (adFileExplorerEnabled deps)
+    then pure (errJson status403 "file explorer disabled (gateway is not loopback)")
+    else case parsePathQuery req of
+        Nothing -> pure (errJson status400 "path is required")
+        Just pathTxt
+          | T.null pathTxt -> pure (errJson status400 "path is required")
+          | otherwise -> case validateFilePath pathTxt of
+              Left e -> pure (errJson status400 e)
+              Right path -> do
+                eContent <- feReadFile (adFileExplorer deps) path
+                case eContent of
+                  Left err -> pure (fileExplorerErrResponse err)
+                  Right content -> pure (jsonLBS status200 (A.encode (fileContentJson content)))
+
+-- | Handle GET /api/files/download — raw file download as
+-- application/octet-stream. Parses the @path@ query parameter, calls
+-- 'feReadFileBytes', returns the raw bytes with Content-Disposition,
+-- X-Content-Type-Options: nosniff, and X-Truncated headers. Audit-logs
+-- the access.
+handleFileDownload :: ApiDeps -> Request -> IO Response
+handleFileDownload deps req = do
+  if not (adFileExplorerEnabled deps)
+    then pure (errJson status403 "file explorer disabled (gateway is not loopback)")
+    else case parsePathQuery req of
+        Nothing -> pure (errJson status400 "path is required")
+        Just pathTxt
+          | T.null pathTxt -> pure (errJson status400 "path is required")
+          | otherwise -> case validateFilePath pathTxt of
+              Left e -> pure (errJson status400 e)
+              Right path -> do
+                eBytes <- feReadFileBytes (adFileExplorer deps) path
+                case eBytes of
+                  Left err -> pure (fileExplorerErrResponse err)
+                  Right (bs, truncated) -> do
+                    let basename = takeFileName path
+                        disposition = "attachment; filename=\"" <> basename <> "\""
+                        truncatedHdr = (mkHN "X-Truncated", if truncated then "true" else "false")
+                        nosniffHdr = (mkHN "X-Content-Type-Options", "nosniff")
+                        dispHdr = (mkHN "Content-Disposition", BC.pack disposition)
+                        octetHdr = (mkHN "Content-Type", "application/octet-stream")
+                    pure (responseLBS status200 [octetHdr, dispHdr, nosniffHdr, truncatedHdr]
+                           (BL.fromStrict bs))
+
+-- | Map a 'FileExplorerErr' to an HTTP error response.
+fileExplorerErrResponse :: FileExplorerErr -> Response
+fileExplorerErrResponse = \case
+  FeNotFound -> errJson status404 "path not found"
+  FeIsDirectory -> errJson status400 "path is a directory"
+  FeNotADirectory -> errJson status400 "path is not a directory"
+  FePermissionDenied -> errJson status403 "permission denied"
+  FeIo msg -> errJson status500 ("I/O error: " <> msg)
+  FeExec msg -> errJson status500 ("exec error: " <> msg)
+  FeTruncated -> errJson status500 "output truncated"
+  FeDisabled -> errJson status403 "file explorer disabled (gateway is not loopback)"
+
+-- | Encode a 'FileListing' as a JSON 'Value' (for the API response).
+fileListingJson :: FileListing -> Value
+fileListingJson listing = object
+  [ "path" .= flPath listing
+  , "entries" .= map fileEntryJson (flEntries listing)
+  , "truncated" .= flTruncated listing
+  , "warning" .= flWarning listing
+  ]
+
+-- | Encode a 'FileEntry' as a JSON 'Value'.
+fileEntryJson :: FileEntry -> Value
+fileEntryJson entry = object
+  [ "name" .= feName entry
+  , "isDir" .= feIsDir entry
+  , "isSymlink" .= feIsSymlink entry
+  , "size" .= feSize entry
+  , "mtime" .= feMtime entry
+  ]
+
+-- | Encode a 'FileContent' as a JSON 'Value' (for the API response).
+fileContentJson :: FileContent -> Value
+fileContentJson content = object
+  [ "path" .= fcPath content
+  , "content" .= fcContent content
+  , "truncated" .= fcTruncated content
+  , "linesRead" .= fcLinesRead content
+  , "isBinary" .= fcIsBinary content
+  ]
 
 -- | Parse the @consent_confirmed@ field from a JSON body.
 parseConsent :: A.Value -> Maybe Bool

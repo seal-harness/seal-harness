@@ -49,6 +49,7 @@ data GatewayConfig = GatewayConfig
     -- passkey-capable secure context. Handed to Warp as the bind address.
   , gcStaticDir      :: Maybe Text  -- ^ the frontend dist dir (Nothing = no static serving)
   , gcAllowedOrigins :: [Text]     -- ^ the WS Origin allowlist (default localhost:8080)
+  , gcFileExplorerEnabled :: Maybe Bool -- ^ enable the file explorer (default True; set False to disable)
   , gcTlsCert        :: Maybe Text
     -- ^ PEM certificate chain. Set together with 'gcTlsKey' to serve HTTPS
     -- directly, with no reverse proxy in front.
@@ -72,6 +73,7 @@ defaultGatewayConfig = GatewayConfig
   , gcHost = "localhost"
   , gcStaticDir = Nothing
   , gcAllowedOrigins = ["http://localhost:8080"]
+  , gcFileExplorerEnabled = Nothing
   , gcTlsCert = Nothing
   , gcTlsKey = Nothing
   , gcTls = False
@@ -155,6 +157,7 @@ gatewayConfigCodec = PartialGatewayConfig
   <*> Toml.dioptional (Toml.text "host") .= pgcHost
   <*> Toml.dioptional (Toml.text "static_dir") .= pgcStaticDir
   <*> originsCodec .= pgcAllowedOrigins
+  <*> Toml.dioptional (Toml.bool "file_explorer_enabled") .= pgcFileExplorerEnabled
   <*> Toml.dioptional (Toml.text "tls_cert") .= pgcTlsCert
   <*> Toml.dioptional (Toml.text "tls_key") .= pgcTlsKey
   <*> Toml.dioptional (Toml.bool "tls") .= pgcTls
@@ -196,6 +199,7 @@ data PartialGatewayConfig = PartialGatewayConfig
   , pgcHost           :: Maybe Text
   , pgcStaticDir      :: Maybe Text
   , pgcAllowedOrigins :: [Text]
+  , pgcFileExplorerEnabled :: Maybe Bool
   , pgcTlsCert        :: Maybe Text
   , pgcTlsKey         :: Maybe Text
   , pgcTls            :: Maybe Bool
@@ -215,6 +219,7 @@ withGatewayDefaults p = GatewayConfig
   , gcAllowedOrigins = if null (pgcAllowedOrigins p)
                          then gcAllowedOrigins defaultGatewayConfig
                          else pgcAllowedOrigins p
+  , gcFileExplorerEnabled = pgcFileExplorerEnabled p
   , gcTlsCert        = pgcTlsCert p
   , gcTlsKey         = pgcTlsKey p
   , gcTls            = fromMaybe False (pgcTls p)

@@ -781,6 +781,7 @@ emptyGateway = PartialGatewayConfig
   , pgcHost = Nothing
   , pgcStaticDir = Nothing
   , pgcAllowedOrigins = []
+  , pgcFileExplorerEnabled = Nothing
   , pgcTlsCert = Nothing
   , pgcTlsKey = Nothing
   , pgcTls = Nothing

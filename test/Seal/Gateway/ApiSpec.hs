@@ -86,6 +86,7 @@ import Seal.TestHelpers.ApiTestHarness
 import Options.Applicative (info)
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry, replySubscribe)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
 import Seal.ISA.RepeatDetect (SessionRepeatRegistry, newSessionRepeatRegistry)
 import Seal.Skills.Backend qualified as Skill (noneBackend, sbCreate)
 import Seal.Skills.Types (Skill (..), mkSkillId)
@@ -320,6 +321,8 @@ mkDepsFor paths = do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     }
@@ -493,6 +496,8 @@ mkProviderTestDeps tmp cfgRoot vr = do
     
     , adWsHealth = pure (StreamHealth "up" 8081)
     , adAbortReg         = testAbortReg
+    , adFileExplorer = mkFailClosedFileExplorer
+    , adFileExplorerEnabled = False
     , adSecurityConfig   = defaultSecurityConfig
     , adMkSessionExec    = Nothing
     }
@@ -2336,6 +2341,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                  }
@@ -2414,6 +2421,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2482,6 +2491,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2551,6 +2562,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2645,6 +2658,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2704,6 +2719,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2762,6 +2779,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2801,6 +2820,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2892,6 +2913,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2949,6 +2972,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3005,6 +3030,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3055,6 +3082,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3114,6 +3143,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3378,6 +3409,8 @@ spec = describe "Seal.Gateway.API" $ do
                 
                 , adWsHealth = pure (StreamHealth "up" 8081)
                 , adAbortReg         = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
                 }
@@ -3568,6 +3601,8 @@ spec = describe "Seal.Gateway.API" $ do
                 
                 , adWsHealth = pure (StreamHealth "up" 8081)
                 , adAbortReg         = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
                 }
@@ -3640,6 +3675,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3687,6 +3724,8 @@ spec = describe "Seal.Gateway.API" $ do
             
             , adWsHealth = pure (StreamHealth "up" 8081)
             , adAbortReg         = testAbortReg
+            , adFileExplorer = mkFailClosedFileExplorer
+            , adFileExplorerEnabled = False
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
             }
@@ -3872,6 +3911,8 @@ spec = describe "Seal.Gateway.API" $ do
             
             , adWsHealth = pure (StreamHealth "up" 8081)
             , adAbortReg         = testAbortReg
+            , adFileExplorer = mkFailClosedFileExplorer
+            , adFileExplorerEnabled = False
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
             }
@@ -4200,6 +4241,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -5235,6 +5278,8 @@ spec = describe "Seal.Gateway.API" $ do
                 , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
         , adAgentRegistry    = fakeAgentRegH
                 , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps, adPaths = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -5372,6 +5417,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Just (const (pure stubExec))
             , adAbortReg = testAbortReg
+            , adFileExplorer = mkFailClosedFileExplorer
+            , adFileExplorerEnabled = False
             }
           app = apiApp deps
       (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sidTxt, "agents"])
@@ -5461,6 +5508,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -5570,6 +5619,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -5741,6 +5792,8 @@ spec = describe "Seal.Gateway.API" $ do
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
             , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
             , adPaths            = paths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+            , adFileExplorer = mkFailClosedFileExplorer
+            , adFileExplorerEnabled = False
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Nothing
             , adAgentRegistry    = fakeAgentRegH
@@ -5868,6 +5921,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -5997,6 +6052,8 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }

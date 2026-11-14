@@ -358,6 +358,7 @@ spec = describe "Seal.Config.Security" $ do
           , pgcHost = Just "0.0.0.0"
           , pgcStaticDir = Just "/srv/seal/frontend-dist"
           , pgcAllowedOrigins = ["https://seal.example.com"]
+          , pgcFileExplorerEnabled = Just True
           , pgcTlsCert = Just "/etc/ssl/fullchain.pem"
           , pgcTlsKey = Just "/etc/ssl/privkey.pem"
           , pgcTls = Just True

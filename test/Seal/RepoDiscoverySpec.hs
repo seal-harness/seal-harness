@@ -933,6 +933,7 @@ scriptedScanRunner recRef canned0 = do
     { runRemote      = recordAndPop recRef qRef . extractCmd
     , runRemoteStdin = \argv _stdin -> recordAndPop recRef qRef (extractCmd argv)
     , runRemoteEnv   = \_env argv -> recordAndPop recRef qRef (extractCmd argv)
+    , runRemoteBytes = \_ -> pure (Right ("", False))
     }
   where
     recordAndPop :: IORef [T.Text] -> IORef [Either ExecError T.Text] -> T.Text

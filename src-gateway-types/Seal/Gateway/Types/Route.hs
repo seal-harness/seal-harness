@@ -156,6 +156,10 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   RouteUiRepos       :: SealRoute '[] '[] (Body Req) Resp
   -- Adopt
   RouteAdopt         :: SealRoute '[] '[] (Body Req) Resp
+  -- Files (machine-level file explorer)
+  RouteFilesList     :: SealRoute '[] '[] Bodyless Resp
+  RouteFilesContent  :: SealRoute '[] '[] Bodyless Resp
+  RouteFilesDownload :: SealRoute '[] '[] Bodyless Resp
   -- Setup (first-run wizard). The gate is blocking: these four are the only
   -- routes the SPA may call before it hands control back to <App/>.
   RouteSetupState    :: SealRoute '[] '[] Bodyless Resp
@@ -240,6 +244,9 @@ routeMeta = \case
   RouteUiCustomModels -> Meta (match "ui" ./ match "custom-models" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteUiRepos -> Meta (match "ui" ./ match "repos" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteAdopt -> Meta (match "adopt" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteFilesList -> Meta (match "files" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteFilesContent -> Meta (match "files" ./ match "content" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteFilesDownload -> Meta (match "files" ./ match "download" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteSetupState -> Meta (match "setup" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteSetupVault -> Meta (match "setup" ./ match "vault" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteSetupVaultReopen -> Meta (match "setup" ./ match "vault" ./ match "reopen" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
@@ -316,6 +323,9 @@ allRoutes =
   , Constructed RouteUiCustomModels
   , Constructed RouteUiRepos
   , Constructed RouteAdopt
+  , Constructed RouteFilesList
+  , Constructed RouteFilesContent
+  , Constructed RouteFilesDownload
   , Constructed RouteSetupState
   , Constructed RouteSetupVault
   , Constructed RouteSetupVaultReopen

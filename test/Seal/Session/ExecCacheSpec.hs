@@ -191,6 +191,7 @@ recordingRunner ref = RemoteRunner
   { runRemote      = \argv -> record argv >> pure (Right "")
   , runRemoteStdin = \argv _ -> record argv >> pure (Right "")
   , runRemoteEnv   = \_ argv -> record argv >> pure (Right "")
+  , runRemoteBytes = \argv -> record argv >> pure (Right ("", False))
   }
   where
     record argv = modifyIORef' ref (++ [argv])
