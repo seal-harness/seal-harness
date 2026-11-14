@@ -1850,7 +1850,7 @@ export function useFileContent(path: string | null | undefined) {
  *  the server's byte ceiling, so we show a warning. The blob is saved via
  *  `URL.createObjectURL` + a temporary `<a download>` click. Returns
  *  `{ truncated: boolean }` so the caller can show a toast. */
-export async function downloadFile(path: string): Promise<{ truncated: boolean; error?: string }> {
+export async function downloadFile(path: string, partialLimit?: number): Promise<{ truncated: boolean; error?: string }> {
   try {
     const res = await fetch(`/api/files/download?path=${encodeURIComponent(path)}`)
     if (!res.ok) return { truncated: false, error: `HTTP ${res.status}` }
@@ -1860,13 +1860,68 @@ export async function downloadFile(path: string): Promise<{ truncated: boolean; 
     const a = document.createElement('a')
     a.href = url
     // Derive a filename from the last path component.
-    a.download = path.split('/').pop() || 'download'
+    const basename = path.split('/').pop() || 'download'
+    if (truncated) {
+      const savedStr = formatBytes(partialLimit ?? blob.size)
+      const totalStr = formatBytes(blob.size)
+      a.download = `${basename}.${savedStr}-of-${totalStr}.partial`
+    } else {
+      a.download = basename
+    }
     document.body.appendChild(a)
     a.click()
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n}B`
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)}KiB`
+  if (n < 1024 * 1024 * 1024) return `${Math.round(n / (1024 * 1024))}MiB`
+  return `${(n / (1024 * 1024 * 1024)).toFixed(1)}GiB`
+}
     document.body.removeChild(a)
     URL.revokeObjectURL(url)
     return { truncated }
   } catch {
     return { truncated: false, error: 'network error' }
+  }
+}
+
+/** Fetch file stat (size, mtime) via `GET /api/files/stat?path=<p>`.
+ *  Returns `{ok:true, stat} | {ok:false, status}`. */
+export async function fetchFileStat(path: string): Promise<{ ok: true; stat: import('../types').FileStat } | { ok: false; status: number }> {
+  try {
+    const res = await fetch(`/api/files/stat?path=${encodeURIComponent(path)}`)
+    if (!res.ok) return { ok: false, status: res.status }
+    const stat = await res.json() as import('../types').FileStat
+    return { ok: true, stat }
+  } catch {
+    return { ok: false, status: 0 }
+  }
+}
+
+/** Fetch a download manifest via `GET /api/files/download/manifest?path=<p>`.
+ *  Returns O(1) metadata (no hash list). */
+export async function fetchFileManifest(path: string): Promise<{ ok: true; manifest: import('../types').FileManifest } | { ok: false; status: number }> {
+  try {
+    const res = await fetch(`/api/files/download/manifest?path=${encodeURIComponent(path)}`)
+    if (!res.ok) return { ok: false, status: res.status }
+    const manifest = await res.json() as import('../types').FileManifest
+    return { ok: true, manifest }
+  } catch {
+    return { ok: false, status: 0 }
+  }
+}
+
+/** Fetch a single chunk via `GET /api/files/download/chunk?path=<p>&index=<i>&size=<s>&mtime=<m>`.
+ *  Returns raw bytes + the X-Chunk-SHA256 header. */
+export async function fetchFileChunk(path: string, index: number, size: number, mtime: number | null): Promise<{ ok: true; bytes: ArrayBuffer; sha256: string | null } | { ok: false; status: number }> {
+  try {
+    const mtimeParam = mtime === null ? 'null' : String(mtime)
+    const res = await fetch(`/api/files/download/chunk?path=${encodeURIComponent(path)}&index=${index}&size=${size}&mtime=${mtimeParam}`)
+    if (!res.ok) return { ok: false, status: res.status }
+    const bytes = await res.arrayBuffer()
+    const sha256 = res.headers.get('X-Chunk-SHA256')
+    return { ok: true, bytes, sha256 }
+  } catch {
+    return { ok: false, status: 0 }
   }
 }

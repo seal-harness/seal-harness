@@ -21,6 +21,7 @@ import { useVirtualWindow } from '../hooks/useVirtualWindow'
 import { rateLimitedLog, detectLoop, logMemoryNow } from '../lib/diag'
 import { nextScrollIntent, type ScrollIntent } from '../lib/scrollIntent'
 import { isAtBottom, isNearTop, isSyntheticScroll } from '../lib/transcriptScroll'
+import { openModalStack } from '../lib/modalStack'
 import type { LoadResult } from '../types/stream'
 
 /** The connection-state banner shown above the transcript when the
@@ -568,9 +569,6 @@ function prettyJsonOrRaw(payload: string): string {
 }
 
 // Stack of currently-open modals. Only the top entry consumes Escape so
-// that closing the topmost doesn't also collapse the one underneath.
-const openModalStack: symbol[] = []
-
 type JsonTab = 'formatted' | 'raw'
 
 function CopyJsonButton({ text }: { text: string }) {

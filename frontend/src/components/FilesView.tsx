@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { FileEntry, FileListing, FileContent } from '../types'
-import { fetchFileListing, fetchFileListingWithRail, fetchFileContent, downloadFile } from '../hooks/useApi'
+import { fetchFileListing, fetchFileListingWithRail, fetchFileContent, downloadFile, fetchFileStat } from '../hooks/useApi'
 import { FileTree, type FileTreeNode } from './FileTree'
+import { DownloadConfirmDialog } from './DownloadConfirmDialog'
 
 // ── URL helpers ─────────────────────────────────────────────────────────
 
@@ -19,6 +20,11 @@ function navigateTo(path: string | null) {
   window.history.pushState(null, '', qs ? `/files?${qs}` : '/files')
   window.dispatchEvent(new PopStateEvent('popstate'))
 }
+
+
+/** The configured prompt threshold for downloads. In production this
+ *  comes from the backend config; for now we use the default. */
+const DOWNLOAD_PROMPT_THRESHOLD = 268435456 // 256 MiB
 
 // ── Paths ───────────────────────────────────────────────────────────────
 
@@ -273,7 +279,7 @@ function DirectoryListing({
       )}
       {downloadTruncated && (
         <div data-testid="download-truncated-warning" style={{ ...bannerStyle, color: 'var(--warning)' }}>
-          ⚠ Last download was truncated — only the first 128 KiB was saved
+          ⚠ Last download was truncated — the file exceeded the server's byte limit
         </div>
       )}
       {sorted.length === 0 ? (
@@ -440,6 +446,7 @@ export function FilesView() {
   const [contentLoading, setContentLoading] = useState(false)
   const [downloadTruncated, setDownloadTruncated] = useState(false)
   const [viewerDownloadTruncated, setViewerDownloadTruncated] = useState(false)
+  const [confirmDialog, setConfirmDialog] = useState<{ path: string; size: number } | null>(null)
   const [railError, setRailError] = useState<Map<string, number>>(new Map())
   const inflight = useRef<Map<string | null, Promise<FileListing | null>>>(new Map())
   const statusRef = useRef<Map<string | null, number>>(new Map())
@@ -739,8 +746,8 @@ export function FilesView() {
     [path, listings],
   )
 
-  const doDownload = useCallback(async (target: string) => {
-    const res = await downloadFile(target)
+  const doDownload = useCallback(async (target: string, partialLimit?: number) => {
+    const res = await downloadFile(target, partialLimit)
     return res.truncated
   }, [])
 
@@ -750,14 +757,26 @@ export function FilesView() {
         ? listings.get(null)
         : listings.get(path) ?? listings.get(parentDir(path))
       const base = listing?.path ?? (path ?? '')
-      setDownloadTruncated(await doDownload(joinPath(base, entry.name)))
+      const target = joinPath(base, entry.name)
+      // Fetch stat first; if over threshold, show confirm dialog.
+      const statRes = await fetchFileStat(target)
+      if (statRes.ok && statRes.stat.size > DOWNLOAD_PROMPT_THRESHOLD) {
+        setConfirmDialog({ path: target, size: statRes.stat.size })
+      } else {
+        setDownloadTruncated(await doDownload(target))
+      }
     },
     [path, listings, doDownload],
   )
 
   const handleViewerDownload = useCallback(async () => {
     if (!content) return
-    setViewerDownloadTruncated(await doDownload(content.path))
+    const statRes = await fetchFileStat(content.path)
+    if (statRes.ok && statRes.stat.size > DOWNLOAD_PROMPT_THRESHOLD) {
+      setConfirmDialog({ path: content.path, size: statRes.stat.size })
+    } else {
+      setViewerDownloadTruncated(await doDownload(content.path))
+    }
   }, [content, doDownload])
 
   // ── Derive the rail ────────────────────────────────────────────────────
@@ -855,6 +874,22 @@ export function FilesView() {
           />
         ) : null}
       </div>
+      {confirmDialog && (
+        <DownloadConfirmDialog
+          path={confirmDialog.path}
+          size={confirmDialog.size}
+          threshold={DOWNLOAD_PROMPT_THRESHOLD}
+          onCancel={() => setConfirmDialog(null)}
+          onPartial={async () => {
+            setConfirmDialog(null)
+            setDownloadTruncated(await doDownload(confirmDialog.path, DOWNLOAD_PROMPT_THRESHOLD))
+          }}
+          onFull={async () => {
+            setConfirmDialog(null)
+            setDownloadTruncated(await doDownload(confirmDialog.path))
+          }}
+        />
+      )}
     </div>
   )
 }
