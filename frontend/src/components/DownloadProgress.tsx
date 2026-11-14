@@ -13,10 +13,26 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GiB`
 }
 
+function formatEta(seconds: number | null): string {
+  if (seconds === null) return 'estimating…'
+  if (seconds <= 0) return 'almost done'
+  if (seconds < 60) return `${Math.ceil(seconds)}s remaining`
+  const mins = Math.floor(seconds / 60)
+  const secs = Math.ceil(seconds % 60)
+  if (mins < 60) return `${mins}m ${secs}s remaining`
+  const hrs = Math.floor(mins / 60)
+  const remMins = Math.ceil(mins % 60)
+  return `${hrs}h ${remMins}m remaining`
+}
+
+function formatSpeed(bps: number | null): string {
+  if (bps === null || bps <= 0) return ''
+  return `${formatBytes(bps)}/s`
+}
+
 export function DownloadProgressUI({ progress, onCancel, onRetry }: DownloadProgressUIProps) {
-  const { state, chunksDone, chunksTotal, bytesDone, bytesTotal, error } = progress
-  const pct = chunksTotal > 0 ? Math.round((chunksDone / chunksTotal) * 100) : 0
-  const valuetext = `${chunksDone} of ${chunksTotal} chunks, ${formatBytes(bytesDone)} of ${formatBytes(bytesTotal)}`
+  const { state, percent, bytesDone, bytesTotal, etaSeconds, bytesPerSecond, error } = progress
+  const pct = Math.min(100, Math.max(0, percent))
 
   if (state === 'error') {
     return (
@@ -38,7 +54,7 @@ export function DownloadProgressUI({ progress, onCancel, onRetry }: DownloadProg
     return (
       <div data-testid="download-partial" style={containerStyle}>
         <span style={{ color: 'var(--warning)' }}>
-          ⚠ Partial download: {chunksDone} of {chunksTotal} chunks saved as .partial
+          ⚠ Partial download saved as .partial ({formatBytes(bytesDone)} of {formatBytes(bytesTotal)})
         </span>
       </div>
     )
@@ -47,7 +63,7 @@ export function DownloadProgressUI({ progress, onCancel, onRetry }: DownloadProg
   if (state === 'cancelled') {
     return (
       <div data-testid="download-cancelled" style={containerStyle}>
-        <span>Download cancelled — {chunksDone} of {chunksTotal} chunks retained</span>
+        <span>Download cancelled ({formatBytes(bytesDone)} downloaded)</span>
       </div>
     )
   }
@@ -68,15 +84,19 @@ export function DownloadProgressUI({ progress, onCancel, onRetry }: DownloadProg
     )
   }
 
-  // Fetching / verifying
+  // Fetching / verifying — show percent + ETA, no chunk counts
+  const statusText = `${formatBytes(bytesDone)} / ${formatBytes(bytesTotal)}`
+  const speedText = formatSpeed(bytesPerSecond)
+  const etaText = formatEta(etaSeconds)
+
   return (
     <div data-testid="download-progress" style={containerStyle}>
       <div
         role="progressbar"
-        aria-valuenow={chunksDone}
+        aria-valuenow={pct}
         aria-valuemin={0}
-        aria-valuemax={chunksTotal}
-        aria-valuetext={valuetext}
+        aria-valuemax={100}
+        aria-valuetext={`${pct}%, ${formatBytes(bytesDone)} of ${formatBytes(bytesTotal)}`}
         style={{
           width: '100%', height: 8, borderRadius: 4,
           background: 'var(--border)', overflow: 'hidden',
@@ -85,18 +105,21 @@ export function DownloadProgressUI({ progress, onCancel, onRetry }: DownloadProg
         <div
           style={{
             width: `${pct}%`, height: '100%',
-            background: 'var(--accent)', transition: 'width 0.2s ease',
+            background: 'var(--accent)', transition: 'width 0.15s ease-out',
           }}
         />
       </div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
-        <span>{valuetext}</span>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, fontSize: '0.85em', color: 'var(--text-muted)' }}>
+        <span>{statusText}{speedText ? ` · ${speedText}` : ''}</span>
+        <span>{etaText}</span>
+      </div>
+      <div style={{ marginTop: 4 }}>
         <button onClick={onCancel} data-testid="download-cancel-btn" style={btnStyle}>
           Cancel
         </button>
       </div>
       <div role="status" aria-live="polite" style={{ position: 'absolute', left: -9999 }}>
-        {(state === 'fetching' || state === 'verifying') && pct === 0 ? 'Download started' : undefined}
+        {pct === 0 ? 'Download started' : undefined}
         {pct === 25 ? '25% complete' : undefined}
         {pct === 50 ? '50% complete' : undefined}
         {pct === 75 ? '75% complete' : undefined}

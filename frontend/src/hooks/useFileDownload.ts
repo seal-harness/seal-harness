@@ -16,10 +16,16 @@ export type DownloadState =
 
 export interface DownloadProgress {
   state: DownloadState
-  chunksDone: number
-  chunksTotal: number
+  /** Percentage 0–100 (rounded). */
+  percent: number
+  /** Bytes downloaded so far. */
   bytesDone: number
+  /** Total bytes to download. */
   bytesTotal: number
+  /** Estimated seconds remaining, or null if not yet computable. */
+  etaSeconds: number | null
+  /** Download speed in bytes/second, or null if not yet computable. */
+  bytesPerSecond: number | null
   error: string | null
 }
 
@@ -53,6 +59,20 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GiB`
 }
 
+// ── ETA helper ─────────────────────────────────────────────────────────
+
+function computeEta(bytesDone: number, bytesTotal: number, elapsedMs: number): {
+  etaSeconds: number | null
+  bytesPerSecond: number | null
+} {
+  if (bytesDone <= 0 || elapsedMs <= 0) return { etaSeconds: null, bytesPerSecond: null }
+  const bytesPerSecond = bytesDone / (elapsedMs / 1000)
+  if (bytesPerSecond <= 0) return { etaSeconds: null, bytesPerSecond: null }
+  const remaining = bytesTotal - bytesDone
+  if (remaining <= 0) return { etaSeconds: 0, bytesPerSecond }
+  return { etaSeconds: remaining / bytesPerSecond, bytesPerSecond }
+}
+
 // ── Hook ───────────────────────────────────────────────────────────────
 
 export function useFileDownload(): UseFileDownloadResult {
@@ -63,13 +83,17 @@ export function useFileDownload(): UseFileDownloadResult {
   const pathRef = useRef<string>('')
   const partialLimitRef = useRef<number | undefined>(undefined)
   const retryFnRef = useRef<(() => Promise<void>) | null>(null)
+  const startTimeRef = useRef<number>(0)
 
   const updateProgress = useCallback((p: Partial<DownloadProgress>) => {
     setProgress(prev => {
       const base = prev ?? {
         state: 'idle' as DownloadState,
-        chunksDone: 0, chunksTotal: 0,
-        bytesDone: 0, bytesTotal: 0,
+        percent: 0,
+        bytesDone: 0,
+        bytesTotal: 0,
+        etaSeconds: null,
+        bytesPerSecond: null,
         error: null,
       }
       return { ...base, ...p }
@@ -86,8 +110,14 @@ export function useFileDownload(): UseFileDownloadResult {
 
     chunkStoreRef.current = new Map()
     manifestRef.current = null
+    startTimeRef.current = Date.now()
 
-    updateProgress({ state: 'fetching', chunksDone: 0, chunksTotal: 0, bytesDone: 0, bytesTotal: 0, error: null })
+    updateProgress({
+      state: 'fetching', percent: 0,
+      bytesDone: 0, bytesTotal: 0,
+      etaSeconds: null, bytesPerSecond: null,
+      error: null,
+    })
 
     try {
       // 1. Fetch manifest
@@ -102,19 +132,11 @@ export function useFileDownload(): UseFileDownloadResult {
       const { size, mtimeEpoch, chunkSize, chunkCount } = manifest
       const limit = partialLimit ?? Infinity
       const effectiveChunks = Math.min(chunkCount, Math.ceil(limit / chunkSize))
+      const totalBytes = Math.min(size, limit)
 
       updateProgress({
-        chunksTotal: effectiveChunks,
-        bytesTotal: Math.min(size, limit),
+        bytesTotal: totalBytes,
       })
-
-      // Milestone live region
-      const announceMilestone = (done: number, total: number) => {
-        const pct = total > 0 ? Math.round((done / total) * 100) : 0
-        if (pct === 0 || pct === 25 || pct === 50 || pct === 75 || pct === 100) {
-          // Milestone announced via aria-live region in the component
-        }
-      }
 
       // 2. Sequential chunk fetching
       let restarted = false
@@ -129,12 +151,18 @@ export function useFileDownload(): UseFileDownloadResult {
         // Resume: skip already-held chunks
         if (chunkStoreRef.current.has(i)) {
           bytesDone += chunkStoreRef.current.get(i)!.byteLength
-          updateProgress({ chunksDone: i + 1, bytesDone })
-          announceMilestone(i + 1, effectiveChunks)
+          const elapsed = Date.now() - startTimeRef.current
+          const { etaSeconds, bytesPerSecond } = computeEta(bytesDone, totalBytes, elapsed)
+          updateProgress({
+            percent: Math.round((bytesDone / totalBytes) * 100),
+            bytesDone,
+            etaSeconds,
+            bytesPerSecond,
+          })
           continue
         }
 
-        updateProgress({ state: 'fetching', chunksDone: i, bytesDone })
+        updateProgress({ state: 'fetching', bytesDone })
 
         let chunkRes
         try {
@@ -159,7 +187,7 @@ export function useFileDownload(): UseFileDownloadResult {
             chunkStoreRef.current.clear()
             bytesDone = 0
             i = -1 // restart loop from 0
-            updateProgress({ chunksDone: 0, bytesDone: 0 })
+            updateProgress({ percent: 0, bytesDone: 0, etaSeconds: null, bytesPerSecond: null })
             continue
           }
           if (chunkRes.status === 0) {
@@ -179,7 +207,7 @@ export function useFileDownload(): UseFileDownloadResult {
         }
 
         // 3. Verify SHA256
-        updateProgress({ state: 'verifying', chunksDone: i, bytesDone })
+        updateProgress({ state: 'verifying', bytesDone })
         const expectedSha = chunkRes.sha256
         const actualSha = chunkRes.bytes ? await sha256(chunkRes.bytes) : null
 
@@ -196,14 +224,23 @@ export function useFileDownload(): UseFileDownloadResult {
             return
           }
           if (retryRes.ok && retryRes.bytes) {
+            chunkStoreRef.current.set(i, retryRes.bytes)
+            bytesDone += retryRes.bytes.byteLength
           }
         } else if (chunkRes.bytes) {
           chunkStoreRef.current.set(i, chunkRes.bytes)
           bytesDone += chunkRes.bytes.byteLength
         }
 
-        updateProgress({ chunksDone: i + 1, bytesDone })
-        announceMilestone(i + 1, effectiveChunks)
+        // Update progress with percentage + ETA
+        const elapsed = Date.now() - startTimeRef.current
+        const { etaSeconds, bytesPerSecond } = computeEta(bytesDone, totalBytes, elapsed)
+        updateProgress({
+          percent: Math.min(100, Math.round((bytesDone / totalBytes) * 100)),
+          bytesDone,
+          etaSeconds,
+          bytesPerSecond,
+        })
       }
 
       // 4. Length assertions
@@ -239,8 +276,9 @@ export function useFileDownload(): UseFileDownloadResult {
 
       updateProgress({
         state: partialLimit !== undefined && effectiveChunks < chunkCount ? 'partial-stop' : 'done',
-        chunksDone: effectiveChunks,
+        percent: 100,
         bytesDone: totalHeld,
+        etaSeconds: 0,
       })
     } catch (err) {
       updateProgress({ state: 'error', error: err instanceof Error ? err.message : String(err) })
