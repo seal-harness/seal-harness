@@ -2306,6 +2306,34 @@ spec = describe "Seal.Gateway.API" $ do
         (A.Object o : _) -> lookupK "agent" o `shouldBe` Just (A.String "my-uploaded-agent")
         _                -> expectationFailure "no session row"
 
+  it "GET /api/sessions/:id/workdir returns 200 + the local workdir path" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let cacheDir = stateDir </> "cache"
+          paths = fakePaths { spState = stateDir, spCache = cacheDir }
+          sidTxt = "20260701-120000-099"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sidTxt, "workdir"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> case lookupK "path" o of
+          Just (A.String p) ->
+            p `shouldBe` T.pack (cacheDir </> "workdirs" </> T.unpack sidTxt)
+          other -> expectationFailure ("expected path string, got: " <> show other)
+        _ -> expectationFailure ("expected JSON object, got: " <> show body)
+
+  it "GET /api/sessions/:id/workdir returns 404 for an unknown session" $ do
+    app <- mkApp
+    status <- runAppStatus app (testRequest methodGet ["api", "sessions", "unknown-sid-999", "workdir"])
+    status `shouldBe` 404
+
   it "GET /api/agents returns 200 with a JSON array" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "agents"])

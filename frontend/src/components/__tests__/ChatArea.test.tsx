@@ -1137,6 +1137,47 @@ describe('ChatArea', () => {
     expect(dots.length).toBe(3)
   })
 
+  it('OpenWorkdirButton: clicking fetches the workdir path and navigates to /files', async () => {
+    // Stub fetch so /api/sessions/:id/workdir returns a fake path.
+    const origFetch = global.fetch
+    const fetchMock = vi.fn(async (url: string) => {
+      if (typeof url === 'string' && url.includes('/workdir')) {
+        return { ok: true, json: async () => ({ path: '/home/user/.seal/cache/workdirs/s1' }) } as Response
+      }
+ return { ok: true, json: async () => null } as Response
+    })
+    global.fetch = fetchMock as unknown as typeof global.fetch
+
+    // Stub history.pushState + popstate dispatch so the navigation is observable.
+    const origPushState = window.history.pushState
+    let pushedUrl = ''
+    window.history.pushState = vi.fn((..._args: unknown[]) => { pushedUrl = '/files?path=%2Fhome%2Fuser%2F.seal%2Fcache%2Fworkdirs%2Fs1' }) as unknown as typeof window.history.pushState
+    const dispatchSpy = vi.spyOn(window, 'dispatchEvent')
+
+    try {
+      const session = makeSession({ id: 's1' })
+      const messages: Message[] = [
+        { id: 'm1', agentName: 'You', agentStatus: 'completed', timestamp: '2024-06-01 12:00:00', blocks: [{ id: 'b1', text: 'hi' }] },
+      ]
+      render(
+        <ChatArea
+          selectedAgent={makeAgent()}
+          selectedSession={session}
+          messages={messages}
+        />,
+      )
+      const btn = screen.getByLabelText('Open session workdir in Files')
+      await act(async () => { fireEvent.click(btn) })
+      expect(pushedUrl).toContain('/files')
+      expect(pushedUrl).toContain('path=')
+      expect(dispatchSpy).toHaveBeenCalled()
+    } finally {
+      global.fetch = origFetch
+      window.history.pushState = origPushState
+      dispatchSpy.mockRestore()
+    }
+  })
+
   it('renders the BottomBar with the supplied token stats', () => {
     render(
       <ChatArea
