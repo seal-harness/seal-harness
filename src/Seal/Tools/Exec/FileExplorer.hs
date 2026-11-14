@@ -43,6 +43,7 @@ import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import System.Directory
   ( doesDirectoryExist, doesFileExist, getHomeDirectory, getFileSize
   , getModificationTime, listDirectory, pathIsSymbolicLink
+  , canonicalizePath
   )
 import System.FilePath (joinPath, splitDirectories, (</>))
 import System.IO (IOMode (..), SeekMode (..), hFileSize, hSeek, withBinaryFile)
@@ -141,6 +142,11 @@ data FileExplorerHandle = FileExplorerHandle
     -- ^ Read at most @len@ bytes starting at @offset@ (0-based). Returns
     -- the raw bytes. A read past EOF returns 'Left FeIo' (not a short
     -- read). Used by the chunked download path.
+  , feCanonicalize :: FilePath -> IO (Either FileExplorerErr FilePath)
+    -- ^ Canonicalize a path (resolve symlinks). Local: 'canonicalizePath';
+    -- remote: @readlink -f -- "$p"@. Used by the chunked download routes
+    -- for blocked-path enforcement (SEC-B3) — the canonical path is run
+    -- through 'blockedSegment' before serving any file metadata.
   , feResolveHome :: IO (Either FileExplorerErr FilePath)
   }
 
@@ -223,6 +229,7 @@ mkFailClosedFileExplorer = FileExplorerHandle
   , feReadFileBytes = \_ -> pure (Left FeDisabled)
   , feStatFile = \_ -> pure (Left FeDisabled)
   , feReadRange = \_ _ _ -> pure (Left FeDisabled)
+  , feCanonicalize = \_ -> pure (Left FeDisabled)
   , feResolveHome = pure (Left FeDisabled)
   }
 
@@ -242,6 +249,7 @@ mkLocalFileExplorer readCeiling downloadChunkBytes = FileExplorerHandle
   , feReadFileBytes = localReadFileBytes readCeiling
   , feStatFile = localStatFile
   , feReadRange = localReadRange downloadChunkBytes
+  , feCanonicalize = localCanonicalize
   , feResolveHome = localResolveHome
   }
 
@@ -491,6 +499,17 @@ localResolveHome = do
     Left ioErr -> Left (FeIo (T.pack (show ioErr)))
     Right home -> Right home
 
+-- | Canonicalize a local path (resolve symlinks). Unlike
+-- 'canonicalizePath' which returns the input unchanged for a non-existent
+-- path, we wrap the result in 'Either' for uniformity with the remote arm.
+localCanonicalize :: FilePath -> IO (Either FileExplorerErr FilePath)
+localCanonicalize origPath = do
+  let path = collapsePath origPath
+  eCanon <- try (canonicalizePath path) :: IO (Either IOException FilePath)
+  pure $ case eCanon of
+    Left ioErr -> Left (FeIo (T.pack (show ioErr)))
+    Right canon -> Right canon
+
 -- ---------------------------------------------------------------------------
 -- Remote arm
 -- ---------------------------------------------------------------------------
@@ -513,6 +532,7 @@ mkRemoteFileExplorer sshCfg runner readCeiling downloadChunkBytes = do
     , feReadFileBytes = remoteReadFileBytes sshCfg runner readCeiling
     , feStatFile = remoteStatFile sshCfg runner
     , feReadRange = remoteReadRange sshCfg runner downloadChunkBytes
+    , feCanonicalize = remoteCanonicalize sshCfg runner
     , feResolveHome = remoteResolveHome sshCfg runner homeCache
     }
 
@@ -687,6 +707,27 @@ remoteResolveHome sshCfg runner ref = do
               else do
                 writeIORef ref (Just home)
                 pure (Right home)
+
+-- | Canonicalize a remote path via @readlink -f -- "$p"@ over SSH. The
+-- path is 'shellQuote'-d. Returns the canonical path or an error.
+remoteCanonicalize
+  :: SshConfig -> RemoteRunner -> FilePath
+  -> IO (Either FileExplorerErr FilePath)
+remoteCanonicalize sshCfg runner origPath = do
+  let path = collapsePath origPath
+      cmdText = T.pack $ unwords
+        [ "readlink -f -- " <> shellQuote path ]
+  case mkShellCommand cmdText of
+    Left _ -> pure (Left (FeExec "invalid command (NUL in path?)"))
+    Right cmd -> do
+      res <- runRemoteShell runner sshCfg cmd
+      case res of
+        Left e -> pure (Left (mapRemoteExecError sshCfg e))
+        Right out ->
+          let canon = T.unpack (T.strip out)
+          in if T.null (T.strip out)
+               then pure (Left (FeIo "readlink returned empty"))
+               else pure (Right canon)
 
 -- ---------------------------------------------------------------------------
 -- Remote command construction

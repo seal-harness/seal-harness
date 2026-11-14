@@ -218,6 +218,9 @@ mkDeps fe enabled = do
     , adAbortReg = abortReg
     , adFileExplorer = fe
     , adFileExplorerEnabled = enabled
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     }
 
 -- | Build a GET request with path segments and query params.

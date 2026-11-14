@@ -123,6 +123,9 @@ mkDeps = do
     , adAbortReg = testAbortReg
     , adFileExplorer = mkFailClosedFileExplorer
     , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     })
 
 spec :: Spec

@@ -13,6 +13,7 @@ module Seal.Security.Path
   , ensureKeysRoot
   , lexicalCollapse
   , blockedNames
+  , blockedSegment
   , SafeKeyPath
   , getSafeKeyPath
   , mkSafeKeyPath

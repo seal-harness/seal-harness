@@ -546,6 +546,9 @@ buildTestEnv tmp mode mRepo opts = do
         , adMkSessionExec = Nothing
         , adFileExplorer = mkFailClosedFileExplorer
         , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
         }
       app = apiApp deps
   pure ApiTestEnv
