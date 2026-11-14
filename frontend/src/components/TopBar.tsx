@@ -17,11 +17,11 @@ export type TopSection =
 
 const SECTION_LABELS: Record<TopSection, string> = {
   sessions: 'Sessions',
-  providers: 'Providers',
   agents: 'Agents',
   skills: 'Skills',
   files: 'Files',
   repos: 'Repos',
+  providers: 'Providers',
   channels: 'Channels',
   secrets: 'Secrets',
   access: 'Access',
