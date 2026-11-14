@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { FileEntry, FileListing, FileContent } from '../types'
-import { fetchFileListing, fetchFileListingWithRail, fetchFileContent, downloadFile, fetchFileStat } from '../hooks/useApi'
+import { fetchFileListing, fetchFileListingWithRail, fetchFileContent, fetchFileStat } from '../hooks/useApi'
 import { useFileDownload } from '../hooks/useFileDownload'
 import { DownloadProgressUI } from './DownloadProgress'
 import { FileTree, type FileTreeNode } from './FileTree'
@@ -446,8 +446,8 @@ export function FilesView() {
   const [error, setError] = useState<number | null>(null)
   const [content, setContent] = useState<FileContent | null>(null)
   const [contentLoading, setContentLoading] = useState(false)
-  const [downloadTruncated, setDownloadTruncated] = useState(false)
-  const [viewerDownloadTruncated, setViewerDownloadTruncated] = useState(false)
+  const [downloadTruncated] = useState(false)
+  const [viewerDownloadTruncated] = useState(false)
   const [confirmDialog, setConfirmDialog] = useState<{ path: string; size: number } | null>(null)
   const fileDownload = useFileDownload()
   const [railError, setRailError] = useState<Map<string, number>>(new Map())
@@ -749,11 +749,6 @@ export function FilesView() {
     [path, listings],
   )
 
-  const doDownload = useCallback(async (target: string, partialLimit?: number) => {
-    const res = await downloadFile(target, partialLimit)
-    return res.truncated
-  }, [])
-
   const handleDownload = useCallback(
     async (entry: FileEntry) => {
       const listing = path === null
@@ -766,10 +761,10 @@ export function FilesView() {
       if (statRes.ok && statRes.stat.size > DOWNLOAD_PROMPT_THRESHOLD) {
         setConfirmDialog({ path: target, size: statRes.stat.size })
       } else {
-        setDownloadTruncated(await doDownload(target))
+        void fileDownload.start(target)
       }
     },
-    [path, listings, doDownload],
+    [path, listings, fileDownload],
   )
 
   const handleViewerDownload = useCallback(async () => {
@@ -778,9 +773,9 @@ export function FilesView() {
     if (statRes.ok && statRes.stat.size > DOWNLOAD_PROMPT_THRESHOLD) {
       setConfirmDialog({ path: content.path, size: statRes.stat.size })
     } else {
-      setViewerDownloadTruncated(await doDownload(content.path))
+      void fileDownload.start(content.path)
     }
-  }, [content, doDownload])
+  }, [content, fileDownload])
 
   // ── Derive the rail ────────────────────────────────────────────────────
 
