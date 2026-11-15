@@ -91,6 +91,22 @@ instance ChatChannel BubbleChan where
   ccProgressStyle _ = PsSingleBubble
   ccChunkLimit _ = Just 1998
 
+-- | A mock with no inline-keyboard support (Signal-like): 'ccSendWithOptions'
+-- returns 'Nothing', so the loop must fall back to text rendering.
+newtype NoKeyboardChan = NoKeyboardChan MockChan
+
+mockNoKeyboard :: IO NoKeyboardChan
+mockNoKeyboard = NoKeyboardChan <$> mkMockChan
+
+instance ChatChannel NoKeyboardChan where
+  ccReceive (NoKeyboardChan c) = ccReceive c
+  ccSend (NoKeyboardChan c) = ccSend c
+  ccSendWithId (NoKeyboardChan c) = ccSendWithId c
+  ccEditMessage (NoKeyboardChan c) = ccEditMessage c
+  ccLabel (NoKeyboardChan c) = ccLabel c
+  -- No inline-keyboard support: the loop must fall back to text rendering.
+  ccSendWithOptions _ _ _ _ = pure Nothing
+
 mkMockChan :: IO MockChan
 mkMockChan = MockChan
   <$> newIORef []
@@ -895,8 +911,46 @@ spec = do
       formatQuestionWithOptions "Which?" [QuestionOption "yes" "proceed", QuestionOption "no" ""]
         `shouldBe` "Which?\n\n1) yes \8212 proceed\n2) no\n\nReply with a number or type your own answer."
 
-    it "returns just the question when no options" $ do
-      formatQuestionWithOptions "Hello?" [] `shouldBe` "Hello?"
+    it "adds a reply hint when there are no options" $ do
+      -- An open-ended ask previously arrived as a bare question, giving the
+      -- human no signal that a answer was expected.
+      formatQuestionWithOptions "Hello?" [] `shouldBe` "Hello?\n\nReply with your answer."
+
+  describe "handleAsk rendering (WU-4)" $ do
+    it "sends an open-ended ask with a reply hint on a keyboard-less channel" $ do
+      nk <- mockNoKeyboard
+      let NoKeyboardChan chan = nk
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+          key = ConversationKey "signal" "conv1"
+          val = A.object
+            [ "id" .= ("aaaaaaaa-0000-0000-0000-000000000000" :: Text)
+            , "question" .= ("Which branch?" :: Text)
+            ]
+      asks <- newPendingAsks
+      handleAsk cfg nk key asks (mkSid "s1") val
+      sends <- getSends chan
+      sends `shouldBe` ["Which branch?\n\nReply with your answer."]
+
+    it "sends an options ask as a numbered list with the numeric hint" $ do
+      nk <- mockNoKeyboard
+      let NoKeyboardChan chan = nk
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+          key = ConversationKey "signal" "conv1"
+          val = A.object
+            [ "id" .= ("aaaaaaaa-0000-0000-0000-000000000000" :: Text)
+            , "question" .= ("Pick" :: Text)
+            , "options" .=
+                [ A.object ["label" .= ("red" :: Text), "description" .= ("warm" :: Text)]
+                , A.object ["label" .= ("blue" :: Text), "description" .= ("" :: Text)]
+                ]
+            ]
+      asks <- newPendingAsks
+      handleAsk cfg nk key asks (mkSid "s1") val
+      sends <- getSends chan
+      sends `shouldBe`
+        ["Pick\n\n1) red \8212 warm\n2) blue\n\nReply with a number or type your own answer."]
   describe "handleInbound inject behavior" $ do
     -- When the user sends "/N payload" (ChatInject), the message should
     -- be sent to tab N's session WITHOUT changing the focused tab. The

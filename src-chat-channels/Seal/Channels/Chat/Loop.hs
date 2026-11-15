@@ -13,6 +13,7 @@ module Seal.Channels.Chat.Loop
   , handleFocus
   , handleServerEvent
   , handleCallback
+  , handleAsk
     -- * Pending asks (for testing)
   , PendingAsks
   , newPendingAsks
@@ -80,7 +81,7 @@ import Seal.Channels.Chat.HttpClient
    httpGetLists, httpRebindNew, httpSetupRepo, httpGetRepos,
    rebindBody, mintBody, setupRepoBody,
    SendResult (..), TabJson (..), ListsJson (..), NewSessionResult (..))
-import Seal.Channels.Chat.Bubble (bubbleText)
+import Seal.Channels.Chat.Bubble (bubbleText, formatAsk)
 import Seal.Channels.Chat.TabRender (renderTabListRow, tabListRows)
 import Seal.Channels.Chat.RateLimit
   (StreamProgressConfig (..), defaultStreamProgressConfig,
@@ -1312,14 +1313,19 @@ handleAsk _cfg chan _key pendingAsks sid val = do
   let question = extractAskQuestion val
       askId = extractAskId val
       opts = extractAskOptions val
+  -- One renderer for both shapes, so an open-ended ask carries a
+  -- "Reply with your answer." hint instead of arriving as a bare question
+  -- the human cannot tell is waiting on them. A channel with inline
+  -- keyboards renders the buttons instead; its body carries the same
+  -- question + option descriptions.
   if null opts
-    then ccSend chan question
+    then ccSend chan (formatAsk question [])
     else do
       let prefix = T.take 8 askId
       mMsgId <- ccSendWithOptions chan question opts prefix
       case mMsgId of
         Just _  -> pure ()
-        Nothing -> ccSend chan (formatQuestionWithOptions question opts)
+        Nothing -> ccSend chan (formatAsk question opts)
   -- Register the ask (newest first) so a button tap can resolve it back to
   -- the option label. An ask without an id can never be resolved — it is
   -- not registered.
@@ -1815,18 +1821,7 @@ extractAskOptions val =
 -- that don't support inline keyboards (Signal, CLI). Mirrors
 -- 'Seal.Handles.AskReply.formatQuestionWithOptions'. Pure.
 formatQuestionWithOptions :: Text -> [QuestionOption] -> Text
-formatQuestionWithOptions question [] = question
-formatQuestionWithOptions question opts =
-  question
-  <> "\n\n"
-  <> T.intercalate "\n" (zipWith formatLine [1 :: Int ..] opts)
-  <> "\n\nReply with a number or type your own answer."
-  where
-    formatLine n (QuestionOption lbl desc)
-      | T.null desc = T.pack (show n <> ") ") <> lbl
-      | otherwise   = T.pack (show n <> ") ") <> lbl <> " — " <> desc
-
--- ---------------------------------------------------------------------------
+formatQuestionWithOptions = formatAsk-- ---------------------------------------------------------------------------
 -- Pure helpers for extracting text from WS event payloads
 -- ---------------------------------------------------------------------------
 
