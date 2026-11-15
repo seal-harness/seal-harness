@@ -8,12 +8,12 @@ module Seal.Command.Serve
 
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (SomeException, catch, try)
-import Control.Monad (filterM, void, forever)
+import Control.Monad (when, filterM, void, forever)
 import Data.Foldable (for_, forM_)
 import Data.Either (fromRight)
 import Data.ByteString qualified as BS
 import Data.Map.Strict qualified as Map
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Time (getCurrentTime)
 import Data.Text qualified as T
@@ -62,7 +62,7 @@ import Seal.Channels.Cursor.Persist (loadCursorMap)
 import Seal.Channels.Loop (ChannelDeps (..), newChannelDeps, mkTabCloseNotifier)
 import Seal.Command.Call (callCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
-import Seal.Core.Types (OpName (..))
+import Seal.Core.Types (OpName (..), sessionIdText)
 import Seal.ISA.Dispatch (DispatchError (OpNotFound))
 import Seal.Command.New (NewDeps (..), newCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
@@ -135,8 +135,9 @@ import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Provision (defaultProvisionDeps)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.UiState (newUiStateHandle)
-import Seal.Cron.Scheduler (CronScheduler (..), startCronScheduler, defaultTickInterval, defaultMaxConcurrent)
+import Seal.Cron.Scheduler (CronScheduler (..), startCronScheduler, defaultTickInterval, defaultMaxConcurrent, applyRunOutcome, checkAutoDisable, reconcileStaleRuns)
 import Seal.Cron.Types (CronJob (..))
+import Seal.Cron.Store (CronStore (..))
 import Seal.ISA.Ops.Cron (CronFireDelegate)
 import Seal.Agent.Def.Types (mkAgentDefId)
 import Control.Concurrent.STM (newTVarIO)
@@ -335,13 +336,39 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
   -- (the scheduler records a Failed run, same as the old stub, but only
   -- for the brief window before sendDeps exists).
   cronSendDepsRef <- newIORef (Nothing :: Maybe SendDeps)
+  -- Per-fire completion handlers, keyed by the session id the fire minted.
+  -- Keyed rather than a single slot because up to csMaxConcurrent fires can be
+  -- in flight at once. An entry is inserted before the turn is forked and
+  -- removed by the handler after it fires once, so a later turn on the same
+  -- session cannot observe a stale handler. Sessions with no entry (every
+  -- non-cron session) make sdTurnComplete a no-op.
+  cronRunHandlers <- newIORef (Map.empty :: Map.Map T.Text (Either T.Text () -> IO ()))
+  let lookupCronHandler sid = Map.lookup sid <$> readIORef cronRunHandlers
+      unregisterCronHandler sid =
+        modifyIORef' cronRunHandlers (Map.delete sid)
+      registerCronHandler sid h =
+        modifyIORef' cronRunHandlers (Map.insert sid h)
+      turnComplete sid outcome = do
+        mH <- lookupCronHandler (sessionIdText sid)
+        case mH of
+          Nothing -> pure ()
+          Just h  -> h outcome
   let loadCfgLocal = fromRight defaultRuntimeConfig <$> loadRuntimeConfig cfgPath
       cronFireDelegate :: CronFireDelegate
       cronFireDelegate job = do
         mSendDeps <- readIORef cronSendDepsRef
         case mSendDeps of
           Nothing -> pure (Left "cron fire delegate: sendDeps not yet initialized")
-          Just sendDeps -> do
+          Just sendDeps
+            -- A prompt that starts with '/' is routed by handleSend to the
+            -- slash-command path, which never starts a plain turn — so no
+            -- completion would ever be reported and the run would look wedged.
+            -- Reject it here, at fire time, as a run failure the operator can
+            -- see in the run history and (via checkAutoDisable) get notified
+            -- about, rather than silently losing it.
+            | "/" `T.isPrefixOf` T.stripStart (cjPrompt job) ->
+                pure (Left "cron prompt must not start with '/': slash commands do not start a turn, so the run could never complete")
+            | otherwise -> do
             -- Resolve the agent def id from the job, falling back to the
             -- configured default. The job's agent_def_id is a raw Text;
             -- validate it through the smart constructor.
@@ -357,6 +384,19 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
                 model = fromMaybe cfgModel mModel
             meta <- newSession paths provider model "cron" mJobAgent
             let sid = smId meta
+            -- Register the completion handler BEFORE forking the turn: the turn
+            -- can finish (or fail) as soon as it starts, and a completion with
+            -- no registered handler would be dropped, leaving the run looking
+            -- in-flight forever — the bug this all exists to fix.
+            registerCronHandler (sessionIdText sid) $ \outcome -> do
+              now <- getCurrentTime
+              csUpdateRun (bCronStore backends0) (cjId job)
+                (applyRunOutcome now outcome)
+              case outcome of
+                Left _ ->
+                  checkAutoDisable (bCronStore backends0) (\_ -> pure ()) now job
+                Right _ -> pure ()
+              unregisterCronHandler (sessionIdText sid)
             void (forkIO (void (handleSend sendDeps sid Nothing (cjPrompt job))))
             pure (Right sid)
   -- Wire the fire delegate into the backends so CRON_MANAGE action=trigger
@@ -365,6 +405,24 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
   -- binding so all downstream consumers (chanDeps, sendDeps, ApiDeps) see
   -- the wired delegate.
   let backends = backends0 { bCronFire = Just cronFireDelegate }
+  -- Repair run rows left in flight by a previous process, BEFORE the scheduler
+  -- forks. A row still Pending/Running at process start cannot belong to this
+  -- process, so no turn is in flight for it: without this, a store wedged by the
+  -- missing-completion bug stays wedged (its stale rows keep counting against
+  -- the concurrency budget) even after the fix ships. Best-effort: a failure
+  -- here must not prevent the gateway from starting.
+  _ <- (do
+          now <- getCurrentTime
+          n <- reconcileStaleRuns (bCronStore backends) now
+          when (n > 0) $
+            logIO logger InfoS (ls ("cron: reconciled " <> T.pack (show n)
+                                    <> " stale run row(s) at startup"))
+          pure n)
+        `catch` (\e -> do
+                    logIO logger WarningS
+                      (ls ("cron: startup reconciliation failed: "
+                           <> T.pack (show (e :: SomeException))))
+                    pure 0)
   -- Start the cron scheduler (background thread).
   cronStopSignal <- newTVarIO False
   let cronScheduler = CronScheduler
@@ -520,6 +578,7 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
         , sdAskReply    = askReply
         , sdApprovals   = approvals
         , sdReplies     = cdReplies chanDeps
+        , sdTurnComplete = turnComplete
         , sdLocks       = cdLocks chanDeps
         , sdAbortReg    = cdAbortReg chanDeps
         , sdRepeatReg   = cdRepeatReg chanDeps

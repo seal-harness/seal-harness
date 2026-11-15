@@ -42,7 +42,7 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionWorkdir, sshAgentsDir)
 import Seal.Core.ChannelKind (ChannelKind (..))
 import Seal.Core.MessageSource (MessageSource (..), mkConversationId, mkMessageSource, mkUserId)
-import Seal.Core.Types (ModelId (..), mkSessionId, SessionId)
+import Seal.Core.Types (ModelId (..), mkSessionId, SessionId, sessionIdText)
 import Seal.Core.TurnEngine (TurnAdapter (..), TurnDeps (..), TurnOutcome (..), buildStartWiring, runSessionTurn)
 import Seal.Gateway.Send
   ( SendDeps (..), SendOutcome (..), ensureTabForSession, handleSend, webAskCaps
@@ -285,6 +285,7 @@ mkSendDepsWith paths resolveStub = do
       sendDeps = SendDeps
         { sdPaths      = paths
         , sdVault      = rt
+        , sdTurnComplete = \_ _ -> pure ()
         , sdRepoReg    = fakeRepoRegistryHandle
         , sdAgentReg   = agentRegH
         , sdProvider   = pr
@@ -333,8 +334,62 @@ seedSessionChannel paths channel sid = do
 seedSession :: SealPaths -> SessionId -> IO ()
 seedSession paths = seedSessionChannel paths "web"
 
+-- | Poll until the action holds, or fail after the given number of attempts.
+-- Needed because a plain turn runs in a forked body.
+eventually :: Int -> IO Bool -> IO ()
+eventually attempts act = go attempts
+  where
+    go 0 = expectationFailure "condition did not hold in time"
+    go n = do
+      ok <- act
+      if ok then pure () else threadDelay 10000 >> go (n - 1)
+
 spec :: Spec
 spec = describe "Seal.Gateway.Send auto-tab" $ do
+
+  describe "sdTurnComplete" $ do
+    it "reports Right () once after a successful plain turn" $
+      withSystemTempDirectory "seal-send-complete" $ \dir -> do
+        let tmp = dir
+            paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        providerRef <- newIORef [ CompletionResponse [CbText "ok"] StopEnd (Usage 0 0) ]
+        baseDeps <- mkSendDeps paths providerRef
+        outcomes <- newIORef ([] :: [(T.Text, Either T.Text ())])
+        tabsH <- newTabsHandle
+        let sid = mkSid "20261108-130000-done"
+            sendDeps = baseDeps
+              { sdTabsHandle = tabsH
+              , sdTurnComplete = \s o -> modifyIORef' outcomes (++ [(sessionIdText s, o)])
+              }
+        seedSession paths sid
+        _ <- handleSend sendDeps sid Nothing "hello"
+        -- The turn runs in a forked body; wait for the callback to land.
+        eventually 200 $ do
+          xs <- readIORef outcomes
+          pure (length xs == 1)
+        xs <- readIORef outcomes
+        map snd xs `shouldBe` [Right ()]
+        map fst xs `shouldBe` [sessionIdText sid]
+
+    it "is a no-op for a session with no registered interest" $
+      withSystemTempDirectory "seal-send-nocomplete" $ \dir -> do
+        let tmp = dir
+            paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        providerRef <- newIORef [ CompletionResponse [CbText "ok"] StopEnd (Usage 0 0) ]
+        baseDeps <- mkSendDeps paths providerRef
+        tabsH <- newTabsHandle
+        let sid = mkSid "20261108-130001-skip"
+            meta = SessionMeta sid "ollama" "llama3.2" "web"
+                     Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+                     sampleTime sampleTime
+            sendDeps = baseDeps { sdTabsHandle = tabsH }
+        seedSession paths sid
+        er <- plainTurn sendDeps meta Nothing "hello"
+        er `shouldBe` Right ()
   describe "mkSendMessageSource" $ do
     it "reconstructs a source from valid body fields" $
       mkSendMessageSource (Just "telegram") (Just "12345") (Just "tg:12345")

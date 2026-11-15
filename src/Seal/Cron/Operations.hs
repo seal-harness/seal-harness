@@ -52,6 +52,13 @@ createJob store name schedStr mTzStr prompt mAgentDefId enabled oneShot
       pure (Left "name must be 1-100 characters")
   | T.null prompt || T.length prompt > 4000 =
       pure (Left "prompt must be 1-4000 characters")
+  -- A '/'-leading prompt is routed by the gateway to the slash-command path,
+  -- which never starts a plain turn — so a scheduled run could never report
+  -- completion and would look permanently in-flight. Reject it at the write
+  -- boundary, where the operator gets an immediate, actionable error, instead
+  -- of failing invisibly five times at fire time.
+  | "/" `T.isPrefixOf` T.stripStart prompt =
+      pure (Left "prompt must not start with '/'")
   | otherwise = case mkCronExpr schedStr of
       Left e -> pure (Left e)
       Right expr -> do
@@ -107,6 +114,9 @@ updateJobValidated store job upd
   | Just prompt <- cuPrompt upd
   , T.null prompt || T.length prompt > 4000 =
       pure (Left "prompt must be 1-4000 characters")
+  | Just prompt <- cuPrompt upd
+  , "/" `T.isPrefixOf` T.stripStart prompt =
+      pure (Left "prompt must not start with '/'")
   | otherwise = do
       -- Validate schedule
       case cuSchedule upd of

@@ -137,6 +137,8 @@ stubCronStore = CronStore
   , csDelete    = \_ -> error "cron store stub: csDelete"
   , csRecordRun = \_ _ -> error "cron store stub: csRecordRun"
   , csListRuns  = \_ _ -> error "cron store stub: csListRuns"
+  , csUpdateRun = \_ _ -> error "cron store stub: csUpdateRun"
+  , csLock = error "cron store stub: csLock"
   }
 
 -- ---------------------------------------------------------------------------
@@ -498,7 +500,7 @@ buildTestEnv tmp mode mRepo opts = do
     Nothing  -> pure Nothing
   let sendDeps = SendDeps
         { sdPaths = paths
-        , sdVault = rt
+        , sdVault = rt        , sdTurnComplete = \_ _ -> pure ()
         , sdRepoReg = repoRegH
         , sdAgentReg = agentRegH
         , sdProvider = pr

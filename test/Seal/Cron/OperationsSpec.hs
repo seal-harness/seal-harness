@@ -112,7 +112,39 @@ spec = do
         Right job -> cjTimezone job `shouldSatisfy` isJust
         Left e -> expectationFailure (T.unpack e)
 
+  describe "prompt validation (slash guard)" $ do
+    -- A '/'-leading prompt is routed by the gateway to the slash-command path,
+    -- which never starts a plain turn, so the run could never report completion
+    -- and would look permanently in-flight. Rejected at the write boundary.
+    it "rejects a create with a '/'-leading prompt" $ do
+      store <- memoryCronStore
+      eJob <- createJob store "test" "0 9 * * 1-5" Nothing "/new"
+        Nothing False False
+      eJob `shouldSatisfy` isLeft
+
+    it "rejects a '/'-leading prompt even with leading whitespace" $ do
+      store <- memoryCronStore
+      eJob <- createJob store "test" "0 9 * * 1-5" Nothing "  /skill list"
+        Nothing False False
+      eJob `shouldSatisfy` isLeft
+
+    it "accepts a prompt containing a slash that does not lead" $ do
+      store <- memoryCronStore
+      eJob <- createJob store "test" "0 9 * * 1-5" Nothing "check src/main"
+        Nothing False False
+      eJob `shouldSatisfy` isRight
+
   describe "Seal.Cron.Operations.updateJob" $ do
+    it "rejects an update that would introduce a '/'-leading prompt" $ do
+      store <- memoryCronStore
+      Right job <- createJob store "test" "0 9 * * 1-5" Nothing "fine"
+        Nothing False False
+      eUpdated <- updateJob store (cjId job) (CronUpdate
+        { cuName = Nothing, cuSchedule = Nothing, cuTimezone = Nothing
+        , cuPrompt = Just "/new", cuAgentDefId = Nothing
+        , cuEnabled = Nothing, cuOneShot = Nothing })
+      eUpdated `shouldSatisfy` isLeft
+
     it "patches only supplied fields and leaves the rest alone" $ do
       store <- memoryCronStore
       Right job <- createJob store "test" "0 9 * * 1-5" Nothing "original prompt" Nothing False False
@@ -243,3 +275,7 @@ isLeft (Right _) = False
 isJust :: Maybe a -> Bool
 isJust Nothing = False
 isJust (Just _) = True
+
+isRight :: Either a b -> Bool
+isRight (Right _) = True
+isRight (Left _) = False
