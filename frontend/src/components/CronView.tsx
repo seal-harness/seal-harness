@@ -164,6 +164,7 @@ export function CronView() {
     if (res.ok) {
       setDetail(res.job)
       refresh()
+      setEnabled(res.job.enabled)
     } else {
       setFormError(res.error)
     }
@@ -206,6 +207,23 @@ export function CronView() {
             No cron jobs defined.
           </div>
         )}
+        {/* Legend */}
+        <div style={{
+          padding: '4px 12px 6px',
+          display: 'flex',
+          gap: 12,
+          fontSize: 10,
+          color: 'var(--text-faint)',
+        }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <span style={{ width: 7, height: 7, borderRadius: '50%', backgroundColor: 'var(--success)' }} />
+            Enabled
+          </span>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <span style={{ width: 7, height: 7, borderRadius: '50%', border: '1.5px solid var(--text-faint)', boxSizing: 'border-box' }} />
+            Disabled
+          </span>
+        </div>
         {sortedJobs.map((job) => (
           <div
             key={job.id}
@@ -213,7 +231,7 @@ export function CronView() {
             style={{
               padding: '8px 12px',
               cursor: 'pointer',
-              borderBottom: '1px solid var(--border-subtle)',
+              borderBottom: '1px solid var(--border)',
               backgroundColor: editing === job.id && !creating ? 'var(--bg-sunken)' : 'transparent',
             }}
           >
@@ -226,18 +244,20 @@ export function CronView() {
               gap: 6,
             }}>
               <span style={{
-                width: 8,
-                height: 8,
+                width: 9,
+                height: 9,
                 borderRadius: '50%',
                 flexShrink: 0,
-                backgroundColor: job.enabled ? 'var(--green)' : 'var(--text-faint)',
+                backgroundColor: job.enabled ? 'var(--success)' : 'transparent',
+                border: job.enabled ? 'none' : '1.5px solid var(--text-faint)',
+                boxSizing: 'border-box',
               }} />
               {job.name}
             </div>
             <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
               {job.schedule}
               {job.consecutive_failures > 0 && (
-                <span style={{ color: 'var(--red)', marginLeft: 8 }}>
+                <span style={{ color: 'var(--needs-input)', marginLeft: 8 }}>
                   {job.consecutive_failures} failures
                 </span>
               )}
@@ -260,14 +280,36 @@ export function CronView() {
               {creating ? 'New Cron Job' : 'Edit Cron Job'}
             </h3>
 
+            {/* Status badge */}
+            {!creating && detail && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: -8 }}>
+                <span style={{
+                  width: 8,
+                  height: 8,
+                  borderRadius: '50%',
+                  flexShrink: 0,
+                  backgroundColor: detail.enabled ? 'var(--success)' : 'transparent',
+                  border: detail.enabled ? 'none' : '1.5px solid var(--text-faint)',
+                  boxSizing: 'border-box',
+                }} />
+                <span style={{
+                  fontSize: 12,
+                  fontWeight: 600,
+                  color: detail.enabled ? 'var(--success)' : 'var(--text-faint)',
+                }}>
+                  {detail.enabled ? 'Enabled' : 'Disabled'}
+                </span>
+              </div>
+            )}
+
             {formError && (
               <div style={{
                 padding: '8px 12px',
-                backgroundColor: 'var(--red-bg)',
-                border: '1px solid var(--red)',
+                backgroundColor: 'var(--needs-input-bg)',
+                border: '1px solid var(--needs-input)',
                 borderRadius: 'var(--radius-sm)',
                 fontSize: 13,
-                color: 'var(--red)',
+                color: 'var(--needs-input)',
               }}>
                 {formError}
               </div>
@@ -365,7 +407,7 @@ export function CronView() {
                 <div><strong>Last fire:</strong> {detail.last_fire ?? '—'}</div>
                 <div><strong>Run count:</strong> {detail.run_count}</div>
                 {detail.consecutive_failures > 0 && (
-                  <div style={{ color: 'var(--red)' }}>
+                  <div style={{ color: 'var(--needs-input)' }}>
                     <strong>Consecutive failures:</strong> {detail.consecutive_failures}
                   </div>
                 )}
