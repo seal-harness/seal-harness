@@ -5,6 +5,29 @@
 > one of two conditions — turn finished (thinking → idle) or ASK_HUMAN.
 > Operator approved the **offset-splice** design after the gate escalated.
 
+## Status: IMPLEMENTED — PR #328 (closes #327)
+
+All five work units landed on `channels/signal-notification-policy`:
+
+| WU | Delivered |
+|---|---|
+| 1 | pure bubble core (`Bubble.hs`) |
+| 2 | single-edited-bubble style in the loop (inert) |
+| 3 | Signal opts in + safe edit-timestamp parse |
+| 4 | open-ended ASK_HUMAN reply hint |
+| 5 | `/watch` reports ASK_HUMAN, and can answer it |
+
+`make check` green: build clean, 4452 examples / 0 failures, hlint "No hints".
+
+Two bugs were found by this plan's own QuickCheck properties during TDD, both
+in the new pure code: `bubbleText` first applied splice offsets against the
+*remaining* text rather than the original (collapsing the text between two
+tool lines), and `chunkMessage` first dropped the break separator at each
+split (silently losing characters, caught by the round-trip property).
+
+**Outstanding before merge**: the §4 manual Signal device check. Everything
+else is verified by the suite.
+
 ## 0. Why offset-splice
 
 The gateway's streaming accumulator is **turn-scoped**: `webAskCaps` creates
