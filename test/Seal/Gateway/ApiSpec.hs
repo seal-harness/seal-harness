@@ -58,6 +58,7 @@ import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webC
 import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Gateway.StreamBroker (newStreamBroker, setThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
+import Seal.Cron.Store (CronStore (..))
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
@@ -321,6 +322,7 @@ mkDepsFor paths = do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -499,6 +501,7 @@ mkProviderTestDeps tmp cfgRoot vr = do
     
     , adWsHealth = pure (StreamHealth "up" 8081)
     , adAbortReg         = testAbortReg
+    , adCronStore = stubCronStore
     , adFileExplorer = mkFailClosedFileExplorer
     , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -543,6 +546,17 @@ waitForPoll totalWaitUs readAction predicate = go totalWaitUs
             else do
               threadDelay stepUs
               go (remaining - stepUs)
+
+stubCronStore :: CronStore
+stubCronStore = CronStore
+  { csCreate    = \_ -> error "cron store stub: csCreate"
+  , csRead      = \_ -> error "cron store stub: csRead"
+  , csList      = \_ -> error "cron store stub: csList"
+  , csSave      = \_ -> error "cron store stub: csSave"
+  , csDelete    = \_ -> error "cron store stub: csDelete"
+  , csRecordRun = \_ _ -> error "cron store stub: csRecordRun"
+  , csListRuns  = \_ _ -> error "cron store stub: csListRuns"
+  }
 
 spec :: Spec
 spec = describe "Seal.Gateway.API" $ do
@@ -2375,6 +2389,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -2458,6 +2473,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -2531,6 +2547,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -2605,6 +2622,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -2704,6 +2722,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -2768,6 +2787,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -2831,6 +2851,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -2875,6 +2896,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -2971,6 +2993,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -3033,6 +3056,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -3094,6 +3118,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -3149,6 +3174,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -3213,6 +3239,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -3482,6 +3509,7 @@ spec = describe "Seal.Gateway.API" $ do
                 
                 , adWsHealth = pure (StreamHealth "up" 8081)
                 , adAbortReg         = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -3677,6 +3705,7 @@ spec = describe "Seal.Gateway.API" $ do
                 
                 , adWsHealth = pure (StreamHealth "up" 8081)
                 , adAbortReg         = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -3754,6 +3783,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -3806,6 +3836,7 @@ spec = describe "Seal.Gateway.API" $ do
             
             , adWsHealth = pure (StreamHealth "up" 8081)
             , adAbortReg         = testAbortReg
+            , adCronStore = stubCronStore
             , adFileExplorer = mkFailClosedFileExplorer
             , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -3996,6 +4027,7 @@ spec = describe "Seal.Gateway.API" $ do
             
             , adWsHealth = pure (StreamHealth "up" 8081)
             , adAbortReg         = testAbortReg
+            , adCronStore = stubCronStore
             , adFileExplorer = mkFailClosedFileExplorer
             , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -4329,6 +4361,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -5369,6 +5402,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
         , adAgentRegistry    = fakeAgentRegH
                 , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps, adPaths = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -5511,6 +5545,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Just (const (pure stubExec))
             , adAbortReg = testAbortReg
+            , adCronStore = stubCronStore
             , adFileExplorer = mkFailClosedFileExplorer
             , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -5605,6 +5640,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -5719,6 +5755,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -5895,6 +5932,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
             , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
             , adPaths            = paths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+            , adCronStore = stubCronStore
             , adFileExplorer = mkFailClosedFileExplorer
             , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -6027,6 +6065,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -6161,6 +6200,7 @@ spec = describe "Seal.Gateway.API" $ do
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456

@@ -34,6 +34,7 @@ import Seal.Logging.Logger (SealLogger, testSealLogger)
 import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..), streamMiddleware)
 import Seal.Gateway.StreamBroker (newStreamBroker, broadcastLists)
 import Seal.Git.Repo (openConfigRepo)
+import Seal.Cron.Store (CronStore (..))
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
@@ -86,6 +87,17 @@ fakeRepoRegistryHandle = RepoRegistryHandle
 fallbackApp :: Application
 fallbackApp _req respond = respond (responseLBS status404 [] "not found")
 
+stubCronStore :: CronStore
+stubCronStore = CronStore
+  { csCreate    = \_ -> error "cron store stub: csCreate"
+  , csRead      = \_ -> error "cron store stub: csRead"
+  , csList      = \_ -> error "cron store stub: csList"
+  , csSave      = \_ -> error "cron store stub: csSave"
+  , csDelete    = \_ -> error "cron store stub: csDelete"
+  , csRecordRun = \_ _ -> error "cron store stub: csRecordRun"
+  , csListRuns  = \_ _ -> error "cron store stub: csListRuns"
+  }
+
 spec :: Spec
 spec = describe "Seal.Phase7aSpec" $ do
   it "the assembled gateway serves /api/health (200)" $ do
@@ -120,6 +132,7 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
+    , adCronStore = stubCronStore
     , adFileExplorer = mkFailClosedFileExplorer
     , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
@@ -186,6 +199,7 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
+    , adCronStore = stubCronStore
     , adFileExplorer = mkFailClosedFileExplorer
     , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456

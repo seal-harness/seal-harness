@@ -8,6 +8,7 @@ import { AgentsView } from './components/AgentsView'
 import { ProvidersView } from './components/ProvidersView'
 import { SkillsView } from './components/SkillsView'
 import { ReposView } from './components/ReposView'
+import { CronView } from './components/CronView'
 import { SecretsView } from './components/SecretsView'
 import { AccessView } from './components/AccessView'
 import { ChannelsView } from './components/ChannelsView'
@@ -71,6 +72,7 @@ function sectionFromPath(): TopSection {
   if (path === '/agents' || path.startsWith('/agents/')) return 'agents'
   if (path === '/skills' || path.startsWith('/skills/')) return 'skills'
   if (path === '/repos' || path.startsWith('/repos/')) return 'repos'
+  if (path === '/cron' || path.startsWith('/cron/')) return 'cron'
   if (path === '/secrets' || path.startsWith('/secrets/')) return 'secrets'
   if (path === '/files' || path.startsWith('/files/')) return 'files'
   if (path === '/access' || path.startsWith('/access/')) return 'access'
@@ -1051,6 +1053,8 @@ export default function App() {
         <SkillsView />
       ) : section === 'repos' ? (
         <ReposView />
+      ) : section === 'cron' ? (
+        <CronView />
       ) : section === 'secrets' ? (
         <SecretsView />
       ) : section === 'files' ? (
