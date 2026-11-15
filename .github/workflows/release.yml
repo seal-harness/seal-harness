@@ -47,6 +47,8 @@ jobs:
       system: ${{ matrix.system }}
       runner: ${{ matrix.runner }}
       push-cache: true
+      # Gate the tagged code, not the default branch.
+      ref: ${{ inputs.tag || github.ref }}
     secrets: inherit
 
   # Tag/version consistency and the prerelease decision, computed once.

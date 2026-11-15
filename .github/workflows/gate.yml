@@ -25,6 +25,15 @@ on:
         required: false
         type: boolean
         default: false
+      ref:
+        description: >-
+          Git ref to check out. Leave empty to use the calling workflow's ref.
+          release.yml passes the release tag so the gate validates the tagged
+          code rather than the default branch (which is what a
+          workflow_dispatch run would otherwise check out).
+        required: false
+        type: string
+        default: ""
     secrets:
       NIX_CACHE_SIGNING_KEY:
         required: false
@@ -45,6 +54,9 @@ jobs:
       NIX_CACHE_AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_AWS_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Empty ref == the calling workflow's ref (the normal case).
+          ref: ${{ inputs.ref }}
 
       - uses: DeterminateSystems/nix-installer-action@v22
         with:
