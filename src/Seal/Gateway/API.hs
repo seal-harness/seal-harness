@@ -29,6 +29,7 @@ import Control.Applicative ((<|>))
 import Data.CaseInsensitive qualified as CI
 import Data.Either (fromRight, isRight)
 import Data.IORef (readIORef)
+import Data.List (isPrefixOf)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Set qualified as Set
 import Data.Map.Strict qualified as Map
@@ -72,7 +73,8 @@ import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 -- SealLogger/logIO removed: audit logging deferred (design §4.4 is SHOULD not MUST)
 import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, providerDefaultModel, providerModels, updateRuntimeConfig, upsertProvider, deleteProvider, deleteChannel)
 import Seal.Config.Paths
-  ( SealPaths (..), repoKeysDir, securityFilePath, sessionMetaPath, sessionWorkdir )
+  ( SealPaths (..), repoKeysDir, securityFilePath, sessionMetaPath, sessionWorkdir
+  , workdirsRoot )
 import Seal.Config.Security
   ( SecurityConfig, untrustedExecConfigFromSecurity )
 import Seal.Session.AgentMetaCache
@@ -2663,6 +2665,11 @@ fileStatJson stat = object
 -- 'canonicalizePath', remote: @readlink -f@), then runs 'blockedSegment'.
 -- Returns @Just resp@ (403) if the path is blocked and the override is
 -- not set; @Nothing@ if the path is allowed (or the override is set).
+--
+-- The harness's own per-session workdirs are exempt: they live under
+-- @~\/.seal\/cache\/workdirs@ and hold agent output the operator is meant to
+-- retrieve. The exemption is matched on the CANONICAL path, so a symlink in
+-- a workdir that resolves into a blocked location is still refused.
 checkBlockedPath :: ApiDeps -> FilePath -> IO (Maybe Response)
 checkBlockedPath deps path =
   if adDownloadAllowBlocked deps
@@ -2672,8 +2679,24 @@ checkBlockedPath deps path =
       case eCanon of
         Left _ -> pure (Just (errJson status403 "blocked_path"))
         Right canon -> case blockedSegment canon of
-          Just _ -> pure (Just (errJson status403 "blocked_path"))
+          -- Fast path: the overwhelming majority of paths carry no blocked
+          -- segment, so do not spend a canonicalization on the exemption root.
           Nothing -> pure Nothing
+          Just _ -> do
+            allowed <- isUnderWorkdirsRoot deps canon
+            pure (if allowed then Nothing else Just (errJson status403 "blocked_path"))
+
+-- | Whether a canonical path sits inside the harness's per-session workdir
+-- cache. The root is canonicalized through the same file-explorer handle as
+-- the candidate (local or remote) so @\/tmp@ vs @\/private\/tmp@ style
+-- differences do not defeat the prefix test. When the root cannot be
+-- canonicalized (e.g. it does not exist yet) the exemption does not apply.
+isUnderWorkdirsRoot :: ApiDeps -> FilePath -> IO Bool
+isUnderWorkdirsRoot deps canon = do
+  eRoot <- feCanonicalize (adFileExplorer deps) (workdirsRoot (adPaths deps))
+  pure $ case eRoot of
+    Left _ -> False
+    Right root -> splitDirectories root `isPrefixOf` splitDirectories canon
 
 -- | Map a 'FileExplorerErr' to an HTTP error response.
 fileExplorerErrResponse :: FileExplorerErr -> Response

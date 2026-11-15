@@ -21,7 +21,7 @@ import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, queryString
   , requestMethod, requestHeaders, responseHeaders, responseStatus )
 import Network.Wai.Internal (Response (..), ResponseReceived (..))
-import System.Directory (createDirectoryIfMissing)
+import System.Directory (createDirectoryIfMissing, createFileLink)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
@@ -170,6 +170,80 @@ spec = describe "Seal.Gateway.ApiFilesSpec" $ do
       resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files", "download"] [("path", Just "/nonexistent/file.bin")])
       responseStatus resp `shouldBe` status404
 
+  -- The harness's per-session workdirs live under ~/.seal/cache/workdirs, so
+  -- the SEC-B3 blocklist would otherwise make the operator's own agent output
+  -- undownloadable. Downloads must be allowed there, while a symlink that
+  -- resolves out of the workdir is still blocked.
+  describe "workdirs-cache download exemption" $ do
+    it "serves a stat for a file under <cache>/workdirs" $ do
+      withSystemTempDirectory "seal-workdir-download" $ \tmp -> do
+        let cacheRoot = tmp </> ".seal" </> "cache"
+            workdir = cacheRoot </> "workdirs" </> "s1"
+            file = workdir </> "out.bin"
+        createDirectoryIfMissing True workdir
+        TIO.writeFile file "workdir output"
+        deps <- mkDepsWithCache cacheRoot (mkLocalFileExplorer 131072 131072) True
+        resp <- runAppResp (apiApp deps)
+          (mkGetReq ["api", "files", "stat"] [("path", Just (T.pack file))])
+        responseStatus resp `shouldBe` status200
+
+    it "serves a manifest for a file under <cache>/workdirs" $ do
+      withSystemTempDirectory "seal-workdir-download" $ \tmp -> do
+        let cacheRoot = tmp </> ".seal" </> "cache"
+            workdir = cacheRoot </> "workdirs" </> "s1"
+            file = workdir </> "out.bin"
+        createDirectoryIfMissing True workdir
+        TIO.writeFile file "workdir output"
+        deps <- mkDepsWithCache cacheRoot (mkLocalFileExplorer 131072 131072) True
+        resp <- runAppResp (apiApp deps)
+          (mkGetReq ["api", "files", "download", "manifest"] [("path", Just (T.pack file))])
+        responseStatus resp `shouldBe` status200
+        body <- responseBodyText resp
+        body `shouldSatisfy` T.isInfixOf "\"chunkCount\""
+
+    it "serves a chunk for a file under <cache>/workdirs" $ do
+      withSystemTempDirectory "seal-workdir-download" $ \tmp -> do
+        let cacheRoot = tmp </> ".seal" </> "cache"
+            workdir = cacheRoot </> "workdirs" </> "s1"
+            file = workdir </> "out.bin"
+        createDirectoryIfMissing True workdir
+        TIO.writeFile file "workdir output"
+        deps <- mkDepsWithCache cacheRoot (mkLocalFileExplorer 131072 131072) True
+        resp <- runAppResp (apiApp deps)
+          (mkGetReq ["api", "files", "download", "chunk"]
+            [ ("path", Just (T.pack file))
+            , ("index", Just "0")
+            , ("size", Just "14")
+            ])
+        responseStatus resp `shouldBe` status200
+        lookup "X-Chunk-SHA256" (responseHeaders resp) `shouldSatisfy` isJust
+
+    it "still blocks a blocked name outside the workdirs cache" $ do
+      withSystemTempDirectory "seal-workdir-download" $ \tmp -> do
+        let cacheRoot = tmp </> ".seal" </> "cache"
+            file = tmp </> ".ssh" </> "id_rsa"
+        createDirectoryIfMissing True (tmp </> ".ssh")
+        TIO.writeFile file "secret"
+        deps <- mkDepsWithCache cacheRoot (mkLocalFileExplorer 131072 131072) True
+        resp <- runAppResp (apiApp deps)
+          (mkGetReq ["api", "files", "download", "manifest"] [("path", Just (T.pack file))])
+        responseStatus resp `shouldBe` status403
+
+    it "still blocks a workdirs symlink that resolves into a blocked location" $ do
+      withSystemTempDirectory "seal-workdir-download" $ \tmp -> do
+        let cacheRoot = tmp </> ".seal" </> "cache"
+            workdir = cacheRoot </> "workdirs" </> "s1"
+            target = tmp </> ".ssh" </> "id_rsa"
+            link = workdir </> "innocent-looking.bin"
+        createDirectoryIfMissing True workdir
+        createDirectoryIfMissing True (tmp </> ".ssh")
+        TIO.writeFile target "secret"
+        createFileLink target link
+        deps <- mkDepsWithCache cacheRoot (mkLocalFileExplorer 131072 131072) True
+        resp <- runAppResp (apiApp deps)
+          (mkGetReq ["api", "files", "download", "manifest"] [("path", Just (T.pack link))])
+        responseStatus resp `shouldBe` status403
+
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
@@ -178,11 +252,16 @@ spec = describe "Seal.Gateway.ApiFilesSpec" $ do
 -- fields the file explorer routes never touch (the dispatch is a pure
 -- pattern match on method + pathInfo before any field is read).
 mkDeps :: FileExplorerHandle -> Bool -> IO ApiDeps
-mkDeps fe enabled = do
+mkDeps = mkDepsWithCache "/tmp"
+
+-- | Build deps with a specific @spCache@ so the workdirs-cache download
+-- exemption can be exercised against a temp directory.
+mkDepsWithCache :: FilePath -> FileExplorerHandle -> Bool -> IO ApiDeps
+mkDepsWithCache cacheRoot fe enabled = do
   abortReg <- newSessionAbortRegistry
   let paths = SealPaths
         { spHome = "/tmp", spState = "/tmp", spConfig = "/tmp"
-        , spKeys = "/tmp", spCache = "/tmp"
+        , spKeys = "/tmp", spCache = cacheRoot
         }
       meta0 = SessionMeta
         (case mkSessionId "test" of Right s -> s; Left _ -> error "sid")
