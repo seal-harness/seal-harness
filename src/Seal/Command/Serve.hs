@@ -84,7 +84,7 @@ import Seal.Config.Security
   ( AccessControlFileConfig (..), SecurityConfig (..), loadSecurityConfig
   , gatewayConfigFromSecurity, untrustedExecConfigFromSecurity )
 import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
-import Seal.Config.Paths (SealPaths (..), configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, serveLockPath, sessionMetaPath, sshAgentsDir, tabListPath, tlsCertPath, tlsKeyPath, vaultFilePath, watchMapPath)
+import Seal.Config.Paths (SealPaths (..), auditDir, configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, serveLockPath, sessionMetaPath, sshAgentsDir, tabListPath, tlsCertPath, tlsKeyPath, vaultFilePath, watchMapPath)
 import Seal.Security.DaemonLock (ServeLock, acquireServeLock)
 import Seal.Gateway.AccessControl
   ( NewAccess (..), newAccessControlHandle, printAccessControlBannerTo )
@@ -100,7 +100,8 @@ import Seal.Gateway.Setup (SetupDeps (..))
 
 import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..))
 import Seal.Gateway.StreamBroker (newStreamBroker, reconcileStaleThinking)
-import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
+import Seal.Audit.Log (fileAuditSinkWithGit, setAuditLogger)
+import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitShortHead)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
@@ -321,6 +322,10 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
       cfgRoot = spConfig paths
   ensureConfigRepo cfgRoot
   let repo = openConfigRepo cfgRoot
+  -- Cross-session audit log: set up the process-global audit logger.
+  -- Writes monthly-rotated files under @~\/.seal\/audit\/@, capturing the
+  -- config repo's git HEAD hash on each write.
+  setAuditLogger (fileAuditSinkWithGit (auditDir paths) (gitShortHead repo))
   embedding <- resolveEmbeddingBackend (rcEmbedding cfg) (spHome paths)
   backends0 <- newBackends paths repo embedding
   -- Publish the sub-agent runtime so an interrupt during the gateway run can

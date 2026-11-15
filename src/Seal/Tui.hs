@@ -27,6 +27,7 @@ import Seal.Config.Templates (ensureConfigTemplates)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
 import Seal.Config.Paths
   ( SealPaths (..)
+  , auditDir
   , configFilePath
   , ensureSealDirs
   , getSealPaths
@@ -35,7 +36,8 @@ import Seal.Config.Paths
   , securityFilePath
   , vaultFilePath
   )
-import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
+import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitShortHead)
+import Seal.Audit.Log (fileAuditSinkWithGit, setAuditLogger)
 import Seal.Handles.AskReply (newAskReplyStore)
 import Seal.Ingest (emptyChain)
 import Seal.Security.Policy (AutonomyLevel)
@@ -127,6 +129,8 @@ runTui autonomy logger = do
   let cfgRoot = spConfig paths
   ensureConfigRepo cfgRoot
   let repo = openConfigRepo cfgRoot
+  -- Cross-session audit log: set up the process-global audit logger.
+  setAuditLogger (fileAuditSinkWithGit (auditDir paths) (gitShortHead repo))
   -- The evolutionary-store backends are disk-backed (Markdown + git), created
   -- once and shared between the @\/skill@ \/ @\/agent@ command specs
   -- (read-only) and the ISA opcodes (mutate, auto-commit). Disk is canonical.
