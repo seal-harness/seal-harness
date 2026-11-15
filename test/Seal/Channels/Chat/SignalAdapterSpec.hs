@@ -10,6 +10,7 @@ import Data.IORef (newIORef, modifyIORef', readIORef)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.Text qualified as T
+import Data.Text.Read qualified as TR
 import Data.Vector qualified as V
 import Network.HTTP.Client (defaultManagerSettings, newManager)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
@@ -129,6 +130,35 @@ spec = do
         captured <- getCaptured
         captured `shouldBe` ["abcde", "fghij"]
 
+  describe "chunkMessage word awareness" $ do
+    it "keeps a numbered option line whole instead of cutting mid-word" $ do
+      let q = "Which branch?\n\n1) main \8212 the default branch\n2) develop \8212 integration\n\nReply with a number or type your own answer."
+          chunks = chunkMessage 60 q
+      T.concat chunks `shouldBe` q
+      chunks `shouldSatisfy` all (\c -> T.length c <= 60)
+
+    it "hard-splits only a token longer than the limit" $ do
+      chunkMessage 10 "abcdefghijklmno" `shouldBe` ["abcdefghij", "klmno"]
+
+  describe "edit timestamp parsing" $ do
+    it "returns False for a non-numeric timestamp instead of throwing" $ do
+      -- The timestamp reaches a subprocess argument; a partial 'read' would
+      -- throw here rather than failing the edit.
+      let transport = SignalChatTransport
+            { sctReceive = pure (Left "inbox empty")
+            , sctSend = \_c _b -> pure ()
+            , sctSendWithId = \_c _b -> pure (Just "1")
+            , sctEditMessage = \_c ts _content ->
+                case TR.decimal ts of
+                  Right (n, rest) | T.null rest, n >= (0 :: Int) -> pure True
+                  _ -> pure False
+            , sctClose = pure ()
+            }
+      withSignalChatChannel AllowAll 1000 testBackoff transport $ \ch -> do
+        waitForSeed
+        ok <- ccEditMessage ch (ChatMessageId "not-a-number") "x"
+        ok `shouldBe` False
+
   describe "reader loop retry" $ do
     it "retries after a transient error and delivers subsequent messages" $ do
       -- The reader loop must NOT die on a transient error (Left from
@@ -178,20 +208,15 @@ spec = do
           Just (InboundMessage _ body _) -> body `shouldBe` "init"
           Nothing -> fail "expected a message after repeated retries"
 
-  describe "streaming edit cadence (issue #198, part 3: total-length bug)" $ do
-    it "gates edits on NEW text since the last edit, not the total length" $ do
-      -- The server now rate-limits BeEntryUpdate frames (1500ms / 80 new
-      -- codepoints), but the client-side gate ALSO measured the TOTAL
-      -- accumulated length — so once the text passed the 80-codepoint
-      -- threshold, every arriving frame forced an outbound edit (the
-      -- 'lots of small updates' on the wire). The client must gate on NEW
-      -- text since the last edit, matching the server's semantics.
+  describe "single-edited-bubble progress (Signal)" $ do
+    it "creates ONE message and edits it in place instead of one per segment" $ do
+      -- Signal used to run with streaming disabled, so every text segment and
+      -- every tool call was flushed as a NEW message - a multi-tool turn
+      -- produced a notification per tool. It now opts into the
+      -- single-edited-bubble style: one message per turn, then edits.
       (transport, getCaptured, getEdits) <- mkMockSignalChatTransport [dummyMsg]
       withSignalChatChannel AllowAll 4000 testBackoff transport $ \ch -> do
         waitForSeed
-        -- Loop plumbing: conversation key + streaming state + a stub WS
-        -- client (entry-updates never touch it — it is only used by the
-        -- focus paths).
         let key = convKeyFromSource (mkMessageSourceFor "sig:+15551234567")
             stubWs = WsClient
               { wcFocus = \_ -> pure ()
@@ -200,40 +225,35 @@ spec = do
               }
         ss <- newStreamingState
         conns <- newTVarIO (Map.singleton key (mkSid "stream", stubWs, ss))
-        -- Fire 40 entry-updates back-to-back. Frame 1 carries 79 chars
-        -- (creates the bubble); each subsequent frame adds 5 chars, so
-        -- the TOTAL crosses 80 at frame 2 — but the NEW text per frame is
-        -- only 5 codepoints.
         mgr <- newManager defaultManagerSettings
         let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                       { cccStreamCfg = defaultStreamProgressConfig }
-            frameLen i = 79 + 5 * (i - 1)  -- frame i (1-based) total length
+            sid = mkSid "stream"
+            frameLen i = 79 + 5 * (i - 1)
             frame i = streamingJsonFor (T.replicate (frameLen i) "x")
         pendingAsks <- newPendingAsks
         tabTracker <- newTVarIO Map.empty
         watchState <- newWatchState
         thinkingTabs <- newThinkingTabs
         bg <- newBgSessions
-        -- Signal has ccSupportsStreaming = False, so entry-updates
-        -- accumulate text WITHOUT sending intermediate edits. The text
-        -- is delivered as a single message when the turn finalizes
-        -- (idle or entry event).
-        mapM_ (handleServerEvent cfg ch key conns pendingAsks bg tabTracker watchState thinkingTabs (mkSid "stream")
-                 . SeEntryUpdate (mkSid "stream") . frame)
-              [1 .. 40]
+        let fire = handleServerEvent cfg ch key conns pendingAsks bg
+                     tabTracker watchState thinkingTabs sid
+        fire (SeActivity sid (A.object
+          ["kind" .= ("harness-status" :: T.Text), "status" .= ("thinking" :: T.Text)]))
+        mapM_ (fire . SeEntryUpdate sid . frame) [1 .. 40]
+        fire (SeActivity sid (A.object
+          ["kind" .= ("harness-status" :: T.Text), "status" .= ("idle" :: T.Text)]))
         edits <- getEdits
-        -- No streaming edits: Signal doesn't support progressive edits.
-        length edits `shouldBe` 0
-        -- Fire idle to finalize the turn — the accumulated text should
-        -- be sent as a single new message.
-        handleServerEvent cfg ch key conns pendingAsks bg tabTracker watchState thinkingTabs (mkSid "stream")
-          (SeActivity (mkSid "stream") (A.object ["kind" .= ("harness-status" :: T.Text), "status" .= ("idle" :: T.Text)]))
+        -- Progressive edits happened rather than 40 separate messages.
+        length edits `shouldSatisfy` (> 0)
         sends <- getCaptured
-        -- The final send carries the last frame's full text (274 chars).
-        -- It's sent as a new message (no streaming bubble was created).
-        case reverse sends of
-          (s : _) -> s `shouldSatisfy` T.isPrefixOf (T.replicate 79 "x")
-          []     -> expectationFailure "expected a final send"
+        -- Exactly one message was created for the whole turn.
+        length sends `shouldBe` 1
+        -- The final edit carries the last frame's full text, with no cursor.
+        case reverse edits of
+          ((_, final) : _) -> do
+            final `shouldBe` T.replicate 274 "x"
+          [] -> expectationFailure "expected at least one edit"
       where
         streamingJsonFor t = A.object
           [ "id" .= ("streaming" :: T.Text)

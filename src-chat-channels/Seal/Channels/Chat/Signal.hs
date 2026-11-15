@@ -24,6 +24,7 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Read qualified as TR
 import Data.Text.Encoding qualified as TE
 import Data.Text.IO qualified as TIO
 import Data.Aeson (Value)
@@ -38,7 +39,7 @@ import System.Process
     waitForProcess, withCreateProcess)
 import System.Timeout (timeout)
 
-import Seal.Channels.Chat.Class (ChatChannel (..))
+import Seal.Channels.Chat.Class (ChatChannel (..), ProgressStyle (..))
 import Seal.Channels.Chat.Types
   (InboundMessage (..), ChatMessageId (..), ReceivedMessage (..))
 import Seal.Gateway.Types.AllowList (AllowList (..))
@@ -172,12 +173,19 @@ mkRealSignalChatTransport account = do
                 let frame = signalSendFrame recipient body Nothing
                 mResp <- sendRequest frame
                 pure (extractTimestamp =<< mResp)
-            , sctEditMessage = \recipient ts content -> do
-                let frame = signalSendFrame recipient content (Just (read (T.unpack ts) :: Int))
-                mResp <- sendRequest frame
-                pure (case mResp of
-                  Just _  -> True
-                  Nothing -> False)
+            , sctEditMessage = \recipient ts content ->
+                -- The timestamp is an opaque identifier we produced ourselves,
+                -- but it still reaches a subprocess argument, so parse it
+                -- without a partial function: an unparseable value fails the
+                -- edit (the loop then falls back to a fresh send).
+                case TR.decimal ts of
+                  Right (n, rest) | T.null rest, n >= 0 -> do
+                    let frame = signalSendFrame recipient content (Just n)
+                    mResp <- sendRequest frame
+                    pure (case mResp of
+                      Just _  -> True
+                      Nothing -> False)
+                  _ -> pure False
             , sctClose = do
                 _ <- try @IOException (hClose hIn)
                 terminateProcess ph
@@ -436,10 +444,18 @@ instance ChatChannel SignalChatChannel where
 
   ccLabel _ = "signal"
 
-  -- Signal doesn't reliably support message editing (signal-cli's
-  -- editTimestamp is flaky in practice). Disable streaming: send the
-  -- final text as a single message after the turn completes.
-  ccSupportsStreaming _ = False
+  -- Signal supports editing a sent message: signal-cli >= 0.14 exposes
+  -- editTimestamp on the JSON-RPC `send` method, and `sctSendWithId` /
+  -- `sctEditMessage` above are built on it. Editing is what lets a turn
+  -- produce ONE notification instead of one per text segment and tool call,
+  -- so opts into the single-edited-bubble style. A failed edit falls back to
+  -- a fresh send, so unreliable edit support degrades to the old behaviour
+  -- rather than losing content.
+  ccSupportsStreaming _ = True
+
+  ccProgressStyle _ = PsSingleBubble
+
+  ccChunkLimit ch = Just (sccChunkLimit ch)
 
 -- | Send one chunk verbatim to the last sender.
 sendRaw :: SignalChatChannel -> Text -> IO ()
