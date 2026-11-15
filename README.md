@@ -18,7 +18,7 @@
 
 ---
 
-> **Status:** Pre-alpha. Active design and development.
+> **Status:** Beta, active design and development.
 
 Most agent harnesses can't guarantee their own integrity. Actions happen off the record. You can't trust what you can't verify.
 
