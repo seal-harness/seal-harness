@@ -61,7 +61,7 @@ import Data.Aeson (Value, (.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust, listToMaybe, mapMaybe)
@@ -74,12 +74,13 @@ import Data.Time (getCurrentTime)
 import System.IO (hPutStrLn, stderr)
 import Network.HTTP.Client (Manager)
 
-import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
+import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..), ProgressStyle (..))
 import Seal.Channels.Chat.HttpClient
   (httpSend, httpGetTabs, httpGetSessions, httpNewSession, httpGetTranscript, httpAnswerQuestion,
    httpGetLists, httpRebindNew, httpSetupRepo, httpGetRepos,
    rebindBody, mintBody, setupRepoBody,
    SendResult (..), TabJson (..), ListsJson (..), NewSessionResult (..))
+import Seal.Channels.Chat.Bubble (bubbleText)
 import Seal.Channels.Chat.TabRender (renderTabListRow, tabListRows)
 import Seal.Channels.Chat.RateLimit
   (StreamProgressConfig (..), defaultStreamProgressConfig,
@@ -1074,11 +1075,14 @@ handleEntryUpdate cfg chan ss val = do
     finalized <- readIORef (ssFinalized ss)
     unless finalized $ do
       writeIORef (ssAccumulated ss) text
-      -- For channels that don't support streaming (Signal), just
-      -- accumulate the text without sending intermediate edits.
-      -- The final text is sent as a single message when the
-      -- recorded entry or idle status arrives (finalizeBubble).
-      when (ccSupportsStreaming chan) $ do
+      -- Single-edited-bubble style: one message per turn, edited in place.
+      -- The frame text is the whole turn so far (the gateway's accumulator
+      -- is turn-scoped), so it is the sole body; tool lines are spliced into
+      -- it at their recorded offsets.
+      when (ccProgressStyle chan == PsSingleBubble) $
+        updateBubble cfg chan ss (spliceContent ss (addCursor (cccStreamCfg cfg) text))
+      -- Separate-messages style: stream a growing bubble per segment.
+      when (ccProgressStyle chan == PsSeparateMessages && ccSupportsStreaming chan) $ do
         now <- getCurrentTime
         mLastEdit <- readIORef (ssLastEdit ss)
         mMsgId <- readIORef (ssMsgId ss)
@@ -1107,6 +1111,44 @@ handleEntryUpdate cfg chan ss val = do
               when ok $ do
                 writeIORef (ssLastEdit ss) (Just now)
                 writeIORef (ssLastLen ss) (T.length text)
+
+-- | Render the single-edited-bubble body for the state's committed data.
+-- The text argument is what to use as the body when the state has no
+-- accumulated frame text (the recorded entry, for a turn that never
+-- streamed); otherwise the accumulated frame text wins, because it is the
+-- whole turn so far and therefore the most current view.
+spliceContent :: StreamingState -> Text -> IO Text
+spliceContent ss fallback = do
+  splices <- readIORef (ssSplices ss)
+  accum <- readIORef (ssAccumulated ss)
+  pure (bubbleText splices (if T.null accum then fallback else accum) "")
+
+-- | Create the turn's bubble on first use, then edit it. Returns 'True' when
+-- the content is on the platform (created or edited). A failed edit falls
+-- back to a fresh message so content is never silently dropped.
+updateBubble
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> StreamingState -> IO Text -> IO ()
+updateBubble cfg chan ss mkContent = do
+  content <- mkContent
+  over <- shouldFallBackToChunks cfg chan content
+  unless over $ do
+    mMsgId <- readIORef (ssMsgId ss)
+    case mMsgId of
+      Nothing -> do
+        mId <- ccSendWithId chan content
+        for_ mId (writeIORef (ssMsgId ss) . Just)
+      Just id' -> do
+        ok <- ccEditMessage chan id' content
+        unless ok $
+          void (ccSendWithId chan content)
+
+-- | Is the rendered body larger than the platform can hold in one message?
+-- When it is, the single-bubble style gives up on editing and lets the final
+-- delivery go through the channel's chunked send path.
+shouldFallBackToChunks :: ChatChannel c => ChatChannelConfig -> c -> Text -> IO Bool
+shouldFallBackToChunks _cfg chan content =
+  pure (maybe False (T.length content >) (ccChunkLimit chan))
 
 -- | Finalize the current streaming bubble for one conversation: edit it
 -- without the cursor (or, if the edit fails, send the full text as a new
@@ -1153,7 +1195,16 @@ handleEntry cfg chan ss val = do
       -- finalized).
       alreadyDelivered <- readIORef (ssFinalized ss)
       unless alreadyDelivered $
-        finalizeBubble cfg chan ss text True
+        case ccProgressStyle chan of
+          -- Single bubble: the recorded entry is the authoritative text. It
+          -- arrives before the tool dispatch, so committing it here means the
+          -- bubble always shows exact text rather than a throttled prefix.
+          -- No finalization latch: later segment frames must still be able to
+          -- extend the bubble.
+          PsSingleBubble -> updateBubble cfg chan ss (do
+            writeIORef (ssAccumulated ss) text
+            spliceContent ss text)
+          PsSeparateMessages -> finalizeBubble cfg chan ss text True
 
 -- | Handle an @activity@ event: if harness-status is idle, finalize any
 -- in-progress streaming bubble.
@@ -1180,17 +1231,25 @@ handleHarnessStatus cfg chan ss val =
       -- Turn start: clear the finalized flag so the new turn streams.
       writeIORef (ssFinalized ss) False
     "idle" -> do
-      mMsgId <- readIORef (ssMsgId ss)
-      accum <- readIORef (ssAccumulated ss)
-      -- For non-streaming channels (Signal), the accumulated text is the
-      -- full response. Send it as a new message (mMsgId is Nothing because
-      -- no streaming bubble was created). For streaming channels, only
-      -- finalize if there's an active streaming bubble (mMsgId is Just).
-      -- Don't mark as finalized — the recorded entry is the canonical
-      -- finalize path. This is just a safety net.
-      when (not (T.null accum) &&
-            (not (ccSupportsStreaming chan) || isJust mMsgId)) $
-        finalizeBubble cfg chan ss accum False
+      case ccProgressStyle chan of
+        -- Single bubble: a final edit with the cursor stripped. The recorded
+        -- entry already committed the exact text, so this only clears the
+        -- cursor and closes the turn; a withheld idle (running background
+        -- children) leaves complete, un-cursored text behind.
+        PsSingleBubble -> do
+          alreadyFinal <- readIORef (ssFinalized ss)
+          unless alreadyFinal $
+            updateBubble cfg chan ss (spliceContent ss "")
+        PsSeparateMessages -> do
+          mMsgId <- readIORef (ssMsgId ss)
+          accum <- readIORef (ssAccumulated ss)
+          -- For non-streaming channels the accumulated text is the full
+          -- response. Send it as a new message (mMsgId is Nothing because no
+          -- streaming bubble was created). For streaming channels, only
+          -- finalize if there's an active streaming bubble (mMsgId is Just).
+          when (not (T.null accum) &&
+                (not (ccSupportsStreaming chan) || isJust mMsgId)) $
+            finalizeBubble cfg chan ss accum False
       resetStreamingState ss
       writeIORef (ssFinalized ss) True
     _ -> pure ()
@@ -1208,20 +1267,34 @@ handleToolCallActivity cfg chan ss val = do
   -- platform messages, with the tool line between them. Without this,
   -- the next entry-update edits the pre-tool bubble (ssMsgId is still
   -- set) and appends the post-tool text onto the pre-tool text.
-  mMsgId <- readIORef (ssMsgId ss)
-  accum <- readIORef (ssAccumulated ss)
-  -- For non-streaming channels, finalize when there's accumulated text
-  -- even without a streaming bubble (mMsgId is Nothing). For streaming
-  -- channels, only finalize when there's an in-progress bubble.
-  when (not (T.null accum) &&
-        (not (ccSupportsStreaming chan) || isJust mMsgId)) $
-    finalizeBubble cfg chan ss accum False
-  case extractToolName val of
-    Nothing -> pure ()
-    Just toolName -> do
-      let mInput = extractToolInput val
-          line = formatToolLine mempty toolName (fromMaybe "" mInput)
-      ccSend chan line
+  case ccProgressStyle chan of
+    PsSingleBubble -> case extractToolName val of
+      Nothing -> pure ()
+      Just toolName -> do
+        -- Record the tool line with the offset it fired at, then re-render
+        -- the one bubble. This keeps the line in its true place in the
+        -- turn's text stream instead of appending it at the end, and it
+        -- produces no new notification.
+        accum <- readIORef (ssAccumulated ss)
+        let mInput = extractToolInput val
+            line = formatToolLine mempty toolName (fromMaybe "" mInput)
+        modifyIORef' (ssSplices ss) (<> [(T.length accum, line)])
+        updateBubble cfg chan ss (spliceContent ss "")
+    PsSeparateMessages -> do
+      mMsgId <- readIORef (ssMsgId ss)
+      accum <- readIORef (ssAccumulated ss)
+      -- For non-streaming channels, finalize when there's accumulated text
+      -- even without a streaming bubble (mMsgId is Nothing). For streaming
+      -- channels, only finalize when there's an in-progress bubble.
+      when (not (T.null accum) &&
+            (not (ccSupportsStreaming chan) || isJust mMsgId)) $
+        finalizeBubble cfg chan ss accum False
+      case extractToolName val of
+        Nothing -> pure ()
+        Just toolName -> do
+          let mInput = extractToolInput val
+              line = formatToolLine mempty toolName (fromMaybe "" mInput)
+          ccSend chan line
 
 -- | Handle an @ask@ event: render the question on the platform. When the
 -- ask has options and the channel supports inline keyboards, sends the

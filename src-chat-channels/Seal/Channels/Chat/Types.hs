@@ -170,6 +170,12 @@ data StreamingState = StreamingState
   , ssLastLen     :: IORef Int
     -- ^ Codepoints in the accumulated text at the last platform edit.
     -- The edit gate measures NEW text since the last edit, not the total.
+  , ssSplices     :: IORef [(Int, Text)]
+    -- ^ Tool-progress lines for the single-edited-bubble style, each paired
+    -- with the length of the turn's cumulative streamed text when it fired.
+    -- The offset lets the renderer splice the line into the text where it
+    -- actually happened instead of appending every tool line at the end.
+    -- Unused by the default ('PsSeparateMessages') style.
   , ssFinalized   :: IORef Bool
     -- ^ 'True' once the turn's final entry has been delivered (the
     -- bubble was finalized). Late entry-updates — which can arrive after
@@ -185,12 +191,14 @@ newStreamingState = do
   accum <- newIORef ""
   lastEdit <- newIORef Nothing
   lastLen <- newIORef 0
+  splices <- newIORef []
   finalized <- newIORef False
   pure StreamingState
     { ssMsgId = msgId
     , ssAccumulated = accum
     , ssLastEdit = lastEdit
     , ssLastLen = lastLen
+    , ssSplices = splices
     , ssFinalized = finalized
     }
 
@@ -206,3 +214,4 @@ resetStreamingState ss = do
   writeIORef (ssAccumulated ss) ""
   writeIORef (ssLastEdit ss) Nothing
   writeIORef (ssLastLen ss) 0
+  writeIORef (ssSplices ss) []

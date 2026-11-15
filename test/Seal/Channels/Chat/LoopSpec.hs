@@ -20,7 +20,7 @@ import Data.Vector qualified as V
 import Network.HTTP.Client (Manager, newManager, defaultManagerSettings)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy, expectationFailure)
 
-import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
+import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..), ProgressStyle (..))
 import Seal.Channels.Chat.Loop
 import Seal.Channels.Chat.HttpClient
   ( ListsJson (..), NewSessionResult (..), SendResult (..), TabJson (..) )
@@ -72,6 +72,24 @@ instance ChatChannel MockChan where
     modifyIORef' (mcWithOpts ch) ((question, map qoLabel opts) :)
     pure (Just (ChatMessageId "with-options"))
   ccLabel _ = "mock"
+
+-- | A second mock that opts into the single-edited-bubble style. Used to
+-- assert the WU-2 behaviour without disturbing the default-style mock that
+-- the existing tests pin.
+newtype BubbleChan = BubbleChan MockChan
+
+mkBubbleChan :: IO BubbleChan
+mkBubbleChan = BubbleChan <$> mkMockChan
+
+instance ChatChannel BubbleChan where
+  ccReceive (BubbleChan c) = ccReceive c
+  ccSend (BubbleChan c) = ccSend c
+  ccSendWithId (BubbleChan c) = ccSendWithId c
+  ccEditMessage (BubbleChan c) = ccEditMessage c
+  ccSendWithOptions (BubbleChan c) = ccSendWithOptions c
+  ccLabel (BubbleChan c) = ccLabel c
+  ccProgressStyle _ = PsSingleBubble
+  ccChunkLimit _ = Just 1998
 
 mkMockChan :: IO MockChan
 mkMockChan = MockChan
@@ -523,6 +541,144 @@ spec = do
       edits <- getEdits chan
       -- And nothing edited the old bubble with turn-two text.
       edits `shouldSatisfy` not . any (T.isInfixOf "turn two text")
+
+  describe "single-edited-bubble style (WU-2)" $ do
+    -- A turn whose first response carries text, then two tool calls, then
+    -- more text. The default style produces one message per segment plus one
+    -- per tool (the notification spam). The single-bubble style must create
+    -- exactly one message and edit it.
+    let runTurn mkChan = do
+          ch <- mkChan
+          let key = ConversationKey "signal" "conv1"
+          mgr <- newManager defaultManagerSettings
+          let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
+                        { cccStreamCfg = defaultStreamProgressConfig }
+          ss <- newStreamingState
+          conns <- newTVarIO (Map.singleton key (mkSid "sess-b", stubWs, ss))
+          pendingAsks <- newPendingAsks
+          tabTracker <- newTVarIO Map.empty
+          watchState <- newWatchState
+          thinkingTabs <- newThinkingTabs
+          bg <- newBgSessions
+          let sid = mkSid "sess-b"
+              fire = handleServerEvent cfg ch key conns pendingAsks bg
+                       tabTracker watchState thinkingTabs sid
+          -- Turn start clears the finalized flag (production sequence).
+          fire (SeActivity sid (statusJson "thinking"))
+          -- Segment 1 streams (throttled: one frame is enough to create).
+          fire (SeEntryUpdate sid (streamingJsonFor "pre-tool text"))
+          -- The recorded entry for response 1 (exact text).
+          fire (SeEntry sid (entryJsonFor "pre-tool text"))
+          -- Two tool calls.
+          fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+          fire (SeActivity sid (toolCallJson "BIN_EXEC"))
+          -- Segment 2 streams, then its recorded entry.
+          fire (SeEntryUpdate sid (streamingJsonFor "pre-tool text\n\npost-tool text"))
+          fire (SeEntry sid (entryJsonFor "pre-tool text\n\npost-tool text"))
+          fire (SeActivity sid (statusJson "idle"))
+          pure ch
+
+    it "creates exactly one message for a multi-tool turn" $ do
+      ch <- runTurn mkBubbleChan
+      let MockChan { mcSendIds = ids } = case ch of BubbleChan c -> c
+      sends <- readIORef ids
+      length sends `shouldBe` 1
+
+    it "shows text, then tool lines, then later text, each exactly once" $ do
+      ch <- runTurn mkBubbleChan
+      let MockChan { mcEdits = eds } = case ch of BubbleChan c -> c
+      edits <- map snd . reverse <$> readIORef eds
+      case reverse edits of
+        [] -> expectationFailure "expected at least one edit"
+        (final : _) -> do
+          final `shouldSatisfy` T.isInfixOf "pre-tool text"
+          final `shouldSatisfy` T.isInfixOf "SHELL_EXEC"
+          final `shouldSatisfy` T.isInfixOf "BIN_EXEC"
+          final `shouldSatisfy` T.isInfixOf "post-tool text"
+          -- The pre-tool text must not be duplicated by the tool splice.
+          T.count "pre-tool text" final `shouldBe` 1
+          -- No cursor in the final body.
+          final `shouldSatisfy` not . T.isInfixOf "\x2589"
+          -- Ordering preserved: the tool lines sit between the two segments.
+          let iPre = T.breakOn "pre-tool text" final
+              iTool = T.breakOn "SHELL_EXEC" final
+              iPost = T.breakOn "post-tool text" final
+          T.length (fst iTool) `shouldSatisfy` (> T.length (fst iPre))
+          T.length (fst iPost) `shouldSatisfy` (> T.length (fst iTool))
+
+    it "still creates a bubble for a tools-only turn" $ do
+      ch <- mkBubbleChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
+                    { cccStreamCfg = defaultStreamProgressConfig }
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (mkSid "sess-t", stubWs, ss))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "sess-t"
+          fire = handleServerEvent cfg ch key conns pendingAsks bg
+                   tabTracker watchState thinkingTabs sid
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeActivity sid (statusJson "idle"))
+      let MockChan { mcSendIds = ids } = case ch of BubbleChan c -> c
+      sends <- readIORef ids
+      length sends `shouldBe` 1
+
+    it "delivers a /bg-style single entry with no preceding frame" $ do
+      -- The bg connection never receives entry-update, so handleEntry must
+      -- create the bubble rather than only editing one.
+      ch <- mkBubbleChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
+                    { cccStreamCfg = defaultStreamProgressConfig }
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (mkSid "sess-bg", stubWs, ss))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "sess-bg"
+      handleServerEvent cfg ch key conns pendingAsks bg tabTracker
+        watchState thinkingTabs sid (SeEntry sid (entryJsonFor "bg reply text"))
+      let MockChan { mcSendIds = ids } = case ch of BubbleChan c -> c
+      sends <- readIORef ids
+      map fst sends `shouldBe` ["bg reply text"]
+
+    it "keeps both segments of a StopMaxTokens continuation" $ do
+      ch <- mkBubbleChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
+                    { cccStreamCfg = defaultStreamProgressConfig }
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (mkSid "sess-c", stubWs, ss))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "sess-c"
+          fire = handleServerEvent cfg ch key conns pendingAsks bg
+                   tabTracker watchState thinkingTabs sid
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntry sid (entryJsonFor "first part"))
+      fire (SeEntryUpdate sid (streamingJsonFor "first part second part"))
+      fire (SeEntry sid (entryJsonFor "first part second part"))
+      fire (SeActivity sid (statusJson "idle"))
+      let MockChan { mcEdits = eds } = case ch of BubbleChan c -> c
+      edits <- map snd . reverse <$> readIORef eds
+      case reverse edits of
+        (final : _) -> do
+          final `shouldSatisfy` T.isInfixOf "first part"
+          final `shouldSatisfy` T.isInfixOf "second part"
+        [] -> expectationFailure "expected an edit"
 
   describe "extractEntryText" $ do
     it "extracts text from a payload with content array" $ do

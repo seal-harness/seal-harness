@@ -14,11 +14,27 @@
 module Seal.Channels.Chat.Class
   ( ChatChannel (..)
   , QuestionOption (..)
+  , ProgressStyle (..)
   ) where
 
 import Data.Text (Text)
 
 import Seal.Channels.Chat.Types (InboundMessage, ChatMessageId)
+
+-- | How the loop renders a turn's progress on the platform.
+--
+-- 'PsSeparateMessages' (the default) is the long-standing behaviour: each
+-- text segment and each tool call becomes its own message. 'PsSingleBubble'
+-- creates one message per turn and edits it in place, so a turn produces a
+-- single notification instead of one per tool call.
+--
+-- Deliberately opt-in per channel: it depends on the platform's edit support
+-- being reliable in practice, which has only been verified for Signal.
+-- Telegram keeps the default.
+data ProgressStyle
+  = PsSeparateMessages
+  | PsSingleBubble
+  deriving stock (Eq, Show)
 
 -- | One discrete choice offered alongside an ASK_HUMAN question. Mirrors
 -- 'Seal.Handles.AskReply.QuestionOption' but lives in the chat-channel
@@ -58,6 +74,21 @@ class ChatChannel c where
   -- editing). Signal sets this to 'False' to match the old behavior.
   ccSupportsStreaming :: c -> Bool
   ccSupportsStreaming _ = True
+
+  -- | How to render a turn's progress. Default 'PsSeparateMessages' — the
+  -- long-standing one-message-per-segment/tool behaviour — so a channel is
+  -- unaffected unless it explicitly opts in.
+  ccProgressStyle :: c -> ProgressStyle
+  ccProgressStyle _ = PsSeparateMessages
+
+  -- | The platform's maximum message length in codepoints, when it has one.
+  -- Used by 'PsSingleBubble' to stop live-editing a bubble that has outgrown
+  -- a single message and fall back to chunked sends. 'Nothing' (the default)
+  -- means no known limit. The loop is polymorphic in the channel, so the
+  -- limit has to be reachable through the class rather than from a
+  -- channel-specific record field.
+  ccChunkLimit :: c -> Maybe Int
+  ccChunkLimit _ = Nothing
 
   -- | Send a question with multiple-choice options as an inline keyboard
   -- (one button per option). The @askIdPrefix@ is the 8-hex prefix of the
