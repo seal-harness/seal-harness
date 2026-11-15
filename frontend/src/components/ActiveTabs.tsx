@@ -1,9 +1,12 @@
 import { Fragment, type ReactNode } from 'react'
+import { useEffect, useState } from 'react'
 import type { TabInfo, TabStatus } from '../types'
 import { tabIndexToChar, repoNameFromUrl } from '../types'
 import type { SessionActivityState } from '../types/stream'
 import { deriveTabStatusKind, type TabStatusKind } from '../lib/tabStatus'
 import type { TabLineField } from '../lib/tabLineConfig'
+import { resolveProviderIcon } from '../lib/providerIcons'
+import { useProviderBaseUrls } from '../hooks/useProviderBaseUrls'
 import { ActivityDot } from './StatusDot'
 import { RowIndexSlot, RowStatusSlot, ROW_SECOND_LINE_INDENT_PX } from './RowLayout'
 import ollamaIcon from '../../assets/ollama-icon.svg'
@@ -93,7 +96,9 @@ export function renderConfigurableLine(fields: TabLineField[], data: TabLineData
 // ── Provider badge ────────────────────────────────────────────────────
 // A small provider icon shown next to a tab/session. Providers with a
 // bundled logo render that logo; the rest fall back to a single-letter
-// glyph on a colored chip.
+// glyph on a colored chip. For OpenAI-compatible providers not in the static
+// map, the icon is fetched from the provider's root page (see
+// 'resolveProviderIcon').
 
 interface ProviderBadgeSpec {
   title: string
@@ -116,6 +121,24 @@ const FALLBACK_PROVIDER: ProviderBadgeSpec = { char: '?', bg: 'var(--text-faint)
 
 function ProviderBadge({ provider }: { provider: string }) {
   const badge = PROVIDER_BADGE[provider] ?? FALLBACK_PROVIDER
+  const baseUrls = useProviderBaseUrls()
+  const [faviconUrl, setFaviconUrl] = useState<string | null>(null)
+  const [faviconError, setFaviconError] = useState(false)
+
+  // For providers not in the static map, try to resolve an icon from the
+  // provider's root page. This is a best-effort fetch: on any failure the
+  // fallback glyph is shown instead.
+  useEffect(() => {
+    if (PROVIDER_BADGE[provider]) return
+    const baseUrl = baseUrls.get(provider)
+    if (!baseUrl) return
+    let cancelled = false
+    void resolveProviderIcon(baseUrl).then((url) => {
+      if (!cancelled) setFaviconUrl(url)
+    })
+    return () => { cancelled = true }
+  }, [provider, baseUrls])
+
   return (
     <span
       data-testid={`provider-badge-${provider || 'unknown'}`}
@@ -144,7 +167,15 @@ function ProviderBadge({ provider }: { provider: string }) {
             aria-hidden="true"
             style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
           />
-        : badge.char}
+        : faviconUrl && !faviconError
+          ? <img
+              src={faviconUrl}
+              alt=""
+              aria-hidden="true"
+              onError={() => setFaviconError(true)}
+              style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
+            />
+          : badge.char}
     </span>
   )
 }
