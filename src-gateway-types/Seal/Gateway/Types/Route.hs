@@ -160,6 +160,9 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   RouteFilesList     :: SealRoute '[] '[] Bodyless Resp
   RouteFilesContent  :: SealRoute '[] '[] Bodyless Resp
   RouteFilesDownload :: SealRoute '[] '[] Bodyless Resp
+  RouteFilesStat     :: SealRoute '[] '[] Bodyless Resp
+  RouteFilesManifest :: SealRoute '[] '[] Bodyless Resp
+  RouteFilesChunk    :: SealRoute '[] '[] Bodyless Resp
   -- Setup (first-run wizard). The gate is blocking: these four are the only
   -- routes the SPA may call before it hands control back to <App/>.
   RouteSetupState    :: SealRoute '[] '[] Bodyless Resp
@@ -247,6 +250,9 @@ routeMeta = \case
   RouteFilesList -> Meta (match "files" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteFilesContent -> Meta (match "files" ./ match "content" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteFilesDownload -> Meta (match "files" ./ match "download" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteFilesStat -> Meta (match "files" ./ match "stat" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteFilesManifest -> Meta (match "files" ./ match "download" ./ match "manifest" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteFilesChunk -> Meta (match "files" ./ match "download" ./ match "chunk" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteSetupState -> Meta (match "setup" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteSetupVault -> Meta (match "setup" ./ match "vault" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteSetupVaultReopen -> Meta (match "setup" ./ match "vault" ./ match "reopen" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
@@ -326,6 +332,9 @@ allRoutes =
   , Constructed RouteFilesList
   , Constructed RouteFilesContent
   , Constructed RouteFilesDownload
+  , Constructed RouteFilesStat
+  , Constructed RouteFilesManifest
+  , Constructed RouteFilesChunk
   , Constructed RouteSetupState
   , Constructed RouteSetupVault
   , Constructed RouteSetupVaultReopen

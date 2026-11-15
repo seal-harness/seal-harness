@@ -242,6 +242,7 @@ mkFakeRemoteRunnerWithRef ref = RemoteRunner
   { runRemote      = \_ -> readIORef ref >>= \t -> pure (Right (t <> "  -\n"))
   , runRemoteStdin = \_ _ -> readIORef ref >>= \t -> pure (Right (t <> "  -\n"))
   , runRemoteEnv   = \_ _ -> readIORef ref >>= \t -> pure (Right (t <> "  -\n"))
+  , runRemoteStream = \_ _ -> pure (Left ExecRemoteUnreachable)
   , runRemoteBytes = \_ -> pure (Right ("", False))
   }
 
@@ -354,6 +355,7 @@ seqFakeRunner canned = unsafePerformIO $ do
     { runRemote      = \_ -> pop ref
     , runRemoteStdin = \_ _ -> pop ref
     , runRemoteEnv   = \_ _ -> pop ref
+    , runRemoteStream = \_ _ -> pure (Left ExecRemoteUnreachable)
     , runRemoteBytes = \_ -> pure (Right ("", False))
     }
   where

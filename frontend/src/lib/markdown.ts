@@ -64,6 +64,12 @@ export function sanitizeHref(href: string): string | null {
   const trimmed = href.trim()
   if (trimmed === '') return null
   const probe = trimmed.replace(/[\u0000-\u0020\u007f]/g, '').toLowerCase()
+  // Block /api/files/download* — an agent-authored markdown link to a
+  // download endpoint is same-site (session cookie sent), so a single
+  // human click exfiltrates file bytes with no opcode, no SafePath, no audit.
+  // The download UI uses fetch(), never an <a href>, so blocking these
+  // hrefs cannot break the legitimate download path. (§6.0a, T-LINK-BLOCKED)
+  if (probe.startsWith('/api/files/download')) return null
   if (probe.startsWith('/') || probe.startsWith('#')) return trimmed
   const scheme = /^([a-z][a-z0-9+.-]*):/.exec(probe)
   if (scheme === null) return trimmed

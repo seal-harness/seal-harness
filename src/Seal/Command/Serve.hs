@@ -510,11 +510,16 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
   -- mkRemoteFileExplorer, remote mode without SSH → mkFailClosedFileExplorer
   -- (fail-closed — NOT a local fallback, per architect review).
   let fileExplorerEnabled = fromMaybe True (gcFileExplorerEnabled gwCfg)
+      downloadPromptBytes = fromMaybe 268435456 (gcFileDownloadPromptBytes gwCfg)
+      downloadChunkBytes  = fromMaybe 4194304 (gcFileDownloadChunkBytes gwCfg)
+      downloadAllowBlocked = fromMaybe False (gcFileDownloadAllowBlocked gwCfg)
   fileExplorer <- case untrustedExecConfigFromSecurity secCfg of
-    Nothing -> pure (mkLocalFileExplorer maxScanBytes)
+    -- WU-1: split ceilings — viewer reads stay at maxScanBytes (128 KiB),
+    -- downloads use a 4 MiB chunk size (full config wiring comes in WU-2).
+    Nothing -> pure (mkLocalFileExplorer maxScanBytes downloadChunkBytes)
     Just uec -> case uecRemote uec of
       Nothing -> pure mkFailClosedFileExplorer
-      Just sshCfg -> mkRemoteFileExplorer sshCfg mkRealRemoteRunner maxScanBytes
+      Just sshCfg -> mkRemoteFileExplorer sshCfg mkRealRemoteRunner maxScanBytes downloadChunkBytes
   let deps = ApiDeps
         { adSessionRuntime  = sr
         , adTabsHandle      = tabsH
@@ -563,6 +568,9 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
         , adAbortReg         = cdAbortReg chanDeps
         , adFileExplorer     = fileExplorer
         , adFileExplorerEnabled = fileExplorerEnabled
+        , adDownloadPromptBytes = downloadPromptBytes
+        , adDownloadChunkBytes  = downloadChunkBytes
+        , adDownloadAllowBlocked = downloadAllowBlocked
         }
   -- The WS stream server is MOUNTED in the HTTP application (same port),
   -- so there is no second listener and no second port to collide with.

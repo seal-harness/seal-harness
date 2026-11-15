@@ -177,6 +177,9 @@ spec = describe "seal access-control" $ do
         { pgcPort = Just 8443, pgcHost = Just "0.0.0.0"
         , pgcStaticDir = Nothing, pgcAllowedOrigins = []
         , pgcFileExplorerEnabled = Nothing
+, pgcFileDownloadPromptBytes = Nothing
+, pgcFileDownloadChunkBytes = Nothing
+, pgcFileDownloadAllowBlocked = Nothing
         , pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing
         , pgcTlsHosts = [] })
       runAccessControlWith paths (AcEnroll enrollWindow) `shouldReturn` ExitFailure 1
@@ -188,6 +191,9 @@ spec = describe "seal access-control" $ do
         { pgcPort = Nothing, pgcHost = Just "localhost"
         , pgcStaticDir = Nothing, pgcAllowedOrigins = []
         , pgcFileExplorerEnabled = Nothing
+, pgcFileDownloadPromptBytes = Nothing
+, pgcFileDownloadChunkBytes = Nothing
+, pgcFileDownloadAllowBlocked = Nothing
         , pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing
         , pgcTlsHosts = [] })
       runAccessControlWith paths (AcEnroll enrollWindow) `shouldReturn` ExitSuccess
@@ -251,7 +257,8 @@ spec = describe "seal access-control" $ do
       saveSecurityConfig (securityFilePath paths)
         defaultSecurityConfig
           { scGateway = Just (PartialGatewayConfig Nothing Nothing Nothing
-                               ["https://old.example.com"] Nothing Nothing Nothing Nothing [])
+                               ["https://old.example.com"] Nothing Nothing Nothing
+                               Nothing Nothing Nothing Nothing [])
           , scAccessControl = Just (AccessControlFileConfig Nothing
                                      (Just "https://old.example.com")
                                      (Just "old.example.com"))
@@ -277,7 +284,8 @@ spec = describe "seal access-control" $ do
       saveSecurityConfig (securityFilePath paths)
         defaultSecurityConfig
           { scGateway = Just (PartialGatewayConfig (Just 443) (Just "localhost") Nothing
-                               [] Nothing (Just "/tmp/cert.pem") (Just "/tmp/key.pem")
+                               [] Nothing Nothing Nothing Nothing
+                               (Just "/tmp/cert.pem") (Just "/tmp/key.pem")
                                (Just True) ["seal.example.com"])
           } PreserveCredentials
         `shouldReturn` Right ()

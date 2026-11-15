@@ -323,6 +323,9 @@ mkDepsFor paths = do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     }
@@ -498,6 +501,9 @@ mkProviderTestDeps tmp cfgRoot vr = do
     , adAbortReg         = testAbortReg
     , adFileExplorer = mkFailClosedFileExplorer
     , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig   = defaultSecurityConfig
     , adMkSessionExec    = Nothing
     }
@@ -2371,6 +2377,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                  }
@@ -2451,6 +2460,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2521,6 +2533,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2592,6 +2607,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2688,6 +2706,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2749,6 +2770,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2809,6 +2833,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2850,6 +2877,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2943,6 +2973,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3002,6 +3035,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3060,6 +3096,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3112,6 +3151,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3173,6 +3215,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3439,6 +3484,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adAbortReg         = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
                 }
@@ -3631,6 +3679,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adAbortReg         = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
                 }
@@ -3705,6 +3756,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3754,6 +3808,9 @@ spec = describe "Seal.Gateway.API" $ do
             , adAbortReg         = testAbortReg
             , adFileExplorer = mkFailClosedFileExplorer
             , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
             }
@@ -3941,6 +3998,9 @@ spec = describe "Seal.Gateway.API" $ do
             , adAbortReg         = testAbortReg
             , adFileExplorer = mkFailClosedFileExplorer
             , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
             }
@@ -4271,6 +4331,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -5308,6 +5371,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps, adPaths = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -5447,6 +5513,9 @@ spec = describe "Seal.Gateway.API" $ do
             , adAbortReg = testAbortReg
             , adFileExplorer = mkFailClosedFileExplorer
             , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
             }
           app = apiApp deps
       (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sidTxt, "agents"])
@@ -5538,6 +5607,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -5649,6 +5721,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -5822,6 +5897,9 @@ spec = describe "Seal.Gateway.API" $ do
             , adPaths            = paths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
             , adFileExplorer = mkFailClosedFileExplorer
             , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Nothing
             , adAgentRegistry    = fakeAgentRegH
@@ -5951,6 +6029,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -6082,6 +6163,9 @@ spec = describe "Seal.Gateway.API" $ do
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }

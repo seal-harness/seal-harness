@@ -382,6 +382,9 @@ sampleSecurityConfig = SecurityConfig
       { pgcPort = Just 8080, pgcHost = Just "sample-host"
       , pgcStaticDir = Just "/srv/sample", pgcAllowedOrigins = ["https://sample"]
       , pgcFileExplorerEnabled = Just True
+, pgcFileDownloadPromptBytes = Nothing
+, pgcFileDownloadChunkBytes = Nothing
+, pgcFileDownloadAllowBlocked = Nothing
       , pgcTlsCert = Just "/c.pem", pgcTlsKey = Just "/k.pem", pgcTls = Just True
       , pgcTlsHosts = ["sample.lan"] })
   }

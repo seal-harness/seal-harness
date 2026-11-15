@@ -238,6 +238,15 @@ describe('sanitizeHref', () => {
     expect(sanitizeHref('/session/1#msg-2')).toBe('/session/1#msg-2')
   })
 
+  it('blocks /api/files/download* hrefs (agent exfiltration path)', () => {
+    expect(sanitizeHref('/api/files/download?path=/etc/passwd')).toBeNull()
+    expect(sanitizeHref('/api/files/download/chunk?path=/Users/x/.ssh/id_rsa&index=0&size=100&mtime=0')).toBeNull()
+    expect(sanitizeHref('/api/files/download/manifest?path=/secret')).toBeNull()
+    // Legitimate relative paths still pass
+    expect(sanitizeHref('/session/1#msg-2')).toBe('/session/1#msg-2')
+    expect(sanitizeHref('/files')).toBe('/files')
+  })
+
   it('rejects javascript:, data:, vbscript: and control-character tricks', () => {
     expect(sanitizeHref('javascript:alert(1)')).toBeNull()
     expect(sanitizeHref('JaVaScRiPt:alert(1)')).toBeNull()

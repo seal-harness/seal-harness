@@ -21,6 +21,7 @@ import { useVirtualWindow } from '../hooks/useVirtualWindow'
 import { rateLimitedLog, detectLoop, logMemoryNow } from '../lib/diag'
 import { nextScrollIntent, type ScrollIntent } from '../lib/scrollIntent'
 import { isAtBottom, isNearTop, isSyntheticScroll } from '../lib/transcriptScroll'
+import { openModalStack } from '../lib/modalStack'
 import type { LoadResult } from '../types/stream'
 
 /** The connection-state banner shown above the transcript when the
@@ -614,9 +615,6 @@ function prettyJsonOrRaw(payload: string): string {
 }
 
 // Stack of currently-open modals. Only the top entry consumes Escape so
-// that closing the topmost doesn't also collapse the one underneath.
-const openModalStack: symbol[] = []
-
 type JsonTab = 'formatted' | 'raw'
 
 function CopyJsonButton({ text }: { text: string }) {
@@ -3000,8 +2998,8 @@ export function ChatArea({
           <div className="ml-auto flex items-center gap-1 shrink-0">
            {isThinking && onStop && <StopButton onStop={onStop} />}
             <TranscriptViewToggle mode={markdownMode} onChange={changeMarkdownMode} />
-            {selectedSession && <CopySessionIdButton sessionId={selectedSession.id} />}
-            {selectedSession && <OpenWorkdirButton sessionId={selectedSession.id} />}
+           {selectedSession && <CopySessionIdButton sessionId={selectedSession.id} />}
+           {selectedSession && <OpenWorkdirButton sessionId={selectedSession.id} />}
             <button
               className="header-scroll-btn"
               title={loadingMore ? "Loading…" : "Scroll to top of transcript"}
@@ -3048,7 +3046,6 @@ export function ChatArea({
         )}
         {selectedSession && messages.length === 0 && (
           <div className="ml-auto flex items-center gap-1 shrink-0">
-           {isThinking && onStop && <StopButton onStop={onStop} />}
             <CopySessionIdButton sessionId={selectedSession.id} />
             <OpenWorkdirButton sessionId={selectedSession.id} />
           </div>
