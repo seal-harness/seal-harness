@@ -1,4 +1,5 @@
 import { Fragment, type ReactNode } from 'react'
+import { useState } from 'react'
 import type { TabInfo, TabStatus } from '../types'
 import { tabIndexToChar, repoNameFromUrl } from '../types'
 import type { SessionActivityState } from '../types/stream'
@@ -93,7 +94,9 @@ export function renderConfigurableLine(fields: TabLineField[], data: TabLineData
 // ── Provider badge ────────────────────────────────────────────────────
 // A small provider icon shown next to a tab/session. Providers with a
 // bundled logo render that logo; the rest fall back to a single-letter
-// glyph on a colored chip.
+// glyph on a colored chip. For OpenAI-compatible providers not in the static
+// map, the icon is fetched from the provider's root page (see
+// 'resolveProviderIcon').
 
 interface ProviderBadgeSpec {
   title: string
@@ -116,6 +119,14 @@ const FALLBACK_PROVIDER: ProviderBadgeSpec = { char: '?', bg: 'var(--text-faint)
 
 function ProviderBadge({ provider }: { provider: string }) {
   const badge = PROVIDER_BADGE[provider] ?? FALLBACK_PROVIDER
+  const [faviconError, setFaviconError] = useState(false)
+  const isKnown = PROVIDER_BADGE[provider] !== undefined
+  // For providers not in the static map, load the favicon from the backend
+  // proxy endpoint. The backend fetches the provider's root page, extracts
+  // <link rel="icon">, and returns the image bytes — avoiding CORS issues.
+  // On error the fallback glyph is shown.
+  const faviconSrc = `/api/providers/${encodeURIComponent(provider)}/icon`
+
   return (
     <span
       data-testid={`provider-badge-${provider || 'unknown'}`}
@@ -144,7 +155,15 @@ function ProviderBadge({ provider }: { provider: string }) {
             aria-hidden="true"
             style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
           />
-        : badge.char}
+        : !isKnown && !faviconError
+          ? <img
+              src={faviconSrc}
+              alt=""
+              aria-hidden="true"
+              onError={() => setFaviconError(true)}
+              style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
+            />
+          : badge.char}
     </span>
   )
 }

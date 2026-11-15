@@ -434,6 +434,8 @@ harnessAppWith config paths ref calls = do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
         }
   pure (apiApp deps)
 

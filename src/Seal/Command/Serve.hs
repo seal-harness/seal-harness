@@ -89,6 +89,7 @@ import Seal.Security.DaemonLock (ServeLock, acquireServeLock)
 import Seal.Gateway.AccessControl
   ( NewAccess (..), newAccessControlHandle, printAccessControlBannerTo )
 import Seal.Gateway.API (ApiDeps (..))
+import Seal.Gateway.ProviderIcon (newIconCache)
 import Seal.Gateway.Config
   ( GatewayConfig (..), gatewayHostError
   , gatewayHostResolutionError, hostResolves, tlsConfigError, tlsEnabled, tlsOriginError
@@ -584,6 +585,7 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
     Just uec -> case uecRemote uec of
       Nothing -> pure mkFailClosedFileExplorer
       Just sshCfg -> mkRemoteFileExplorer sshCfg mkRealRemoteRunner maxScanBytes downloadChunkBytes
+  iconCache <- newIconCache
   let deps = ApiDeps
         { adSessionRuntime  = sr
         , adTabsHandle      = tabsH
@@ -636,6 +638,8 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
         , adDownloadPromptBytes = downloadPromptBytes
         , adDownloadChunkBytes  = downloadChunkBytes
         , adDownloadAllowBlocked = downloadAllowBlocked
+        , adHttpManager = Just mgr
+        , adIconCache = Just iconCache
         }
   -- The WS stream server is MOUNTED in the HTTP application (same port),
   -- so there is no second listener and no second port to collide with.

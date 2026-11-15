@@ -563,6 +563,8 @@ buildTestEnv tmp mode mRepo opts = do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
         }
       app = apiApp deps
   pure ApiTestEnv
