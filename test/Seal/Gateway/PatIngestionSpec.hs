@@ -282,6 +282,8 @@ mkVaultDeps vr tmp = do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
         , adSecurityConfig   = defaultSecurityConfig
         , adMkSessionExec    = Nothing
         }

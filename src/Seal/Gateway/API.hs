@@ -41,6 +41,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Text.Read (decimal)
 import Text.Read (readMaybe)
+import Network.HTTP.Client (Manager)
 import Network.HTTP.Types
   ( Header, HeaderName, Status, methodDelete, methodGet, methodOptions
   , methodPost, methodPut
@@ -106,6 +107,8 @@ import Seal.Gateway.Send
   , handleAnswerDelivery, handleAnswerTextDelivery, parseAnswerBody
   , handleAskCancel, handleSetupRepo, sendOutcomeJson )
 import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastAgentDefsChanged, broadcastSkillsChanged, broadcastReposChanged)
+import Seal.Gateway.ProviderIcon
+  ( IconCache, IconResult (..), resolveProviderIconBytes, newIconCache )
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
 import Seal.Gateway.SessionJson
   ( sessionInfoJsonWithSnippet, tabToJson )
@@ -215,6 +218,12 @@ data ApiDeps = ApiDeps
   , adDownloadPromptBytes :: Int    -- ^ the size threshold (bytes) above which the frontend prompts the user before downloading (default 256 MiB).
   , adDownloadChunkBytes  :: Int    -- ^ the chunk size for chunked downloads (default 4 MiB). Also the second Int passed to 'mkLocalFileExplorer'/'mkRemoteFileExplorer'.
   , adDownloadAllowBlocked :: Bool  -- ^ when 'True', the chunked download routes skip 'blockedSegment' enforcement (SEC-B3 override; default 'False').
+  , adHttpManager :: Maybe Manager
+    -- ^ The shared TLS HTTP manager (for the provider favicon proxy
+    -- endpoint). 'Nothing' in tests; 'Just mgr' in production.
+  , adIconCache :: Maybe IconCache
+    -- ^ In-memory cache of resolved favicons. 'Nothing' in tests;
+    -- 'Just cache' in production.
   }
 
 -- | The REST API as a WAI Application.
@@ -723,6 +732,11 @@ dispatchApi deps req respond =
     -- DELETE /api/providers/:name -> remove vault credentials + clear default.
     (m', ["api", "providers", p]) | m' == methodDelete ->
      respond =<< handleProviderDelete deps p
+    -- GET /api/providers/:name/icon — proxy the provider's favicon.
+    -- Fetches the root page, extracts <link rel="icon">, and returns the
+    -- image bytes with the correct Content-Type. 404 when no icon found.
+    (m', ["api", "providers", p, "icon"]) | m' == methodGet ->
+      respond =<< handleProviderIcon deps p
     -- T11: GET /api/providers/:p/models -> a STATIC list of models for the
     -- provider (the real /v1/models upstream call needs vault credentials +
     -- a live HTTP request and is out of scope). Context windows come from
@@ -3400,6 +3414,42 @@ handleProviderDelete deps name = do
                             ("the credentials were removed, but the provider config could not be updated: " <> e))
                 Right () -> pure noContent
             else pure noContent
+
+-- | Handle GET /api/providers/:name/icon — proxy the provider's favicon.
+-- Looks up the provider's base URL from config, derives the root page URL,
+-- fetches the HTML, extracts the @<link rel="icon">@ href, fetches the icon
+-- image bytes, and returns them with the correct Content-Type. Returns 404
+-- when no icon is found or the HTTP manager / cache is not available.
+handleProviderIcon :: ApiDeps -> Text -> IO Response
+handleProviderIcon deps name = do
+  case (adHttpManager deps, adIconCache deps) of
+    (Nothing, _) -> pure (errJson status404 "icon resolution not available")
+    (_, Nothing) -> do
+      cache <- newIconCache
+      handleProviderIconWith cache deps name
+    (Just _mgr, Just cache) -> handleProviderIconWith cache deps name
+
+-- | The shared icon-resolution path, given a cache + the deps.
+handleProviderIconWith :: IconCache -> ApiDeps -> Text -> IO Response
+handleProviderIconWith cache deps name = do
+  let cfgPath = srConfigPath (adSessionRuntime deps)
+  eCfg <- loadRuntimeConfig cfgPath
+  let cfg = fromRight defaultRuntimeConfig eCfg
+      mBaseUrl = providerBaseUrl cfg name
+  case mBaseUrl of
+    Nothing -> pure (errJson status404 "no base URL configured for this provider")
+    Just baseUrl -> case adHttpManager deps of
+      Nothing -> pure (errJson status404 "icon resolution not available")
+      Just mgr -> do
+        result <- resolveProviderIconBytes cache mgr baseUrl
+        case result of
+          IconNotFound -> pure (errJson status404 "no icon found")
+          IconFound bytes contentType ->
+            pure (responseLBS status200
+              [ (mkHN "Content-Type", TE.encodeUtf8 contentType)
+              , (mkHN "Cache-Control", "public, max-age=600")
+              ] (BL.fromStrict bytes))
+
 
 -- ---------------------------------------------------------------------------
 -- Channel CRUD handlers (design §3.7)

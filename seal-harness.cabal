@@ -254,6 +254,7 @@ library
          Seal.Gateway.OriginGuard
          Seal.Gateway.Setup
          Seal.Gateway.Audit
+         Seal.Gateway.ProviderIcon
         Seal.Gateway.API
          Seal.Gateway.Embedded
          Seal.Gateway.Route
@@ -475,6 +476,7 @@ test-suite tests
         Seal.Core.SystemPromptSpec
         Seal.Gateway.ConfigSpec
         Seal.Gateway.EmbeddedSpec
+        Seal.Gateway.ProviderIconSpec
         Seal.Gateway.AccessControlSpec
         Seal.Gateway.OriginGuardSpec
         Seal.Gateway.MutationGuardSpec

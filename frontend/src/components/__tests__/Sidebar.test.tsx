@@ -7,14 +7,6 @@ import { ROW_SESSION_NAME_INDENT_PX } from '../RowLayout'
 import { DEFAULT_TAB_LINE_FIELDS } from '../../lib/tabLineConfig'
 import type { SessionInfo, TabInfo } from '../../types'
 
-// Mock the provider base URL hook so ProviderBadge does not trigger a real
-// fetch in tests. The map is empty by default; individual tests can override.
-vi.mock('../../hooks/useProviderBaseUrls', () => ({
-  useProviderBaseUrls: () => new Map<string, string>(),
-  getProviderBaseUrls: () => Promise.resolve(new Map<string, string>()),
-  refreshProviderBaseUrls: () => {},
-}))
-
 function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   return {
     id: 's1',

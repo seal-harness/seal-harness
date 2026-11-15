@@ -1,12 +1,10 @@
 import { Fragment, type ReactNode } from 'react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import type { TabInfo, TabStatus } from '../types'
 import { tabIndexToChar, repoNameFromUrl } from '../types'
 import type { SessionActivityState } from '../types/stream'
 import { deriveTabStatusKind, type TabStatusKind } from '../lib/tabStatus'
 import type { TabLineField } from '../lib/tabLineConfig'
-import { resolveProviderIcon } from '../lib/providerIcons'
-import { useProviderBaseUrls } from '../hooks/useProviderBaseUrls'
 import { ActivityDot } from './StatusDot'
 import { RowIndexSlot, RowStatusSlot, ROW_SECOND_LINE_INDENT_PX } from './RowLayout'
 import ollamaIcon from '../../assets/ollama-icon.svg'
@@ -121,23 +119,13 @@ const FALLBACK_PROVIDER: ProviderBadgeSpec = { char: '?', bg: 'var(--text-faint)
 
 function ProviderBadge({ provider }: { provider: string }) {
   const badge = PROVIDER_BADGE[provider] ?? FALLBACK_PROVIDER
-  const baseUrls = useProviderBaseUrls()
-  const [faviconUrl, setFaviconUrl] = useState<string | null>(null)
   const [faviconError, setFaviconError] = useState(false)
-
-  // For providers not in the static map, try to resolve an icon from the
-  // provider's root page. This is a best-effort fetch: on any failure the
-  // fallback glyph is shown instead.
-  useEffect(() => {
-    if (PROVIDER_BADGE[provider]) return
-    const baseUrl = baseUrls.get(provider)
-    if (!baseUrl) return
-    let cancelled = false
-    void resolveProviderIcon(baseUrl).then((url) => {
-      if (!cancelled) setFaviconUrl(url)
-    })
-    return () => { cancelled = true }
-  }, [provider, baseUrls])
+  const isKnown = PROVIDER_BADGE[provider] !== undefined
+  // For providers not in the static map, load the favicon from the backend
+  // proxy endpoint. The backend fetches the provider's root page, extracts
+  // <link rel="icon">, and returns the image bytes — avoiding CORS issues.
+  // On error the fallback glyph is shown.
+  const faviconSrc = `/api/providers/${encodeURIComponent(provider)}/icon`
 
   return (
     <span
@@ -167,9 +155,9 @@ function ProviderBadge({ provider }: { provider: string }) {
             aria-hidden="true"
             style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
           />
-        : faviconUrl && !faviconError
+        : !isKnown && !faviconError
           ? <img
-              src={faviconUrl}
+              src={faviconSrc}
               alt=""
               aria-hidden="true"
               onError={() => setFaviconError(true)}
