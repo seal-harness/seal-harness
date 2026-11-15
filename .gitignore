@@ -28,3 +28,7 @@ currently-running.txt
 # Playwright artifacts
 frontend/test-results/
 frontend/playwright-report/
+
+# Release tarballs produced by scripts/package-release.sh
+/seal-*.tar.gz
+/seal-*.tar.gz.sha256

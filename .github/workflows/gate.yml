@@ -1,0 +1,306 @@
+name: Gate
+
+# The single definition of "the gate". Both ci.yml (on push to main and on
+# pull requests) and release.yml (on a release tag) call this workflow, so a
+# tag cannot publish through a weaker check than the one guarding main.
+#
+# `make check` is deliberately NOT used here: it runs `cabal build` against the
+# working tree, which has no `frontend/dist` after a clean checkout, so the
+# embedded-UI paths would be silently skipped. Building with nix instead makes
+# the UI a real build input (see flake.nix) — the same artifact users download.
+
+on:
+  workflow_call:
+    inputs:
+      system:
+        description: Nix system string (e.g. x86_64-linux)
+        required: true
+        type: string
+      runner:
+        description: GitHub runner label
+        required: true
+        type: string
+      push-cache:
+        description: Push built store paths to the S3 Nix binary cache
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      NIX_CACHE_SIGNING_KEY:
+        required: false
+      NIX_CACHE_AWS_ACCESS_KEY_ID:
+        required: false
+      NIX_CACHE_AWS_SECRET_ACCESS_KEY:
+        required: false
+
+jobs:
+  gate:
+    name: Gate (${{ inputs.system }})
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+    env:
+      NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+      NIX_CACHE_AWS_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_AWS_ACCESS_KEY_ID }}
+      NIX_CACHE_AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          extra-conf: |
+            accept-flake-config = true
+
+      - name: Restore Nix store cache
+        uses: nix-community/cache-nix-action/restore@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      - name: Populate Nix store with dependencies
+        run: nix develop --command true
+
+      - name: Save Nix store cache
+        uses: nix-community/cache-nix-action/save@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          gc-max-store-size-linux: 5G
+          gc-max-store-size-macos: 5G
+          purge: true
+          purge-created: 604800
+
+      # Build the release artifact: the single self-contained binary, with the
+      # web UI compiled in.
+      - name: Build
+        run: nix build --print-build-logs
+
+      # hlint is a documented requirement (`make check`) that CI did not
+      # previously enforce. See issue #7.
+      - name: Lint (hlint)
+        run: nix develop --command hlint src/ test/
+
+      - name: Run Haskell tests with coverage
+        run: nix develop --command cabal test --enable-coverage
+
+      - name: Run frontend tests
+        run: nix develop --command bash -c 'cd frontend && npm ci --prefer-offline && npm test'
+
+      # ───────────────────────────────────────────────────────────────────
+      # Assert the artifact is actually a working single binary. A UI-less
+      # build is valid for developers but never for a release, and nothing
+      # previously executed the packaged binary, so one shipped unnoticed.
+      # ───────────────────────────────────────────────────────────────────
+      - name: Smoke test the built binary
+        run: |
+          set -eu
+          BIN=./result/bin/seal
+          # The binary must be self-contained: no dist, no static dir.
+          rm -rf frontend/dist
+
+          "$BIN" --help > /dev/null
+          "$BIN" gen-openapi > /dev/null
+
+          # Boot the gateway and require the embedded UI to be served.
+          export HOME="$(mktemp -d)"
+          "$BIN" serve --no-enrollment-token --yolo > smoke.log 2>&1 &
+          SERVE_PID=$!
+          trap 'kill $SERVE_PID 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -sf -o index.html http://localhost:8080/ 2>/dev/null; then break; fi
+            sleep 1
+          done
+
+          if ! grep -q '<div id="root">' index.html 2>/dev/null; then
+            echo "::error::Built binary did not serve the embedded UI."
+            echo "--- GET / ---"
+            cat index.html 2>/dev/null || echo "(no response)"
+            echo "--- serve.log ---"
+            cat smoke.log
+            exit 1
+          fi
+          echo "Embedded UI served ($(wc -c < index.html) bytes)."
+
+          # Static assets referenced by the page must resolve from the binary.
+          ASSET=$(grep -oE '/assets/[A-Za-z0-9_.-]+\.js' index.html | head -1)
+          if [ -n "$ASSET" ]; then
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:8080$ASSET")
+            if [ "$CODE" != "200" ]; then
+              echo "::error::Embedded asset $ASSET returned $CODE"
+              exit 1
+            fi
+            echo "Embedded asset $ASSET served."
+          fi
+
+      - name: Post test timing summary
+        if: always()
+        run: |
+          {
+            echo "## Test Case Timing Report"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f currently-running.txt ] && [ -s currently-running.txt ]; then
+            RUNNING=$(cat currently-running.txt)
+            {
+              echo "### ⚠️ Test process was killed while running: \`$RUNNING\`"
+              echo ""
+              echo "This test was still executing when the process terminated."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ ! -f test-timings.txt ]; then
+            echo "No test-timings.txt found — timing summary skipped." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "### Slowest test cases (top 20)"
+            echo ""
+            echo "| # | Duration | Result | Test |"
+            echo "|---:|----------|--------|------|"
+            tail -n +2 test-timings.txt \
+              | sort -t$'\t' -k1 -rn \
+              | head -20 \
+              | nl -w1 -s'. ' | while IFS=$'\t' read -r num dur result path; do
+                echo "| $num | ${dur}s | $result | \`$path\` |"
+              done
+            echo ""
+            echo "<details>"
+            echo "<summary>Full timing data (all completed test cases, streaming)</summary>"
+            echo ""
+            echo '```tsv'
+            cat test-timings.txt
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate coverage report
+        if: always()
+        run: |
+          nix develop --command bash -c '
+          TIX=$(find dist-newstyle -name "tests.tix" 2>/dev/null | head -1)
+          if [ -z "$TIX" ]; then
+            echo "No .tix file found — coverage report skipped."
+            exit 0
+          fi
+          MIXDIRS=$(find dist-newstyle -path "*/hpc/vanilla/mix" -type d 2>/dev/null)
+          HPCDIR_ARGS=""
+          for d in $MIXDIRS; do
+            HPCDIR_ARGS="$HPCDIR_ARGS --hpcdir=$d"
+          done
+          echo "=== HPC Coverage Report ==="
+          REPORT=$(hpc report "$TIX" $HPCDIR_ARGS \
+            --exclude=Main \
+            --exclude=Paths_seal_harness \
+            2>&1)
+          echo "$REPORT"
+          echo "$REPORT" > coverage-report.txt
+          echo ""
+          echo "=== Per-Module Coverage ==="
+          MODULE_REPORT=$(hpc report "$TIX" $HPCDIR_ARGS \
+            --exclude=Main \
+            --exclude=Paths_seal_harness \
+            --per-module \
+            2>&1)
+          echo "$MODULE_REPORT"
+          echo "$MODULE_REPORT" > coverage-per-module.txt
+          '
+
+      - name: Post coverage to job summary
+        if: always()
+        run: |
+          if [ ! -f coverage-report.txt ]; then
+            echo "No coverage report found." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## Code Coverage (HPC)"
+            echo ""
+            echo '```'
+            cat coverage-report.txt
+            echo '```'
+            echo ""
+            echo "<details>"
+            echo "<summary>Per-module breakdown</summary>"
+            echo ""
+            echo '```'
+            cat coverage-per-module.txt
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ───────────────────────────────────────────────────────────────────
+      # Optional: push built store paths to the S3 Nix binary cache so the
+      # next run (and the release job) substitutes instead of rebuilding.
+      # Gated on secrets, which GitHub withholds from fork PRs.
+      # ───────────────────────────────────────────────────────────────────
+      - name: Push to S3 Nix cache
+        if: inputs.push-cache && env.NIX_CACHE_SIGNING_KEY != '' && env.NIX_CACHE_AWS_ACCESS_KEY_ID != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_AWS_SECRET_ACCESS_KEY }}
+        run: |
+          S3_CACHE='s3://${{ vars.NIX_CACHE_BUCKET }}'
+          KEY=/tmp/nix-cache-priv-key.pem
+          echo "$NIX_CACHE_SIGNING_KEY" > "$KEY"
+
+          echo "Collecting store paths..."
+          RESULT_PATHS=""
+          if [ -e ./result ]; then
+            RESULT_PATHS=$(nix-store -qR ./result)
+          else
+            echo "No ./result found, pushing dev shell only."
+          fi
+
+          DEVSHELL_OUT=$(nix build .#devShells.${{ inputs.system }}.default --print-out-paths --no-link 2>/dev/null || true)
+          DEVSHELL_PATHS=""
+          if [ -n "$DEVSHELL_OUT" ]; then
+            DEVSHELL_PATHS=$(nix-store -qR $DEVSHELL_OUT)
+          fi
+
+          ALL_PATHS=$(echo -e "${RESULT_PATHS}\n${DEVSHELL_PATHS}" | sort -u | grep -v '^$')
+          if [ -z "$ALL_PATHS" ]; then
+            echo "No store paths to push."
+            exit 0
+          fi
+
+          TOTAL=$(echo "$ALL_PATHS" | wc -l)
+          echo "Signing and pushing $TOTAL store paths..."
+          echo "$ALL_PATHS" | xargs nix store sign --key-file "$KEY"
+          echo "$ALL_PATHS" | xargs nix copy --to "$S3_CACHE"
+          echo "Cache push complete: $TOTAL paths."
+
+      - name: Stage coverage HTML for Pages
+        if: always()
+        run: |
+          HTML_DIR=$(find dist-newstyle -path "*/hpc/vanilla/html" -type d 2>/dev/null | head -1)
+          if [ -n "$HTML_DIR" ]; then
+            mkdir -p new-coverage
+            cp -r "$HTML_DIR"/* new-coverage/
+            [ -f coverage-report.txt ] && cp coverage-report.txt new-coverage/summary.txt
+          fi
+
+      - name: Generate OpenAPI spec
+        if: always()
+        run: |
+          ./result/bin/seal gen-openapi > openapi.json
+          if [ -s openapi.json ]; then
+            echo "OpenAPI spec generated ($(wc -c < openapi.json) bytes)"
+          else
+            echo "OpenAPI spec generation failed — skipping Pages deploy"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-docs-${{ inputs.system }}
+          path: |
+            coverage-report.txt
+            coverage-per-module.txt
+            new-coverage
+            openapi.json
+          if-no-files-found: ignore
+          retention-days: 7
