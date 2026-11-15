@@ -191,11 +191,14 @@ export function CronView() {
         }}>
           <span style={{ fontSize: 13, fontWeight: 600 }}>Cron Jobs</span>
           <button
-            className="btn btn-ghost"
+            type="button"
+            className="btn btn-ghost flex items-center justify-center"
+            style={{ width: 22, height: 22, padding: 0, fontSize: 14, lineHeight: 1 }}
             onClick={() => { setCreating(true); setEditing(null) }}
-            style={{ fontSize: 12, padding: '2px 8px' }}
+            aria-label="New cron job"
+            title="New cron job"
           >
-            + New
+            +
           </button>
         </div>
         {sortedJobs.length === 0 && loaded && (
@@ -372,7 +375,8 @@ export function CronView() {
             {/* Action buttons */}
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               <button
-                className="btn btn-primary"
+                type="button"
+                className="btn btn-primary px-3 py-2 rounded-lg text-sm font-medium"
                 onClick={handleSubmit}
                 disabled={submitting || !name || !schedule || !prompt}
               >
@@ -381,7 +385,8 @@ export function CronView() {
 
               {!creating && editing && (
                 <button
-                  className="btn btn-ghost"
+                  type="button"
+                  className="btn btn-ghost px-3 py-2 rounded-lg text-sm font-medium"
                   onClick={() => handleToggleEnabled(jobs.find((j) => j.id === editing)!)}
                 >
                   {enabled ? 'Disable' : 'Enable'}
@@ -393,13 +398,15 @@ export function CronView() {
                   <>
                     <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Confirm?</span>
                     <button
-                      className="btn btn-danger-ghost"
+                      type="button"
+                      className="btn btn-danger-ghost px-3 py-2 rounded-lg text-sm font-medium"
                       onClick={() => handleDelete(editing)}
                     >
                       Yes, delete
                     </button>
                     <button
-                      className="btn btn-ghost"
+                      type="button"
+                      className="btn btn-ghost px-3 py-2 rounded-lg text-sm font-medium"
                       onClick={() => setConfirmingDelete(null)}
                     >
                       Cancel
@@ -407,7 +414,8 @@ export function CronView() {
                   </>
                 ) : (
                   <button
-                    className="btn btn-danger-ghost"
+                    type="button"
+                    className="btn btn-danger-ghost px-3 py-2 rounded-lg text-sm font-medium"
                     onClick={() => setConfirmingDelete(editing)}
                   >
                     Delete
@@ -416,7 +424,8 @@ export function CronView() {
               )}
 
               <button
-                className="btn btn-ghost"
+                type="button"
+                className="btn btn-ghost px-3 py-2 rounded-lg text-sm font-medium"
                 onClick={() => { setEditing(null); setCreating(false); setFormError(null) }}
               >
                 Cancel
