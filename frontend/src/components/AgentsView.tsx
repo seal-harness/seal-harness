@@ -9,6 +9,7 @@ import {
   useAgentDefs,
   useConfiguredProviders,
 } from '../hooks/useApi'
+import { type AgentGroup, groupAgents } from '../lib/agentGroups'
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -98,45 +99,6 @@ function defToInput(d: AgentDefInfo): AgentDefInput {
 }
 
 // ── Grouping ─────────────────────────────────────────────────────────────
-
-/** The display label for an agent's group.  Ungrouped agents (group === null
- *  or empty string) fall under the default "Agents" heading, matching the
- *  behaviour of the backend's available-agents catalog and the flat on-disk
- *  layout (no subdirectory). Mirrors SkillsView.groupLabel. */
-function groupLabel(group: string | null): string {
-  const g = group?.trim()
-  if (!g) return 'Agents'
-  return g
-}
-
-/** Partition agents into groups in display order.  Ungrouped agents come
- *  first (under "Agents"), then named groups in alphabetical order —
- *  matching the sorting in the backend's prompt catalog. Mirrors
- *  SkillsView.groupSkills. */
-interface AgentGroup {
-  label: string
-  agents: AgentDefInfo[]
-}
-
-function groupAgents(agents: AgentDefInfo[]): AgentGroup[] {
-  const sorted = [...agents].sort((a, b) => {
-    const ga = a.group?.trim() ?? ''
-    const gb = b.group?.trim() ?? ''
-    if (ga !== gb) return ga.localeCompare(gb)
-    return a.id.localeCompare(b.id)
-  })
-  const groups: AgentGroup[] = []
-  for (const a of sorted) {
-    const label = groupLabel(a.group)
-    const last = groups[groups.length - 1]
-    if (last && last.label === label) {
-      last.agents.push(a)
-    } else {
-      groups.push({ label, agents: [a] })
-    }
-  }
-  return groups
-}
 
 // ── Collapsible group section ────────────────────────────────────────────
 

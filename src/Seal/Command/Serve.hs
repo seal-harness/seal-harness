@@ -15,6 +15,7 @@ import Data.ByteString qualified as BS
 import Data.Map.Strict qualified as Map
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, isNothing)
+import Data.Time (getCurrentTime)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.X509.CertificateStore
@@ -71,7 +72,7 @@ import Seal.Command.Repo (RepoTestSeam (..))
 import Seal.Command.Shutdown (handleServeInterrupt)
 import Seal.Command.Stop (mkStopTranscriptWriter)
 import Seal.Command.Spec (mkRegistry)
-import Seal.Gateway.Send (SendDeps (..), handleSetupRepo, newSessionWakeMutex)
+import Seal.Gateway.Send (SendDeps (..), handleSend, handleSetupRepo, newSessionWakeMutex)
 import Seal.Logging.Logger (SealLogger, logIO)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Migrate (migrateSecurityConfig)
@@ -124,7 +125,7 @@ import Seal.Session.AgentMetaCache
 import Seal.SourceControl.AgentRegistry (AgentRegistryHandle, mkAgentRegistryHandle, arProbeAndSweep)
 import Seal.SourceControl.Registry (RepoRegistryHandle, mkRepoRegistryHandle)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
-import Seal.Session.Store (SessionRuntime (..), initSessionMeta)
+import Seal.Session.Store (SessionRuntime (..), initSessionMeta, newSession, resolveDefaultAgent, defaultSessionSelection)
 import Seal.Tabs (newPersistingTabsHandle, insertTabH, seedTabsHandle)
 import Seal.Tabs.Persist (loadTabList)
 import Seal.Text.LineFile (maxScanBytes)
@@ -135,6 +136,11 @@ import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Provision (defaultProvisionDeps)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Web.UiState (newUiStateHandle)
+import Seal.Cron.Scheduler (CronScheduler (..), startCronScheduler, defaultTickInterval, defaultMaxConcurrent)
+import Seal.Cron.Types (CronJob (..))
+import Seal.ISA.Ops.Cron (CronFireDelegate)
+import Seal.Agent.Def.Types (mkAgentDefId)
+import Control.Concurrent.STM (newTVarIO)
 
 -- | Full @seal serve@ startup wiring. Mirrors 'Seal.Tui.runTui': paths →
 -- config → vault → session → backends → tabsH → broker → gateway + WS
@@ -321,11 +327,61 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
   -- config repo's git HEAD hash on each write.
   setAuditLogger (fileAuditSinkWithGit (auditDir paths) (gitShortHead repo))
   embedding <- resolveEmbeddingBackend (rcEmbedding cfg) (spHome paths)
-  backends <- newBackends paths repo embedding
+  backends0 <- newBackends paths repo embedding
   -- Publish the sub-agent runtime so an interrupt during the gateway run can
   -- log exactly which children are being taken down with the process
   -- ('Seal.Command.Shutdown').
-  writeIORef runtimeRef (Just (bRuntime backends))
+  writeIORef runtimeRef (Just (bRuntime backends0))
+  -- Cron fire delegate: creates a fresh session and runs the job's prompt
+  -- through the web turn path. The delegate closes over an IORef that is
+  -- filled once 'sendDeps' is constructed (below) — this breaks the
+  -- circular dependency (Backends → scheduler → delegate → SendDeps →
+  -- Backends). Until the IORef is filled, the delegate returns an error
+  -- (the scheduler records a Failed run, same as the old stub, but only
+  -- for the brief window before sendDeps exists).
+  cronSendDepsRef <- newIORef (Nothing :: Maybe SendDeps)
+  let loadCfgLocal = fromRight defaultRuntimeConfig <$> loadRuntimeConfig cfgPath
+      cronFireDelegate :: CronFireDelegate
+      cronFireDelegate job = do
+        mSendDeps <- readIORef cronSendDepsRef
+        case mSendDeps of
+          Nothing -> pure (Left "cron fire delegate: sendDeps not yet initialized")
+          Just sendDeps -> do
+            -- Resolve the agent def id from the job, falling back to the
+            -- configured default. The job's agent_def_id is a raw Text;
+            -- validate it through the smart constructor.
+            cronCfg <- loadCfgLocal
+            (mAgent, mProv, mModel) <- resolveDefaultAgent (bAgentDefs backends0) cronCfg
+            let (cfgProv, cfgModel) = defaultSessionSelection cronCfg
+                mJobAgent = case cjAgentDefId job of
+                  Just raw -> case mkAgentDefId raw of
+                    Right aid -> Just aid
+                    Left _ -> Nothing
+                  Nothing -> mAgent
+                provider = fromMaybe cfgProv mProv
+                model = fromMaybe cfgModel mModel
+            meta <- newSession paths provider model "cron" mJobAgent
+            let sid = smId meta
+            void (forkIO (void (handleSend sendDeps sid Nothing (cjPrompt job))))
+            pure (Right sid)
+  -- Wire the fire delegate into the backends so CRON_MANAGE action=trigger
+  -- (and any other consumer of bCronFire) can fire jobs too, not just the
+  -- scheduler. The original backends had bCronFire = Nothing. Shadow the
+  -- binding so all downstream consumers (chanDeps, sendDeps, ApiDeps) see
+  -- the wired delegate.
+  let backends = backends0 { bCronFire = Just cronFireDelegate }
+  -- Start the cron scheduler (background thread).
+  cronStopSignal <- newTVarIO False
+  let cronScheduler = CronScheduler
+        { csStore = bCronStore backends
+        , csFireDelegate = cronFireDelegate
+        , csClock = getCurrentTime
+        , csTickInterval = defaultTickInterval
+        , csStopSignal = cronStopSignal
+        , csMaxConcurrent = defaultMaxConcurrent
+        , csNotifyHuman = \_msg -> pure ()
+        }
+  void (forkIO (startCronScheduler cronScheduler))
   wakeMutex <- newSessionWakeMutex
   -- W4: the source-control repo registry handle (closes over
   -- repos.toml). Built once at startup and threaded into ApiDeps for
@@ -499,6 +555,9 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
           -- ^ Irrelevant in production ('sdMkWorker' is 'Nothing'); the
           -- default keeps the depth-conditional stub semantics coherent.
         }
+  -- Publish the fully-constructed sendDeps to the cron fire delegate so
+  -- the scheduler can start spawning sessions for due jobs.
+  writeIORef cronSendDepsRef (Just sendDeps)
   -- Build the gateway config (from the [gateway] section or the default)
   let gwCfg = gwCfgTls
   -- The WS stream server's liveness, published through /api/health. The
@@ -571,6 +630,7 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
         , adSecurityConfig   = secCfg
         , adMkSessionExec    = Nothing
         , adAbortReg         = cdAbortReg chanDeps
+        , adCronStore        = bCronStore backends
         , adFileExplorer     = fileExplorer
         , adFileExplorerEnabled = fileExplorerEnabled
         , adDownloadPromptBytes = downloadPromptBytes

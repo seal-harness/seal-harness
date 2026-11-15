@@ -41,6 +41,18 @@ import Seal.Tools.Exec.FileExplorer
   , mkLocalFileExplorer
   , mkFailClosedFileExplorer
   )
+import Seal.Cron.Store (CronStore (..))
+
+stubCronStore :: CronStore
+stubCronStore = CronStore
+  { csCreate    = \_ -> error "cron store stub: csCreate"
+  , csRead      = \_ -> error "cron store stub: csRead"
+  , csList      = \_ -> error "cron store stub: csList"
+  , csSave      = \_ -> error "cron store stub: csSave"
+  , csDelete    = \_ -> error "cron store stub: csDelete"
+  , csRecordRun = \_ _ -> error "cron store stub: csRecordRun"
+  , csListRuns  = \_ _ -> error "cron store stub: csListRuns"
+  }
 
 spec :: Spec
 spec = describe "Seal.Gateway.ApiFilesSpec" $ do
@@ -295,6 +307,7 @@ mkDepsWithCache cacheRoot fe enabled = do
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     , adAbortReg = abortReg
+    , adCronStore = stubCronStore
     , adFileExplorer = fe
     , adFileExplorerEnabled = enabled
 , adDownloadPromptBytes = 268435456
