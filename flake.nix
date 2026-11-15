@@ -34,7 +34,7 @@
           (final: _prev: {
             sealHarnessProject =
               final.haskell-nix.cabalProject' {
-                src = ./.;
+                src = projectSrc;
                 # Concrete patch version that haskell.nix prebuilds and pushes to
                 # cache.iog.io (see nixConfig above). The bare "ghc912" alias
                 # resolved to an uncached GHC, forcing a source build in CI.
@@ -68,11 +68,76 @@
           inherit (haskellNix) config;
         };
 
+        # ─────────────────────────────────────────────────────────────────
+        # Frontend build. `frontend/dist` is gitignored, so it is absent from
+        # the flake source; without this the `file-embed` splice in
+        # Seal.Gateway.Embedded takes its empty branch and `nix build` ships a
+        # binary whose `seal serve` has no UI. Building it here makes the UI a
+        # reproducible build input, so `nix build` alone yields the
+        # self-contained single binary that is the release deliverable.
+        # ─────────────────────────────────────────────────────────────────
+        frontendSrc = lib.cleanSourceWith {
+          src = ./frontend;
+          name = "seal-harness-frontend-src";
+          filter = path: _type:
+            let base = baseNameOf path;
+            in !(builtins.elem base [ "node_modules" "dist" ]);
+        };
+
+        frontendDist = pkgs.buildNpmPackage {
+          pname = "seal-harness-frontend";
+          version = "0.1.0";
+          src = frontendSrc;
+          # Hashes the `deps` tree from package-lock.json. Regenerate when the
+          # lockfile changes: `nix run .#prefetch-npm-deps frontend/package-lock.json`.
+          npmDepsHash = "sha256-nfdSmqPYGIqFkUUfUugkdF/0t7zT4rsg9oupF3g1sJ4=";
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out
+            cp -r dist/. $out/
+            # Sentinel read by Seal.Gateway.Embedded.distManifest: identifies
+            # which UI build is baked into a binary. Hashes the asset tree,
+            # excluding the sentinel itself, which does not exist until now.
+            ( cd $out \
+              && find . -type f ! -name '.seal-manifest' -print0 \
+                 | LC_ALL=C sort -z \
+                 | xargs -0 sha256sum \
+                 | sha256sum > .seal-manifest )
+            runHook postInstall
+          '';
+        };
+
+        # The flake source with the built dist spliced in, so that the splice
+        # in Seal.Gateway.Embedded finds `frontend/dist` at compile time.
+        projectSrc = pkgs.runCommand "seal-harness-src" { } ''
+          cp -r ${./.} $out
+          chmod -R u+w $out
+          rm -rf $out/frontend/dist $out/frontend/node_modules
+          cp -r ${frontendDist} $out/frontend/dist
+        '';
+
+        lib = pkgs.lib;
+
         flake = pkgs.sealHarnessProject.flake { };
 
       in flake // {
         # `nix build` produces the seal executable.
         packages.default = flake.packages."seal-harness:exe:seal";
+
+        # `nix build .#frontend` produces the compiled UI on its own.
+        packages.frontend = frontendDist;
+
+        # Exposed so `npmDepsHash` above can be regenerated after a lockfile
+        # change: `nix run .#prefetch-npm-deps frontend/package-lock.json`.
+        packages.prefetch-npm-deps =
+          pkgs.runCommand "prefetch-npm-deps-wrapper" { } ''
+            mkdir -p $out/bin
+            cat > $out/bin/prefetch-npm-deps <<'EOF'
+            #!${pkgs.runtimeShell}
+            exec ${pkgs.prefetch-npm-deps}/bin/prefetch-npm-deps "$@"
+            EOF
+            chmod +x $out/bin/prefetch-npm-deps
+          '';
 
         # `nix build .#checks` runs the test suite.
         checks = flake.checks;
