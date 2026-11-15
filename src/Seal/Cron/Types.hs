@@ -162,6 +162,14 @@ data CronJob = CronJob
   , cjTimezone    :: !(Maybe CronTimeZone)
   , cjPrompt      :: !Text
   , cjAgentDefId  :: !(Maybe Text)
+  , cjProvider    :: !(Maybe Text)
+    -- ^ Optional provider override. 'Nothing' means "use Seal's configured
+    -- default provider". Validated at the write boundary by 'isProviderName'
+    -- (syntactic only — an unconfigured-but-valid name is caught at fire time).
+  , cjModel       :: !(Maybe Text)
+    -- ^ Optional model override. 'Nothing' means "use Seal's configured
+    -- default model". Independent of 'cjProvider': a model with no provider
+    -- applies to whichever provider resolves at fire time.
   , cjEnabled     :: !Bool
   , cjOneShot     :: !Bool
   , cjCreatedAt   :: !UTCTime
@@ -179,6 +187,8 @@ instance ToJSON CronJob where
     , "timezone" .= cjTimezone j
     , "prompt" .= cjPrompt j
     , "agent_def_id" .= cjAgentDefId j
+    , "provider" .= cjProvider j
+    , "model" .= cjModel j
     , "enabled" .= cjEnabled j
     , "one_shot" .= cjOneShot j
     , "created_at" .= cjCreatedAt j
@@ -197,6 +207,8 @@ instance FromJSON CronJob where
     mTz <- o .:? "timezone"
     prompt <- o .: "prompt"
     mAgentDefId <- o .:? "agent_def_id"
+    mProvider <- o .:? "provider"
+    mModel <- o .:? "model"
     enabled <- o .: "enabled"
     oneShot <- o .: "one_shot"
     createdAt <- o .: "created_at"
@@ -211,6 +223,8 @@ instance FromJSON CronJob where
       , cjTimezone = mTz
       , cjPrompt = prompt
       , cjAgentDefId = mAgentDefId
+      , cjProvider = mProvider
+      , cjModel = mModel
       , cjEnabled = enabled
       , cjOneShot = oneShot
       , cjCreatedAt = createdAt

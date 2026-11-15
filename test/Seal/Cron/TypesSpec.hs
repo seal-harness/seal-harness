@@ -186,9 +186,77 @@ spec = do
     it "slugify result is at most 32 chars" $
       property $ \(name :: Text) -> T.length (slugify name) <= 32
 
+  describe "CronJob provider + model" $ do
+    it "round-trips provider and model through encode/decode" $ do
+      let job = sampleJob { cjProvider = Just "anthropic"
+                          , cjModel = Just "claude-opus-4-8" }
+      case decode (encode job) :: Maybe CronJob of
+        Nothing -> expectationFailure "job did not decode"
+        Just back -> do
+          cjProvider back `shouldBe` Just "anthropic"
+          cjModel back `shouldBe` Just "claude-opus-4-8"
+
+    it "round-trips absent provider and model as Nothing" $ do
+      let job = sampleJob { cjProvider = Nothing, cjModel = Nothing }
+      case decode (encode job) :: Maybe CronJob of
+        Nothing -> expectationFailure "job did not decode"
+        Just back -> do
+          cjProvider back `shouldBe` Nothing
+          cjModel back `shouldBe` Nothing
+
+    -- Backward compatibility: a job file written by the previous build has
+    -- none of the new keys. `.:?` must make it decode with both fields unset
+    -- rather than failing the whole job (which would silently drop it from
+    -- the schedule).
+    it "decodes a job written before the fields existed" $ do
+      let legacy = object
+            [ "id" .= ("legacy-job" :: Text)
+            , "name" .= ("Legacy" :: Text)
+            , "schedule" .= ("0 9 * * *" :: Text)
+            , "prompt" .= ("do things" :: Text)
+            , "enabled" .= False
+            , "one_shot" .= False
+            , "created_at" .= sampleTime
+            , "updated_at" .= sampleTime
+            , "run_count" .= (0 :: Int)
+            ]
+      case decode (encode legacy) :: Maybe CronJob of
+        Nothing -> expectationFailure "legacy job did not decode"
+        Just back -> do
+          cjProvider back `shouldBe` Nothing
+          cjModel back `shouldBe` Nothing
+          cjAgentDefId back `shouldBe` Nothing
+
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
+
+sampleJob :: CronJob
+sampleJob = CronJob
+  { cjId = case mkCronJobId "sample-job" of
+      Right j -> j
+      Left _  -> error "unreachable"
+  , cjName = "Sample"
+  , cjSchedule = case mkCronExpr "0 9 * * *" of
+      Right e -> e
+      Left _  -> error "unreachable"
+  , cjTimezone = Nothing
+  , cjPrompt = "do things"
+  , cjAgentDefId = Nothing
+  , cjProvider = Nothing
+  , cjModel = Nothing
+  , cjEnabled = False
+  , cjOneShot = False
+  , cjCreatedAt = sampleTime
+  , cjUpdatedAt = sampleTime
+  , cjLastFire = Nothing
+  , cjRunCount = 0
+  , cjConsecutiveFailures = 0
+  }
+
+-- | A fixed reference time for the round-trip fixtures.
+sampleTime :: UTCTime
+sampleTime = UTCTime (fromGregorian 2026 10 14) (secondsToDiffTime 0)
 
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True

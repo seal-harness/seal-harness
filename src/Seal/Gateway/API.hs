@@ -938,6 +938,8 @@ handleCronCreate deps body =
           (ciTimezone input)
           (ciPrompt input)
           (ciAgentDefId input)
+          (ciProvider input)
+          (ciModel input)
           (ciEnabled input)
           (ciOneShot input)
         case eJob of
@@ -998,6 +1000,8 @@ cronJobSummaryJson j = A.object
   , "timezone" .= cjTimezone j
   , "prompt" .= cjPrompt j
   , "agent_def_id" .= cjAgentDefId j
+  , "provider" .= cjProvider j
+  , "model" .= cjModel j
   , "enabled" .= cjEnabled j
   , "one_shot" .= cjOneShot j
   , "created_at" .= cjCreatedAt j
@@ -1016,6 +1020,8 @@ cronJobDetailJson j mNextFire = A.object
   , "timezone" .= cjTimezone j
   , "prompt" .= cjPrompt j
   , "agent_def_id" .= cjAgentDefId j
+  , "provider" .= cjProvider j
+  , "model" .= cjModel j
   , "enabled" .= cjEnabled j
   , "one_shot" .= cjOneShot j
   , "created_at" .= cjCreatedAt j
@@ -1034,6 +1040,8 @@ data CronCreateInput = CronCreateInput
   , ciTimezone   :: !(Maybe Text)
   , ciPrompt     :: !Text
   , ciAgentDefId :: !(Maybe Text)
+  , ciProvider   :: !(Maybe Text)
+  , ciModel      :: !(Maybe Text)
   , ciEnabled    :: !Bool
   , ciOneShot    :: !Bool
   }
@@ -1049,11 +1057,14 @@ parseCronCreateInput v = case parseMaybe parser v of
       mTz <- o .:? "timezone"
       prompt <- o .: "prompt"
       mAid <- o .:? "agent_def_id"
+      mProv <- o .:? "provider"
+      mModel <- o .:? "model"
       enabled <- fromMaybe False <$> o .:? "enabled"
       oneShot <- fromMaybe False <$> o .:? "one_shot"
       pure CronCreateInput
         { ciName = name, ciSchedule = sched, ciTimezone = mTz
         , ciPrompt = prompt, ciAgentDefId = mAid
+        , ciProvider = mProv, ciModel = mModel
         , ciEnabled = enabled, ciOneShot = oneShot }
 
 parseCronUpdateInput :: A.Value -> Either Text CronOps.CronUpdate
@@ -1067,11 +1078,14 @@ parseCronUpdateInput v = case parseMaybe parser v of
       mTz <- o .:? "timezone"
       mPrompt <- o .:? "prompt"
       mAid <- o .:? "agent_def_id"
+      mProv <- o .:? "provider"
+      mModel <- o .:? "model"
       mEnabled <- o .:? "enabled"
       mOneShot <- o .:? "one_shot"
       pure CronOps.CronUpdate
         { CronOps.cuName = mName, CronOps.cuSchedule = mSched, CronOps.cuTimezone = mTz
         , CronOps.cuPrompt = mPrompt, CronOps.cuAgentDefId = mAid
+        , CronOps.cuProvider = mProv, CronOps.cuModel = mModel
         , CronOps.cuEnabled = mEnabled, CronOps.cuOneShot = mOneShot }
 
 

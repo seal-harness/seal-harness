@@ -63,6 +63,12 @@ promptField = parseMaybe (withObject "in" (.: "prompt"))
 agentDefIdField :: Value -> Maybe Text
 agentDefIdField v = joinMaybe (parseMaybe (withObject "in" (.:? "agent_def_id")) v)
 
+providerField :: Value -> Maybe Text
+providerField v = joinMaybe (parseMaybe (withObject "in" (.:? "provider")) v)
+
+modelField :: Value -> Maybe Text
+modelField v = joinMaybe (parseMaybe (withObject "in" (.:? "model")) v)
+
 enabledField :: Value -> Bool
 enabledField v = fromMaybe False (joinMaybe (parseMaybe (withObject "in" (.:? "enabled")) v))
 
@@ -92,7 +98,9 @@ handleCreate store v = do
           mAgentDefId = agentDefIdField v
           enabled = enabledField v
           oneShot = oneShotField v
-      eJob <- liftIO (createJob store name sched mTzStr prompt mAgentDefId enabled oneShot)
+          mProv = providerField v
+          mModel = modelField v
+      eJob <- liftIO (createJob store name sched mTzStr prompt mAgentDefId mProv mModel enabled oneShot)
       case eJob of
         Left e -> pure (errResult e)
         Right job -> do
@@ -151,6 +159,8 @@ handleUpdate store v = do
         , cuTimezone = timezoneField v
         , cuPrompt = promptField v
         , cuAgentDefId = agentDefIdField v
+        , cuProvider = providerField v
+        , cuModel = modelField v
         , cuEnabled = enabledField' v
         , cuOneShot = oneShotField' v
         }))
@@ -249,7 +259,8 @@ authorizeCronManage v =
       CaList    -> Right ()
       CaUpdate  -> do
         _ <- checkId v "update"
-        let hasField = any isJust [nameField v, scheduleField v, timezoneField v, promptField v]
+        let hasField = any isJust [ nameField v, scheduleField v, timezoneField v
+                                  , promptField v, providerField v, modelField v ]
                       || isJust (enabledField' v) || isJust (oneShotField' v)
         if hasField then Right () else Left "update requires at least one field to update"
       CaDelete  -> checkId v "delete"
@@ -293,6 +304,12 @@ cronManageOp mFireDelegate store _session = TrustedOpcode
           , fromText "agent_def_id" .= object
               [ "type" .= ("string" :: Text)
               , "description" .= ("Agent def id to use (create, update). Default: default agent." :: Text) ]
+          , fromText "provider" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Provider override for this job (create, update). Omit or send \"\" to use Seal's configured default provider." :: Text) ]
+          , fromText "model" .= object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Model override for this job (create, update). Omit or send \"\" to use Seal's configured default model." :: Text) ]
           , fromText "enabled" .= object
               [ "type" .= ("boolean" :: Text)
               , "description" .= ("Initial enabled state (create, update). Default: false on create." :: Text) ]
@@ -331,6 +348,8 @@ renderJob j = T.intercalate "\n"
   , "name: " <> cjName j
   , "schedule: " <> cronExprText (cjSchedule j)
   , "timezone: " <> maybe "(host local)" cronTimeZoneText (cjTimezone j)
+  , "provider: " <> fromMaybe "(configured default)" (cjProvider j)
+  , "model: " <> fromMaybe "(configured default)" (cjModel j)
   , "prompt: " <> cjPrompt j
   , "enabled: " <> (if cjEnabled j then "true" else "false" :: Text)
   , "one_shot: " <> (if cjOneShot j then "true" else "false" :: Text)

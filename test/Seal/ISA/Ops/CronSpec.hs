@@ -263,5 +263,150 @@ spec = describe "Seal.ISA.Ops.Cron" $ do
         ]))
       orIsError r `shouldBe` True
 
+  describe "CRON_MANAGE provider + model" $ do
+    it "stores provider and model on create and echoes them on read" $ do
+      store <- memoryCronStore
+      let op = cronManageOp Nothing store sampleSession
+      _ <- runTestApp (opRun op localBackend (object
+        [ "action" .= ("create" :: Text)
+        , "name" .= ("Test" :: Text)
+        , "schedule" .= ("0 9 * * *" :: Text)
+        , "prompt" .= ("test" :: Text)
+        , "provider" .= ("anthropic" :: Text)
+        , "model" .= ("claude-opus-4-8" :: Text)
+        ]))
+      mJob <- csRead store (case mkCronJobId "test" of Right j -> j; Left _ -> error "u")
+      case mJob of
+        Just job -> do
+          cjProvider job `shouldBe` Just "anthropic"
+          cjModel job `shouldBe` Just "claude-opus-4-8"
+        Nothing -> expectationFailure "job not stored"
+      -- `read` renders the job; the fields must be visible to the agent.
+      r <- runTestApp (opRun op localBackend (object
+        [ "action" .= ("read" :: Text)
+        , "id" .= ("test" :: Text)
+        ]))
+      case orParts r of
+        [TrpText msg] -> do
+          msg `shouldSatisfy` isInText "provider: anthropic"
+          msg `shouldSatisfy` isInText "model: claude-opus-4-8"
+        _ -> expectationFailure "expected TrpText"
+
+    it "omits provider and model from read when unset" $ do
+      store <- memoryCronStore
+      let op = cronManageOp Nothing store sampleSession
+      _ <- runTestApp (opRun op localBackend (object
+        [ "action" .= ("create" :: Text)
+        , "name" .= ("Test" :: Text)
+        , "schedule" .= ("0 9 * * *" :: Text)
+        , "prompt" .= ("test" :: Text)
+        ]))
+      r <- runTestApp (opRun op localBackend (object
+        [ "action" .= ("read" :: Text)
+        , "id" .= ("test" :: Text)
+        ]))
+      case orParts r of
+        [TrpText msg] -> do
+          msg `shouldSatisfy` isInText "provider: (configured default)"
+          msg `shouldSatisfy` isInText "model: (configured default)"
+        _ -> expectationFailure "expected TrpText"
+
+    it "rejects an injection-shaped provider on create" $ do
+      store <- memoryCronStore
+      let op = cronManageOp Nothing store sampleSession
+      r <- runTestApp (opRun op localBackend (object
+        [ "action" .= ("create" :: Text)
+        , "name" .= ("Test" :: Text)
+        , "schedule" .= ("0 9 * * *" :: Text)
+        , "prompt" .= ("test" :: Text)
+        , "provider" .= ("../seal" :: Text)
+        ]))
+      orIsError r `shouldBe` True
+
+    it "sets provider and model on update" $ do
+      store <- memoryCronStore
+      let op = cronManageOp Nothing store sampleSession
+      _ <- runTestApp (opRun op localBackend (object
+        [ "action" .= ("create" :: Text)
+        , "name" .= ("Test" :: Text)
+        , "schedule" .= ("0 9 * * *" :: Text)
+        , "prompt" .= ("test" :: Text)
+        ]))
+      r <- runTestApp (opRun op localBackend (object
+        [ "action" .= ("update" :: Text)
+        , "id" .= ("test" :: Text)
+        , "provider" .= ("ollama" :: Text)
+        , "model" .= ("llama3.2" :: Text)
+        ]))
+      orIsError r `shouldBe` False
+      mJob <- csRead store (case mkCronJobId "test" of Right j -> j; Left _ -> error "u")
+      case mJob of
+        Just job -> do
+          cjProvider job `shouldBe` Just "ollama"
+          cjModel job `shouldBe` Just "llama3.2"
+        Nothing -> expectationFailure "job not stored"
+
+    it "clears provider and model on update with an empty string" $ do
+      store <- memoryCronStore
+      let op = cronManageOp Nothing store sampleSession
+      _ <- runTestApp (opRun op localBackend (object
+        [ "action" .= ("create" :: Text)
+        , "name" .= ("Test" :: Text)
+        , "schedule" .= ("0 9 * * *" :: Text)
+        , "prompt" .= ("test" :: Text)
+        , "provider" .= ("anthropic" :: Text)
+        , "model" .= ("claude-opus-4-8" :: Text)
+        ]))
+      r <- runTestApp (opRun op localBackend (object
+        [ "action" .= ("update" :: Text)
+        , "id" .= ("test" :: Text)
+        , "provider" .= ("" :: Text)
+        , "model" .= ("" :: Text)
+        ]))
+      orIsError r `shouldBe` False
+      mJob <- csRead store (case mkCronJobId "test" of Right j -> j; Left _ -> error "u")
+      case mJob of
+        Just job -> do
+          cjProvider job `shouldBe` Nothing
+          cjModel job `shouldBe` Nothing
+        Nothing -> expectationFailure "job not stored"
+
+    it "rejects an injection-shaped provider on update" $ do
+      store <- memoryCronStore
+      let op = cronManageOp Nothing store sampleSession
+      _ <- runTestApp (opRun op localBackend (object
+        [ "action" .= ("create" :: Text)
+        , "name" .= ("Test" :: Text)
+        , "schedule" .= ("0 9 * * *" :: Text)
+        , "prompt" .= ("test" :: Text)
+        ]))
+      r <- runTestApp (opRun op localBackend (object
+        [ "action" .= ("update" :: Text)
+        , "id" .= ("test" :: Text)
+        , "provider" .= ("../seal" :: Text)
+        ]))
+      orIsError r `shouldBe` True
+
+    -- An update whose ONLY field is provider must pass the "at least one
+    -- field to update" authorization check.
+    it "authorizes an update whose only field is provider" $ do
+      store <- memoryCronStore
+      let op = cronManageOp Nothing store sampleSession
+          input = object [ "action" .= ("update" :: Text)
+                         , "id" .= ("test" :: Text)
+                         , "provider" .= ("ollama" :: Text) ]
+      toAuthorize op input `shouldBe` Right ()
+
+    it "still rejects an update with no fields at all" $ do
+      store <- memoryCronStore
+      let op = cronManageOp Nothing store sampleSession
+          input = object [ "action" .= ("update" :: Text)
+                         , "id" .= ("test" :: Text) ]
+      toAuthorize op input `shouldSatisfy` isLeft'
+
 isInText :: Text -> Text -> Bool
 isInText needle haystack = needle `DT.isInfixOf` haystack
+
+isLeft' :: Either a b -> Bool
+isLeft' (Left _) = True
+isLeft' (Right _) = False

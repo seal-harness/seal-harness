@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Cron.StoreSpec (spec) where
 
+import Control.Monad (replicateM_)
 import Data.Text qualified as T
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import System.FilePath ((</>))
@@ -29,6 +30,8 @@ sampleJob = CronJob
   , cjTimezone = Nothing
   , cjPrompt = "Review the code"
   , cjAgentDefId = Nothing
+  , cjProvider = Nothing
+  , cjModel = Nothing
   , cjEnabled = True
   , cjOneShot = False
   , cjCreatedAt = sampleTime
@@ -109,6 +112,70 @@ spec = do
       store <- memoryCronStore
       runs <- csListRuns store sampleJobId 10
       runs `shouldBe` []
+
+
+  describe "csUpdateRun" $ do
+    it "transforms the newest run row (memory backend)" $ do
+      store <- memoryCronStore
+      csRecordRun store sampleJobId sampleRun
+      csUpdateRun store sampleJobId (\r -> r { crStatus = CrCompleted })
+      runs <- csListRuns store sampleJobId 10
+      case runs of
+        (r:_) -> crStatus r `shouldBe` CrCompleted
+        [] -> expectationFailure "expected a run row"
+
+    -- The transformation is applied to every row, which is what lets startup
+    -- reconciliation repair a whole wedged history (one stuck row per fire)
+    -- rather than only the newest. Order and identity are preserved.
+    it "maps the transformation over every row, preserving order" $ do
+      store <- memoryCronStore
+      csRecordRun store sampleJobId sampleRun { crSessionId = "older" }
+      csRecordRun store sampleJobId sampleRun { crSessionId = "newer" }
+      csUpdateRun store sampleJobId (\r -> r { crStatus = CrCompleted })
+      runs <- csListRuns store sampleJobId 10
+      length runs `shouldBe` 2
+      case runs of
+        (newest : older : _) -> do
+          crSessionId newest `shouldBe` "newer"
+          crSessionId older `shouldBe` "older"
+          map crStatus [newest, older] `shouldBe` [CrCompleted, CrCompleted]
+        _ -> expectationFailure "expected two rows"
+
+    it "leaves rows alone when the transformation changes nothing" $ do
+      store <- memoryCronStore
+      csRecordRun store sampleJobId sampleRun
+      csUpdateRun store sampleJobId id
+      runs <- csListRuns store sampleJobId 10
+      map crStatus runs `shouldBe` [CrPending]
+
+    it "is a no-op for a job with no runs" $ do
+      store <- memoryCronStore
+      csUpdateRun store sampleJobId (\r -> r { crStatus = CrCompleted })
+      runs <- csListRuns store sampleJobId 10
+      runs `shouldBe` []
+
+    it "is a no-op for an unknown job" $ do
+      store <- memoryCronStore
+      other <- case mkCronJobId "other-job" of Right j -> pure j; Left _ -> error "u"
+      csUpdateRun store other (\r -> r { crStatus = CrCompleted })
+      runs <- csListRuns store other 10
+      runs `shouldBe` []
+
+    -- The lock exists because a lost update re-wedges a job: the scheduler
+    -- writes Running while a turn-completion writes Completed. Serializing
+    -- both must preserve the last writer rather than corrupting the file.
+    it "does not lose updates when many writers run concurrently (memory backend)" $ do
+      store <- memoryCronStore
+      csRecordRun store sampleJobId sampleRun
+      replicateM_ 50 $
+        csUpdateRun store sampleJobId (\r -> r { crStatus = CrCompleted, crError = Just "x" })
+      runs <- csListRuns store sampleJobId 10
+      length runs `shouldBe` 1
+      case runs of
+        (r:_) -> do
+          crStatus r `shouldBe` CrCompleted
+          crError r `shouldBe` Just "x"
+        [] -> expectationFailure "expected a run row"
 
   describe "fileCronStore" $ do
     it "creates and reads a job from disk" $ do
