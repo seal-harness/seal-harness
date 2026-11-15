@@ -4,8 +4,10 @@ import {
   deleteCronJob,
   fetchCronJob,
   updateCronJob,
+  useAgentDefs,
   useCronJobs,
 } from '../hooks/useApi'
+import { agentOptionLabel, groupAgents } from '../lib/agentGroups'
 import type { CronJobDetail, CronJobSummary } from '../types'
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -57,6 +59,7 @@ function Row({
  *  separate, explicit action (design D3). */
 export function CronView() {
   const { jobs, loaded, error, refresh } = useCronJobs()
+  const { agents, loaded: agentsLoaded } = useAgentDefs()
 
   const [editing, setEditing] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
@@ -115,6 +118,7 @@ export function CronView() {
   const sortedJobs = useMemo(() => {
     return [...jobs].sort((a, b) => a.name.localeCompare(b.name))
   }, [jobs])
+  const agentGroups = useMemo(() => groupAgents(agents), [agents])
 
   async function handleSubmit() {
     setSubmitting(true)
@@ -355,14 +359,50 @@ export function CronView() {
               />
             </Row>
 
-            <Row label="Agent Def" htmlFor="cron-agent" hint="Optional — defaults to the configured default agent">
-              <input
+            <Row
+              label="Agent"
+              htmlFor="cron-agent"
+              hint="The agent definition that runs this job's prompt. The unset option uses the configured default agent."
+            >
+              {/* A constrained picker, not free text: the job's
+                  agent_def_id must name an agent def that exists, and the
+                  backend validates it with mkAgentDefId. Grouping mirrors the
+                  Agents view so the two surfaces present the same order. */}
+              <select
                 id="cron-agent"
                 style={inputStyle}
+                className="composer-select"
                 value={agentDefId}
                 onChange={(e) => setAgentDefId(e.target.value)}
-                placeholder="default"
-              />
+              >
+                <option value="">
+                  {agentsLoaded ? '(use configured default)' : 'Loading…'}
+                </option>
+                {agentGroups.map((grp) =>
+                  grp.ungrouped ? (
+                    grp.agents.map((a) => (
+                      <option key={a.id} value={a.id}>{agentOptionLabel(a)}</option>
+                    ))
+                  ) : (
+                    <optgroup key={grp.label} label={grp.label}>
+                      {grp.agents.map((a) => (
+                        <option key={a.id} value={a.id}>{agentOptionLabel(a)}</option>
+                      ))}
+                    </optgroup>
+                  ),
+                )}
+                {/* Keep an id that no longer resolves to a def selectable, so
+                    opening and saving a job cannot silently clear its agent.
+                    The backend re-validates the id on write; this only keeps
+                    the stored value visible and unchanged. While the list is
+                    still loading we cannot tell "missing" from "not fetched
+                    yet", so the label stays bare until it has loaded. */}
+                {agentDefId !== '' && !agents.some((a) => a.id === agentDefId) && (
+                  <option value={agentDefId}>
+                    {agentsLoaded ? `${agentDefId} (missing)` : agentDefId}
+                  </option>
+                )}
+              </select>
             </Row>
 
             <Row label="Enabled" htmlFor="cron-enabled">
@@ -421,6 +461,7 @@ export function CronView() {
                 className="btn btn-primary px-3 py-2 rounded-lg text-sm font-medium"
                 onClick={handleSubmit}
                 disabled={submitting || !name || !schedule || !prompt}
+                aria-label={creating ? 'Create cron job' : 'Save cron job'}
               >
                 {submitting ? 'Saving…' : creating ? 'Create' : 'Save'}
               </button>
