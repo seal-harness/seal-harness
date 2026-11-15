@@ -7,13 +7,19 @@ import Data.Set qualified as Set
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import Test.Hspec
 
-import Seal.Core.Types (OpName (..), mkSystemSessionId)
+import Seal.Core.Types (OpName (..), mkSystemSessionId, sessionIdText)
 import Seal.Cron.Types
 import Seal.Cron.Store
 import Seal.Cron.Scheduler
 
 sampleTime :: UTCTime
 sampleTime = UTCTime (fromGregorian 2026 10 14) (secondsToDiffTime (9 * 3600))
+
+-- | Two minutes before sampleTime. Jobs created at this time with a
+-- @* * * * *@ schedule have a next-fire (the minute after creation) that
+-- is in the past relative to @sampleTime@, so @tick@ considers them due.
+createdTime :: UTCTime
+createdTime = UTCTime (fromGregorian 2026 10 14) (secondsToDiffTime (9 * 3600 - 120))
 
 sampleJobId :: CronJobId
 sampleJobId = case mkCronJobId "test-job" of Right j -> j; Left _ -> error "u"
@@ -28,8 +34,8 @@ sampleJob = CronJob
   , cjAgentDefId = Nothing
   , cjEnabled = True
   , cjOneShot = False
-  , cjCreatedAt = sampleTime
-  , cjUpdatedAt = sampleTime
+  , cjCreatedAt = createdTime
+  , cjUpdatedAt = createdTime
   , cjLastFire = Nothing
   , cjRunCount = 0
   , cjConsecutiveFailures = 0
@@ -109,6 +115,32 @@ spec = do
       case runs of
         (r:_) -> crStatus r `shouldBe` CrFailed
         [] -> False `shouldBe` True
+
+    it "records the session id from a successful fire" $ do
+      store <- memoryCronStore
+      csCreate store sampleJob
+      let scheduler = CronScheduler
+            { csStore = store
+            , csFireDelegate = \_job -> pure (Right (mkSystemSessionId "cron-session-42"))
+            , csClock = pure sampleTime
+            , csTickInterval = 60
+            , csStopSignal = error "unused in tick"
+            , csMaxConcurrent = 5
+            , csNotifyHuman = \_ -> pure ()
+            }
+      tick scheduler
+      runs <- csListRuns store sampleJobId 10
+      case runs of
+        (r:_) -> do
+          crStatus r `shouldBe` CrRunning
+          crSessionId r `shouldBe` sessionIdText (mkSystemSessionId "cron-session-42")
+        [] -> False `shouldBe` True
+      mJob <- csRead store sampleJobId
+      case mJob of
+        Just job -> do
+          cjRunCount job `shouldBe` 1
+          cjLastFire job `shouldBe` Just sampleTime
+        Nothing -> False `shouldBe` True
 
     it "auto-disables after consecutive failures" $ do
       store <- memoryCronStore

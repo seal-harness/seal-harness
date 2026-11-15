@@ -17,6 +17,7 @@ module Seal.Cron.Scheduler
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (TVar, readTVarIO)
 import Control.Monad (when, unless)
+import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -88,13 +89,19 @@ tick scheduler = do
   mapM_ (fireIfDue scheduler now) jobs
 
 -- | Fire a job if it's due (next_fire <= now) and not overlapping.
+-- The next fire time is computed from the job's last fire time (or
+-- creation time if never fired), not from @now@ — this is the standard
+-- cron pattern: "the scheduled time for the next run has arrived."
+-- Computing from @now@ would always return a future time (the next
+-- minute boundary after now), so no job would ever be due.
 fireIfDue :: CronScheduler -> UTCTime -> CronJob -> IO ()
 fireIfDue scheduler now job = do
-  mNextFire <- computeNextFire (cjSchedule job) (cjTimezone job) now
+  let refTime = fromMaybe (cjCreatedAt job) (cjLastFire job)
+  mNextFire <- computeNextFire (cjSchedule job) (cjTimezone job) refTime
   case mNextFire of
     Nothing -> pure ()
     Just nextFire
-      | nextFire > now -> pure ()  -- not due yet
+      | nextFire > now -> pure ()  -- next scheduled fire is still in the future
       | otherwise -> do
           -- Check overlap: previous run still pending/running
           runs <- csListRuns (csStore scheduler) (cjId job) 1

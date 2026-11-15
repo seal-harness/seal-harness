@@ -4,6 +4,7 @@ module Seal.ISA.Ops.CronSpec (spec) where
 import Data.Aeson (object, (.=))
 import Data.Text qualified as DT
 import Data.Text (Text)
+import Data.IORef
 import Test.Hspec
 
 import Seal.Core.Types (SessionId, mkSystemSessionId)
@@ -206,6 +207,30 @@ spec = describe "Seal.ISA.Ops.Cron" $ do
         , "id" .= ("test" :: Text)
         ]))
       orIsError r `shouldBe` True
+
+    it "fires via trigger when a fire delegate is wired" $ do
+      store <- memoryCronStore
+      fired <- newIORef ([] :: [Text])
+      let delegate _job = do
+            modifyIORef' fired (++ ["fired"])
+            pure (Right (mkSystemSessionId "cron-triggered"))
+          op = cronManageOp (Just delegate) store sampleSession
+      _ <- runTestApp (opRun op localBackend (object
+        [ "action" .= ("create" :: Text)
+        , "name" .= ("Test" :: Text)
+        , "schedule" .= ("0 9 * * *" :: Text)
+        , "prompt" .= ("test" :: Text)
+        ]))
+      r <- runTestApp (opRun op localBackend (object
+        [ "action" .= ("trigger" :: Text)
+        , "id" .= ("test" :: Text)
+        ]))
+      orIsError r `shouldBe` False
+      calls <- readIORef fired
+      length calls `shouldBe` 1
+      case orParts r of
+        [TrpText msg] -> msg `shouldSatisfy` isInText "triggered"
+        _ -> expectationFailure "expected TrpText"
 
   describe "CRON_MANAGE update" $ do
     it "updates schedule on existing job" $ do
