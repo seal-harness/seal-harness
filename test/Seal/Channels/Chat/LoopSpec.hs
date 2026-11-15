@@ -23,7 +23,8 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy, ex
 import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..), ProgressStyle (..))
 import Seal.Channels.Chat.Loop
 import Seal.Channels.Chat.HttpClient
-  ( ListsJson (..), NewSessionResult (..), SendResult (..), TabJson (..) )
+  ( ListsJson (..), NewSessionResult (..), PendingQuestionJson (..), SendResult (..)
+  , TabJson (..) )
 import Seal.Channels.Chat.RateLimit (defaultStreamProgressConfig)
 import Seal.Channels.Chat.Types
   ( ChatMessageId (..)
@@ -244,12 +245,15 @@ data Seams = Seams
   , smAnswerQueue :: IORef [Either Text Bool]
     -- ^ Queued answer results (Right False = already resolved); an empty
     -- queue yields an accepted answer.
+  , smQuestionQueue :: IORef [Either Text [PendingQuestionJson]]
+    -- ^ Queued @GET \/questions@ results; an empty queue yields @[]@ (no
+    -- pending question).
   }
 
 mkSeams :: IO Seams
 mkSeams = Seams
   <$> newIORef [] <*> newIORef [] <*> newIORef [] <*> newIORef []
-  <*> newIORef [] <*> newIORef [] <*> newIORef []
+  <*> newIORef [] <*> newIORef [] <*> newIORef [] <*> newIORef []
   <*> newIORef [] <*> newIORef [] <*> newIORef [] <*> newIORef []
   <*> newIORef [] <*> newIORef [] <*> newIORef []
 
@@ -308,6 +312,8 @@ stubCfg mgr seams = (defaultChatChannelConfig mgr defaultGatewayConfig)
   , cccAnswerQuestion = \_mgr _apiBase sid askId answer -> do
       modifyIORef' (smAnswers seams) ((sid, askId, answer) :)
       nextQueued (smAnswerQueue seams) (Right True)
+  , cccGetQuestions = \_mgr _apiBase _sid ->
+      nextQueued (smQuestionQueue seams) (Right [])
   }
 
 getMints :: Seams -> IO [A.Value]
@@ -1155,6 +1161,116 @@ spec = do
         (SeActivity otherSid (statusJson "idle"))
       sends <- getSends chan
       sends `shouldSatisfy` any (T.isInfixOf "finished thinking")
+
+    it "watched session that ASKS posts a needs-input notification with the question" $ do
+      -- A watched tab blocked on ASK_HUMAN broadcasts an all-subscriber
+      -- harness-status idle (wrapCapsForAskStatus fires it before blocking),
+      -- which is indistinguishable from a finished turn by the event alone.
+      -- The loop must consult the session's pending questions and say
+      -- "needs your input", with the question, instead of "finished".
+      chan <- mkMockChan
+      seams <- mkSeams
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = stubCfg mgr seams
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let otherSid = mkSid "other"
+      writeIORef (smQuestionQueue seams)
+        [Right [PendingQuestionJson "q-1" "Which branch?" []]]
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
+        watchState thinkingTabs (mkSid "focused")
+        (SeActivity otherSid (statusJson "thinking"))
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
+        watchState thinkingTabs (mkSid "focused")
+        (SeActivity otherSid (statusJson "idle"))
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "needs your input")
+      sends `shouldSatisfy` any (T.isInfixOf "Which branch?")
+      sends `shouldSatisfy` not . any (T.isInfixOf "finished thinking")
+      -- The question is registered so a plain-text reply can answer it.
+      asks <- pendingAsksFor pendingAsks
+      case Map.lookup otherSid asks of
+        Just (a : _) -> paAskId a `shouldBe` "q-1"
+        _            -> expectationFailure "expected the watched ask to be registered"
+
+    it "does not re-announce a watched ask it already notified about" $ do
+      chan <- mkMockChan
+      seams <- mkSeams
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = stubCfg mgr seams
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let otherSid = mkSid "other"
+      writeIORef (smQuestionQueue seams)
+        [ Right [PendingQuestionJson "q-1" "Which branch?" []]
+        , Right [PendingQuestionJson "q-1" "Which branch?" []]
+        ]
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      let fireIdle = handleServerEvent cfg chan key conns pendingAsks bg tabTracker
+                       watchState thinkingTabs (mkSid "focused")
+                       (SeActivity otherSid (statusJson "idle"))
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
+        watchState thinkingTabs (mkSid "focused")
+        (SeActivity otherSid (statusJson "thinking"))
+      fireIdle
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
+        watchState thinkingTabs (mkSid "focused")
+        (SeActivity otherSid (statusJson "thinking"))
+      fireIdle
+      sends <- getSends chan
+      -- The question is announced once; the second idle sees it already
+      -- registered and stays silent rather than also emitting "finished
+      -- thinking". (The /watch confirmation is dropped: it now mentions
+      -- "needs your input" too.)
+      let notices = filter (T.isInfixOf "Which branch?") sends
+      length notices `shouldBe` 1
+      length (filter (T.isInfixOf "finished thinking") sends) `shouldBe` 0
+
+    it "answers a watched ask by plain text against its own session" $ do
+      chan <- mkMockChan
+      seams <- mkSeams
+      sessions <- newSessionMap
+      let key = ConversationKey "signal" "conv1"
+      sessionInsert sessions key (mkSid "focused")
+      ss <- newStreamingState
+      wsConns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let otherSid = mkSid "other"
+      mgr <- newManager defaultManagerSettings
+      let cfg = stubCfg mgr seams
+      writeIORef (smQuestionQueue seams)
+        [Right [PendingQuestionJson "q-1" "Which branch?" []]]
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      let fire = handleServerEvent cfg chan key wsConns pendingAsks bg
+                   tabTracker watchState thinkingTabs (mkSid "focused")
+      fire (SeActivity otherSid (statusJson "thinking"))
+      fire (SeActivity otherSid (statusJson "idle"))
+      _ <- getSends chan
+      -- A plain reply is consumed as the answer for the watched session.
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs key "main"
+      answers <- getAnswers seams
+      answers `shouldBe` [(otherSid, "q-1", "main")]
 
     it "non-focused session idle does NOT send a notification when watch is off" $ do
       chan <- mkMockChan

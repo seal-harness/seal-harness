@@ -15,6 +15,7 @@ module Seal.Channels.Chat.Loop
   , handleCallback
   , handleAsk
     -- * Pending asks (for testing)
+  , PendingAsk (..)
   , PendingAsks
   , newPendingAsks
   , pendingAsksFor
@@ -52,6 +53,7 @@ module Seal.Channels.Chat.Loop
   , snapshotWatch
   ) where
 
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, modifyTVar', readTVar, readTVarIO, writeTVar)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (SomeException, catch)
@@ -69,6 +71,7 @@ import Data.Maybe (fromMaybe, isJust, listToMaybe, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
+import Data.Vector qualified as V
 import Data.Char (isDigit)
 import Data.Text qualified as T
 import Data.Time (getCurrentTime)
@@ -78,9 +81,10 @@ import Network.HTTP.Client (Manager)
 import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..), ProgressStyle (..))
 import Seal.Channels.Chat.HttpClient
   (httpSend, httpGetTabs, httpGetSessions, httpNewSession, httpGetTranscript, httpAnswerQuestion,
-   httpGetLists, httpRebindNew, httpSetupRepo, httpGetRepos,
+   httpGetLists, httpRebindNew, httpSetupRepo, httpGetRepos, httpGetQuestions,
    rebindBody, mintBody, setupRepoBody,
-   SendResult (..), TabJson (..), ListsJson (..), NewSessionResult (..))
+   SendResult (..), TabJson (..), ListsJson (..), NewSessionResult (..),
+   PendingQuestionJson (..))
 import Seal.Channels.Chat.Bubble (bubbleText, formatAsk)
 import Seal.Channels.Chat.TabRender (renderTabListRow, tabListRows)
 import Seal.Channels.Chat.RateLimit
@@ -112,6 +116,11 @@ import Seal.Gateway.Types.NewArgs
 data PendingAsk = PendingAsk
   { paAskId :: !Text
   , paOptions :: ![QuestionOption]
+  , paWatched :: !Bool
+    -- ^ Registered by the @\/watch@ path for a NON-focused session, rather
+    -- than by 'handleAsk' for the focused one. Such an ask is answerable by
+    -- plain text from this conversation even though the conversation is not
+    -- focused on its session.
   , paSeq :: !Int
     -- ^ Registration order. Gives a total order across the conversation's
     -- sessions, which the per-session lists cannot provide (each list is
@@ -355,6 +364,11 @@ data ChatChannelConfig = ChatChannelConfig
   , cccStartWs :: Text -> Int -> WsEventCallback -> IO (Either Text WsClient)
     -- ^ Connect a WS client. The seam the @/bg@ handler uses for the bg
     -- session's dedicated connection; the default is 'startWsClient'.
+  , cccGetQuestions :: Manager -> Text -> SessionId -> IO (Either Text [PendingQuestionJson])
+    -- ^ @GET /api/sessions/:id/questions@. The seam @\/watch@ uses to tell
+    -- a session that is waiting for input apart from one that merely
+    -- finished: both surface as a @harness-status idle@ activity event. The
+    -- default is 'httpGetQuestions'.
   , cccAnswerQuestion :: Manager -> Text -> SessionId -> Text -> Text -> IO (Either Text Bool)
     -- ^ @POST /api/sessions/:id/questions/:qid/answer@. The seam used to
     -- answer a pending ask (text answer or button tap); the default is
@@ -376,6 +390,7 @@ defaultChatChannelConfig mgr gw = ChatChannelConfig
   , cccSendMessage = httpSend
   , cccStartWs = startWsClient (gcWsSecure gw) (gcTlsCert gw) Nothing
   , cccAnswerQuestion = httpAnswerQuestion
+  , cccGetQuestions = httpGetQuestions
   , cccGetLists = httpGetLists
   }
 
@@ -842,7 +857,7 @@ handleServerEvent cfg chan key wsConns pendingAsks bgSessions tabTracker watchSt
           isBg <- bgOwnsSession bgSessions key sid
           dbg ("[watch] SeActivity non-focused sid=" <> sessionIdText sid <> " focusedSid=" <> sessionIdText focusedSid <> " kind=" <> extractActivityKind val <> " status=" <> extractActivityStatus val <> " bg=" <> (if isBg then "true" else "false"))
           unless isBg $
-            handleWatchActivity cfg chan key watchState thinkingTabs focusedSid sid val
+            handleWatchActivity cfg chan key pendingAsks watchState thinkingTabs focusedSid sid val
     -- Tool-call events are BeActivity with kind="tool-call", broadcast
     -- by the server's aeOnToolCall hook. They arrive as SeActivity.
     -- handleActivity dispatches on kind internally.
@@ -908,7 +923,7 @@ handleWatchToggle chan watchState key body =
 -- | The confirmation message for a watch-mode change.
 watchConfirm :: Bool -> Text
 watchConfirm True =
-  "watch mode enabled — you will be notified when any tab finishes thinking"
+  "watch mode enabled — you will be notified when a tab needs your input or finishes thinking"
 watchConfirm False =
   "watch mode disabled"
 
@@ -926,7 +941,7 @@ watchHelp = T.unlines
   , "Usage: /watch [on|off|status]"
   , ""
   , "Available commands:"
-  , "  on          Enable watch mode — notify when any tab finishes thinking"
+  , "  on          Enable watch mode — notify when a tab needs input or finishes"
   , "  off         Disable watch mode"
   , "  status      Show the current watch mode state"
   , ""
@@ -949,9 +964,9 @@ watchHelp = T.unlines
 handleWatchActivity
   :: ChatChannel c
   => ChatChannelConfig -> c -> ConversationKey
-  -> WatchState -> ThinkingTabs
+  -> PendingAsks -> WatchState -> ThinkingTabs
   -> SessionId -> SessionId -> Value -> IO ()
-handleWatchActivity cfg chan key watchState thinkingTabs _focusedSid sid val = do
+handleWatchActivity cfg chan key pendingAsks watchState thinkingTabs _focusedSid sid val = do
   watchOn <- lookupWatch watchState key
   dbg ("[watch] handleWatchActivity sid=" <> sessionIdText sid <> " watchOn=" <> (if watchOn then "true" else "false"))
   when watchOn $ do
@@ -975,9 +990,117 @@ handleWatchActivity cfg chan key watchState thinkingTabs _focusedSid sid val = d
                 _ -> pure False
             dbg ("[watch] idle received, wasThinking=" <> (if wasThinking then "true" else "false") <> " sid=" <> sessionIdText sid)
             when wasThinking $
-              sendWatchNotification cfg chan sid
+              notifyWatchCompletion cfg chan pendingAsks sid
           _ -> pure ()
       _ -> pure ()
+
+-- | A non-focused watched session just went idle. That single activity event
+-- covers two very different situations, and the activity itself cannot tell
+-- them apart:
+--
+-- * the turn finished normally, or
+-- * the turn is blocked waiting for an ASK_HUMAN answer.
+--
+-- The gateway broadcasts @idle@ /before/ it blocks on the prompt
+-- ('wrapCapsForAskStatus'), so a question may also be registered a moment
+-- after the event. Ask the gateway for the session's pending questions, with a
+-- short bounded re-check to cover that ordering, then send the one
+-- notification that matches.
+--
+-- The pending-ask store doubles as the dedupe: a question already registered
+-- for this session has been announced, so a later idle must not announce it
+-- again. It is cleared by the normal resolve paths
+-- ('SeAskResolved' -> 'forgetAskByPrefix', 'answerAsk' -> 'forgetAsk').
+notifyWatchCompletion
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> PendingAsks -> SessionId -> IO ()
+notifyWatchCompletion cfg chan pendingAsks sid = do
+  mQ <- pollForQuestion cfg sid 5
+  case mQ of
+    Just q -> do
+      known <- asksFor pendingAsks sid
+      unless (any ((== pqjId q) . paAskId) known) $ do
+        -- Register the question so a plain-text reply can answer it: the
+        -- gateway's focus filter means a non-focused ask never reaches
+        -- 'handleAsk', which is what normally registers one.
+        registerWatchedAsk pendingAsks sid q
+        header <- watchHeader cfg sid "needs your input"
+        ccSend chan (header <> ":\n" <> formatAsk (pqjQuestion q) (decodeOptions q))
+    Nothing ->
+      sendWatchNotification cfg chan sid
+
+-- | Poll the session's pending questions up to @n@ times, 100 ms apart, and
+-- return the oldest if one appears. Bounded so a watched idle cannot stall the
+-- WS reader for long. Any transport failure counts as "no question" (the
+-- notification is then the ordinary finished one), matching
+-- 'sendWatchNotification''s tolerance for gateway failures.
+pollForQuestion
+  :: ChatChannelConfig -> SessionId -> Int -> IO (Maybe PendingQuestionJson)
+pollForQuestion cfg sid = go
+  where
+    mgr = cccHttpManager cfg
+    apiBase = gcApiBase (cccGateway cfg)
+    go 0 = pure Nothing
+    go k = do
+      eQs <- cccGetQuestions cfg mgr apiBase sid
+      case eQs of
+        Right (q : _) -> pure (Just q)
+        _ -> do
+          threadDelay 100_000
+          go (k - 1 :: Int)
+
+-- | The pending asks registered for one session.
+asksFor :: PendingAsks -> SessionId -> IO [PendingAsk]
+asksFor pendingAsks sid =
+  fromMaybe [] . Map.lookup sid <$> readTVarIO (paStore pendingAsks)
+
+-- | Register a question discovered by the watch path, so a plain-text reply can
+-- answer it. Mirrors 'handleAsk''s registration (newest first, monotonic
+-- sequence number).
+registerWatchedAsk :: PendingAsks -> SessionId -> PendingQuestionJson -> IO ()
+registerWatchedAsk pendingAsks sid q = do
+  seqNo <- atomically $ do
+    n <- readTVar (paNext pendingAsks)
+    writeTVar (paNext pendingAsks) (n + 1)
+    pure n
+  let entry = PendingAsk
+        { paAskId = pqjId q
+        , paOptions = decodeOptions q
+        , paWatched = True
+        , paSeq = seqNo
+        }
+  atomically (modifyTVar' (paStore pendingAsks) (Map.insertWith (++) sid [entry]))
+
+-- | Decode a watched question's option objects with the same decoder the
+-- @ask@ event uses, so rendering and numeric-answer resolution agree.
+decodeOptions :: PendingQuestionJson -> [QuestionOption]
+decodeOptions q = extractAskOptions (A.object ["options" .= A.Array (V.fromList (pqjOptions q))])
+
+-- | The @\"Tab N (title)\"@ prefix for a watch notification, resolved from the
+-- gateway. Falls back to @?@ / the session id when a lookup fails, so a
+-- notification is never dropped just because a gateway call did.
+watchHeader :: ChatChannelConfig -> SessionId -> Text -> IO Text
+watchHeader cfg sid suffix = do
+  let mgr = cccHttpManager cfg
+      apiBase = gcApiBase (cccGateway cfg)
+      sidText = sessionIdText sid
+  tabIdx <- do
+    eTabs <- httpGetTabs mgr apiBase
+    pure $ case eTabs of
+      Right tabs -> case [ t | t <- tabs, tjSessionId t == Just sidText ] of
+        (t : _) -> case mkTabIndex (tjIndex t) of
+          Right idx -> T.singleton (tabIndexToChar idx)
+          Left _    -> T.pack (show (tjIndex t))
+        [] -> "?"
+      Left _ -> "?"
+  title <- do
+    eSessions <- httpGetSessions mgr apiBase
+    pure $ case eSessions of
+      Right sessions -> case [ s | s <- sessions, sessionJsonId s == Just sidText ] of
+        (s : _) -> sessionDisplayTitle s
+        []      -> sidText
+      Left _ -> sidText
+  pure ("\x1F4D4 Tab " <> tabIdx <> " (" <> title <> ") " <> suffix)
 
 -- | Send a \"tab finished thinking\" notification to the channel. Fetches
 -- the tab list (to resolve the tab label) and the transcript (to get the
@@ -1334,7 +1457,7 @@ handleAsk _cfg chan _key pendingAsks sid val = do
       n <- readTVar (paNext pendingAsks)
       writeTVar (paNext pendingAsks) (n + 1)
       pure n
-    let entry = PendingAsk { paAskId = askId, paOptions = opts, paSeq = seqNo }
+    let entry = PendingAsk { paAskId = askId, paOptions = opts, paWatched = False, paSeq = seqNo }
     atomically (modifyTVar' (paStore pendingAsks) (Map.insertWith (++) sid [entry]))
 
 -- | Send a plain text message via the HTTP API. Resolves the conversation's
@@ -1643,6 +1766,17 @@ answerPendingBgAsk
 answerPendingBgAsk cfg chan pendingAsks bgSessions key body = do
   bg <- bgSessionsFor bgSessions key
   asksMap <- readTVarIO (paStore pendingAsks)
+  let bgIds = map bgSid bg
+      -- A question raised on a non-focused tab never reaches 'handleAsk' (the
+      -- broker focus-filters asks), so the watch path registers it with
+      -- 'paWatched' set. Those are answerable here too — otherwise the
+      -- notification could be read but not replied to.
+      watched =
+        [ (sess, ask)
+        | (sess, asks) <- Map.toList asksMap
+        , sess `notElem` bgIds
+        , Just ask <- [earliestRegistered (filter paWatched asks)]
+        ]
   -- Per session the earliest-registered ask is the list tail ('handleAsk'
   -- prepends); across sessions 'paSeq' orders them, which session order
   -- cannot.
@@ -1651,7 +1785,7 @@ answerPendingBgAsk cfg chan pendingAsks bgSessions key body = do
         | sess <- bg
         , Just asks <- [Map.lookup (bgSid sess) asksMap]
         , Just ask <- [earliestRegistered asks]
-        ]
+        ] <> watched
   case oldestAcross candidates of
     Nothing -> pure False
     Just (sid, ask) -> do
