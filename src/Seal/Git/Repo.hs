@@ -18,6 +18,7 @@ module Seal.Git.Repo
   , gitCommit
   , gitCommitAll
   , gitHasCommits
+  , gitShortHead
   , readProcessBinaryCwdEnv
   ) where
 
@@ -95,6 +96,16 @@ gitHasCommits' :: FilePath -> IO Bool
 gitHasCommits' root = do
   (ec, _out, _err) <- runGit root ["rev-parse", "--verify", "HEAD"]
   pure (ec == ExitSuccess)
+
+-- | Get the short HEAD commit hash (first 7+ chars) of the config repo.
+-- Returns 'Nothing' if git is unavailable or the repo has no commits.
+-- Best-effort: any error is swallowed and rendered as @-@ in the audit log.
+gitShortHead :: ConfigRepo -> IO (Maybe Text)
+gitShortHead repo = do
+  (ec, out, _err) <- runGit (crRoot repo) ["rev-parse", "--short", "HEAD"]
+  case ec of
+    ExitSuccess -> pure (Just (T.strip out))
+    ExitFailure _ -> pure Nothing
 
 -- | Stage one path (relative to the repo root). @git add <path>@.
 gitAdd :: ConfigRepo -> FilePath -> IO ()

@@ -128,6 +128,8 @@ mkDeps = do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     })
 
 -- | A pure 'CronStore' stub for ApiDeps literals that don't exercise cron.

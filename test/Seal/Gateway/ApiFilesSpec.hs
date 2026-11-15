@@ -315,6 +315,8 @@ mkDepsWithCache cacheRoot fe enabled = do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     }
 
 -- | Build a GET request with path segments and query params.

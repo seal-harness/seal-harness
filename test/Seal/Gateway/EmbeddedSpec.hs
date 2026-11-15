@@ -33,6 +33,19 @@ spec = do
         when (embeddedAssetCount > 0) $
           not (any (".." `isInfixOf`) (Map.keys embeddedAssets)) `shouldBe` True
 
+      -- The sentinel and the asset map come from the same build. If the map
+      -- is populated but the sentinel still reads the fallback, a binary
+      -- would report itself as UI-less while carrying a UI — the kind of
+      -- skew that makes "which UI is in this binary?" unanswerable.
+      it "distManifest is not the absent-fallback when assets are embedded" $
+        when (embeddedAssetCount > 0) $
+          distManifest `shouldNotBe` "absent"
+
+      it "distManifest looks like a sha256 hex digest" $
+        when (embeddedAssetCount > 0) $
+          take 64 distManifest `shouldSatisfy` \h ->
+            length h == 64 && all (`elem` ("0123456789abcdef" :: String)) h
+
     context "when no assets are embedded (count == 0)" $ do
       it "distManifest is non-empty (fallback file exists)" $
         when (embeddedAssetCount == 0) $

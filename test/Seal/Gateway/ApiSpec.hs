@@ -328,6 +328,8 @@ mkDepsFor paths = do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     }
@@ -507,6 +509,8 @@ mkProviderTestDeps tmp cfgRoot vr = do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig   = defaultSecurityConfig
     , adMkSessionExec    = Nothing
     }
@@ -2397,6 +2401,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                  }
@@ -2481,6 +2487,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2555,6 +2563,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2630,6 +2640,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2730,6 +2742,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2795,6 +2809,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2859,6 +2875,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2904,6 +2922,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3001,6 +3021,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3064,6 +3086,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3126,6 +3150,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3182,6 +3208,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3247,6 +3275,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3517,6 +3547,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
                 }
@@ -3713,6 +3745,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
                 }
@@ -3791,6 +3825,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3844,6 +3880,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
             }
@@ -4035,6 +4073,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
             }
@@ -4369,6 +4409,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -5561,6 +5603,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -5704,6 +5748,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
             }
           app = apiApp deps
       (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sidTxt, "agents"])
@@ -5799,6 +5845,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -5914,6 +5962,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -6091,6 +6141,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Nothing
             , adAgentRegistry    = fakeAgentRegH
@@ -6224,6 +6276,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -6359,6 +6413,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
