@@ -556,6 +556,8 @@ stubCronStore = CronStore
   , csDelete    = \_ -> error "cron store stub: csDelete"
   , csRecordRun = \_ _ -> error "cron store stub: csRecordRun"
   , csListRuns  = \_ _ -> error "cron store stub: csListRuns"
+  , csUpdateRun = \_ _ -> error "cron store stub: csUpdateRun"
+  , csLock = error "cron store stub: csLock"
   }
 
 spec :: Spec
@@ -5740,7 +5742,7 @@ spec = describe "Seal.Gateway.API" $ do
       let sr = SessionRuntime { srPaths = fakePaths { spState = tmp }, srConfigPath = "", srActive = activeRef }
           sendDeps = SendDeps
             { sdPaths      = fakePaths { spState = tmp }
-            , sdVault      = error "sdVault: unused on the 404 path"
+            , sdVault      = error "sdVault: unused on the 404 path"            , sdTurnComplete = \_ _ -> pure ()
             , sdRepoReg    = fakeRepoRegistryHandle
             , sdAgentReg   = fakeAgentRegH
             , sdProvider   = error "sdProvider: unused on the 404 path"
@@ -5855,7 +5857,7 @@ spec = describe "Seal.Gateway.API" $ do
           resolveStub _ = pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2"))
           sendDeps = SendDeps
             { sdPaths      = paths
-            , sdVault      = rt
+            , sdVault      = rt            , sdTurnComplete = \_ _ -> pure ()
             , sdRepoReg    = fakeRepoRegistryHandle
             , sdAgentReg   = fakeAgentRegH
             , sdProvider   = pr
@@ -6033,7 +6035,7 @@ spec = describe "Seal.Gateway.API" $ do
           resolveStub _ = pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2"))
           sendDeps = SendDeps
             { sdPaths      = paths
-            , sdVault      = rt
+            , sdVault      = rt            , sdTurnComplete = \_ _ -> pure ()
             , sdRepoReg    = fakeRepoRegistryHandle
             , sdProvider   = pr
             , sdSession    = sr
@@ -6165,7 +6167,7 @@ spec = describe "Seal.Gateway.API" $ do
           registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps (mkWebTurnDeps sendDeps) requestSid) ]
           sendDeps = SendDeps
             { sdPaths      = paths
-            , sdVault      = rt
+            , sdVault      = rt            , sdTurnComplete = \_ _ -> pure ()
             , sdRepoReg    = fakeRepoRegistryHandle
             , sdAgentReg   = fakeAgentRegH
             , sdProvider   = pr
@@ -6300,7 +6302,7 @@ spec = describe "Seal.Gateway.API" $ do
           registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps (mkWebTurnDeps sendDeps) requestSid) ]
           sendDeps = SendDeps
             { sdPaths      = paths
-            , sdVault      = rt
+            , sdVault      = rt            , sdTurnComplete = \_ _ -> pure ()
             , sdRepoReg    = fakeRepoRegistryHandle
             , sdAgentReg   = fakeAgentRegH
             , sdProvider   = pr
