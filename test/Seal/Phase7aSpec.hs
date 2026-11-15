@@ -34,19 +34,20 @@ import Seal.Logging.Logger (SealLogger, testSealLogger)
 import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..), streamMiddleware)
 import Seal.Gateway.StreamBroker (newStreamBroker, broadcastLists)
 import Seal.Git.Repo (openConfigRepo)
+import Seal.Cron.Store (CronStore (..))
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
 import Seal.Skills.Backend qualified as Skill (noneBackend)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
 import Seal.Web.UiState (newUiStateHandle)
-import Seal.Cron.Store (CronStore (..))
 
 -- | A shared test abort registry (top-level, created once via unsafePerformIO).
 testAbortReg :: SessionAbortRegistry
@@ -86,7 +87,6 @@ fakeRepoRegistryHandle = RepoRegistryHandle
 fallbackApp :: Application
 fallbackApp _req respond = respond (responseLBS status404 [] "not found")
 
--- | A pure 'CronStore' stub for ApiDeps literals that don't exercise cron.
 stubCronStore :: CronStore
 stubCronStore = CronStore
   { csCreate    = \_ -> error "cron store stub: csCreate"
@@ -97,6 +97,7 @@ stubCronStore = CronStore
   , csRecordRun = \_ _ -> error "cron store stub: csRecordRun"
   , csListRuns  = \_ _ -> error "cron store stub: csListRuns"
   }
+
 spec :: Spec
 spec = describe "Seal.Phase7aSpec" $ do
   it "the assembled gateway serves /api/health (200)" $ do
@@ -132,6 +133,11 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
     , adCronStore = stubCronStore
+    , adFileExplorer = mkFailClosedFileExplorer
+    , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
           }
         app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
@@ -194,6 +200,11 @@ spec = describe "Seal.Phase7aSpec" $ do
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
     , adCronStore = stubCronStore
+    , adFileExplorer = mkFailClosedFileExplorer
+    , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
           }
         app = gatewayApp testLogger Nothing deps Nothing
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "tabs"] })

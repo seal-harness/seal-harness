@@ -53,6 +53,7 @@ import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
 import Seal.Web.UiState (newUiStateHandle)
 import Seal.Cron.Store (CronStore (..))
 
@@ -245,6 +246,11 @@ mkApp canonicalOrigin = do
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
     , adCronStore = stubCronStore
+    , adFileExplorer = mkFailClosedFileExplorer
+    , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     }
 
 testAbortReg :: SessionAbortRegistry

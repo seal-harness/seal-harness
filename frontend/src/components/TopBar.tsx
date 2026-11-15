@@ -13,15 +13,17 @@ export type TopSection =
   | 'cron'
   | 'channels'
   | 'secrets'
+  | 'files'
   | 'access'
 
 const SECTION_LABELS: Record<TopSection, string> = {
   sessions: 'Sessions',
-  providers: 'Providers',
   agents: 'Agents',
   skills: 'Skills',
+  files: 'Files',
   repos: 'Repos',
   cron: 'Cron',
+  providers: 'Providers',
   channels: 'Channels',
   secrets: 'Secrets',
   access: 'Access',

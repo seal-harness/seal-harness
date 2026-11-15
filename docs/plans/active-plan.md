@@ -1,30 +1,29 @@
 # Active Plan
-<!-- approved: 2026-10-23 -->
-<!-- gate-iterations: 6 -->
+<!-- approved: 2026-11-14 -->
+<!-- gate-iterations: 3 -->
 <!-- user-approved: true -->
 <!-- status: completed -->
 
-CRON_MANAGE Web UI — a `Cron` tab in the top bar with a two-pane CRUD view
-over the existing `CronStore`. The gateway-wide Origin check (WU-4 in the
-original plan) is already implemented by the passkey/mutation-guard work and
-is dropped from this plan. Run history is also dropped (operator decision);
-the route count goes from 70 to 75 (5 cron routes).
+Chunked Resumable Download — full implementation plan.
 
 Canonical plan (full text, work units, DoD):
-`docs/plans/2026-10-22-cron-web-ui-plan.md` (revision 6; WU-4 dropped,
-run history dropped, `adAllowedOrigins` subsumed by existing
-`adCanonicalOrigin`).
+`docs/superpowers/plans/2026-11-14-chunked-resumable-download-plan.md`
 
-Execution: TDD per work unit, one commit per WU.
+Design spec:
+`docs/superpowers/specs/2026-11-13-chunked-resumable-download-design.md`
 
-| WU | Title | Status |
-|---|---|---|
-| WU-0 | set the active plan | complete |
-| WU-1 | shared cron operations module + total `computeNextFire` | complete |
-| WU-2 | `ApiDeps.adCronStore` field | complete |
-| WU-3 | 5 cron REST endpoints (route count 70 → 75) | complete |
-| ~~WU-4~~ | ~~gateway-wide Origin check~~ | dropped (already done) |
-| WU-5 | frontend types + API hooks | complete |
-| WU-6 | `CronView` component | complete |
-| WU-7 | top bar + routing | complete |
-| WU-8 | full gate + docs | complete |
+Execution: orchestrated (6 work units).
+
+Operator decisions:
+- Full downloader (Slice 1 + Slice 2)
+- Both local and remote arms
+- No cross-reload resume (in-memory only, no IndexedDB)
+
+| WU | Title | Status | Commit |
+|---|---|---|---|
+| WU-1 | Backend: ceiling split + readBoundedFile fix + FileStat + feReadRange + runRemoteStream | complete | e4d8e50 |
+| WU-2 | Backend: stat + manifest + chunk routes + config + blocked-path | complete | df18a2d |
+| WU-3 | Frontend: confirm dialog + stat + .partial naming + modalStack | complete | 7fe6ed7 |
+| WU-4 | Frontend: chunked download orchestration + progress UI | complete | 8e979a6 |
+| WU-5 | Security: sanitizeHref link block | complete | cdc56ec |
+| WU-6 | Docs + full gate | complete | — |

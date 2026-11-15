@@ -49,6 +49,10 @@ data GatewayConfig = GatewayConfig
     -- passkey-capable secure context. Handed to Warp as the bind address.
   , gcStaticDir      :: Maybe Text  -- ^ the frontend dist dir (Nothing = no static serving)
   , gcAllowedOrigins :: [Text]     -- ^ the WS Origin allowlist (default localhost:8080)
+  , gcFileExplorerEnabled :: Maybe Bool -- ^ enable the file explorer (default True; set False to disable)
+  , gcFileDownloadPromptBytes :: Maybe Int -- ^ size threshold (bytes) above which the frontend prompts before download (default 256 MiB = 268435456)
+  , gcFileDownloadChunkBytes :: Maybe Int -- ^ chunk size for chunked downloads (default 4 MiB = 4194304)
+  , gcFileDownloadAllowBlocked :: Maybe Bool -- ^ override SEC-B3 blocked-path enforcement for downloads (default False)
   , gcTlsCert        :: Maybe Text
     -- ^ PEM certificate chain. Set together with 'gcTlsKey' to serve HTTPS
     -- directly, with no reverse proxy in front.
@@ -72,6 +76,10 @@ defaultGatewayConfig = GatewayConfig
   , gcHost = "localhost"
   , gcStaticDir = Nothing
   , gcAllowedOrigins = ["http://localhost:8080"]
+  , gcFileExplorerEnabled = Nothing
+  , gcFileDownloadPromptBytes = Nothing
+  , gcFileDownloadChunkBytes = Nothing
+  , gcFileDownloadAllowBlocked = Nothing
   , gcTlsCert = Nothing
   , gcTlsKey = Nothing
   , gcTls = False
@@ -155,6 +163,10 @@ gatewayConfigCodec = PartialGatewayConfig
   <*> Toml.dioptional (Toml.text "host") .= pgcHost
   <*> Toml.dioptional (Toml.text "static_dir") .= pgcStaticDir
   <*> originsCodec .= pgcAllowedOrigins
+  <*> Toml.dioptional (Toml.bool "file_explorer_enabled") .= pgcFileExplorerEnabled
+  <*> Toml.dimap (fmap fromIntegral) (fmap fromIntegral) (Toml.dioptional (Toml.integer "file_download_prompt_bytes")) .= pgcFileDownloadPromptBytes
+  <*> Toml.dimap (fmap fromIntegral) (fmap fromIntegral) (Toml.dioptional (Toml.integer "file_download_chunk_bytes")) .= pgcFileDownloadChunkBytes
+  <*> Toml.dioptional (Toml.bool "file_download_allow_blocked") .= pgcFileDownloadAllowBlocked
   <*> Toml.dioptional (Toml.text "tls_cert") .= pgcTlsCert
   <*> Toml.dioptional (Toml.text "tls_key") .= pgcTlsKey
   <*> Toml.dioptional (Toml.bool "tls") .= pgcTls
@@ -196,6 +208,10 @@ data PartialGatewayConfig = PartialGatewayConfig
   , pgcHost           :: Maybe Text
   , pgcStaticDir      :: Maybe Text
   , pgcAllowedOrigins :: [Text]
+  , pgcFileExplorerEnabled :: Maybe Bool
+  , pgcFileDownloadPromptBytes :: Maybe Int
+  , pgcFileDownloadChunkBytes :: Maybe Int
+  , pgcFileDownloadAllowBlocked :: Maybe Bool
   , pgcTlsCert        :: Maybe Text
   , pgcTlsKey         :: Maybe Text
   , pgcTls            :: Maybe Bool
@@ -215,6 +231,10 @@ withGatewayDefaults p = GatewayConfig
   , gcAllowedOrigins = if null (pgcAllowedOrigins p)
                          then gcAllowedOrigins defaultGatewayConfig
                          else pgcAllowedOrigins p
+  , gcFileExplorerEnabled = pgcFileExplorerEnabled p
+  , gcFileDownloadPromptBytes = pgcFileDownloadPromptBytes p
+  , gcFileDownloadChunkBytes = pgcFileDownloadChunkBytes p
+  , gcFileDownloadAllowBlocked = pgcFileDownloadAllowBlocked p
   , gcTlsCert        = pgcTlsCert p
   , gcTlsKey         = pgcTlsKey p
   , gcTls            = fromMaybe False (pgcTls p)

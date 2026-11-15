@@ -87,6 +87,7 @@ import Seal.TestHelpers.ApiTestHarness
 import Options.Applicative (info)
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry, replySubscribe)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
 import Seal.ISA.RepeatDetect (SessionRepeatRegistry, newSessionRepeatRegistry)
 import Seal.Skills.Backend qualified as Skill (noneBackend, sbCreate)
 import Seal.Skills.Types (Skill (..), mkSkillId)
@@ -322,6 +323,11 @@ mkDepsFor paths = do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     }
@@ -496,26 +502,15 @@ mkProviderTestDeps tmp cfgRoot vr = do
     , adWsHealth = pure (StreamHealth "up" 8081)
     , adAbortReg         = testAbortReg
     , adCronStore = stubCronStore
+    , adFileExplorer = mkFailClosedFileExplorer
+    , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig   = defaultSecurityConfig
     , adMkSessionExec    = Nothing
     }
 
-
--- | A pure 'CronStore' stub for inline @deps = ApiDeps {…}@ literals
--- (which are in a pure @let@ context and cannot call 'memoryCronStore').
--- Every field raises so a mis-routed request is unmistakable rather than
--- a plausible-looking empty 200. The cron tests build a real
--- 'memoryCronStore' in IO and inject it.
-stubCronStore :: CronStore
-stubCronStore = CronStore
-  { csCreate    = \_ -> error "cron store stub: csCreate called in non-cron test"
-  , csRead      = \_ -> error "cron store stub: csRead called in non-cron test"
-  , csList      = \_ -> error "cron store stub: csList called in non-cron test"
-  , csSave      = \_ -> error "cron store stub: csSave called in non-cron test"
-  , csDelete    = \_ -> error "cron store stub: csDelete called in non-cron test"
-  , csRecordRun = \_ _ -> error "cron store stub: csRecordRun called in non-cron test"
-  , csListRuns  = \_ _ -> error "cron store stub: csListRuns called in non-cron test"
-  }
 
 -- | The pure 'RepoRegistryHandle' value backing 'mkFakeRepoRegistryHandle'.
 -- Used by the inline @deps = ApiDeps {…}@ literals (which are in a pure
@@ -551,6 +546,17 @@ waitForPoll totalWaitUs readAction predicate = go totalWaitUs
             else do
               threadDelay stepUs
               go (remaining - stepUs)
+
+stubCronStore :: CronStore
+stubCronStore = CronStore
+  { csCreate    = \_ -> error "cron store stub: csCreate"
+  , csRead      = \_ -> error "cron store stub: csRead"
+  , csList      = \_ -> error "cron store stub: csList"
+  , csSave      = \_ -> error "cron store stub: csSave"
+  , csDelete    = \_ -> error "cron store stub: csDelete"
+  , csRecordRun = \_ _ -> error "cron store stub: csRecordRun"
+  , csListRuns  = \_ _ -> error "cron store stub: csListRuns"
+  }
 
 spec :: Spec
 spec = describe "Seal.Gateway.API" $ do
@@ -2314,6 +2320,34 @@ spec = describe "Seal.Gateway.API" $ do
         (A.Object o : _) -> lookupK "agent" o `shouldBe` Just (A.String "my-uploaded-agent")
         _                -> expectationFailure "no session row"
 
+  it "GET /api/sessions/:id/workdir returns 200 + the local workdir path" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let cacheDir = stateDir </> "cache"
+          paths = fakePaths { spState = stateDir, spCache = cacheDir }
+          sidTxt = "20260701-120000-099"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sidTxt, "workdir"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> case lookupK "path" o of
+          Just (A.String p) ->
+            p `shouldBe` T.pack (cacheDir </> "workdirs" </> T.unpack sidTxt)
+          other -> expectationFailure ("expected path string, got: " <> show other)
+        _ -> expectationFailure ("expected JSON object, got: " <> show body)
+
+  it "GET /api/sessions/:id/workdir returns 404 for an unknown session" $ do
+    app <- mkApp
+    status <- runAppStatus app (testRequest methodGet ["api", "sessions", "unknown-sid-999", "workdir"])
+    status `shouldBe` 404
+
   it "GET /api/agents returns 200 with a JSON array" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "agents"])
@@ -2356,6 +2390,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                  }
@@ -2435,6 +2474,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2504,6 +2548,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2574,6 +2623,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2669,6 +2723,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2729,6 +2788,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2788,6 +2852,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2828,6 +2897,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2920,6 +2994,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2978,6 +3057,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3035,6 +3119,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3086,6 +3175,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3146,6 +3240,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3411,6 +3510,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adWsHealth = pure (StreamHealth "up" 8081)
                 , adAbortReg         = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
                 }
@@ -3602,6 +3706,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adWsHealth = pure (StreamHealth "up" 8081)
                 , adAbortReg         = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
                 }
@@ -3675,6 +3784,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3723,6 +3837,11 @@ spec = describe "Seal.Gateway.API" $ do
             , adWsHealth = pure (StreamHealth "up" 8081)
             , adAbortReg         = testAbortReg
             , adCronStore = stubCronStore
+            , adFileExplorer = mkFailClosedFileExplorer
+            , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
             }
@@ -3909,6 +4028,11 @@ spec = describe "Seal.Gateway.API" $ do
             , adWsHealth = pure (StreamHealth "up" 8081)
             , adAbortReg         = testAbortReg
             , adCronStore = stubCronStore
+            , adFileExplorer = mkFailClosedFileExplorer
+            , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
             }
@@ -4238,6 +4362,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -5274,6 +5403,11 @@ spec = describe "Seal.Gateway.API" $ do
         , adAgentRegistry    = fakeAgentRegH
                 , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps, adPaths = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -5412,6 +5546,11 @@ spec = describe "Seal.Gateway.API" $ do
             , adMkSessionExec = Just (const (pure stubExec))
             , adAbortReg = testAbortReg
             , adCronStore = stubCronStore
+            , adFileExplorer = mkFailClosedFileExplorer
+            , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
             }
           app = apiApp deps
       (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sidTxt, "agents"])
@@ -5502,6 +5641,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -5612,6 +5756,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -5784,6 +5933,11 @@ spec = describe "Seal.Gateway.API" $ do
             , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
             , adPaths            = paths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
             , adCronStore = stubCronStore
+            , adFileExplorer = mkFailClosedFileExplorer
+            , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Nothing
             , adAgentRegistry    = fakeAgentRegH
@@ -5912,6 +6066,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -6042,6 +6201,11 @@ spec = describe "Seal.Gateway.API" $ do
                 , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
                 , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }

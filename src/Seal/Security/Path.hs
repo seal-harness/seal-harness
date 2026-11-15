@@ -11,6 +11,9 @@ module Seal.Security.Path
   , mkSafePathRemoteAllowAbs
   , KeysRoot (..)
   , ensureKeysRoot
+  , lexicalCollapse
+  , blockedNames
+  , blockedSegment
   , SafeKeyPath
   , getSafeKeyPath
   , mkSafeKeyPath

@@ -34,6 +34,7 @@ import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
 import Seal.Skills.Backend qualified as Skill (noneBackend)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
@@ -122,6 +123,11 @@ mkDeps = do
     , adMkSessionExec = Nothing
     , adAbortReg = testAbortReg
     , adCronStore = stubCronStore
+    , adFileExplorer = mkFailClosedFileExplorer
+    , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
     })
 
 -- | A pure 'CronStore' stub for ApiDeps literals that don't exercise cron.

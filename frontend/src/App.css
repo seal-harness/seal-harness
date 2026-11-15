@@ -398,6 +398,19 @@ body {
 .icon-btn svg { display: block; }
 .icon-btn + .icon-btn { margin-left: -4px; }
 
+/* ── Files view: main-pane rows ────────────────────────────────────────── */
+/*
+ * The file/directory rows in the detail pane are real <button>s (so Enter and
+ * Space work natively and there is no bespoke ARIA tree), which means they
+ * need the same visible focus treatment as .icon-btn. Without this the row's
+ * native outline is the only cue, which reads as a browser default rather
+ * than as part of the app.
+ */
+.files-row:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--accent-primary);
+}
+
 /* ── WebSocket connection modal ────────────────────────────────────────── */
 /*
  * A persistent live-stream disconnect. Deliberately NOT a full-screen

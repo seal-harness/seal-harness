@@ -5,6 +5,8 @@ import type {
   AgentInfo,
   DeployKeyInfo,
   DiscoverableWindow,
+  FileContent,
+  FileListing,
   HarnessInfo,
   ProviderInfo,
   ProviderDetail,
@@ -1272,6 +1274,19 @@ export async function setupRepo(sessionId: string, url: string, branch?: string,
     clearTimeout(t)
   }
 }
+
+/** Fetch the absolute workdir path for a session. The backend computes
+ *  the path from the security config: local mode →
+ *  `<cache>/workdirs/<sid>`; remote mode →
+ *  `<remote-workspace>/workdirs/<sid>`. The frontend uses this for the
+ *  "open session workdir in Files" link in the chat header. Returns the
+ *  path string, or null on any failure (network error, 404, parse
+ *  error). */
+export async function fetchSessionWorkdir(sessionId: string): Promise<string | null> {
+  const res = await fetchJson<{ path: string }>(`/api/sessions/${encodeURIComponent(sessionId)}/workdir`)
+  return res?.path ?? null
+}
+
 // ── Agent CRUD ──────────────────────────────────────────────────────────
 
 /** Fetch all agent defs (the full def, including provider/model/system/
@@ -1806,4 +1821,222 @@ export function useCronJobs() {
   const refresh = useCallback(() => setRefreshCount((n) => n + 1), [])
 
   return { jobs, loaded, error, refresh }
+}
+
+// ── File Explorer ───────────────────────────────────────────────────────
+
+/** Fetch a directory listing. Returns the listing on success, or an
+ *  error status code (400/403/404) on failure. Pass null/undefined for
+ *  `path` to resolve the home directory (the backend defaults to $HOME). */
+export async function fetchFileListing(
+  path: string | null | undefined,
+  signal?: AbortSignal,
+): Promise<{ ok: true; listing: FileListing } | { ok: false; status: number }> {
+  try {
+    const url = path
+      ? `/api/files?path=${encodeURIComponent(path)}`
+      : '/api/files'
+    const res = await fetch(url, signal ? { signal } : undefined)
+    if (!res.ok) return { ok: false, status: res.status }
+    const listing = (await res.json()) as FileListing
+    return { ok: true, listing }
+  } catch {
+    return { ok: false, status: 0 }
+  }
+}
+
+/** Fetch a listing AND, in the same round trip, listings for several extra
+ *  directories (the rail's expansion chain). The backend serves the extras
+ *  from one batched remote operation, so N directories cost one SSH round
+ *  trip instead of N.
+ *
+ *  Returns the primary listing plus any rail listings that arrived complete.
+ *  Directories the transport truncated are simply absent from `rail`; the
+ *  caller re-requests those individually. */
+export async function fetchFileListingWithRail(
+  path: string | null | undefined,
+  railPaths: string[],
+  signal?: AbortSignal,
+): Promise<
+  | { ok: true; listing: FileListing; rail: FileListing[] }
+  | { ok: false; status: number }
+> {
+  try {
+    const qs = new URLSearchParams()
+    if (path) qs.set('path', path)
+    for (const p of railPaths) qs.append('paths', p)
+    const url = `/api/files?${qs.toString()}`
+    const res = await fetch(url, signal ? { signal } : undefined)
+    if (!res.ok) return { ok: false, status: res.status }
+    const body = (await res.json()) as FileListing & { rail?: FileListing[] }
+    const { rail, ...listing } = body
+    return { ok: true, listing: listing as FileListing, rail: rail ?? [] }
+  } catch {
+    return { ok: false, status: 0 }
+  }
+}
+
+export async function fetchFileContent(
+  path: string,
+  signal?: AbortSignal,
+): Promise<{ ok: true; content: FileContent } | { ok: false; status: number }> {
+  try {
+    const res = await fetch(
+      `/api/files/content?path=${encodeURIComponent(path)}`,
+      signal ? { signal } : undefined,
+    )
+    if (!res.ok) return { ok: false, status: res.status }
+    const content = (await res.json()) as FileContent
+    return { ok: true, content }
+  } catch {
+    return { ok: false, status: 0 }
+  }
+}
+
+/** Hook: fetch and hold a directory listing. Re-fetches when `path`
+ *  changes or `refresh` is called. Returns `listing`, `loading`, `error`
+ *  (the HTTP status code, or 0 for a network error), and `refresh`. */
+export function useFileListing(path: string | null | undefined) {
+  const [listing, setListing] = useState<FileListing | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<number | null>(null)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+    fetchFileListing(path).then((res) => {
+      if (cancelled) return
+      if (res.ok) {
+        setListing(res.listing)
+        setError(null)
+      } else {
+        setListing(null)
+        setError(res.status)
+      }
+      setLoading(false)
+    })
+    return () => { cancelled = true }
+  }, [path, refreshCount])
+
+  return { listing, loading, error, refresh }
+}
+
+/** Hook: fetch and hold file content. Re-fetches when `path` changes or
+ *  `refresh` is called. Returns `content`, `loading`, `error` (the HTTP
+ *  status code, or 0 for a network error), and `refresh`. */
+export function useFileContent(path: string | null | undefined) {
+  const [content, setContent] = useState<FileContent | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<number | null>(null)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+    if (!path) {
+      setContent(null); setLoading(false); return
+    }
+    fetchFileContent(path).then((res) => {
+      if (cancelled) return
+      if (res.ok) {
+        setContent(res.content)
+        setError(null)
+      } else {
+        setContent(null)
+        setError(res.status)
+      }
+      setLoading(false)
+    })
+    return () => { cancelled = true }
+  }, [path, refreshCount])
+
+  return { content, loading, error, refresh }
+}
+
+/** Download a file via `fetch()` (NOT a plain `<a href>`). Checks the
+ *  `X-Truncated` response header — when true, the file was truncated by
+ *  the server's byte ceiling, so we show a warning. The blob is saved via
+ *  `URL.createObjectURL` + a temporary `<a download>` click. Returns
+ *  `{ truncated: boolean }` so the caller can show a toast. */
+export async function downloadFile(path: string, partialLimit?: number): Promise<{ truncated: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/files/download?path=${encodeURIComponent(path)}`)
+    if (!res.ok) return { truncated: false, error: `HTTP ${res.status}` }
+    const truncated = res.headers.get('X-Truncated') === 'true'
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    // Derive a filename from the last path component.
+    const basename = path.split('/').pop() || 'download'
+    if (truncated) {
+      const savedStr = formatBytes(partialLimit ?? blob.size)
+      const totalStr = formatBytes(blob.size)
+      a.download = `${basename}.${savedStr}-of-${totalStr}.partial`
+    } else {
+      a.download = basename
+    }
+    document.body.appendChild(a)
+    a.click()
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n}B`
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)}KiB`
+  if (n < 1024 * 1024 * 1024) return `${Math.round(n / (1024 * 1024))}MiB`
+  return `${(n / (1024 * 1024 * 1024)).toFixed(1)}GiB`
+}
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+    return { truncated }
+  } catch {
+    return { truncated: false, error: 'network error' }
+  }
+}
+
+/** Fetch file stat (size, mtime) via `GET /api/files/stat?path=<p>`.
+ *  Returns `{ok:true, stat} | {ok:false, status}`. */
+export async function fetchFileStat(path: string): Promise<{ ok: true; stat: import('../types').FileStat } | { ok: false; status: number }> {
+  try {
+    const res = await fetch(`/api/files/stat?path=${encodeURIComponent(path)}`)
+    if (!res.ok) return { ok: false, status: res.status }
+    const stat = await res.json() as import('../types').FileStat
+    return { ok: true, stat }
+  } catch {
+    return { ok: false, status: 0 }
+  }
+}
+
+/** Fetch a download manifest via `GET /api/files/download/manifest?path=<p>`.
+ *  Returns O(1) metadata (no hash list). */
+export async function fetchFileManifest(path: string): Promise<{ ok: true; manifest: import('../types').FileManifest } | { ok: false; status: number }> {
+  try {
+    const res = await fetch(`/api/files/download/manifest?path=${encodeURIComponent(path)}`)
+    if (!res.ok) return { ok: false, status: res.status }
+    const manifest = await res.json() as import('../types').FileManifest
+    return { ok: true, manifest }
+  } catch {
+    return { ok: false, status: 0 }
+  }
+}
+
+/** Fetch a single chunk via `GET /api/files/download/chunk?path=<p>&index=<i>&size=<s>&mtime=<m>`.
+ *  Returns raw bytes + the X-Chunk-SHA256 header. */
+export async function fetchFileChunk(path: string, index: number, size: number, mtime: number | null): Promise<{ ok: true; bytes: ArrayBuffer; sha256: string | null } | { ok: false; status: number }> {
+  try {
+    const mtimeParam = mtime === null ? 'null' : String(mtime)
+    const res = await fetch(`/api/files/download/chunk?path=${encodeURIComponent(path)}&index=${index}&size=${size}&mtime=${mtimeParam}`)
+    if (!res.ok) return { ok: false, status: res.status }
+    const bytes = await res.arrayBuffer()
+    const sha256 = res.headers.get('X-Chunk-SHA256')
+    return { ok: true, bytes, sha256 }
+  } catch {
+    return { ok: false, status: 0 }
+  }
 }

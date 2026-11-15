@@ -143,6 +143,12 @@ openApiMeta = \case
   RouteUiCustomModels -> api (match "ui" ./ match "custom-models" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
   RouteUiRepos -> api (match "ui" ./ match "repos" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
   RouteAdopt -> api (match "adopt" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteFilesList -> api (match "files" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteFilesContent -> api (match "files" ./ match "content" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteFilesDownload -> api (match "files" ./ match "download" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteFilesStat -> api (match "files" ./ match "stat" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteFilesManifest -> api (match "files" ./ match "download" ./ match "manifest" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteFilesChunk -> api (match "files" ./ match "download" ./ match "chunk" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteSetupState -> api (match "setup" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteSetupVault -> api (match "setup" ./ match "vault" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
   RouteSetupVaultReopen -> api (match "setup" ./ match "vault" ./ match "reopen" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post

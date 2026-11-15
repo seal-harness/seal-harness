@@ -12,6 +12,7 @@ import { CronView } from './components/CronView'
 import { SecretsView } from './components/SecretsView'
 import { AccessView } from './components/AccessView'
 import { ChannelsView } from './components/ChannelsView'
+import { FilesView } from './components/FilesView'
 import { PerfOverlay } from './components/PerfOverlay'
 import { startMemoryMonitor, rateLimitedLog, detectLoop } from './lib/diag'
 import { useTranscriptMessages } from './hooks/useTranscriptMessages'
@@ -73,6 +74,7 @@ function sectionFromPath(): TopSection {
   if (path === '/repos' || path.startsWith('/repos/')) return 'repos'
   if (path === '/cron' || path.startsWith('/cron/')) return 'cron'
   if (path === '/secrets' || path.startsWith('/secrets/')) return 'secrets'
+  if (path === '/files' || path.startsWith('/files/')) return 'files'
   if (path === '/access' || path.startsWith('/access/')) return 'access'
   return 'sessions'
 }
@@ -547,9 +549,16 @@ export default function App() {
 
   const syncSection = useCallback((s: TopSection) => {
     if (typeof window !== 'undefined') {
-      window.history.pushState(null, '', pathFromSection(s))
+      // When switching back to the sessions section, preserve the
+      // currently-focused session/tab in the URL instead of resetting
+      // to '/'. This prevents the session header buttons (Copy ID,
+      // Open workdir) from disappearing when toggling Files → Sessions.
+      const target = s === 'sessions' && selectedId
+        ? pathFromSelectedId(selectedId)
+        : pathFromSection(s)
+      window.history.pushState(null, '', target)
     }
-  }, [])
+  }, [selectedId])
 
   const handleSectionChange = useCallback((s: TopSection) => {
     setSection(s)
@@ -1048,6 +1057,8 @@ export default function App() {
         <CronView />
       ) : section === 'secrets' ? (
         <SecretsView />
+      ) : section === 'files' ? (
+        <FilesView />
       ) : section === 'access' ? (
         <AccessView />
       ) : (
