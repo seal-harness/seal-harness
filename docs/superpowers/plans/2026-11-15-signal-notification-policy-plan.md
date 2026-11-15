@@ -308,7 +308,11 @@ WU-2 becomes inert. That revert is the rollback path — no data migration.
 - **Overflow**: a body past the channel limit falls back to chunked sends.
 - **Two asks in one turn**: the oldest is announced; the next on a later idle.
 - **Focused *and* watched**: skipped when `sid == focusedSid`.
-- **Test churn**: the 3 tool-emoji tests (`LoopSpec.hs:639-695`), the 3 streaming
-  tests (`:412-525`), the `formatQuestionWithOptions` test (`:737-743`), the
-  Signal streaming test (`SignalAdapterSpec.hs:212-245`). Telegram's tests stay
-  untouched and must stay green.
+- **Test churn (actual, narrower than predicted)**: the plan expected the 3
+  tool-emoji tests to need rewriting; they did **not**. Because
+  `PsSeparateMessages` is the default and only Signal opts out of it, the
+  existing tool-emoji and streaming tests pass unchanged — which is itself the
+  evidence that the default path is byte-identical. Only two assertions had to
+  change, both because they encoded behaviour this plan deliberately removes:
+  the Signal "no streaming edits" cadence test, and
+  `formatQuestionWithOptions "Hello?" []`. Telegram's tests are untouched.
