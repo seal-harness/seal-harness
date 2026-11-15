@@ -695,6 +695,10 @@ export interface CronJobSummary {
   timezone: string | null
   prompt: string
   agent_def_id: string | null
+  /** Optional provider override. `null` = use Seal's configured default. */
+  provider: string | null
+  /** Optional model override. `null` = use Seal's configured default. */
+  model: string | null
   enabled: boolean
   one_shot: boolean
   created_at: string
@@ -718,6 +722,10 @@ export interface CronJobInput {
   timezone?: string
   prompt: string
   agent_def_id?: string
+  /** Optional; omit (or send "") to use Seal's configured default provider. */
+  provider?: string | null
+  /** Optional; omit (or send "") to use Seal's configured default model. */
+  model?: string | null
   enabled?: boolean
   one_shot?: boolean
 }
@@ -730,6 +738,11 @@ export interface CronJobUpdateInput {
   timezone?: string
   prompt?: string
   agent_def_id?: string
+  /** Absent or `null` = leave unchanged; `""` = clear to the configured
+   *  default; a name = set. */
+  provider?: string | null
+  /** Same three-way convention as `provider`. */
+  model?: string | null
   enabled?: boolean
   one_shot?: boolean
 }

@@ -353,8 +353,15 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
                     Right aid -> Just aid
                     Left _ -> Nothing
                   Nothing -> mAgent
-                provider = fromMaybe cfgProv mProv
-                model = fromMaybe cfgModel mModel
+                -- The job's own provider/model override comes first, then
+                -- the bound agent def's override, then Seal's configured
+                -- default. The two fields are independent: a job that sets
+                -- neither resolves exactly as it did before this feature, and
+                -- a model with no provider applies to whichever provider
+                -- resolves. An absent job field is 'Nothing', so the
+                -- resolution chain is unchanged for every other caller.
+                provider = fromMaybe (fromMaybe cfgProv mProv) (cjProvider job)
+                model = fromMaybe (fromMaybe cfgModel mModel) (cjModel job)
             meta <- newSession paths provider model "cron" mJobAgent
             let sid = smId meta
             void (forkIO (void (handleSend sendDeps sid Nothing (cjPrompt job))))

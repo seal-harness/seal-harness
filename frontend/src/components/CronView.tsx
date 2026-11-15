@@ -3,11 +3,14 @@ import {
   createCronJob,
   deleteCronJob,
   fetchCronJob,
+  fetchProviderModels,
   updateCronJob,
   useAgentDefs,
+  useConfiguredProviders,
   useCronJobs,
 } from '../hooks/useApi'
 import { agentOptionLabel, groupAgents } from '../lib/agentGroups'
+import { CustomModelCombobox, ProviderSelect } from './ProviderModelFields'
 import type { CronJobDetail, CronJobSummary } from '../types'
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -60,6 +63,7 @@ function Row({
 export function CronView() {
   const { jobs, loaded, error, refresh } = useCronJobs()
   const { agents, loaded: agentsLoaded } = useAgentDefs()
+  const { providers, loaded: providersLoaded } = useConfiguredProviders()
 
   const [editing, setEditing] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
@@ -68,6 +72,15 @@ export function CronView() {
   const [timezone, setTimezone] = useState('')
   const [prompt, setPrompt] = useState('')
   const [agentDefId, setAgentDefId] = useState('')
+  const [provider, setProvider] = useState('')
+  const [model, setModel] = useState('')
+  // Model suggestions for the picked provider. `modelsLoading` lets the
+  // combobox show a loading hint instead of an empty list while the fetch is
+  // in flight; `modelsFor` guards against a stale response landing after the
+  // operator has already flipped to a different provider.
+  const [modelOptions, setModelOptions] = useState<string[]>([])
+  const [modelsLoading, setModelsLoading] = useState(false)
+  const modelsFor = useRef<string>('')
   const [enabled, setEnabled] = useState(false)
   const [oneShot, setOneShot] = useState(false)
   const [submitting, setSubmitting] = useState(false)
@@ -99,6 +112,8 @@ export function CronView() {
         setTimezone(job.timezone ?? '')
         setPrompt(job.prompt)
         setAgentDefId(job.agent_def_id ?? '')
+        setProvider(job.provider ?? '')
+        setModel(job.model ?? '')
         setEnabled(job.enabled)
         setOneShot(job.one_shot)
         setFormError(null)
@@ -109,16 +124,60 @@ export function CronView() {
       setTimezone('')
       setPrompt('')
       setAgentDefId('')
+      setProvider('')
+      setModel('')
       setEnabled(false) // D3: create defaults to disabled
       setOneShot(false)
       setFormError(null)
     }
   }, [editing, creating])
 
+  // Fetch the model suggestions for the selected provider. Configured
+  // `models` win; otherwise ask the provider live. `fetchProviderModels`
+  // never throws and returns [] on any failure, so the combobox always stays
+  // usable for free-text entry. The `cancelled` flag drops a response for a
+  // provider the operator has already switched away from.
+  useEffect(() => {
+    if (!provider) {
+      setModelOptions([])
+      setModelsLoading(false)
+      return
+    }
+    const info = providers.find((p) => p.name === provider)
+    const configured = info?.models ?? []
+    if (configured.length > 0) {
+      setModelOptions(configured)
+      setModelsLoading(false)
+      return
+    }
+    let cancelled = false
+    setModelsLoading(true)
+    modelsFor.current = provider
+    fetchProviderModels(provider).then((rows) => {
+      if (cancelled || modelsFor.current !== provider) return
+      setModelOptions(rows.map((r) => r.name))
+      setModelsLoading(false)
+    })
+    return () => { cancelled = true }
+  }, [provider, providers])
+
   const sortedJobs = useMemo(() => {
     return [...jobs].sort((a, b) => a.name.localeCompare(b.name))
   }, [jobs])
   const agentGroups = useMemo(() => groupAgents(agents), [agents])
+
+  // The provider picker's options. A stored provider that no longer resolves
+  // to a configured provider is kept selectable as "(missing)", mirroring the
+  // agent picker above: opening and saving a job must not silently clear a
+  // value the operator never touched. While the list is still loading we
+  // cannot tell "missing" from "not fetched yet", so no synthetic entry is
+  // added until it has loaded.
+  const providerOptions = useMemo(() => {
+    const base = providers.filter((p) => p.configured !== false)
+    if (!providersLoaded || provider === '') return base
+    if (base.some((p) => p.name === provider)) return base
+    return [...base, { name: provider, missing: true }]
+  }, [providers, providersLoaded, provider])
 
   async function handleSubmit() {
     setSubmitting(true)
@@ -129,6 +188,12 @@ export function CronView() {
       timezone: timezone || undefined,
       prompt,
       agent_def_id: agentDefId || undefined,
+      // Provider/model are optional: no provider means "Seal's configured
+      // default". An empty model likewise omits the key, so the job follows
+      // the configured default model rather than pinning one. On edit an
+      // emptied provider sends "" — the wire signal that clears the field.
+      provider: provider || (creating ? undefined : ''),
+      model: model || (creating ? undefined : ''),
       enabled,
       one_shot: oneShot,
     }
@@ -403,6 +468,64 @@ export function CronView() {
                   </option>
                 )}
               </select>
+            </Row>
+
+            <Row
+              label="Provider"
+              htmlFor="cron-provider"
+              hint="Optional override. Unset uses Seal's configured default provider."
+            >
+              <ProviderSelect
+                id="cron-provider"
+                value={provider}
+                onChange={(v) => {
+                  setProvider(v)
+                  // Provider and model are independent, but a model chosen for
+                  // one provider is rarely valid on another, and the model
+                  // control is disabled without a provider. Clearing it here
+                  // keeps the pair consistent without pinning a model the
+                  // operator never typed.
+                  if (v === '') setModel('')
+                }}
+                providers={providerOptions}
+                loading={!providersLoaded}
+                showDefaultOption
+              />
+            </Row>
+
+            <Row
+              label="Model"
+              htmlFor="cron-model"
+              hint="Optional override. Unset uses Seal's configured default model."
+            >
+              {provider === '' ? (
+                // No provider yet, so the model cannot be meaningfully
+                // edited. `value` still shows a stored model so the form
+                // never hides a value it will submit (a job may legitimately
+                // carry a model with no provider; see the backend D4 note).
+                <input
+                  id="cron-model"
+                  type="text"
+                  value={model}
+                  disabled
+                  readOnly
+                  style={inputStyle}
+                  placeholder="(use configured default)"
+                />
+              ) : (
+                <CustomModelCombobox
+                  id="cron-model"
+                  value={model}
+                  onChange={setModel}
+                  options={modelOptions}
+                  placeholder={
+                    modelsLoading
+                      ? 'Loading models…'
+                      : 'model id (pick a suggestion or type your own)'
+                  }
+                  testId="cron-model-list"
+                />
+              )}
             </Row>
 
             <Row label="Enabled" htmlFor="cron-enabled">
