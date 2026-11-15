@@ -46,10 +46,17 @@ if tar --version 2>/dev/null | grep -q 'GNU tar'; then
   tar --numeric-owner --owner=0 --group=0 --mtime='@0' \
       -czf "${BASENAME}.tar.gz" -C "$STAGING" seal
 else
-  # bsdtar: pin ownership and timestamps before archiving instead, which is
-  # portable and gives the same reproducible result.
+  # bsdtar (macOS) has no --mtime/--owner, and stamps each file's real mtime,
+  # so the same binary produces a different archive every run. Pin the mtime
+  # on the file itself instead; SOURCE_DATE_EPOCH is the conventional epoch and
+  # COPYFILE_DISABLE stops bsdtar adding AppleDouble ._ entries.
+  #
+  # `gzip -n` is what actually makes the output stable: without -n, gzip
+  # records its own creation timestamp in the header (bytes 4-7), so the
+  # archive differs run to run even when the tar payload is byte-identical.
+  touch -t 198001010000 "$STAGING/seal"
   chmod 0755 "$STAGING/seal"
-  ( cd "$STAGING" && COPYFILE_DISABLE=1 tar -czf - seal ) > "${BASENAME}.tar.gz"
+  ( cd "$STAGING" && COPYFILE_DISABLE=1 tar -cf - seal | gzip -n ) > "${BASENAME}.tar.gz"
 fi
 
 sha256sum "${BASENAME}.tar.gz" > "${BASENAME}.tar.gz.sha256" 2>/dev/null \
