@@ -321,6 +321,8 @@ library
         Seal.Logging.ChannelContext
         Seal.Logging.Exceptions
         Seal.Logging.Global
+        Seal.Audit.Log
+        Seal.Audit.Predicate
     -- The local untrusted executor is omitted under -f remote-only-untrusted
     -- (the hardened build: untrusted execution can only run remotely).
     if !flag(remote-only-untrusted)
@@ -685,3 +687,4 @@ test-suite tests
         Seal.ISA.RepeatDetectSpec
         Seal.Logging.LoggerSpec
         Seal.Logging.ExceptionsSpec
+        Seal.Audit.LogSpec

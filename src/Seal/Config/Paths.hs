@@ -7,6 +7,7 @@ module Seal.Config.Paths
   , vaultFilePath
   , securityFilePath
   , credentialsFilePath
+  , auditDir
   , enrollmentGrantPath
   , enrollmentClaimPath
   , enrollmentTokenPath
@@ -103,6 +104,7 @@ ensureSealDirs paths = do
   createDirectoryIfMissing True (spConfig paths)
   createDirectoryIfMissing True (spState  paths)
   createDirectoryIfMissing True (spCache  paths)
+  createDirectoryIfMissing True (auditDir  paths)
   createDirectoryIfMissing True (spKeys   paths)
   -- The vault lives in a subdirectory of config/ ('vaultFilePath'); create it
   -- so the atomic vault write has an existing parent for its .tmp file.
@@ -140,6 +142,13 @@ securityFilePath paths = spHome paths </> "security.toml"
 -- @~\/.seal\/@.
 credentialsFilePath :: SealPaths -> FilePath
 credentialsFilePath paths = spHome paths </> "credentials.toml"
+
+-- | The audit log directory: @\<home\>\/audit@. Holds monthly-rotated,
+-- append-only audit log files (@audit-YYYY-MM.log@) for trusted mutating
+-- opcodes. A sibling of @config\/@ and @state\/@ (not under @config\/@ so
+-- the config git repo cannot audit-log its own commits).
+auditDir :: SealPaths -> FilePath
+auditDir paths = spHome paths </> "audit"
 
 -- | Path to the outstanding enrollment grant: @\<state\>\/enrollment-grant.json@.
 --

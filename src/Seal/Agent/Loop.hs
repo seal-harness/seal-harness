@@ -43,6 +43,8 @@ import Seal.Handles.AskReply
   ( ApprovalScope (..), checkApproval, parseApprovalScope, recordApproval )
 import Seal.Handles.Transcript (IndexedTranscriptHandle (..), IndexedTranscriptWrite (..))
 import Seal.ISA.Dispatch (DispatchError (..), dispatch)
+import Seal.Audit.Log (globalAuditWrite)
+import Seal.Audit.Predicate (shouldAudit, extractAction, extractTargetId)
 import Seal.Tools.Exec.Abort (clearAbort, isAborted)
 import Seal.ISA.Opcode (OpResult (..), Opcode, opTrust, opBlocking)
 import Seal.ISA.Registry (registryToolDefs', lookupOp)
@@ -620,6 +622,17 @@ runTurn env userText = do
       let (isErr, partCount) = case result of
             CbToolResult _ parts err -> (err, length parts)
             _ -> (False, 0)
+      -- Cross-session audit log: record mutating evolutionary-store
+      -- opcodes (SKILL_MANAGE write/delete, AGENT_DEF_MANAGE write/delete,
+      -- SECRET_MANAGE put/delete, MEMORY_MANAGE write/archive). Only fires
+      -- on successful (non-error) dispatches. The git hash is fetched from
+      -- the config repo at write time by the audit sink. Best-effort: a
+      -- failure in the audit log never crashes the turn.
+      when (not isErr && shouldAudit name (extractAction input)) $
+        liftIO $ do
+          now <- getCurrentTime
+          globalAuditWrite now (Just (aeSession env)) name
+                     (extractAction input) (extractTargetId input)
       liftIO (logToolDispatch (aeLogPath env) name isErr partCount)
       pure result
       where

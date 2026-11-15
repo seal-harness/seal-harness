@@ -1,5 +1,6 @@
 module Main (main) where
 
+import qualified Seal.Audit.LogSpec
 import Seal.TestHelpers.SshAgentGuard (withNoLeakedSshAgents)
 import Seal.TestHelpers.TimingFormatter (timingFormatter)
 import Test.Hspec
@@ -435,6 +436,7 @@ specs = do
   Seal.ISA.RepeatDetectSpec.spec
   Seal.Logging.LoggerSpec.spec
   Seal.Logging.ExceptionsSpec.spec
+  Seal.Audit.LogSpec.spec
   Seal.Tools.TimeoutSpec.spec
   Seal.Tools.Exec.AbortSpec.spec
   Seal.Tools.Exec.HostKeyAdoptionSpec.spec
