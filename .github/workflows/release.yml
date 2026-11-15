@@ -1,20 +1,133 @@
 name: Release
 
-# Tag-triggered versioned releases. Push a tag like `git tag v0.1.0 && git push origin v0.1.0`
-# to create an immutable GitHub Release with per-platform binaries + checksums.
-# For bleeding-edge builds from main, see the rolling "latest" release in ci.yml.
+# Tag-triggered releases. Push a tag to publish an immutable GitHub Release
+# with a self-contained per-platform binary (the web UI is compiled in).
+#
+#   v0.1.0        → stable release
+#   alpha-*, beta-*, rc-*  → pre-release (flagged as such on GitHub)
+#
+# For bleeding-edge builds from main, see the rolling "latest" release in
+# ci.yml. Use `workflow_dispatch` to release a tag pushed before this workflow
+# existed, without deleting and re-pushing it.
 
 on:
   push:
     tags:
       - "v*"
+      - "alpha-*"
+      - "beta-*"
+      - "rc-*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release (e.g. beta-0)
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # The same gate that guards main. A tag must not publish through a weaker
+  # check than a merge does.
+  # ─────────────────────────────────────────────────────────────────────────
+  gate:
+    name: Gate (${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-darwin
+            runner: macos-latest
+    uses: ./.github/workflows/gate.yml
+    with:
+      system: ${{ matrix.system }}
+      runner: ${{ matrix.runner }}
+      push-cache: true
+      # Gate the tagged code, not the default branch.
+      ref: ${{ inputs.tag || github.ref }}
+    secrets: inherit
+
+  # Tag/version consistency and the prerelease decision, computed once.
+  meta:
+    name: Resolve release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.m.outputs.tag }}
+      version: ${{ steps.m.outputs.version }}
+      prerelease: ${{ steps.m.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # workflow_dispatch may name an older tag than the checked-out commit.
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve tag, version and prerelease flag
+        id: m
+        run: |
+          set -eu
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          # Strip a leading v/alpha-/beta-/rc- to get the bare version, then
+          # require it to match the .cabal version (0.1.0.0 ↔ 0.1.0).
+          BARE="${TAG#v}"
+          BARE="${BARE#alpha-}"; BARE="${BARE#beta-}"; BARE="${BARE#rc-}"
+          echo "version=$BARE" >> "$GITHUB_OUTPUT"
+
+          case "$TAG" in
+            alpha-*|beta-*|rc-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *)                   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+          CABAL_VER=$(sed -n 's/^version:[[:space:]]*//p' seal-harness.cabal | head -1)
+          echo "cabal version: $CABAL_VER / tag version: $BARE"
+          # 0.1.0 and 0.1.0.0 are the same release; compare after normalising
+          # to three components.
+          norm() { echo "$1" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/'; }
+
+          # A stable tag (v*) MUST agree with the .cabal version: it is the
+          # number users see. A pre-release tag may carry a rolling or ad-hoc
+          # suffix with no version in it at all (beta-0), in which case there is
+          # nothing to compare and the check is skipped with a warning rather
+          # than blocking an otherwise valid pre-release.
+          case "$TAG" in
+            v*)
+              STRICT=true
+              ;;
+            *)
+              if echo "$BARE" | grep -qE '^[0-9]+\.[0-9]+'; then
+                STRICT=true
+              else
+                STRICT=false
+              fi
+              ;;
+          esac
+
+          if [ "$STRICT" = "true" ]; then
+            if [ "$(norm "$BARE")" != "$(norm "$CABAL_VER")" ]; then
+              echo "::error::Tag '$TAG' does not match version '$CABAL_VER' in seal-harness.cabal."
+              echo "Bump the .cabal version (and CHANGELOG) or retag."
+              exit 1
+            fi
+          else
+            echo "::warning::Tag '$TAG' carries no version; skipping the .cabal version check."
+          fi
+
+          if ! grep -q "^## $(norm "$CABAL_VER")\|^## $(norm "$BARE")" CHANGELOG.md; then
+            echo "::warning::No CHANGELOG.md section found for $(norm "$BARE")."
+          fi
+
   build:
     name: Build ${{ matrix.system }}
+    needs: [gate, meta]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -24,9 +137,10 @@ jobs:
             runner: ubuntu-latest
           - system: aarch64-darwin
             runner: macos-latest
-
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: DeterminateSystems/nix-installer-action@v22
         with:
@@ -47,43 +161,92 @@ jobs:
 
       - name: Package
         run: |
-          VERSION="${GITHUB_REF#refs/tags/}"
-          TARGET="seal-${{ matrix.system }}"
-          ARCHIVE="seal-${VERSION}-${TARGET}.tar.gz"
-          mkdir -p staging
-          cp ./result/bin/seal "staging/seal"
-          tar czf "$ARCHIVE" -C staging seal
-          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
-          echo "Packaged $ARCHIVE ($(wc -c < "$ARCHIVE") bytes)"
+          ./scripts/package-release.sh \
+            "${{ matrix.system }}" \
+            "${{ needs.meta.outputs.version }}" \
+            "seal-${{ needs.meta.outputs.version }}-${{ matrix.system }}"
+
+      # ── Verify the artifact before it is allowed to publish ──────────────
+      # A UI-less build is a valid developer build but never a valid release.
+      # Every release published so far was UI-less because nothing executed
+      # the packaged binary.
+      - name: Verify the packaged binary
+        run: |
+          set -eu
+          TARBALL="seal-${{ needs.meta.outputs.version }}-${{ matrix.system }}.tar.gz"
+          EXTRACT="$(mktemp -d)"
+          tar xzf "$TARBALL" -C "$EXTRACT"
+          BIN="$EXTRACT/seal"
+
+          test -x "$BIN"
+          "$BIN" --help > /dev/null
+          "$BIN" gen-openapi > /dev/null
+
+          export HOME="$(mktemp -d)"
+          "$BIN" serve --no-enrollment-token --yolo > serve.log 2>&1 &
+          SERVE_PID=$!
+          trap 'kill $SERVE_PID 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -sf -o index.html http://localhost:8080/ 2>/dev/null; then break; fi
+            sleep 1
+          done
+
+          if ! grep -q '<div id="root">' index.html 2>/dev/null; then
+            echo "::error::$TARBALL does not serve the embedded UI."
+            cat index.html 2>/dev/null || echo "(no response)"
+            cat serve.log
+            exit 1
+          fi
+
+          ASSET=$(grep -oE '/assets/[A-Za-z0-9_.-]+\.js' index.html | head -1)
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:8080$ASSET")
+          if [ "$CODE" != "200" ]; then
+            echo "::error::Embedded asset $ASSET returned $CODE"
+            exit 1
+          fi
+          echo "Verified: embedded UI and $ASSET served from $TARBALL"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: seal-${{ matrix.system }}
+          name: release-${{ matrix.system }}
           path: |
-            seal-*.tar.gz
-            seal-*.tar.gz.sha256
+            seal-${{ needs.meta.outputs.version }}-${{ matrix.system }}.tar.gz
+            seal-${{ needs.meta.outputs.version }}-${{ matrix.system }}.tar.gz.sha256
+          if-no-files-found: error
 
   release:
     name: Publish release
-    needs: build
+    needs: [build, meta]
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
+          path: artifacts
           merge-multiple: true
 
-      - name: Generate checksums
+      - name: Consolidate checksums
         run: |
-          cat *.sha256 > checksums-sha256.txt
+          set -eu
+          mkdir -p assets
+          find artifacts -name 'seal-*.tar.gz' -exec cp {} assets/ \;
+          # One checksums file over the published tarballs, regenerated here
+          # rather than concatenated, so it cannot carry stale sidecars.
+          ( cd assets && sha256sum seal-*.tar.gz > checksums-sha256.txt )
           echo "Release assets:"
-          ls -la seal-*.tar.gz checksums-sha256.txt
+          ls -la assets/
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: ${{ needs.meta.outputs.tag }}
           generate_release_notes: true
+          prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
+          # Refuse to silently mutate an already-published release.
+          fail_on_unmatched_files: true
           files: |
-            seal-*.tar.gz
-            checksums-sha256.txt
+            assets/seal-*.tar.gz
+            assets/checksums-sha256.txt

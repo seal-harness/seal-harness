@@ -23,8 +23,12 @@ build: frontend-build ## Build the library and executable (-Werror)
  
 frontend-build: frontend-install ## Build the web UI + stamp sentinel manifest
 	@cd frontend && npm run build
+	@# sha256sum (not shasum) to match the nix-side frontend build in flake.nix,
+	@# so the sentinel has one format regardless of who built it. shasum is
+	@# SHA-1 and silently produces a different digest to the same file.
+	@# (macOS has no sha256sum coreutils binary; use `shasum -a 256`.)
 	@cd frontend/dist && (find . -type f ! -name '.seal-manifest' \
-	    | LC_ALL=C sort | xargs shasum | shasum) > .seal-manifest
+	    | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256) > .seal-manifest
 
 test: ## Run the test suite
 	$(NIX) cabal test
