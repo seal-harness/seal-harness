@@ -156,8 +156,12 @@ jobs:
       - name: Populate Nix store with dependencies
         run: nix develop --command true
 
-      - name: Build
-        run: nix build --print-build-logs
+      - name: Build portable artifact
+        run: nix build --print-build-logs .#dist
+
+      # Fail here, not on a user's machine, if the binary would need Nix.
+      - name: Check portability
+        run: ./scripts/check-portability.sh result
 
       - name: Package
         run: |
@@ -176,9 +180,11 @@ jobs:
           TARBALL="seal-${{ needs.meta.outputs.version }}-${{ matrix.system }}.tar.gz"
           EXTRACT="$(mktemp -d)"
           tar xzf "$TARBALL" -C "$EXTRACT"
-          BIN="$EXTRACT/seal"
+          BIN="$EXTRACT/bin/seal"
 
           test -x "$BIN"
+          # The tarball must be self-contained: `seal` plus any bundled libs.
+          ./scripts/check-portability.sh "$EXTRACT"
           "$BIN" --help > /dev/null
           "$BIN" gen-openapi > /dev/null
 

@@ -64,11 +64,13 @@ jobs:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
 
-      - name: Build
-        run: nix build --print-build-logs
+      - name: Build portable artifact
+        run: nix build --print-build-logs .#dist
 
       - name: Package binary artifact
-        run: ./scripts/package-release.sh "${{ matrix.system }}" "" "seal-${{ matrix.system }}"
+        run: |
+          ./scripts/check-portability.sh result
+          ./scripts/package-release.sh "${{ matrix.system }}" "" "seal-${{ matrix.system }}"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4

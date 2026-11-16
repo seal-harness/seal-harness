@@ -116,6 +116,97 @@
           cp -r ${frontendDist} $out/frontend/dist
         '';
 
+        # ─────────────────────────────────────────────────────────────────
+        # Portability: a release binary must run on a machine with no Nix.
+        #
+        # On Linux the Nix build produces a dynamically linked ELF that
+        # hard-codes /nix/store paths for glibc, ncurses, gmp and friends, so it
+        # only runs where Nix exists. `pkgsStatic` (musl) links those in
+        # statically and yields a genuinely self-contained executable.
+        #
+        # On macOS a fully static Haskell executable is not attainable (Apple
+        # ships no static libSystem, and the RTS needs system frameworks), so
+        # instead the non-system dylibs are bundled beside the binary and their
+        # install names rewritten to @executable_path. The executable then links
+        # only against /usr/lib and /System/Library.
+        #
+        # NOTE: the Linux arm is not yet proven. haskell.nix has to build Linux
+        # derivations to compute the plan, which cannot happen on a darwin
+        # machine with no Linux builder, so it is untested pending a CI run.
+        # macOS ships the bundled layout today; see the follow-up issue.
+        # ─────────────────────────────────────────────────────────────────
+        sealDist =
+          if pkgs.stdenv.isDarwin
+            then darwinBundle
+            else linuxStatic;
+
+        linuxStatic =
+          # pkgsStatic is a separate package set without the haskell.nix
+          # overlay, so extend it explicitly. Without this, `haskell-nix` is
+          # simply absent from the set.
+          (((pkgs.pkgsStatic.extend haskellNix.overlay).haskell-nix).cabalProject' {
+            src = projectSrc;
+            compiler-nix-name = "ghc912";
+          }).flake { }.packages."seal-harness:exe:seal";
+
+        darwinBundle = pkgs.runCommand "seal-dist-darwin"
+          {
+            # install_name_tool/otool come from cctools; codesign is NOT a
+            # separate package on macOS — it lives in the SDK, so reference it
+            # by absolute path rather than through PATH.
+            nativeBuildInputs = [ pkgs.darwin.cctools ];
+            CODESIGN = "/usr/bin/codesign";
+          }
+          ''
+            mkdir -p $out/bin/dylibs
+            cp ${flake.packages."seal-harness:exe:seal"}/bin/seal $out/bin/seal
+            chmod u+w $out/bin/seal
+
+            # Rewrite every non-system dependency to a sibling lookup and copy
+            # the library in. `otool -L` supplies the exact set, so this cannot
+            # drift as the closure changes.
+            deps=$(otool -L $out/bin/seal \
+                   | tail -n +2 \
+                   | sed 's/^[[:space:]]*//; s/ (compatibility.*//' \
+                   | grep -v '^/usr/lib/' \
+                   | grep -v '^/System/' \
+                   | grep -v '^@executable_path/' || true)
+
+            for dep in $deps; do
+              base=$(basename "$dep")
+              cp "$dep" "$out/bin/dylibs/$base"
+              chmod u+w "$out/bin/dylibs/$base"
+              install_name_tool -id "@executable_path/dylibs/$base" "$out/bin/dylibs/$base"
+              install_name_tool -change "$dep" "@executable_path/dylibs/$base" "$out/bin/seal"
+            done
+
+            # Bundled libraries can depend on each other (libiconv ->
+            # libcharset), so resolve their store references the same way.
+            for lib in $out/bin/dylibs/*.dylib; do
+              [ -e "$lib" ] || continue
+              subdeps=$(otool -L "$lib" \
+                        | tail -n +2 \
+                        | sed 's/^[[:space:]]*//; s/ (compatibility.*//' \
+                        | grep -v '^/usr/lib/' \
+                        | grep -v '^/System/' \
+                        | grep -v '^@executable_path/' || true)
+              for dep in $subdeps; do
+                base=$(basename "$dep")
+                if [ ! -e "$out/bin/dylibs/$base" ]; then
+                  cp "$dep" "$out/bin/dylibs/$base"
+                  chmod u+w "$out/bin/dylibs/$base"
+                  install_name_tool -id "@executable_path/dylibs/$base" "$out/bin/dylibs/$base"
+                fi
+                install_name_tool -change "$dep" "@executable_path/dylibs/$base" "$lib"
+              done
+            done
+
+            # Re-sign after rewriting: install_name_tool invalidates the
+            # signature, and arm64 refuses to run an invalidly signed binary.
+            $CODESIGN --force --sign - $out/bin/dylibs/*.dylib
+            $CODESIGN --force --sign - $out/bin/seal
+          '';
+
         lib = pkgs.lib;
 
         flake = pkgs.sealHarnessProject.flake { };
@@ -123,6 +214,11 @@
       in flake // {
         # `nix build` produces the seal executable.
         packages.default = flake.packages."seal-harness:exe:seal";
+
+        # `nix build .#dist` produces the portable release artifact: a bin/
+        # tree holding `seal` plus any libraries it needs beside it. This is
+        # what gets packaged as a tarball.
+        packages.dist = sealDist;
 
         # `nix build .#frontend` produces the compiled UI on its own.
         packages.frontend = frontendDist;
