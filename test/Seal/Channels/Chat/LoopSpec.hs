@@ -702,6 +702,39 @@ spec = do
           final `shouldSatisfy` T.isInfixOf "second part"
         [] -> expectationFailure "expected an edit"
 
+  describe "over-limit single-bubble turn (regression: final text was dropped)" $ do
+    -- Reported from a real Signal session: the bubble edited correctly as
+    -- tools ran, but when the turn finished the final message never arrived.
+    -- Cause: once the rendered body exceeded the platform's message limit,
+    -- updateBubble skipped the send/edit entirely and returned, so the text
+    -- was discarded and the turn then finalized.
+    it "still delivers the text when the body exceeds the chunk limit" $ do
+      inner <- mkMockChan
+      let chan = BubbleChan inner
+          key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (mkSid "sess-big", stubWs, ss))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "sess-big"
+          fire = handleServerEvent cfg chan key conns pendingAsks bg
+                   tabTracker watchState thinkingTabs sid
+          bigText = T.replicate 3000 "x"
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntryUpdate sid (streamingJsonFor bigText))
+      fire (SeEntry sid (entryJsonFor bigText))
+      fire (SeActivity sid (statusJson "idle"))
+      sends <- getSends inner
+      -- The text reached the channel rather than being dropped.
+      T.length (T.concat sends) `shouldSatisfy` (>= 3000)
+      -- ...exactly once, not once per event that hit the overflow branch.
+      T.length (T.concat sends) `shouldSatisfy` (<= 3100)
+
   describe "extractEntryText" $ do
     it "extracts text from a payload with content array" $ do
       let val = A.object

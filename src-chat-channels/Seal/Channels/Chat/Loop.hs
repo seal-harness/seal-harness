@@ -1257,15 +1257,37 @@ updateBubble cfg chan ss mkContent = do
   content <- mkContent
   over <- shouldFallBackToChunks cfg chan content
   unless over $ do
-    mMsgId <- readIORef (ssMsgId ss)
-    case mMsgId of
-      Nothing -> do
-        mId <- ccSendWithId chan content
-        for_ mId (writeIORef (ssMsgId ss) . Just)
-      Just id' -> do
-        ok <- ccEditMessage chan id' content
-        unless ok $
-          void (ccSendWithId chan content)
+      mMsgId <- readIORef (ssMsgId ss)
+      case mMsgId of
+        Nothing -> do
+          mId <- ccSendWithId chan content
+          for_ mId (writeIORef (ssMsgId ss) . Just)
+        Just id' -> do
+          ok <- ccEditMessage chan id' content
+          unless ok $
+            void (ccSendWithId chan content)
+
+-- | Deliver the turn's final body. Normally that is one more edit of the
+-- bubble. When the body has outgrown a single platform message there is no
+-- message left to edit, so the text is sent once through the channel's
+-- chunking path (the same path every ordinary long reply takes).
+--
+-- Deliberately called only at turn end: sending from the overflow branch of
+-- 'updateBubble' would re-send the whole body on every frame, entry and
+-- idle - one full-text delivery per event instead of one per turn.
+finalizeSingleBubble
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> StreamingState -> IO ()
+finalizeSingleBubble cfg chan ss = do
+  content <- spliceContent ss ""
+  over <- shouldFallBackToChunks cfg chan content
+  if over
+    then do
+      -- No usable bubble any more; avoid editing a message that cannot hold
+      -- the text.
+      writeIORef (ssMsgId ss) Nothing
+      ccSend chan content
+    else updateBubble cfg chan ss (pure content)
 
 -- | Is the rendered body larger than the platform can hold in one message?
 -- When it is, the single-bubble style gives up on editing and lets the final
@@ -1363,7 +1385,7 @@ handleHarnessStatus cfg chan ss val =
         PsSingleBubble -> do
           alreadyFinal <- readIORef (ssFinalized ss)
           unless alreadyFinal $
-            updateBubble cfg chan ss (spliceContent ss "")
+            finalizeSingleBubble cfg chan ss
         PsSeparateMessages -> do
           mMsgId <- readIORef (ssMsgId ss)
           accum <- readIORef (ssAccumulated ss)
