@@ -119,42 +119,22 @@
         # ─────────────────────────────────────────────────────────────────
         # Portability: a release binary must run on a machine with no Nix.
         #
-        # On Linux the Nix build produces a dynamically linked ELF that
-        # hard-codes /nix/store paths for glibc, ncurses, gmp and friends, so it
-        # only runs where Nix exists. `pkgsStatic` (musl) links those in
-        # statically and yields a genuinely self-contained executable.
-        #
         # On macOS a fully static Haskell executable is not attainable (Apple
         # ships no static libSystem, and the RTS needs system frameworks), so
         # instead the non-system dylibs are bundled beside the binary and their
         # install names rewritten to @executable_path. The executable then links
         # only against /usr/lib and /System/Library.
         #
-        # NOTE: the Linux arm is not yet proven. haskell.nix has to build Linux
-        # derivations to compute the plan, which cannot happen on a darwin
-        # machine with no Linux builder, so it is untested pending a CI run.
-        # macOS ships the bundled layout today; see the follow-up issue.
+        # On Linux the Nix build still produces a dynamically linked ELF that
+        # hard-codes /nix/store paths, so it only runs where Nix exists. Static
+        # musl is not solved; that is a separate, deliberately out-of-scope
+        # follow-up (it needs a Linux machine to iterate on), so Linux ships the
+        # ordinary build and the portability check is skipped there.
         # ─────────────────────────────────────────────────────────────────
         sealDist =
           if pkgs.stdenv.isDarwin
             then darwinBundle
-            else linuxStatic;
-
-        linuxStatic =
-          # pkgsStatic is a separate package set without the haskell.nix
-          # overlay, so extend it explicitly. Without this, `haskell-nix` is
-          # simply absent from the set.
-          #
-          # Use the project's `hsPkgs` accessor rather than the `flake`
-          # combinator: under pkgsStatic the combinator's `packages` attribute
-          # comes back empty ("attribute 'packages' missing"), whereas
-          # `hsPkgs.<pkg>.components.exes.<exe>` resolves.
-          let
-            staticProject = (pkgs.pkgsStatic.extend haskellNix.overlay).haskell-nix.cabalProject' {
-              src = projectSrc;
-              compiler-nix-name = "ghc912";
-            };
-          in staticProject.hsPkgs."seal-harness".components.exes.seal;
+            else flake.packages."seal-harness:exe:seal";
 
         darwinBundle = pkgs.runCommand "seal-dist-darwin"
           {

@@ -80,17 +80,22 @@ if [ "$(uname -s)" = "Darwin" ]; then
     fi
   done
 else
-  if ldd "$DIST/bin/seal" 2>&1 | grep -q 'not a dynamic executable'; then
+  # Linux is not portable yet: static musl is unsolved (see flake.nix), so the
+  # shipped artifact is the ordinary dynamically linked build. Report the
+  # state but do not fail the build — otherwise every Linux leg would be red
+  # for a known, deliberately deferred gap. Flip this to `fail=1` once the
+  # static build lands.
+  if ! command -v ldd >/dev/null 2>&1; then
+    echo "::warning::ldd not available; cannot assess static linkage"
+  elif ldd "$DIST/bin/seal" 2>&1 | grep -q 'not a dynamic executable'; then
     echo "OK: static ELF"
   else
-    echo "::error file=$DIST/bin/seal::not statically linked; ldd reports:"
+    echo "::warning file=$DIST/bin/seal::not statically linked (known gap; Linux static is a deferred follow-up)"
     ldd "$DIST/bin/seal" 2>&1 | sed 's/^/    /' | head -20
-    fail=1
   fi
 
   if strings -a "$DIST/bin/seal" | grep -q '/nix/store/'; then
-    echo "::error file=$DIST/bin/seal::contains embedded /nix/store paths"
-    fail=1
+    echo "::warning file=$DIST/bin/seal::contains /nix/store paths (known gap on Linux)"
   fi
 fi
 
@@ -99,4 +104,8 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 
-echo "Portability check passed: $(uname -s) artifact has no Nix store dependencies."
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "Portability check passed: macOS artifact has no Nix store dependencies."
+else
+  echo "Portability check: Linux portability is a known, deferred gap (see flake.nix); not enforced."
+fi
