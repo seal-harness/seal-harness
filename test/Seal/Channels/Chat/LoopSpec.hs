@@ -1627,6 +1627,36 @@ spec = do
       sent <- getAllSent chan
       sent `shouldSatisfy` any (T.isInfixOf "the background answer")
 
+    it "delivers a /bg reply as exactly ONE message on the single-bubble style" $ do
+      -- The bg connection never receives entry-update, so handleEntry must
+      -- CREATE the bubble rather than only editing one. And because bg idle
+      -- retires the session without finalizing, the reply must not be sent a
+      -- second time. Guarded here directly on handleBgServerEvent, since the
+      -- /bg path is what regressed twice during review.
+      inner <- mkMockChan
+      let chan = BubbleChan inner
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1"]
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg hi"
+      cbs <- getCallbacks seams
+      case cbs of
+        (cb : _) -> do
+          cb (SeEntry bgSid1 (bgReplyJson "the background answer"))
+          cb (SeActivity bgSid1 (statusJson "idle"))
+        [] -> expectationFailure "expected a bg WS callback"
+      sent <- getAllSent inner
+      length (filter (T.isInfixOf "the background answer") sent) `shouldBe` 1
+
     it "ignores entry-updates, list snapshots, and other sessions on the bg connection" $ do
       chan <- mkMockChan
       mgr <- newManager defaultManagerSettings
