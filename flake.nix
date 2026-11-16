@@ -125,16 +125,30 @@
         # install names rewritten to @executable_path. The executable then links
         # only against /usr/lib and /System/Library.
         #
-        # On Linux the Nix build still produces a dynamically linked ELF that
-        # hard-codes /nix/store paths, so it only runs where Nix exists. Static
-        # musl is not solved; that is a separate, deliberately out-of-scope
-        # follow-up (it needs a Linux machine to iterate on), so Linux ships the
-        # ordinary build and the portability check is skipped there.
+        # On Linux the release artifact is a fully static musl ELF, built as a
+        # cross build from glibc (build platform) to musl (host platform).
+        # `pkgsCross.musl64` supplies static gmp, ncurses, libffi, etc., and
+        # haskell.nix adds `-optl=-static` to every executable when the host
+        # platform is musl. The result has no dynamic loader, so it runs on any
+        # recent x86_64 Linux machine without Nix.
         # ─────────────────────────────────────────────────────────────────
+        pkgsMusl = pkgs.pkgsCross.musl64;
+
+        staticProject = pkgsMusl.haskell-nix.cabalProject' {
+          src = projectSrc;
+          compiler-nix-name = "ghc912";
+        };
+
+        staticExe = staticProject.hsPkgs.seal-harness.components.exes.seal;
+
         sealDist =
           if pkgs.stdenv.isDarwin
             then darwinBundle
-            else flake.packages."seal-harness:exe:seal";
+            else if system == "x86_64-linux"
+              then staticExe
+              # Other Linux architectures still ship the dynamic build until a
+              # matching musl target is added; CI releases only x86_64-linux.
+              else flake.packages."seal-harness:exe:seal";
 
         darwinBundle = pkgs.runCommand "seal-dist-darwin"
           {
@@ -199,28 +213,34 @@
         flake = pkgs.sealHarnessProject.flake { };
 
       in flake // {
-        # `nix build` produces the seal executable.
-        packages.default = flake.packages."seal-harness:exe:seal";
+        packages = {
+          # `nix build` produces the seal executable.
+          default = flake.packages."seal-harness:exe:seal";
 
-        # `nix build .#dist` produces the portable release artifact: a bin/
-        # tree holding `seal` plus any libraries it needs beside it. This is
-        # what gets packaged as a tarball.
-        packages.dist = sealDist;
+          # `nix build .#dist` produces the portable release artifact: a bin/
+          # tree holding `seal` plus any libraries it needs beside it. This is
+          # what gets packaged as a tarball.
+          dist = sealDist;
 
-        # `nix build .#frontend` produces the compiled UI on its own.
-        packages.frontend = frontendDist;
+          # `nix build .#frontend` produces the compiled UI on its own.
+          frontend = frontendDist;
 
-        # Exposed so `npmDepsHash` above can be regenerated after a lockfile
-        # change: `nix run .#prefetch-npm-deps frontend/package-lock.json`.
-        packages.prefetch-npm-deps =
-          pkgs.runCommand "prefetch-npm-deps-wrapper" { } ''
-            mkdir -p $out/bin
-            cat > $out/bin/prefetch-npm-deps <<'EOF'
-            #!${pkgs.runtimeShell}
-            exec ${pkgs.prefetch-npm-deps}/bin/prefetch-npm-deps "$@"
-            EOF
-            chmod +x $out/bin/prefetch-npm-deps
-          '';
+          # Exposed so `npmDepsHash` above can be regenerated after a lockfile
+          # change: `nix run .#prefetch-npm-deps frontend/package-lock.json`.
+          prefetch-npm-deps =
+            pkgs.runCommand "prefetch-npm-deps-wrapper" { } ''
+              mkdir -p $out/bin
+              cat > $out/bin/prefetch-npm-deps <<'EOF'
+              #!${pkgs.runtimeShell}
+              exec ${pkgs.prefetch-npm-deps}/bin/prefetch-npm-deps "$@"
+              EOF
+              chmod +x $out/bin/prefetch-npm-deps
+            '';
+        } // lib.optionalAttrs (system == "x86_64-linux") {
+          # On x86_64-linux `.#dist` is already this static ELF; expose it
+          # under its own name for direct verification (`make static`).
+          static = staticExe;
+        };
 
         # `nix build .#checks` runs the test suite.
         checks = flake.checks;

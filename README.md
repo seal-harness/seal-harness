@@ -193,10 +193,11 @@ Verify download integrity with the SHA256 checksums provided alongside
 each release asset.
 
 The tarball is self-contained — no Nix and no other installs required. It
-extracts to `bin/seal` plus, on macOS, the `bin/dylibs/` shared libraries the
-binary loads from beside itself. Keep that directory next to `seal`: if you
-move the binary, move the whole `bin/` tree. The web UI is compiled into the
-binary, so `seal serve` needs no static files and no configuration.
+extracts to `bin/seal`; on Linux that binary is fully static (musl), while on
+macOS it is accompanied by the `bin/dylibs/` shared libraries it loads from
+beside itself. Keep the `bin/` tree together: if you move the binary, move the
+whole tree. The web UI is compiled into the binary, so `seal serve` needs no
+static files and no configuration.
 
 **macOS Gatekeeper.** Release binaries are not yet signed with an Apple
 Developer ID, so a freshly downloaded `seal` is quarantined and macOS reports

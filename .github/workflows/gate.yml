@@ -62,6 +62,7 @@ jobs:
         with:
           extra-conf: |
             accept-flake-config = true
+            max-jobs = auto
 
       - name: Restore Nix store cache
         uses: nix-community/cache-nix-action/restore@v7
