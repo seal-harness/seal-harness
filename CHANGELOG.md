@@ -2,6 +2,26 @@
 
 ## 0.1.0.0 — unreleased
 
+* **The enrollment link now works, and `enroll` prints it.** Two changes to the
+  first-run enrollment journey, both reported from real use.
+
+  Following the `…/#enroll=<token>` link that `seal serve` prints used to land
+  on a setup screen with an **empty** "Enrollment token" field and the hint
+  "Paste the token printed in the terminal". The token had in fact been captured
+  and every request was carrying it — but the page asked for manual work that
+  was already done, which reads as "the link did nothing". A captured token now
+  renders a one-line confirmation instead of the field, with a "Use a different
+  token" reveal for the case where the link's token has expired and the operator
+  holds a fresh one. With no token in the URL, the screen is unchanged.
+
+  `seal access-control enroll` writes a strict two-line contract to stdout:
+  **line 1 is the token and nothing else**, **line 2 is the ready-made enroll
+  link**. An automated system helping with enrollment can therefore show the
+  operator a link, or take line 1 as the secret, without reimplementing the
+  composition. The token stays on line 1 even when no origin resolved (line 2 is
+  then omitted); a `--no-token` window grant prints one explanatory line, since
+  it carries no secret to put in a link. Hints remain on stderr.
+
 * **Configure the gateway coordinates before the first passkey.** New
   `seal access-control configure [--host HOST] [--port PORT] [--tls|--no-tls]
   [--tls-cert PATH --tls-key PATH] [--tls-host NAME]... [--origin URL]

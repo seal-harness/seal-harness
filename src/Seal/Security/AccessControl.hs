@@ -13,6 +13,7 @@
 module Seal.Security.AccessControl
   ( resolveCoordinates
   , canonicalOriginFor
+  , enrollUrlFor
   , isLoopbackHost
   , isWildcardHost
   , isIpLiteral
@@ -90,6 +91,21 @@ canonicalOriginFor :: Text -> Int -> Text
 canonicalOriginFor bindHost bindPort
   | isLoopbackHost bindHost = "http://localhost:" <> tshow bindPort
   | otherwise               = "http://" <> T.toLower bindHost <> ":" <> tshow bindPort
+
+-- | The one-time enrollment link: the resolved origin plus the @#enroll=@
+-- fragment the SPA already parses at startup (see
+-- @readEnrollTokenFromHash@). Single definition because three places compose
+-- this string and none may drift: the boot banner, the browser-minted portable
+-- grant, and @seal access-control enroll@. A link printed to a terminal that
+-- the SPA could not parse would look like a broken token, not a broken
+-- formatter.
+--
+-- 'Nothing' when no origin resolved (a wildcard bind with access control
+-- open), because there is genuinely no address to point at. A caller must not
+-- invent one from the request Host or from the bind address.
+enrollUrlFor :: Maybe Text -> Text -> Maybe Text
+enrollUrlFor mOrigin token =
+  (<> "/#enroll=" <> token) . T.dropWhileEnd (== '/') <$> mOrigin
 
 resolveRpId :: Maybe Text -> Maybe Text -> Either Text (Maybe Text)
 resolveRpId mOrigin mRpId = do

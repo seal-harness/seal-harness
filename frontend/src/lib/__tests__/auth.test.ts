@@ -3,6 +3,8 @@ import {
   b64urlToBytes,
   bytesToB64url,
   ceremonyCode,
+  clearEnrollToken,
+  getStoredEnrollToken,
   isSecureContextOk,
   normaliseToken,
   readEnrollTokenFromHash,
@@ -44,6 +46,37 @@ describe('auth helpers', () => {
     expect(window.location.hash).toBe('')
     // It survives a reload via sessionStorage.
     expect(readEnrollTokenFromHash()).toBe('deadbeef')
+  })
+
+  // The report behind this: `seal serve` prints a link, the operator opens it,
+  // and the page still asks them to "paste the token printed in the terminal".
+  // The token had in fact been captured — the field was simply empty and the
+  // hint described a manual step that was not needed, so the link looked
+  // broken. A captured token must be distinguishable from "type it yourself".
+  describe('a token captured from the link', () => {
+    it('is not mistaken for a typed token, and reports where it came from', () => {
+      window.history.replaceState(null, '', '/#enroll=deadbeef')
+      expect(readEnrollTokenFromHash()).toBe('deadbeef')
+      // Captured, not typed: the UI keys its "no field needed" path off this.
+      expect(getStoredEnrollToken()).toBe('deadbeef')
+    })
+
+    it('is dropped once the ceremony spent it', () => {
+      window.history.replaceState(null, '', '/#enroll=deadbeef')
+      expect(readEnrollTokenFromHash()).toBe('deadbeef')
+      clearEnrollToken()
+      expect(getStoredEnrollToken()).toBeNull()
+      expect(readEnrollTokenFromHash()).toBeNull()
+    })
+  })
+
+  // A link the operator has already used must not re-arm on every reload, or
+  // the setup screen would keep reappearing for a spent token.
+  it('does not resurrect a token that was cleared', () => {
+    window.history.replaceState(null, '', '/')
+    clearEnrollToken()
+    expect(readEnrollTokenFromHash()).toBeNull()
+    expect(window.sessionStorage.getItem('seal.enroll-token')).toBeNull()
   })
 
   it('returns null when there is no token anywhere', () => {

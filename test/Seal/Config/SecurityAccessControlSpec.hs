@@ -30,7 +30,7 @@ import Seal.Config.Security
   )
 import Seal.Security.AccessControl
   ( CredentialAvailability (..), canonicalOriginFor, credentialAvailability
-  , isIpLiteral, resolveCoordinates
+  , enrollUrlFor, isIpLiteral, resolveCoordinates
   , credentialFromFile, credentialToFile, credentialLabelMaxLength
   , mkCredentialLabel, parseIsoTime, rpMismatch )
 import Seal.Security.WebAuthn.Types
@@ -214,6 +214,25 @@ spec = describe "Seal.Config.Security access_control" $ do
       canonicalOriginFor "::1" 9000 `shouldBe` "http://localhost:9000"
     it "uses the bind host otherwise" $
       canonicalOriginFor "10.0.0.5" 8080 `shouldBe` "http://10.0.0.5:8080"
+
+  -- The link `seal access-control enroll` prints beside the token. It has to be
+  -- the *same* composition the boot banner and the browser-minted grant use
+  -- (origin + "/#enroll=" + token), or the three would drift and a printed link
+  -- would stop being the link the SPA parses.
+  describe "enrollUrlFor" $ do
+    it "composes the documented #enroll= fragment onto the origin" $
+      enrollUrlFor (Just "https://seal.example.com:8443") "abc123"
+        `shouldBe` Just "https://seal.example.com:8443/#enroll=abc123"
+
+    it "answers Nothing when no origin resolved" $
+      enrollUrlFor Nothing "abc123" `shouldBe` Nothing
+
+    -- An origin arriving with a trailing slash must not yield a double slash: a
+    -- pasted link with "//#enroll=" still parses, but it looks like a bug and
+    -- the operator reasonably assumes they copied it wrong.
+    it "does not double the separator when the origin has a trailing slash" $
+      enrollUrlFor (Just "https://seal.example.com:8443/") "abc123"
+        `shouldBe` Just "https://seal.example.com:8443/#enroll=abc123"
 
   -- A WebAuthn RP ID must be a domain string. Browsers reject an IP origin with
   -- `SecurityError` before any ceremony runs, so an IP must be caught at boot

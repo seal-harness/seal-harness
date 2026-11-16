@@ -47,6 +47,11 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
   const [loadFailed, setLoadFailed] = useState(false)
   const [enrollToken, setEnrollToken] = useState<string | null>(null)
   const [tokenInput, setTokenInput] = useState('')
+  // Purely presentational: a captured token hides the field, and this is the
+  // operator asking to see it anyway (the link's token may have expired and
+  // they may hold a fresh one). It never clears the captured token — that
+  // only happens when the ceremony spends it.
+  const [revealToken, setRevealToken] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [recovery, setRecovery] = useState(false)
@@ -284,7 +289,19 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
   // the token field is hidden and the register button is enabled without one.
   const noTokenNeeded = status.enrollment_via === 'cli_window'
 
-  const tokenField = (status.enrollment_via === 'none' || noTokenNeeded) ? null : (
+  // A token that arrived in the link (or survived a reload) needs no input. The
+  // empty field this used to render said "Paste the token printed in the
+  // terminal" — an instruction that was both unnecessary and false, and that
+  // made a working link look broken. The token is still sent; it just stops
+  // being the operator's problem.
+  const capturedToken = enrollToken !== null && tokenInput.trim() === ''
+
+  const tokenField = (status.enrollment_via === 'none' || noTokenNeeded) ? null
+    : capturedToken && !revealToken ? (
+      <CapturedTokenNote
+        onReveal={() => { setRevealToken(true) }}
+      />
+    ) : (
     <TokenField
       value={tokenInput}
       onChange={(value) => {
@@ -296,8 +313,8 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
           clearEnrollToken()
         }
       }}
-      captured={enrollToken !== null}
       minted={status.enrollment_via === 'cli_token' || status.enrollment_via === 'cli_window'}
+      captured={capturedToken}
     />
   )
 
@@ -453,6 +470,26 @@ function canUsePasskey(): boolean {
   return isSecureContextOk() && hasWebAuthn()
 }
 
+/** The quiet case: a token already arrived, so there is nothing to type.
+ *
+ *  This replaces an always-rendered, always-empty input whose hint said "Paste
+ *  the token printed in the terminal". On a `#enroll=` link that hint is wrong
+ *  — there is nothing to paste — and an empty required-looking field reads as
+ *  "the link failed". The confirmation says the opposite in one line, and the
+ *  reveal keeps the substitution path reachable without putting a form in the
+ *  operator's way.
+ */
+function CapturedTokenNote({ onReveal }: { onReveal: () => void }) {
+  return (
+    <p className="agate-note" data-testid="enroll-token-captured">
+      Enrollment token received from this link — no need to type it.{' '}
+      <button type="button" className="agate-linkbutton" onClick={onReveal}>
+        Use a different token
+      </button>
+    </p>
+  )
+}
+
 function TokenField({
   value,
   onChange,
@@ -461,6 +498,8 @@ function TokenField({
 }: {
   value: string
   onChange: (value: string) => void
+  /** A token is already in hand; the field is only here because the operator
+   *  asked to substitute one. */
   captured: boolean
   minted: boolean
 }) {
@@ -470,11 +509,13 @@ function TokenField({
       <input
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        placeholder={captured ? 'already captured from the link' : 'printed by `seal access-control enroll`'}
+        placeholder={captured ? 'paste a replacement token' : 'printed by `seal access-control enroll`'}
         aria-label="Enrollment token"
       />
       <small>
-        {minted
+        {captured
+          ? 'The token from the link is still in use until you replace it here.'
+          : minted
           ? 'A grant is armed on this gateway. Paste the token printed in the terminal (or follow the link it printed).'
           : 'Mint one with `seal access-control enroll` in the terminal where Seal runs.'}
       </small>

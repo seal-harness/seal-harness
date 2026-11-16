@@ -166,8 +166,10 @@ describe('AccessGate', () => {
     window.history.replaceState(null, '', '/#enroll=abc123')
     renderGate()
     await screen.findByText('Set up access control')
-    // The token was captured from the fragment, so no typing is needed.
-    expect(screen.getByLabelText('Enrollment token')).toHaveValue('')
+    // The token was captured from the fragment, so no field is shown at all —
+    // an empty one plus a "paste the token" hint made a working link look
+    // broken.
+    expect(screen.queryByLabelText('Enrollment token')).not.toBeInTheDocument()
     const button = screen.getByRole('button', { name: /Register a passkey/ })
     await waitFor(() => expect(button).toBeEnabled())
     fireEvent.click(button)
@@ -177,13 +179,54 @@ describe('AccessGate', () => {
     expect(verifyHeaders['X-Seal-Enroll-Token']).toBe('abc123')
   })
 
+  // The reported bug. `seal serve` prints `/#enroll=<token>`; opening it used
+  // to render an *empty* token field plus "paste the token printed in the
+  // terminal", which reads exactly like the link did nothing. The token had
+  // been captured all along — so the field and its manual instruction must go,
+  // while the enrolment itself still works without the operator touching them.
+  it('needs no token entry when the link carried one', async () => {
+    window.history.replaceState(null, '', '/#enroll=abc123')
+    renderGate()
+    await screen.findByText('Set up access control')
+    expect(screen.queryByLabelText('Enrollment token')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Paste the token printed in the terminal/)).not.toBeInTheDocument()
+    // It is still visibly true that a token is in play — silence would leave
+    // the operator unsure whether the link was honoured.
+    expect(screen.getByText(/from this link/)).toBeInTheDocument()
+    const button = screen.getByRole('button', { name: /Register a passkey/ })
+    await waitFor(() => expect(button).toBeEnabled())
+    fireEvent.click(button)
+    expect(await screen.findByText('THE APP')).toBeInTheDocument()
+    expect(verifyHeaders['X-Seal-Enroll-Token']).toBe('abc123')
+  })
+
+  // The escape hatch has to survive: a link token can expire, and the operator
+  // may hold a fresh one from `seal access-control enroll`. Hiding the field
+  // outright would remove the only way to substitute it.
+  it('offers a way to use a different token than the link carried', async () => {
+    window.history.replaceState(null, '', '/#enroll=stale')
+    renderGate()
+    await screen.findByText('Set up access control')
+    fireEvent.click(screen.getByRole('button', { name: /different token/i }))
+    fireEvent.change(screen.getByLabelText('Enrollment token'), {
+      target: { value: 'fresh' },
+    })
+    const button = screen.getByRole('button', { name: /Register a passkey/ })
+    await waitFor(() => expect(button).toBeEnabled())
+    fireEvent.click(button)
+    expect(await screen.findByText('THE APP')).toBeInTheDocument()
+    expect(verifyHeaders['X-Seal-Enroll-Token']).toBe('fresh')
+  })
+
   it('lets a typed token replace one captured from the link', async () => {
     window.history.replaceState(null, '', '/#enroll=abc123')
     renderGate()
     await screen.findByText('Set up access control')
     // The link captured abc123, but the operator pastes a fresh token. The
     // typed value must win; otherwise a stale link token silently overrides it
-    // and the server answers grant_invalid.
+    // and the server answers grant_invalid. The field is behind the reveal now,
+    // so open it first.
+    fireEvent.click(screen.getByRole('button', { name: /different token/i }))
     fireEvent.change(screen.getByLabelText('Enrollment token'), {
       target: { value: 'deadbeef' },
     })
