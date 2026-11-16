@@ -11,7 +11,7 @@ NIX := nix develop --command
 ARGS ?=
 
 .DEFAULT_GOAL := help
-.PHONY: help build test lint check run tui ghci clean shell frontend-install frontend-test
+.PHONY: help build test lint check run tui ghci clean shell frontend-install frontend-test dist package
 
 help: ## List the available targets
 	@echo "seal-harness — make targets:"
@@ -61,6 +61,14 @@ clean: ## Remove build artifacts (dist-newstyle)
 
 shell: ## Enter an interactive Nix dev shell
 	nix develop
+
+dist: ## Build the portable release artifact (bin/seal + any bundled libs)
+	nix build --print-build-logs .#dist
+	@./scripts/check-portability.sh result
+
+package: dist ## Build and package the release tarball (VERSION=... to version it)
+	@VERSION="$(VERSION)"; \
+	./scripts/package-release.sh "$$(nix eval --impure --raw --expr 'builtins.currentSystem')" "$$VERSION" "seal$${VERSION:+-$$VERSION}-$$(nix eval --impure --raw --expr 'builtins.currentSystem')"
 
 codegraph-sigs: ## Print all the type signatures in the project
 	codegraph query "" --kind function --limit 10000 --json | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));d.filter(x=>x.node.language==='haskell'&&x.node.signature).forEach(x=>console.log(x.node.qualifiedName+' :: '+x.node.signature))"

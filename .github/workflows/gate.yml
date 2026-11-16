@@ -86,6 +86,13 @@ jobs:
       - name: Build
         run: nix build --print-build-logs
 
+      # The portable release artifact: `seal` plus any shared libraries it
+      # needs beside it. Fails if the binary would not run without Nix.
+      - name: Build portable artifact
+        run: |
+          nix build --print-build-logs .#dist
+          ./scripts/check-portability.sh result
+
       # hlint is a documented requirement (`make check`) that CI did not
       # previously enforce. See issue #7.
       - name: Lint (hlint)
@@ -105,6 +112,8 @@ jobs:
       - name: Smoke test the built binary
         run: |
           set -eu
+          # `nix build .#dist` above replaced ./result with the portable tree;
+          # its layout is bin/seal (plus bin/dylibs on macOS).
           BIN=./result/bin/seal
           # The binary must be self-contained: no dist, no static dir.
           rm -rf frontend/dist
