@@ -8,6 +8,7 @@ module Seal.Cron.Store
   , memoryCronStore
   ) where
 
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Data.Aeson (eitherDecode, encode)
 import Data.IORef
 import Data.List (isSuffixOf, sortOn)
@@ -39,6 +40,20 @@ data CronStore = CronStore
   , csDelete    :: CronJobId -> IO ()
   , csRecordRun :: CronJobId -> CronRun -> IO ()
   , csListRuns  :: CronJobId -> Int -> IO [CronRun]
+  , csUpdateRun :: CronJobId -> (CronRun -> CronRun) -> IO ()
+    -- ^ Apply a pure transformation to every run row of a job. Keyed on the job,
+    -- not the session: a row exists from the moment a fire starts (before it
+    -- has a session id), and reconciliation must repair a whole history, not
+    -- just its newest row. Both callers pass a terminal-respecting
+    -- transformation, so mapping all rows is idempotent. A job with no runs is
+    -- a no-op.
+  , csLock      :: MVar ()
+    -- ^ Serializes every mutation. The file backend does whole-file
+    -- read-modify-write on both jobs (one file) and runs (one JSONL), so two
+    -- writers (the scheduler tick and a turn-completion callback) would
+    -- otherwise lose updates — and a lost update is exactly what re-wedges a
+    -- job. 'seal serve' is single-process per SEAL_HOME, so an in-process lock
+    -- is sufficient.
   }
 
 fileCronStore :: FilePath -> ConfigRepo -> IO CronStore
@@ -47,14 +62,17 @@ fileCronStore dir repo = do
       runsDir = dir </> "runs"
   createDirectoryIfMissing True jobsDir
   createDirectoryIfMissing True runsDir
+  lock <- newMVar ()
   pure CronStore
-    { csCreate    = writeJobFile jobsDir repo
+    { csCreate    = \j -> withMVar lock (\_ -> writeJobFile jobsDir repo j)
     , csRead      = readJobFile jobsDir
     , csList      = listJobs jobsDir
-    , csSave      = writeJobFile jobsDir repo
-    , csDelete    = deleteJobFile jobsDir repo
-    , csRecordRun = recordRun runsDir repo
+    , csSave      = \j -> withMVar lock (\_ -> writeJobFile jobsDir repo j)
+    , csDelete    = \jid -> withMVar lock (\_ -> deleteJobFile jobsDir repo jid)
+    , csRecordRun = \jid run -> withMVar lock (\_ -> recordRun runsDir repo jid run)
     , csListRuns  = listRuns runsDir
+    , csUpdateRun = \jid f -> withMVar lock (\_ -> updateRunFile runsDir repo jid f)
+    , csLock      = lock
     }
 
 writeJobFile :: FilePath -> ConfigRepo -> CronJob -> IO ()
@@ -117,6 +135,27 @@ recordRun runsDir repo jid run = do
   _ <- gitCommitAll repo rel ("seal: CRON run record " <> cronJobIdText jid)
   pure ()
 
+-- | Apply a transformation to every run row of a job (order preserved, 100-run
+-- cap preserved). Both callers pass a transformation that respects terminal
+-- rows, so mapping the whole history is idempotent and is what lets startup
+-- reconciliation repair every row a previous process wedged — not just the
+-- newest. When nothing changes the file is not rewritten and no commit is made,
+-- so the common case costs one read.
+updateRunFile :: FilePath -> ConfigRepo -> CronJobId -> (CronRun -> CronRun) -> IO ()
+updateRunFile runsDir repo jid f = do
+  let path = runFilePath runsDir jid
+  exists <- doesFileExist path
+  when exists $ do
+    existing <- readRunFile path
+    let updated = map f existing
+    if updated == existing
+      then pure ()
+      else do
+        writeRunFile path updated
+        let rel = "cron/runs" </> T.unpack (cronJobIdText jid) <.> "jsonl"
+        _ <- gitCommitAll repo rel ("seal: CRON run update " <> cronJobIdText jid)
+        pure ()
+
 listRuns :: FilePath -> CronJobId -> Int -> IO [CronRun]
 listRuns runsDir jid limit = do
   let path = runFilePath runsDir jid
@@ -167,6 +206,7 @@ memoryCronStore :: IO CronStore
 memoryCronStore = do
   jobsRef <- newIORef (Map.empty :: Map CronJobId CronJob)
   runsRef <- newIORef (Map.empty :: Map CronJobId [CronRun])
+  lock <- newMVar ()
   pure CronStore
     { csCreate = \job -> modifyIORef' jobsRef (Map.insert (cjId job) job)
     , csRead   = \jid -> do
@@ -181,9 +221,15 @@ memoryCronStore = do
         pure (sortOn (cronJobIdText . cjId) filtered)
     , csSave   = \job -> modifyIORef' jobsRef (Map.insert (cjId job) job)
     , csDelete = modifyIORef' jobsRef . Map.delete
-    , csRecordRun = \jid run -> modifyIORef' runsRef
-        (Map.insertWith (\_new old -> take 100 (run : old)) jid [run])
+    , csRecordRun = \jid run -> withMVar lock (\_ -> modifyIORef' runsRef
+        (Map.insertWith (\_new old -> take 100 (run : old)) jid [run]))
     , csListRuns = \jid limit -> do
         m <- readIORef runsRef
         pure (take limit (fromMaybe [] (Map.lookup jid m)))
+    , csUpdateRun = \jid f -> withMVar lock (\_ -> do
+        m <- readIORef runsRef
+        case Map.lookup jid m of
+          Nothing -> pure ()
+          Just rs  -> modifyIORef' runsRef (Map.insert jid (map f rs)))
+    , csLock = lock
     }

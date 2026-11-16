@@ -58,7 +58,7 @@ import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webC
 import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Gateway.StreamBroker (newStreamBroker, setThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
-import Seal.Cron.Store (CronStore (..))
+import Seal.Cron.Store (CronStore (..), memoryCronStore)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
@@ -328,6 +328,8 @@ mkDepsFor paths = do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     }
@@ -507,6 +509,8 @@ mkProviderTestDeps tmp cfgRoot vr = do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig   = defaultSecurityConfig
     , adMkSessionExec    = Nothing
     }
@@ -556,6 +560,8 @@ stubCronStore = CronStore
   , csDelete    = \_ -> error "cron store stub: csDelete"
   , csRecordRun = \_ _ -> error "cron store stub: csRecordRun"
   , csListRuns  = \_ _ -> error "cron store stub: csListRuns"
+  , csUpdateRun = \_ _ -> error "cron store stub: csUpdateRun"
+  , csLock = error "cron store stub: csLock"
   }
 
 spec :: Spec
@@ -2395,6 +2401,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                  }
@@ -2479,6 +2487,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2553,6 +2563,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2628,6 +2640,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2728,6 +2742,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2793,6 +2809,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2857,6 +2875,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2902,6 +2922,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2999,6 +3021,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3062,6 +3086,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3124,6 +3150,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3180,6 +3208,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3245,6 +3275,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3515,6 +3547,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
                 }
@@ -3711,6 +3745,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
                 }
@@ -3789,6 +3825,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3842,6 +3880,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
             }
@@ -4033,6 +4073,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
             }
@@ -4367,6 +4409,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -5340,6 +5384,157 @@ spec = describe "Seal.Gateway.API" $ do
           _ -> expectationFailure "expected session_id string"
       _ -> expectationFailure "expected JSON object"
 
+
+  describe "/api/cron provider + model" $ do
+    -- Each test gets its own in-memory cron store bound into ApiDeps, so the
+    -- CRUD assertions are isolated from every other test's jobs. The store is
+    -- a plain record field on ApiDeps, so a record update is enough.
+    let withCronStore body = withSystemTempDirectory "seal-cron-provider" $ \tmp -> do
+          let paths = fakePaths { spState = tmp </> "state", spConfig = tmp </> "config" }
+          createDirectoryIfMissing True (spState paths </> "sessions")
+          createDirectoryIfMissing True (spConfig paths)
+          base <- mkDepsFor paths
+          store <- memoryCronStore
+          body (base { adCronStore = store }) store
+
+    it "POST /api/cron stores and echoes provider + model" $ do
+      withCronStore $ \deps _ -> do
+        let app = apiApp deps
+        req <- testPost ["api", "cron"] (A.encode (A.object
+          [ "name" .= ("Daily" :: T.Text)
+          , "schedule" .= ("0 9 * * *" :: T.Text)
+          , "prompt" .= ("summarize" :: T.Text)
+          , "provider" .= ("anthropic" :: T.Text)
+          , "model" .= ("claude-opus-4-8" :: T.Text)
+          ]))
+        (status, body) <- runAppBody app req
+        status `shouldBe` 201
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> do
+            lookupK "provider" o `shouldBe` Just (A.String "anthropic")
+            lookupK "model" o `shouldBe` Just (A.String "claude-opus-4-8")
+          _ -> expectationFailure "expected a cron job object"
+
+    it "POST /api/cron with neither field returns nulls" $ do
+      withCronStore $ \deps _ -> do
+        let app = apiApp deps
+        req <- testPost ["api", "cron"] (A.encode (A.object
+          [ "name" .= ("Daily" :: T.Text)
+          , "schedule" .= ("0 9 * * *" :: T.Text)
+          , "prompt" .= ("summarize" :: T.Text)
+          ]))
+        (status, body) <- runAppBody app req
+        status `shouldBe` 201
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> do
+            lookupK "provider" o `shouldBe` Just A.Null
+            lookupK "model" o `shouldBe` Just A.Null
+          _ -> expectationFailure "expected a cron job object"
+
+    it "GET /api/cron lists provider + model per job" $ do
+      withCronStore $ \deps _ -> do
+        let app = apiApp deps
+        createReq <- testPost ["api", "cron"] (A.encode (A.object
+          [ "name" .= ("Daily" :: T.Text)
+          , "schedule" .= ("0 9 * * *" :: T.Text)
+          , "prompt" .= ("summarize" :: T.Text)
+          , "provider" .= ("ollama" :: T.Text)
+          , "model" .= ("llama3.2" :: T.Text)
+          ]))
+        _ <- runAppBody app createReq
+        (status, body) <- runAppBody app (testRequest methodGet ["api", "cron"])
+        status `shouldBe` 200
+        case A.decode body :: Maybe [A.Value] of
+          Just [A.Object o] -> do
+            lookupK "provider" o `shouldBe` Just (A.String "ollama")
+            lookupK "model" o `shouldBe` Just (A.String "llama3.2")
+          _ -> expectationFailure "expected a one-element cron job array"
+
+    it "PUT with an empty provider clears it and leaves model untouched" $ do
+      withCronStore $ \deps _ -> do
+        let app = apiApp deps
+        createReq <- testPost ["api", "cron"] (A.encode (A.object
+          [ "name" .= ("Daily" :: T.Text)
+          , "schedule" .= ("0 9 * * *" :: T.Text)
+          , "prompt" .= ("summarize" :: T.Text)
+          , "provider" .= ("anthropic" :: T.Text)
+          , "model" .= ("claude-opus-4-8" :: T.Text)
+          ]))
+        (_, created) <- runAppBody app createReq
+        jid <- case A.decode created :: Maybe A.Value of
+          Just (A.Object o) -> case lookupK "id" o of
+            Just (A.String i) -> pure i
+            _ -> expectationFailure "expected id" >> pure ""
+          _ -> expectationFailure "expected job object" >> pure ""
+        putReq <- testPut ["api", "cron", jid] (A.encode (A.object
+          [ "provider" .= ("" :: T.Text) ]))
+        (status, body) <- runAppBody app putReq
+        status `shouldBe` 200
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> do
+            -- "" clears the provider...
+            lookupK "provider" o `shouldBe` Just A.Null
+            -- ...and the model, never supplied, survives untouched.
+            lookupK "model" o `shouldBe` Just (A.String "claude-opus-4-8")
+          _ -> expectationFailure "expected a cron job object"
+
+    it "PUT omitting both fields leaves them unchanged" $ do
+      withCronStore $ \deps _ -> do
+        let app = apiApp deps
+        createReq <- testPost ["api", "cron"] (A.encode (A.object
+          [ "name" .= ("Daily" :: T.Text)
+          , "schedule" .= ("0 9 * * *" :: T.Text)
+          , "prompt" .= ("summarize" :: T.Text)
+          , "provider" .= ("anthropic" :: T.Text)
+          , "model" .= ("claude-opus-4-8" :: T.Text)
+          ]))
+        (_, created) <- runAppBody app createReq
+        jid <- case A.decode created :: Maybe A.Value of
+          Just (A.Object o) -> case lookupK "id" o of
+            Just (A.String i) -> pure i
+            _ -> expectationFailure "expected id" >> pure ""
+          _ -> expectationFailure "expected job object" >> pure ""
+        putReq <- testPut ["api", "cron", jid] (A.encode (A.object
+          [ "name" .= ("Renamed" :: T.Text) ]))
+        (status, body) <- runAppBody app putReq
+        status `shouldBe` 200
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> do
+            lookupK "name" o `shouldBe` Just (A.String "Renamed")
+            lookupK "provider" o `shouldBe` Just (A.String "anthropic")
+            lookupK "model" o `shouldBe` Just (A.String "claude-opus-4-8")
+          _ -> expectationFailure "expected a cron job object"
+
+    it "POST with an injection-shaped provider is rejected with 400" $ do
+      withCronStore $ \deps _ -> do
+        let app = apiApp deps
+        req <- testPost ["api", "cron"] (A.encode (A.object
+          [ "name" .= ("Daily" :: T.Text)
+          , "schedule" .= ("0 9 * * *" :: T.Text)
+          , "prompt" .= ("summarize" :: T.Text)
+          , "provider" .= ("Not A Provider" :: T.Text)
+          ]))
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "PUT with an injection-shaped provider is rejected with 400" $ do
+      withCronStore $ \deps _ -> do
+        let app = apiApp deps
+        createReq <- testPost ["api", "cron"] (A.encode (A.object
+          [ "name" .= ("Daily" :: T.Text)
+          , "schedule" .= ("0 9 * * *" :: T.Text)
+          , "prompt" .= ("summarize" :: T.Text)
+          ]))
+        (_, created) <- runAppBody app createReq
+        jid <- case A.decode created :: Maybe A.Value of
+          Just (A.Object o) -> case lookupK "id" o of
+            Just (A.String i) -> pure i
+            _ -> expectationFailure "expected id" >> pure ""
+          _ -> expectationFailure "expected job object" >> pure ""
+        putReq <- testPut ["api", "cron", jid] (A.encode (A.object
+          [ "provider" .= ("../seal" :: T.Text) ]))
+        status <- runAppStatus app putReq
+        status `shouldBe` 400
   describe "/api/sessions/:id/agents (session-scoped agent defs)" $ do
     -- Build a session.json + a workdir with a repo carrying
     -- .agents/agents.md + a sub-agent, plus a user agent-def backend with
@@ -5408,6 +5603,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -5551,6 +5748,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
             }
           app = apiApp deps
       (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sidTxt, "agents"])
@@ -5589,7 +5788,7 @@ spec = describe "Seal.Gateway.API" $ do
       let sr = SessionRuntime { srPaths = fakePaths { spState = tmp }, srConfigPath = "", srActive = activeRef }
           sendDeps = SendDeps
             { sdPaths      = fakePaths { spState = tmp }
-            , sdVault      = error "sdVault: unused on the 404 path"
+            , sdVault      = error "sdVault: unused on the 404 path"            , sdTurnComplete = \_ _ -> pure ()
             , sdRepoReg    = fakeRepoRegistryHandle
             , sdAgentReg   = fakeAgentRegH
             , sdProvider   = error "sdProvider: unused on the 404 path"
@@ -5646,6 +5845,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -5704,7 +5905,7 @@ spec = describe "Seal.Gateway.API" $ do
           resolveStub _ = pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2"))
           sendDeps = SendDeps
             { sdPaths      = paths
-            , sdVault      = rt
+            , sdVault      = rt            , sdTurnComplete = \_ _ -> pure ()
             , sdRepoReg    = fakeRepoRegistryHandle
             , sdAgentReg   = fakeAgentRegH
             , sdProvider   = pr
@@ -5761,6 +5962,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -5882,7 +6085,7 @@ spec = describe "Seal.Gateway.API" $ do
           resolveStub _ = pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2"))
           sendDeps = SendDeps
             { sdPaths      = paths
-            , sdVault      = rt
+            , sdVault      = rt            , sdTurnComplete = \_ _ -> pure ()
             , sdRepoReg    = fakeRepoRegistryHandle
             , sdProvider   = pr
             , sdSession    = sr
@@ -5938,6 +6141,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Nothing
             , adAgentRegistry    = fakeAgentRegH
@@ -6014,7 +6219,7 @@ spec = describe "Seal.Gateway.API" $ do
           registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps (mkWebTurnDeps sendDeps) requestSid) ]
           sendDeps = SendDeps
             { sdPaths      = paths
-            , sdVault      = rt
+            , sdVault      = rt            , sdTurnComplete = \_ _ -> pure ()
             , sdRepoReg    = fakeRepoRegistryHandle
             , sdAgentReg   = fakeAgentRegH
             , sdProvider   = pr
@@ -6071,6 +6276,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -6149,7 +6356,7 @@ spec = describe "Seal.Gateway.API" $ do
           registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps (mkWebTurnDeps sendDeps) requestSid) ]
           sendDeps = SendDeps
             { sdPaths      = paths
-            , sdVault      = rt
+            , sdVault      = rt            , sdTurnComplete = \_ _ -> pure ()
             , sdRepoReg    = fakeRepoRegistryHandle
             , sdAgentReg   = fakeAgentRegH
             , sdProvider   = pr
@@ -6206,6 +6413,8 @@ spec = describe "Seal.Gateway.API" $ do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }

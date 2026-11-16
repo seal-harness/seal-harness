@@ -282,6 +282,8 @@ mkVaultDeps vr tmp = do
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
 , adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
         , adSecurityConfig   = defaultSecurityConfig
         , adMkSessionExec    = Nothing
         }
@@ -331,6 +333,8 @@ stubCronStore = CronStore
   , csDelete    = \_ -> error "cron store stub: csDelete"
   , csRecordRun = \_ _ -> error "cron store stub: csRecordRun"
   , csListRuns  = \_ _ -> error "cron store stub: csListRuns"
+  , csUpdateRun = \_ _ -> error "cron store stub: csUpdateRun"
+  , csLock = error "cron store stub: csLock"
   }
 spec :: Spec
 spec = describe "Seal.Gateway.PatIngestion (cross-layer integration)" $ do

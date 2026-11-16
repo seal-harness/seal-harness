@@ -1,5 +1,6 @@
 module Main (main) where
 
+import qualified Seal.Audit.LogSpec
 import Seal.TestHelpers.SshAgentGuard (withNoLeakedSshAgents)
 import Seal.TestHelpers.TimingFormatter (timingFormatter)
 import Test.Hspec
@@ -13,6 +14,7 @@ import qualified Seal.Core.PagingSpec
 import qualified Seal.Core.SystemPromptSpec
 import qualified Seal.Gateway.ConfigSpec
 import qualified Seal.Gateway.EmbeddedSpec
+import qualified Seal.Gateway.ProviderIconSpec
 import qualified Seal.Gateway.ApiRouteSpec
 import qualified Seal.Gateway.AccessControlSpec
 import qualified Seal.Gateway.OriginGuardSpec
@@ -240,6 +242,7 @@ specs = do
   Seal.Core.SystemPromptSpec.spec
   Seal.Gateway.ConfigSpec.spec
   Seal.Gateway.EmbeddedSpec.spec
+  Seal.Gateway.ProviderIconSpec.spec
   Seal.Gateway.ApiRouteSpec.spec
   Seal.Gateway.AccessControlSpec.spec
   Seal.Gateway.OriginGuardSpec.spec
@@ -447,6 +450,7 @@ specs = do
   Seal.ISA.RepeatDetectSpec.spec
   Seal.Logging.LoggerSpec.spec
   Seal.Logging.ExceptionsSpec.spec
+  Seal.Audit.LogSpec.spec
   Seal.Tools.TimeoutSpec.spec
   Seal.Tools.Exec.AbortSpec.spec
   Seal.Tools.Exec.HostKeyAdoptionSpec.spec

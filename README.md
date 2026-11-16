@@ -173,10 +173,14 @@ Pre-built binaries are available on the
 
 ```bash
 # Linux (x86_64)
-curl -L https://github.com/seal-harness/seal-harness/releases/download/v0.1.0/seal-v0.1.0-seal-x86_64-linux.tar.gz | tar xz
+curl -L https://github.com/seal-harness/seal-harness/releases/download/v0.1.0/seal-0.1.0-x86_64-linux.tar.gz | tar xz
 chmod +x seal
 ./seal --help
 ```
+
+Pre-releases (tags like `beta-0`, `alpha-1`, `rc-0.1.0`) are published on the
+same page and are flagged as pre-releases. Their tarball name uses the tag
+without the leading keyword, e.g. `seal-0-x86_64-linux.tar.gz` for `beta-0`.
 
 **Bleeding edge** (rolling `latest` tag, rebuilt on every push to main):
 
@@ -189,6 +193,9 @@ chmod +x seal
 
 Verify download integrity with the SHA256 checksums provided alongside
 each release asset.
+
+The tarball contains a single self-contained `seal` binary: the web UI is
+compiled in, so `seal serve` needs no static files and no config.
 
 #### Build from source
 

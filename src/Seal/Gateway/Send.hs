@@ -243,6 +243,11 @@ data SendDeps = SendDeps
     -- parent session is idle. Without this, N completions fire N
     -- wake-up calls, each consuming a scripted response in tests or
     -- causing redundant LLM calls in production.
+  , sdTurnComplete :: SessionId -> Either Text () -> IO ()
+    -- ^ Called exactly once when a plain turn settles, with its outcome, so a
+    -- caller that spawned the session (the cron fire delegate) can record a
+    -- terminal state. Runs in the turn's forked body, including on the path
+    -- where the turn threw. No-op for surfaces that do not track turn outcomes.
   , sdEnableIdleWake :: Bool
     -- ^ When True, the wake-up hook is wired into 'TurnDeps'. When False
     -- (tests with scripted providers), the wake-up is disabled so
@@ -688,10 +693,17 @@ startPlainTurn deps meta mSrc t = do
   void (forkIO (do
     er <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath (sdPaths deps) sid')) "plainTurn" $
       plainTurn deps meta mSrc t
+    -- Report the outcome to whoever spawned this session (no-op unless someone
+    -- registered interest, e.g. the cron scheduler). The thrown-turn case is
+    -- reported as a failure rather than silently dropped: a turn that never
+    -- runs is exactly what leaves a scheduled job looking permanently
+    -- "in flight". A slash command that a cron prompt reached earlier never
+    -- gets here at all, which is why the cron delegate rejects such prompts.
     case er of
-      Left _   -> pure ()
-      Right (Left _) -> pure ()
+      Left e -> sdTurnComplete deps sid' (Left (T.pack (show e)))
+      Right (Left e) -> sdTurnComplete deps sid' (Left e)
       Right (Right ()) -> do
+        sdTurnComplete deps sid' (Right ())
         when (shouldAutoTab meta) $
           ensureTabForSession (sdTabsHandle deps) KindProvider sid'
         triggerBroadcast deps))
