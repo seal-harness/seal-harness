@@ -66,7 +66,8 @@ import Seal.Gateway.Config
   , withGatewayDefaults )
 import Seal.Security.AccessControl
   ( CredentialAvailability (NoCredentials), canonicalOriginFor
-  , credentialAvailability, isIpLiteral, isLoopbackHost, isWildcardHost )
+  , credentialAvailability, enrollUrlFor, isIpLiteral, isLoopbackHost
+  , isWildcardHost )
 import Seal.Security.DaemonLock
   ( acquireServeLock, daemonHoldsLock, releaseServeLock )
 import Seal.Security.EnrollmentGrant
@@ -204,7 +205,12 @@ enroll paths opts
                 minted <- enrollGrant paths source ttl (eoForce opts)
                 case minted of
                   Left err     -> refuse err
-                  Right result -> announce paths result
+                  Right result -> do
+                    -- Best effort: an unresolvable origin only costs the link,
+                    -- never the token, so it must not turn a successful mint
+                    -- into a refusal.
+                    mOrigin <- resolvedOrigin paths
+                    announce paths mOrigin result
 
 -- | @--no-token@ is authority with no secret, so it is confined to the
 -- bootstrap state (design §7.1, §12): a loopback bind, a loopback resolved
@@ -240,8 +246,11 @@ windowAllowed paths CliWindow = do
         <> "  alone. Mint a token instead: `seal access-control enroll`."
 
 -- | Print the minted grant: token on stdout, everything else on stderr.
-announce :: SealPaths -> MintedGrant -> IO ExitCode
-announce paths minted = do
+--
+-- @mOrigin@ is the origin the gateway would verify, so the printed link opens
+-- the right address. It is 'Nothing' when no origin resolved.
+announce :: SealPaths -> Maybe Text -> MintedGrant -> IO ExitCode
+announce paths mOrigin minted = do
   now <- getCurrentTime
   _ <- appendAudit paths now (emptyAuditFields GrantMinted)
          { afVia = Just (grSource (mgGrant minted))
@@ -250,13 +259,20 @@ announce paths minted = do
   interactive <- hIsTerminalDevice stderr
   case mgToken minted of
     Just token -> do
+      -- stdout is a machine contract: line 1 is the token and nothing else,
+      -- so `seal access-control enroll | head -1` is exactly the secret.
+      -- Line 2 is the ready-made link, so a tool driving enrollment on the
+      -- operator's behalf never has to reimplement the composition.
       TIO.putStrLn token
+      forM_ (enrollUrlFor mOrigin token) TIO.putStrLn
       unless interactive $ do
         writeSecretFile (enrollmentTokenPath paths) token
         hPutStrLn stderr ("The token is also stored at "
                             <> enrollmentTokenPath paths <> " (mode 0600), because "
                             <> "stderr is not a terminal.")
     Nothing ->
+      -- A CliWindow presents no secret, so there is nothing a link could
+      -- carry. Saying so keeps line 1 non-empty and self-describing.
       TIO.putStrLn "No token: this is a loopback enrollment window (5 minutes)."
   hPutStrLn stderr (T.unpack (summary now (mgGrant minted)))
   pure ExitSuccess
@@ -269,6 +285,25 @@ announce paths minted = do
         <> T.pack (show (max 0 (ceiling
              (realToFrac (diffUTCTime (grExpiresAt grant) now) :: Double) :: Int)))
         <> "s. Open the web UI and enroll a passkey; the grant is consumed on success."
+
+-- | The origin the gateway would verify, for composing the enrollment link.
+--
+-- Deliberately the /same/ source of truth the daemon uses: @[gateway]@
+-- coordinates plus @[access_control]@ origin, resolved by 'bootPlan'. Reading
+-- it from anywhere else — the request Host, the bind address — would produce a
+-- link that fails WebAuthn's origin check on the machine that opens it.
+--
+-- Failure is flattened to 'Nothing' on purpose: an unresolvable origin means
+-- only that no link can be composed, and that must not turn a mint that
+-- already succeeded into a refusal. A gateway in that state also refuses to
+-- serve, so the operator learns about it from the daemon, not from a command
+-- whose real job (minting) worked.
+resolvedOrigin :: SealPaths -> IO (Maybe Text)
+resolvedOrigin paths = do
+  gwCfg <- gatewayConfig paths
+  inputs <- preflight paths
+  let coords = BindCoordinates (gcHost gwCfg) (gcPort gwCfg)
+  pure (either (const Nothing) bpOrigin (inputs >>= bootPlan coords))
 
 -- | @disable@: the only way to turn access control off.
 --

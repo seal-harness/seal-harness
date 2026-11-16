@@ -77,7 +77,7 @@ import Seal.Gateway.Audit
   ( AuditFields (..), admitRefusal, appendAudit, emptyAuditFields, newAuditGate )
 import Seal.Security.AccessControl
   ( CredentialAvailability (..), credentialAvailability, credentialToFile
-  , mkCredentialLabel, rpMismatch )
+  , enrollUrlFor, mkCredentialLabel, rpMismatch )
 import Seal.Security.Crypto (constantTimeEq, generateToken, getRandomBytes, sha256Hash)
 import Seal.Security.WebAuthn
   ( AssertionInput (..), RegistrationInput (..), RegistrationResult (..)
@@ -1296,7 +1296,7 @@ mintPortableGrant h = do
 -- the request: a link composed from @Host@ would fail the origin check on the
 -- other machine, and under DNS rebinding it would be the attacker's origin.
 enrollUrlFrom :: Maybe Text -> Text -> Maybe Text
-enrollUrlFrom origin token = fmap (<> "/#enroll=" <> token) origin
+enrollUrlFrom = enrollUrlFor
 
 -- | Write the assertion grant into the session that earned it.
 mintAssertionGrant

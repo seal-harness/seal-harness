@@ -5,6 +5,7 @@
 -- code is assertable here without spawning a process.
 module Seal.Command.AccessControlSpec (spec) where
 
+import Control.Exception (finally)
 import Control.Concurrent (threadDelay)
 import Data.Bits ((.&.))
 import Data.Maybe (isJust, isNothing)
@@ -16,7 +17,9 @@ import System.Directory
   ( createDirectoryIfMissing, doesFileExist, listDirectory )
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
+import System.IO (hClose, hFlush, openFile, stdout, IOMode (WriteMode))
 import System.IO.Temp (withSystemTempDirectory)
+import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import System.Posix.Files (fileMode, getFileStatus)
 import System.Posix.Process
   ( ProcessStatus (..), exitImmediately, forkProcess, getProcessStatus )
@@ -360,10 +363,77 @@ spec = describe "seal access-control" $ do
         configureOpts { coTls = True, coNoTls = True }
         `shouldSatisfy` isConfigureUsage
 
+  -- `enroll` is consumed by automated systems on the operator's behalf, so
+  -- stdout is a contract: line 1 is the token and nothing else, so
+  -- `seal access-control enroll | head -1` yields exactly the secret. Line 2 is
+  -- the ready-made link, so those systems never reimplement the
+  -- "origin + /#enroll=<token>" composition and get it subtly wrong.
+  describe "enroll stdout contract" $ do
+    it "prints the token, then the link, each on its own line" $
+      withHome $ \paths -> do
+        (code, out) <- captureStdout (runAccessControlWith paths (AcEnroll enrollToken))
+        code `shouldBe` ExitSuccess
+        token <- T.strip <$> TIO.readFile (enrollmentTokenPath paths)
+        lines (T.unpack out) `shouldBe` [ T.unpack token
+                                        , "http://localhost:8080/#enroll=" <> T.unpack token ]
+
+    it "omits the link when no origin resolves, keeping the token first" $
+      withHome $ \paths -> do
+        -- A wildcard bind with no [access_control] origin is the one state
+        -- where nothing can be composed. The token still has to be printed —
+        -- dropping to a single line must not shift the secret off line 1.
+        writeGateway paths (PartialGatewayConfig
+          { pgcPort = Just 8443, pgcHost = Just "0.0.0.0"
+          , pgcStaticDir = Nothing, pgcAllowedOrigins = []
+          , pgcFileExplorerEnabled = Nothing
+          , pgcFileDownloadPromptBytes = Nothing
+          , pgcFileDownloadChunkBytes = Nothing
+          , pgcFileDownloadAllowBlocked = Nothing
+          , pgcTlsCert = Nothing, pgcTlsKey = Nothing, pgcTls = Nothing
+          , pgcTlsHosts = [] })
+        (code, out) <- captureStdout (runAccessControlWith paths (AcEnroll enrollToken))
+        code `shouldBe` ExitSuccess
+        token <- T.strip <$> TIO.readFile (enrollmentTokenPath paths)
+        lines (T.unpack out) `shouldBe` [T.unpack token]
+
+    it "prints only the 'no token' line for a window grant" $
+      withHome $ \paths -> do
+        (code, out) <- captureStdout (runAccessControlWith paths (AcEnroll enrollWindow))
+        code `shouldBe` ExitSuccess
+        -- A CliWindow presents no secret, so there is nothing to put in a link.
+        lines (T.unpack out)
+          `shouldBe` ["No token: this is a loopback enrollment window (5 minutes)."]
+
 -- Helpers ------------------------------------------------------------------
 
 quiet :: Outputs
 quiet = Outputs (\_ -> pure ()) (\_ -> pure ())
+
+-- | Run an action with stdout redirected to a file, and return what it wrote.
+--
+-- The command writes its contract output with 'TIO.putStrLn', so the only way
+-- to assert the exact bytes — including which line is which — is to swap the
+-- handle underneath it. stderr is left alone so a refusal still reaches the
+-- test log.
+--
+-- The sink is closed before it is read back: macOS refuses a second open of a
+-- file that still has a live write handle (ResourceBusy), so holding it open
+-- across the read fails for a reason that has nothing to do with the code under
+-- test.
+captureStdout :: IO a -> IO (a, T.Text)
+captureStdout action =
+  withSystemTempDirectory "seal-ac-stdout" $ \dir -> do
+    let path = dir </> "stdout"
+    sink <- openFile path WriteMode
+    old <- hDuplicate stdout
+    hDuplicateTo sink stdout
+    result <- action `finally` hDuplicateTo old stdout
+    hFlush stdout
+    hDuplicateTo old stdout
+    hClose old
+    hClose sink
+    written <- TIO.readFile path
+    pure (result, written)
 
 configureOpts :: ConfigureOptions
 configureOpts = ConfigureOptions

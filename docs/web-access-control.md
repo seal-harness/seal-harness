@@ -48,7 +48,8 @@ Enrollment authority is always a secret presented on the request — never a
 cookie:
 
 ```bash
-seal access-control enroll                 # 10-minute token on stdout, hints on stderr
+seal access-control enroll                 # line 1: token; line 2: enroll link; hints stderr
+seal access-control enroll | head -1       # just the token, for scripts
 seal access-control enroll --ttl 90s       # s/m/h required; clamped to 30s-24h
 seal access-control enroll --no-token      # loopback-only window, bootstrap state only
 seal access-control enroll --cancel        # drop the outstanding grant
@@ -57,6 +58,15 @@ seal access-control disable --yes          # turn access control off (keeps cred
 seal access-control reset --yes            # delete credentials.toml + the section
 seal access-control migrate-credentials    # move pre-split credentials out of security.toml
 ```
+
+`enroll` writes a strict two-line contract to stdout: **line 1 is the token and
+nothing else**, and **line 2 is a ready-made `https://…/#enroll=<token>` link**.
+That lets an automated system drive enrollment — show the operator the link, or
+take line 1 as the secret — without reimplementing the link composition. The
+token stays on line 1 even when no origin resolved (a wildcard bind with access
+control open), in which case line 2 is omitted rather than left empty. A
+`--no-token` window grant carries no secret, so it prints one explanatory line
+and no link.
 
 On a terminal the boot banner prints the enrollment URL and the token; off a
 terminal (`systemd`, `launchd`, a pipe) it writes the token to
