@@ -1264,7 +1264,11 @@ updateBubble cfg chan ss mkContent = do
           for_ mId (writeIORef (ssMsgId ss) . Just)
         Just id' -> do
           ok <- ccEditMessage chan id' content
-          unless ok $
+          unless ok $ do
+            -- An edit failure used to be invisible: the fallback sent a new
+            -- message, so the text still arrived but the single-bubble
+            -- guarantee was silently lost.
+            dbg "[bubble] edit failed; sending a fresh message instead"
             void (ccSendWithId chan content)
 
 -- | Deliver the turn's final body. Normally that is one more edit of the
@@ -1285,6 +1289,8 @@ finalizeSingleBubble cfg chan ss = do
     then do
       -- No usable bubble any more; avoid editing a message that cannot hold
       -- the text.
+      dbg ("[bubble] body over limit (" <> T.pack (show (T.length content))
+           <> " chars); delivering chunked instead of editing")
       writeIORef (ssMsgId ss) Nothing
       ccSend chan content
     else updateBubble cfg chan ss (pure content)
