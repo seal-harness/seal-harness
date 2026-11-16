@@ -130,13 +130,40 @@
         # `pkgsCross.musl64` supplies static gmp, ncurses, libffi, etc., and
         # haskell.nix adds `-optl=-static` to every executable when the host
         # platform is musl. The result has no dynamic loader, so it runs on any
-        # recent x86_64 Linux machine without Nix.
+        # recent x86_64 Linux machine without Nix. Timezone data comes from the
+        # host with an embedded fallback (Seal.Cron.Types), and ncurses is
+        # linked with a system terminfo default, so the binary embeds no
+        # /nix/store paths either.
         # ─────────────────────────────────────────────────────────────────
         pkgsMusl = pkgs.pkgsCross.musl64;
+
+        # ncurses' compiled-in terminfo search path starts with its own store
+        # output. The system directories follow, so the TUI still works without
+        # Nix, but the store path would remain in the binary. Build ncurses for
+        # the final link with a system-only default (and no database install,
+        # since the host supplies terminfo) and link its static libtinfo
+        # explicitly. GHC keeps using the original ncurses; this is only a link
+        # input for the static exe.
+        staticNcurses = pkgsMusl.ncurses.overrideAttrs (old: {
+          configureFlags = (builtins.filter (x:
+            !(builtins.match "--with-(default-)?terminfo-dirs.*" x != null)
+          ) (old.configureFlags or [])) ++ [
+            "--disable-db-install"
+            "--with-default-terminfo-dir=/usr/share/terminfo"
+            "--with-terminfo-dirs=/etc/terminfo:/lib/terminfo:/usr/share/terminfo"
+          ];
+        });
 
         staticProject = pkgsMusl.haskell-nix.cabalProject' {
           src = projectSrc;
           compiler-nix-name = "ghc912";
+          modules = [{
+            # Put the system-default ncurses first in the linker search path so
+            # `-ltinfo` resolves to it instead of the store-path build.
+            packages.seal-harness.components.exes.seal.preConfigure = ''
+              export NIX_LDFLAGS="-L${staticNcurses}/lib ''${NIX_LDFLAGS:-}"
+            '';
+          }];
         };
 
         staticExe = staticProject.hsPkgs.seal-harness.components.exes.seal;

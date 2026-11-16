@@ -10,8 +10,7 @@
 # "runs without Nix" verifiable rather than aspirational.
 #
 #   Linux  — a fully static ELF is expected: no dynamic loader and no
-#            /nix/store shared-library dependencies. Embedded /nix/store
-#            *data* paths (tzdata, terminfo) are reported as a warning.
+#            /nix/store paths (including embedded data directories).
 #   macOS  — a static Haskell executable is not attainable, so the requirement
 #            is that the Mach-O links only against /usr/lib, /System/Library and
 #            sibling @executable_path libraries (bundled next to it).
@@ -30,12 +29,14 @@ fi
 
 fail=0
 
-# Print embedded Nix store paths, one per line. Capture rather than piping
-# `strings` into `grep -q`: under `set -o pipefail`, grep exiting on the first
-# match makes strings die of SIGPIPE (141), which would hide a real finding.
+# Print embedded Nix store paths, one per line. Match strings that start with
+# /nix/store (a runtime path), not build-only metadata that merely mentions one.
+# Capture rather than piping `strings` into `grep -q`: under `set -o pipefail`,
+# grep exiting on the first match makes strings die of SIGPIPE (141), which
+# would hide a real finding.
 nix_store_paths() {
   command -v strings >/dev/null 2>&1 || return 0
-  strings -a "$1" 2>/dev/null | grep '/nix/store/' || true
+  strings -a "$1" 2>/dev/null | grep '^/nix/store/' || true
 }
 
 if [ "$(uname -s)" = "Darwin" ]; then
@@ -126,15 +127,14 @@ else
     fi
   fi
 
-  # Static linkage does not mean the closure is free of Nix store *data*
-  # paths: tzdata and ncurses terminfo embed the directories they were built
-  # against. They do not involve the loader, but cron time zones and the TUI
-  # can miss them on a host without /nix. Track as a follow-up; do not block
-  # the static-link release on them.
+  # Static linkage is not enough: a portable artifact must not embed /nix/store
+  # data paths either (tzdata, terminfo). The static build rewrites both to
+  # system locations, so any remaining store path is a release blocker.
   _nix_paths=$(nix_store_paths "$DIST/bin/seal")
   if [ -n "$_nix_paths" ]; then
-    echo "::warning file=$DIST/bin/seal::contains embedded /nix/store data paths (non-loader; see follow-up)"
+    echo "::error file=$DIST/bin/seal::contains embedded /nix/store paths"
     printf '%s\n' "$_nix_paths" | sort -u | sed -n '1,5p' | sed 's/^/    /'
+    fail=1
   fi
 fi
 
@@ -146,5 +146,5 @@ fi
 if [ "$(uname -s)" = "Darwin" ]; then
   echo "Portability check passed: macOS artifact has no Nix store dependencies."
 else
-  echo "Portability check passed: Linux artifact is statically linked."
+  echo "Portability check passed: Linux artifact is statically linked and has no Nix store dependencies."
 fi
