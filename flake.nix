@@ -144,10 +144,17 @@
           # pkgsStatic is a separate package set without the haskell.nix
           # overlay, so extend it explicitly. Without this, `haskell-nix` is
           # simply absent from the set.
-          (((pkgs.pkgsStatic.extend haskellNix.overlay).haskell-nix).cabalProject' {
-            src = projectSrc;
-            compiler-nix-name = "ghc912";
-          }).flake { }.packages."seal-harness:exe:seal";
+          #
+          # Use the project's `hsPkgs` accessor rather than the `flake`
+          # combinator: under pkgsStatic the combinator's `packages` attribute
+          # comes back empty ("attribute 'packages' missing"), whereas
+          # `hsPkgs.<pkg>.components.exes.<exe>` resolves.
+          let
+            staticProject = (pkgs.pkgsStatic.extend haskellNix.overlay).haskell-nix.cabalProject' {
+              src = projectSrc;
+              compiler-nix-name = "ghc912";
+            };
+          in staticProject.hsPkgs."seal-harness".components.exes.seal;
 
         darwinBundle = pkgs.runCommand "seal-dist-darwin"
           {
