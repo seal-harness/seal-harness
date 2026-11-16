@@ -24,10 +24,11 @@ module Seal.Channels.Chat.Bubble
   , chunkMessage
   ) where
 
+import Data.ByteString qualified as BS
 import Data.List (sortOn)
-import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 
 import Seal.Channels.Chat.Class (QuestionOption (..))
 
@@ -82,24 +83,51 @@ formatAsk question opts =
 chunkMessage :: Int -> Text -> [Text]
 chunkMessage limit msg
   | limit <= 0 = [msg]
-  | T.length msg <= limit = [msg]
+  | utf8Len msg <= limit = [msg]
   | otherwise = go msg
   where
     go t
-      | T.length t <= limit = [t]
+      | utf8Len t <= limit = [t]
       | otherwise = T.take n t : go (T.drop n t)
       where n = splitPoint t
 
-    -- How many characters the first chunk takes: break AFTER the last newline
-    -- inside the limit, else after the last space, else hard-split at the
-    -- limit. The break separator stays with the chunk, so concatenating the
-    -- chunks reproduces the input exactly.
-    splitPoint t = fromMaybe (fromMaybe limit (lastBreak ' ' t)) (lastBreak '\n' t)
+    -- How many characters the first chunk takes. Prefers the last newline
+    -- inside the byte budget, then the last space, then a hard split at the
+    -- last character boundary that still fits.
+    splitPoint t = case lastBreak '\n' t of
+      Just n  -> n
+      Nothing -> case lastBreak ' ' t of
+        Just n  -> n
+        Nothing -> hardSplit t
 
-    -- 1-based length of the prefix ending at the last @ch@ inside the limit.
-    -- 'Nothing' when @ch@ does not occur in the first @limit@ characters.
+    -- 1-based character count of the longest prefix ending at @ch@ whose
+    -- UTF-8 encoding fits the limit.
     lastBreak ch t =
-      let headPart = T.take limit t
-      in case T.findIndex (== ch) (T.reverse headPart) of
-           Just fromEnd -> Just (T.length headPart - fromEnd)
+      let fits = takeFitting t
+      in case T.findIndex (== ch) (T.reverse fits) of
+           Just fromEnd -> Just (T.length fits - fromEnd)
            Nothing      -> Nothing
+
+    -- The longest prefix that fits the byte budget.
+    takeFitting t = T.take (fittingChars t 0 0) t
+
+    -- Consume whole characters while their encoded size still fits. Never
+    -- splits a codepoint: a byte-level cut could produce invalid UTF-8, which
+    -- the platform would reject or mangle.
+    fittingChars t n bytes =
+      case T.uncons (T.drop n t) of
+        Nothing -> n
+        Just (c, _)
+          | bytes + utf8Len (T.singleton c) <= limit -> fittingChars t (n + 1) (bytes + utf8Len (T.singleton c))
+          | otherwise -> n
+
+    -- No break opportunity: cut at the last character that fits, but always
+    -- take at least one so a single oversized character still makes progress.
+    hardSplit t = max 1 (fittingChars t 0 0)
+
+-- | UTF-8 encoded length of a text. Platform message limits are expressed in
+-- bytes (Signal's is 2048 bytes), not characters, so a character-count limit
+-- silently overruns the real one for any non-ASCII text (an emoji is 4
+-- bytes, a CJK character 3).
+utf8Len :: Text -> Int
+utf8Len = BS.length . TE.encodeUtf8

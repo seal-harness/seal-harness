@@ -11,9 +11,11 @@
 -- tools actually ran.
 module Seal.Channels.Chat.BubbleSpec (spec) where
 
+import Data.ByteString qualified as BS
 import Data.Text (Text)
 import Data.Text qualified as T
-import Test.Hspec (Spec, describe, it, shouldBe)
+import Data.Text.Encoding qualified as TE
+import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.Hspec.QuickCheck (prop)
 import Test.QuickCheck (Gen, elements, forAll, listOf1)
 
@@ -23,6 +25,10 @@ import Seal.Channels.Chat.Bubble
   , chunkMessage
   )
 import Seal.Channels.Chat.Class (QuestionOption (..))
+
+-- | UTF-8 encoded length, the unit Signal's limit is actually expressed in.
+utf8Len :: Text -> Int
+utf8Len = BS.length . TE.encodeUtf8
 
 -- | Arbitrary text with no newlines, so splice offsets stay meaningful.
 genLine :: Gen Text
@@ -107,6 +113,29 @@ spec = do
 
     it "hard-splits a token longer than the limit" $
       chunkMessage 5 "abcdefghij" `shouldBe` ["abcde", "fghij"]
+
+    -- Signal's limit is BYTES, not characters: text over ~2048 bytes is moved
+    -- to an attachment and only the first part is inlined. Splitting on
+    -- character count therefore overruns the real limit for any non-ASCII
+    -- text (an emoji is 4 UTF-8 bytes), causing silent truncation on the
+    -- recipient's device.
+    it "measures the limit in UTF-8 bytes, not characters" $ do
+      -- 4 ASCII chars = 4 bytes, so three fit in 12.
+      chunkMessage 12 "abcdefghijkl" `shouldBe` ["abcdefghijkl"]
+      -- 3 emoji = 12 bytes; a 12-byte budget allows all three in one chunk.
+      let three = T.replicate 3 "\x1F600"
+      T.concat (chunkMessage 12 three) `shouldBe` three
+
+    it "splits multi-byte text by byte size even when the char count fits" $ do
+      -- 4 emoji are only 4 codepoints but 16 UTF-8 bytes.
+      let four = T.replicate 4 "\x1F600"
+          chunks = chunkMessage 8 four
+      chunks `shouldSatisfy` ((> 1) . length)
+      chunks `shouldSatisfy` all (\c -> T.length c <= 2)
+
+    prop "never exceeds the byte limit" $
+      forAll genLine $ \t ->
+        all (\c -> utf8Len c <= 20) (chunkMessage 20 t)
 
     it "does not split a message that fits" $
       chunkMessage 12 "aaa\nbbb\nccc" `shouldBe` ["aaa\nbbb\nccc"]
