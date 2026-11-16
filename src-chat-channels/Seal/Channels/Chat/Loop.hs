@@ -755,8 +755,19 @@ handleBgServerEvent cfg chan key pendingAsks bgSessions bgSid ss delivered ev =
                 wasTracked <- retireBgSession pendingAsks bgSessions key bgSid
                 when wasTracked $ do
                   wasDelivered <- readIORef delivered
-                  unless wasDelivered $
-                    ccSend chan ("bg session " <> shortSessionId bgSid <> " produced no reply")
+                  if wasDelivered
+                    then do
+                      -- The reply was accumulated by 'handleEntry' but bg
+                      -- idle retires the session WITHOUT going through
+                      -- 'handleHarnessStatus', so nothing else would deliver
+                      -- it: the single-bubble style never writes the answer
+                      -- into the bubble (it must arrive as its own notifying
+                      -- message). Send it here.
+                      answer <- stripCursorText (cccStreamCfg cfg)
+                                  <$> readIORef (ssAccumulated ss)
+                      unless (T.null (T.strip answer)) $ ccSend chan answer
+                    else ccSend chan ("bg session " <> shortSessionId bgSid
+                                      <> " produced no reply")
           _ -> pure ()
     _ -> pure ()
 
@@ -1198,13 +1209,30 @@ handleEntryUpdate cfg chan ss val = do
     -- entirely while the turn is finalized.
     finalized <- readIORef (ssFinalized ss)
     unless finalized $ do
-      writeIORef (ssAccumulated ss) text
+      -- The separate-messages style treats the accumulator as the live text
+      -- of the bubble it is growing, so it tracks the newest frame. The
+      -- single-bubble style must NOT: its accumulator holds the recorded
+      -- answers (the text of the NOTIFYING final message), and a frame
+      -- previews the same response, so writing it here duplicates the answer.
+      when (ccProgressStyle chan == PsSeparateMessages) $
+        writeIORef (ssAccumulated ss) text
       -- Single-edited-bubble style: one message per turn, edited in place.
       -- The frame text is the whole turn so far (the gateway's accumulator
       -- is turn-scoped), so it is the sole body; tool lines are spliced into
       -- it at their recorded offsets.
-      when (ccProgressStyle chan == PsSingleBubble) $
-        updateBubble cfg chan ss (spliceContent ss (addCursor (cccStreamCfg cfg) text))
+      -- Live-edit only an existing progress bubble. Creating one here would
+      -- put the answer text in a bubble that is then edited rather than
+      -- sent, which does not notify - and a plain answer must notify. A
+      -- bubble exists only once a tool has run this turn.
+      --
+      -- The frame is also NOT folded into the answer accumulator: an
+      -- entry-update previews the same response its recorded entry will
+      -- carry, so accumulating both would duplicate the answer.
+      when (ccProgressStyle chan == PsSingleBubble) $ do
+        hasBubble <- isJust <$> readIORef (ssMsgId ss)
+        when hasBubble $
+          updateBubble cfg chan ss
+            (spliceContent ss (Just (if T.null text then "" else addCursor (cccStreamCfg cfg) text)))
       -- Separate-messages style: stream a growing bubble per segment.
       when (ccProgressStyle chan == PsSeparateMessages && ccSupportsStreaming chan) $ do
         now <- getCurrentTime
@@ -1241,11 +1269,11 @@ handleEntryUpdate cfg chan ss val = do
 -- accumulated frame text (the recorded entry, for a turn that never
 -- streamed); otherwise the accumulated frame text wins, because it is the
 -- whole turn so far and therefore the most current view.
-spliceContent :: StreamingState -> Text -> IO Text
-spliceContent ss fallback = do
+spliceContent :: StreamingState -> Maybe Text -> IO Text
+spliceContent ss mPreview = do
   splices <- readIORef (ssSplices ss)
   accum <- readIORef (ssAccumulated ss)
-  pure (bubbleText splices (if T.null accum then fallback else accum) "")
+  pure (bubbleText splices (fromMaybe accum mPreview) "")
 
 -- | Create the turn's bubble on first use, then edit it. Returns 'True' when
 -- the content is on the platform (created or edited). A failed edit falls
@@ -1271,6 +1299,39 @@ updateBubble cfg chan ss mkContent = do
             dbg "[bubble] edit failed; sending a fresh message instead"
             void (ccSendWithId chan content)
 
+-- | Merge one recorded response into the turn's answer.
+--
+-- Two things can happen, and they are easy to confuse:
+--
+-- * the same response arrives again / later text extends the previous one
+--   (the gateway's accumulator is turn-scoped, so a second response's text can
+--   already contain the first). The previous contribution is REPLACED, so the
+--   overlap is not concatenated twice;
+-- * a genuinely new segment arrives (a @StopMaxTokens@ continuation, which
+--   does not contain the earlier text). It is APPENDED.
+--
+-- @prev@ is the text of the previous entry, already folded into @accum@; it is
+-- what must be dropped before adding @next@.
+mergeAnswer :: Text -> Text -> Text -> Text
+mergeAnswer accum prev next
+  | T.null next = accum
+  | T.null accum = next
+  -- The new text extends / repeats the previous entry: swap the old
+  -- contribution for the new one.
+  | not (T.null prev), prev `T.isPrefixOf` next = dropSuffix prev accum <> next
+  -- A fresh segment.
+  | otherwise = accum <> "\n\n" <> next
+  where
+    dropSuffix suf t = case T.stripSuffix suf t of
+      Just before -> T.dropWhileEnd (== '\n') before
+      Nothing     -> t
+
+-- | Strip the streaming cursor from a finished body. Mirrors the cursor
+-- handling the edited-bubble path uses, without importing the config type
+-- into this helper's signature.
+stripCursorText :: StreamProgressConfig -> Text -> Text
+stripCursorText = stripCursor
+
 -- | Deliver the turn's final body. Normally that is one more edit of the
 -- bubble. When the body has outgrown a single platform message there is no
 -- message left to edit, so the text is sent once through the channel's
@@ -1283,17 +1344,24 @@ finalizeSingleBubble
   :: ChatChannel c
   => ChatChannelConfig -> c -> StreamingState -> IO ()
 finalizeSingleBubble cfg chan ss = do
-  content <- spliceContent ss ""
-  over <- shouldFallBackToChunks cfg chan content
-  if over
-    then do
-      -- No usable bubble any more; avoid editing a message that cannot hold
-      -- the text.
-      dbg ("[bubble] body over limit (" <> T.pack (show (T.length content))
-           <> " chars); delivering chunked instead of editing")
-      writeIORef (ssMsgId ss) Nothing
-      ccSend chan content
-    else updateBubble cfg chan ss (pure content)
+  -- 1. Close the progress bubble: strip the cursor so a half-typed preview
+  --    does not linger. The bubble holds tool progress only.
+  mBubble <- readIORef (ssMsgId ss)
+  when (isJust mBubble) $ do
+    body <- spliceContent ss (Just "")
+    over <- shouldFallBackToChunks cfg chan body
+    if over
+      then do
+        dbg ("[bubble] progress body over limit ("
+             <> T.pack (show (T.length body)) <> " chars); leaving it as-is")
+        writeIORef (ssMsgId ss) Nothing
+      else updateBubble cfg chan ss (pure body)
+  -- 2. Deliver the answer as its own message. This is what notifies the
+  --    human: an edit never does.
+  answer <- stripCursorText (cccStreamCfg cfg) <$> readIORef (ssAccumulated ss)
+  dbg ("[bubble] delivering final answer as a new message ("
+       <> T.pack (show (T.length answer)) <> " chars)")
+  unless (T.null (T.strip answer)) $ ccSend chan answer
 
 -- | Is the rendered body larger than the platform can hold in one message?
 -- When it is, the single-bubble style gives up on editing and lets the final
@@ -1353,9 +1421,16 @@ handleEntry cfg chan ss val = do
           -- bubble always shows exact text rather than a throttled prefix.
           -- No finalization latch: later segment frames must still be able to
           -- extend the bubble.
-          PsSingleBubble -> updateBubble cfg chan ss (do
-            writeIORef (ssAccumulated ss) text
-            spliceContent ss text)
+          -- The answer is accumulated, not written into the progress
+          -- bubble: the bubble is a separate message that gets edited (no
+          -- notification), while the answer must arrive as a NEW message so
+          -- the human is notified. Response entries are appended because a
+          -- turn can record several (a StopMaxTokens continuation).
+          PsSingleBubble -> do
+            accum <- readIORef (ssAccumulated ss)
+            prev <- readIORef (ssLastEntry ss)
+            writeIORef (ssLastEntry ss) text
+            writeIORef (ssAccumulated ss) (mergeAnswer accum prev text)
           PsSeparateMessages -> finalizeBubble cfg chan ss text True
 
 -- | Handle an @activity@ event: if harness-status is idle, finalize any
@@ -1431,7 +1506,7 @@ handleToolCallActivity cfg chan ss val = do
         let mInput = extractToolInput val
             line = formatToolLine mempty toolName (fromMaybe "" mInput)
         modifyIORef' (ssSplices ss) (<> [(T.length accum, line)])
-        updateBubble cfg chan ss (spliceContent ss "")
+        updateBubble cfg chan ss (spliceContent ss (Just ""))
     PsSeparateMessages -> do
       mMsgId <- readIORef (ssMsgId ss)
       accum <- readIORef (ssAccumulated ss)

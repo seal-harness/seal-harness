@@ -170,6 +170,11 @@ data StreamingState = StreamingState
   , ssLastLen     :: IORef Int
     -- ^ Codepoints in the accumulated text at the last platform edit.
     -- The edit gate measures NEW text since the last edit, not the total.
+  , ssLastEntry   :: IORef Text
+    -- ^ The text of the most recently recorded response entry. The gateway's
+    -- streaming accumulator is turn-scoped, so a later response's text can
+    -- already INCLUDE an earlier one; this is what lets the loop tell "the
+    -- same text arriving again" from "a genuinely new segment".
   , ssSplices     :: IORef [(Int, Text)]
     -- ^ Tool-progress lines for the single-edited-bubble style, each paired
     -- with the length of the turn's cumulative streamed text when it fired.
@@ -191,6 +196,7 @@ newStreamingState = do
   accum <- newIORef ""
   lastEdit <- newIORef Nothing
   lastLen <- newIORef 0
+  lastEntry <- newIORef ""
   splices <- newIORef []
   finalized <- newIORef False
   pure StreamingState
@@ -198,6 +204,7 @@ newStreamingState = do
     , ssAccumulated = accum
     , ssLastEdit = lastEdit
     , ssLastLen = lastLen
+    , ssLastEntry = lastEntry
     , ssSplices = splices
     , ssFinalized = finalized
     }
@@ -214,4 +221,5 @@ resetStreamingState ss = do
   writeIORef (ssAccumulated ss) ""
   writeIORef (ssLastEdit ss) Nothing
   writeIORef (ssLastLen ss) 0
+  writeIORef (ssLastEntry ss) ""
   writeIORef (ssSplices ss) []

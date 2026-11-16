@@ -209,11 +209,11 @@ spec = do
           Nothing -> fail "expected a message after repeated retries"
 
   describe "single-edited-bubble progress (Signal)" $ do
-    it "creates ONE message and edits it in place instead of one per segment" $ do
-      -- Signal used to run with streaming disabled, so every text segment and
-      -- every tool call was flushed as a NEW message - a multi-tool turn
-      -- produced a notification per tool. It now opts into the
-      -- single-edited-bubble style: one message per turn, then edits.
+    it "sends a pure-text turn once, with no edits" $ do
+      -- Signal used to run with streaming disabled, so every text segment
+      -- and every tool call was flushed as a NEW message. It now opts into
+      -- the single-bubble style: tool progress goes in one edited bubble, and
+      -- the answer is delivered as its own message so it notifies.
       (transport, getCaptured, getEdits) <- mkMockSignalChatTransport [dummyMsg]
       withSignalChatChannel AllowAll 4000 testBackoff transport $ \ch -> do
         waitForSeed
@@ -241,19 +241,27 @@ spec = do
         fire (SeActivity sid (A.object
           ["kind" .= ("harness-status" :: T.Text), "status" .= ("thinking" :: T.Text)]))
         mapM_ (fire . SeEntryUpdate sid . frame) [1 .. 40]
+        -- The answer comes from the RECORDED entry, not the preview frames.
+        fire (SeEntry sid (A.object
+          [ "id" .= ("e1" :: T.Text)
+          , "direction" .= ("response" :: T.Text)
+          , "payload" .= A.object
+              [ "content" .= A.Array
+                  (V.fromList [A.object ["text" .= T.replicate 274 "x", "type" .= ("text" :: T.Text)]])
+              ]
+          ]))
         fire (SeActivity sid (A.object
           ["kind" .= ("harness-status" :: T.Text), "status" .= ("idle" :: T.Text)]))
         edits <- getEdits
-        -- Progressive edits happened rather than 40 separate messages.
-        length edits `shouldSatisfy` (> 0)
         sends <- getCaptured
-        -- Exactly one message was created for the whole turn.
+        -- A pure-text turn has no tool call, so no progress bubble is
+        -- created and nothing is edited: the answer is delivered once, as its
+        -- own (notifying) message.
+        length edits `shouldBe` 0
         length sends `shouldBe` 1
-        -- The final edit carries the last frame's full text, with no cursor.
-        case reverse edits of
-          ((_, final) : _) -> do
-            final `shouldBe` T.replicate 274 "x"
-          [] -> expectationFailure "expected at least one edit"
+        case reverse sends of
+          (final : _) -> final `shouldBe` T.replicate 274 "x"
+          [] -> expectationFailure "expected the answer to be delivered"
       where
         streamingJsonFor t = A.object
           [ "id" .= ("streaming" :: T.Text)

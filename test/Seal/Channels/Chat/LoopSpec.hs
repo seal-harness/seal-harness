@@ -606,27 +606,21 @@ spec = do
       sends <- readIORef ids
       length sends `shouldBe` 1
 
-    it "shows text, then tool lines, then later text, each exactly once" $ do
+    it "keeps tool lines in the progress bubble and the answer in its own message" $ do
       ch <- runTurn mkBubbleChan
-      let MockChan { mcEdits = eds } = case ch of BubbleChan c -> c
+      let MockChan { mcEdits = eds, mcSendIds = ids } = case ch of BubbleChan c -> c
+      -- The bubble is the edited progress message: tool lines only.
       edits <- map snd . reverse <$> readIORef eds
-      case reverse edits of
-        [] -> expectationFailure "expected at least one edit"
-        (final : _) -> do
-          final `shouldSatisfy` T.isInfixOf "pre-tool text"
-          final `shouldSatisfy` T.isInfixOf "SHELL_EXEC"
-          final `shouldSatisfy` T.isInfixOf "BIN_EXEC"
-          final `shouldSatisfy` T.isInfixOf "post-tool text"
-          -- The pre-tool text must not be duplicated by the tool splice.
-          T.count "pre-tool text" final `shouldBe` 1
-          -- No cursor in the final body.
-          final `shouldSatisfy` not . T.isInfixOf "\x2589"
-          -- Ordering preserved: the tool lines sit between the two segments.
-          let iPre = T.breakOn "pre-tool text" final
-              iTool = T.breakOn "SHELL_EXEC" final
-              iPost = T.breakOn "post-tool text" final
-          T.length (fst iTool) `shouldSatisfy` (> T.length (fst iPre))
-          T.length (fst iPost) `shouldSatisfy` (> T.length (fst iTool))
+      creates <- map fst . reverse <$> readIORef ids
+      -- The bubble's FINAL state is tool progress only. (Answer text may
+      -- preview in it transiently while the turn streams, then be stripped.)
+      let finalBubble = lastOrCrash (creates <> edits)
+      finalBubble `shouldSatisfy` T.isInfixOf "SHELL_EXEC"
+      finalBubble `shouldSatisfy` T.isInfixOf "BIN_EXEC"
+      finalBubble `shouldSatisfy` not . T.isInfixOf "post-tool text"
+      -- The answer is sent as its own (notifying) message.
+      answer <- lastOrCrash <$> getSends (case ch of BubbleChan c -> c)
+      answer `shouldBe` "pre-tool text\n\npost-tool text"
 
     it "still creates a bubble for a tools-only turn" $ do
       ch <- mkBubbleChan
@@ -651,9 +645,10 @@ spec = do
       sends <- readIORef ids
       length sends `shouldBe` 1
 
-    it "delivers a /bg-style single entry with no preceding frame" $ do
-      -- The bg connection never receives entry-update, so handleEntry must
-      -- create the bubble rather than only editing one.
+    it "delivers a single recorded answer with no preceding frame" $ do
+      -- The /bg connection never receives entry-update (it ignores them), so
+      -- the answer must survive with no streaming frame to preview it. It is
+      -- delivered at idle, as its own notifying message.
       ch <- mkBubbleChan
       let key = ConversationKey "signal" "conv1"
       mgr <- newManager defaultManagerSettings
@@ -667,11 +662,14 @@ spec = do
       thinkingTabs <- newThinkingTabs
       bg <- newBgSessions
       let sid = mkSid "sess-bg"
-      handleServerEvent cfg ch key conns pendingAsks bg tabTracker
-        watchState thinkingTabs sid (SeEntry sid (entryJsonFor "bg reply text"))
-      let MockChan { mcSendIds = ids } = case ch of BubbleChan c -> c
-      sends <- readIORef ids
-      map fst sends `shouldBe` ["bg reply text"]
+          fire = handleServerEvent cfg ch key conns pendingAsks bg tabTracker
+                   watchState thinkingTabs sid
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntry sid (entryJsonFor "bg reply text"))
+      fire (SeActivity sid (statusJson "idle"))
+      sends <- getSends (case ch of BubbleChan c -> c)
+      -- One delivery, as a real message.
+      sends `shouldBe` ["bg reply text"]
 
     it "keeps both segments of a StopMaxTokens continuation" $ do
       ch <- mkBubbleChan
@@ -694,13 +692,11 @@ spec = do
       fire (SeEntryUpdate sid (streamingJsonFor "first part second part"))
       fire (SeEntry sid (entryJsonFor "first part second part"))
       fire (SeActivity sid (statusJson "idle"))
-      let MockChan { mcEdits = eds } = case ch of BubbleChan c -> c
-      edits <- map snd . reverse <$> readIORef eds
-      case reverse edits of
-        (final : _) -> do
-          final `shouldSatisfy` T.isInfixOf "first part"
-          final `shouldSatisfy` T.isInfixOf "second part"
-        [] -> expectationFailure "expected an edit"
+      -- Both segments survive into the delivered answer (they are separate
+      -- recorded responses, joined rather than overwriting one another).
+      answer <- lastOrCrash <$> getSends (case ch of BubbleChan c -> c)
+      answer `shouldSatisfy` T.isInfixOf "first part"
+      answer `shouldSatisfy` T.isInfixOf "second part"
 
   describe "over-limit single-bubble turn (regression: final text was dropped)" $ do
     -- Reported from a real Signal session: the bubble edited correctly as
@@ -734,6 +730,89 @@ spec = do
       T.length (T.concat sends) `shouldSatisfy` (>= 3000)
       -- ...exactly once, not once per event that hit the overflow branch.
       T.length (T.concat sends) `shouldSatisfy` (<= 3100)
+
+  describe "final answer is a NEW message (so it notifies)" $ do
+    -- A Signal edit does not notify, so a final answer edited into the
+    -- progress bubble arrives silently. The answer must be its own message;
+    -- the bubble carries progress (tool lines) only.
+    let mkCfg = do
+          mgr <- newManager defaultManagerSettings
+          pure (defaultChatChannelConfig mgr defaultGatewayConfig)
+        mkState = do
+          ss' <- newStreamingState
+          conns <- newTVarIO (Map.singleton (ConversationKey "signal" "conv1")
+                                (mkSid "s1", stubWs, ss'))
+          pure (ss', conns)
+
+    it "sends a plain answer as its own message, with no progress bubble" $ do
+      inner <- mkMockChan
+      cfg <- mkCfg
+      conns <- snd <$> mkState
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "s1"
+          key = ConversationKey "signal" "conv1"
+          fire = handleServerEvent cfg (BubbleChan inner) key conns pendingAsks bg
+                   tabTracker watchState thinkingTabs sid
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntryUpdate sid (streamingJsonFor "the answer"))
+      fire (SeEntry sid (entryJsonFor "the answer"))
+      fire (SeActivity sid (statusJson "idle"))
+      got <- getSends inner
+      -- Exactly one message, carrying the answer, and no bubble was created.
+      got `shouldBe` ["the answer"]
+      bubbleIds <- map snd . reverse <$> readIORef (mcSendIds inner)
+      bubbleIds `shouldBe` []
+
+    it "keeps the progress bubble free of the answer text" $ do
+      inner <- mkMockChan
+      cfg <- mkCfg
+      conns <- snd <$> mkState
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "s1"
+          key = ConversationKey "signal" "conv1"
+          fire = handleServerEvent cfg (BubbleChan inner) key conns pendingAsks bg
+                   tabTracker watchState thinkingTabs sid
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntry sid (entryJsonFor "let me look"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeEntry sid (entryJsonFor "let me look\n\nthe final answer"))
+      fire (SeActivity sid (statusJson "idle"))
+      -- The tool line is in the bubble (a new-message create)...
+      created <- map fst . reverse <$> readIORef (mcSendIds inner)
+      created `shouldSatisfy` any (T.isInfixOf "SHELL_EXEC")
+      created `shouldSatisfy` not . any (T.isInfixOf "the final answer")
+      -- ...and the answer is delivered as its own notifying message.
+      sent <- getSends inner
+      sent `shouldSatisfy` any (T.isInfixOf "the final answer")
+
+    it "delivers the answer exactly once across bubble and new message" $ do
+      inner <- mkMockChan
+      cfg <- mkCfg
+      conns <- snd <$> mkState
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "s1"
+          key = ConversationKey "signal" "conv1"
+          fire = handleServerEvent cfg (BubbleChan inner) key conns pendingAsks bg
+                   tabTracker watchState thinkingTabs sid
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntry sid (entryJsonFor "answer text"))
+      fire (SeActivity sid (statusJson "idle"))
+      sent <- getSends inner
+      created <- map fst . reverse <$> readIORef (mcSendIds inner)
+      let everything = T.concat (sent <> created)
+      T.count "answer text" everything `shouldBe` 1
 
   describe "extractEntryText" $ do
     it "extracts text from a payload with content array" $ do
