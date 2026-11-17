@@ -124,6 +124,22 @@ instance ChatChannel NoKeyboardChan where
   -- No inline-keyboard support: the loop must fall back to text rendering.
   ccSendWithOptions _ _ _ _ = pure Nothing
 
+-- | A single-bubble mock whose silent send always fails. Used to prove the
+-- loop falls back to a notifying create rather than losing the progress
+-- bubble entirely.
+newtype NoSilentChan = NoSilentChan MockChan
+
+instance ChatChannel NoSilentChan where
+  ccReceive (NoSilentChan c) = ccReceive c
+  ccSend (NoSilentChan c) = ccSend c
+  ccSendWithId (NoSilentChan c) = ccSendWithId c
+  ccEditMessage (NoSilentChan c) = ccEditMessage c
+  ccSendWithOptions (NoSilentChan c) = ccSendWithOptions c
+  ccLabel (NoSilentChan c) = ccLabel c
+  ccSendWithIdSilently _ _ = pure Nothing
+  ccProgressStyle _ = PsSingleBubble
+  ccChunkLimit _ = Just 1998
+
 mkMockChan :: IO MockChan
 mkMockChan = MockChan
   <$> newIORef []
@@ -818,6 +834,140 @@ spec = do
           body `shouldSatisfy` T.isInfixOf "SHELL_EXEC"
           body `shouldSatisfy` T.isInfixOf "BIN_EXEC"
           body `shouldSatisfy` T.isInfixOf "PROCESS_MANAGE"
+
+  describe "Telegram-style turn shapes (WU-2)" $ do
+    -- The operator's requirement in one place: a tool turn must notify exactly
+    -- ONCE (the answer); a tools-only turn must also notify exactly once; a
+    -- plain Q&A turn notifies once with no bubble.
+    let setup = do
+          inner <- mkMockChan
+          mgr <- newManager defaultManagerSettings
+          let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+          ss' <- newStreamingState
+          conns <- newTVarIO (Map.singleton (ConversationKey "signal" "conv1")
+                                (mkSid "s1", stubWs, ss'))
+          pendingAsks <- newPendingAsks
+          tabTracker <- newTVarIO Map.empty
+          watchState <- newWatchState
+          thinkingTabs <- newThinkingTabs
+          bg <- newBgSessions
+          let sid = mkSid "s1"
+              key = ConversationKey "signal" "conv1"
+              fire = handleServerEvent cfg (BubbleChan inner) key conns
+                       pendingAsks bg tabTracker watchState thinkingTabs sid
+          pure (inner, fire, sid)
+
+    it "creates the progress bubble silently" $ do
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      silent <- readIORef (mcSilentSends inner)
+      -- The bubble's create went through the silent path...
+      silent `shouldSatisfy` (not . null)
+      -- ...so nothing notifying was sent yet.
+      getSends inner `shouldReturn` []
+
+    it "notifies exactly once for a tool turn (the answer)" $ do
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeEntry sid (entryJsonFor "the answer"))
+      fire (SeActivity sid (statusJson "idle"))
+      sends <- getSends inner
+      -- Exactly one notifying send, and it carries the answer.
+      sends `shouldBe` ["the answer"]
+
+    it "still notifies exactly once for a tools-only turn" $ do
+      -- The bubble is silent and edits are silent, so without a close notice
+      -- this turn would notify ZERO times - breaking the rule that the last
+      -- message before idle notifies.
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeActivity sid (statusJson "idle"))
+      sends <- getSends inner
+      length sends `shouldBe` 1
+      -- ...and it is a close notice, not an answer.
+      sends `shouldSatisfy` not . any (T.isInfixOf "SHELL_EXEC")
+
+    it "notifies exactly once for a plain Q&A turn, with no bubble" $ do
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntryUpdate sid (streamingJsonFor "the answer"))
+      fire (SeEntry sid (entryJsonFor "the answer"))
+      fire (SeActivity sid (statusJson "idle"))
+      sends <- getSends inner
+      sends `shouldBe` ["the answer"]
+      -- No bubble was created, so the silent path was never used.
+      silent <- readIORef (mcSilentSends inner)
+      silent `shouldBe` []
+
+    it "sends nothing for an empty turn" $ do
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (statusJson "idle"))
+      getSends inner `shouldReturn` []
+      readIORef (mcSilentSends inner) `shouldReturn` []
+
+    it "falls back to a notifying create when the silent send fails" $ do
+      inner <- mkMockChan
+      -- A channel whose silent send fails but whose normal send works.
+      let chan = NoSilentChan inner
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ss' <- newStreamingState
+      conns <- newTVarIO (Map.singleton (ConversationKey "signal" "conv1")
+                            (mkSid "s1", stubWs, ss'))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "s1"
+          key = ConversationKey "signal" "conv1"
+          fire = handleServerEvent cfg chan key conns pendingAsks bg
+                   tabTracker watchState thinkingTabs sid
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      -- Progress was not lost: a notifying create happened instead.
+      created <- readIORef (mcSendIds inner)
+      length created `shouldBe` 1
+
+    it "closes an over-limit bubble with a deliberate line, not a frozen prefix" $ do
+      -- An abandoned bubble used to keep a truncated prefix AND a streaming
+      -- cursor on screen, which reads as "still working" forever. It now gets
+      -- one short closing edit; the full text arrives via the chunked send.
+      --
+      -- The limit applies to the BUBBLE BODY (tool progress), not the answer,
+      -- so the body must itself exceed ccChunkLimit - many tool calls, each
+      -- contributing a line.
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      -- A tool call first: under PsSingleBubble it is the only bubble creator.
+      mapM_ (\_ -> fire (SeActivity sid (toolCallJson "SHELL_EXEC"))) [1 .. 120 :: Int]
+      fire (SeEntry sid (entryJsonFor "the answer"))
+      fire (SeActivity sid (statusJson "idle"))
+      edits <- reverse <$> readIORef (mcEdits inner)
+      let bodies = map snd edits
+      -- The last edit is the over-limit closing line.
+      case reverse bodies of
+        (lastBody:_) -> do
+          lastBody `shouldBe` "turn finished - answer below"
+          lastBody `shouldSatisfy` not . T.isInfixOf "\x2589"
+        [] -> expectationFailure "expected a closing edit for the over-limit bubble"
+      -- The answer still reached the channel.
+      sends <- getSends inner
+      sends `shouldBe` ["the answer"]
+
+    it "does not apply the over-limit close to a plain Q&A turn" $ do
+      -- No bubble exists, so the close is a no-op and the answer is unchanged.
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntry sid (entryJsonFor "short answer"))
+      fire (SeActivity sid (statusJson "idle"))
+      getSends inner `shouldReturn` ["short answer"]
+      readIORef (mcEdits inner) `shouldReturn` []
+
 
   describe "final answer is a NEW message (so it notifies)" $ do
     -- A Signal edit does not notify, so a final answer edited into the

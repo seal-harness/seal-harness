@@ -1288,7 +1288,15 @@ updateBubble cfg chan ss mkContent = do
       mMsgId <- readIORef (ssMsgId ss)
       case mMsgId of
         Nothing -> do
-          mId <- ccSendWithId chan content
+          -- Prefer a SILENT create: a turn's progress should be visible
+          -- without pinging the human, so a tool turn notifies exactly once
+          -- (the answer) rather than once for the bubble too. A channel that
+          -- cannot send silently returns 'Nothing' and we fall back to the
+          -- notifying send, so progress is never lost.
+          mSilent <- ccSendWithIdSilently chan content
+          mId <- case mSilent of
+            Just i  -> pure (Just i)
+            Nothing -> ccSendWithId chan content
           for_ mId (writeIORef (ssMsgId ss) . Just)
         Just id' -> do
           ok <- ccEditMessage chan id' content
@@ -1355,13 +1363,22 @@ finalizeSingleBubble cfg chan ss = do
   -- 1. Close the progress bubble: strip the cursor so a half-typed preview
   --    does not linger. The bubble holds tool progress only.
   mBubble <- readIORef (ssMsgId ss)
+  let hadBubble = isJust mBubble
   when (isJust mBubble) $ do
     body <- spliceContent ss (Just "")
     over <- shouldFallBackToChunks cfg chan body
     if over
       then do
+        -- The body outgrew one message. Abandoning the bubble mid-turn used
+        -- to leave a truncated prefix frozen on screen WITH a streaming
+        -- cursor, which reads as "still working" forever. Replace it with one
+        -- deliberate closing line instead; the full text arrives below via
+        -- the chunked send path.
         dbg ("[bubble] progress body over limit ("
-             <> T.pack (show (T.length body)) <> " chars); leaving it as-is")
+             <> T.pack (show (T.length body)) <> " chars); closing it")
+        case mBubble of
+          Just id' -> void (ccEditMessage chan id' overLimitCloseText)
+          Nothing  -> pure ()
         writeIORef (ssMsgId ss) Nothing
       else updateBubble cfg chan ss (pure body)
   -- 2. Deliver the answer as its own message. This is what notifies the
@@ -1369,7 +1386,24 @@ finalizeSingleBubble cfg chan ss = do
   answer <- stripCursorText (cccStreamCfg cfg) <$> readIORef (ssAccumulated ss)
   dbg ("[bubble] delivering final answer as a new message ("
        <> T.pack (show (T.length answer)) <> " chars)")
-  unless (T.null (T.strip answer)) $ ccSend chan answer
+  if T.null (T.strip answer)
+    then
+      -- A tools-only turn has no answer to deliver. Without this it would
+      -- notify ZERO times - the bubble is silent and edits are silent - which
+      -- would break the rule that the last message before idle notifies.
+      -- Send a short close notice so every turn notifies exactly once.
+      when hadBubble $ ccSend chan closeNoticeText
+    else ccSend chan answer
+
+-- | The single line an over-limit progress bubble is closed with. Kept short
+-- so it always fits in one platform message.
+overLimitCloseText :: Text
+overLimitCloseText = "turn finished - answer below"
+
+-- | The notifying message sent when a turn produced progress but no answer
+-- text, so that a tools-only turn still notifies exactly once.
+closeNoticeText :: Text
+closeNoticeText = "turn finished"
 
 -- | Is the rendered body larger than the platform can hold in one message?
 -- When it is, the single-bubble style gives up on editing and lets the final
