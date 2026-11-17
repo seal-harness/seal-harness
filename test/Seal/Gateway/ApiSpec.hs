@@ -4517,6 +4517,23 @@ spec = describe "Seal.Gateway.API" $ do
             _ -> pure ()
           _ -> expectationFailure "expected object"
 
+    it "31b: for a non-Ollama provider the keys are ABSENT, not null" $ do
+      -- `(.=)` on a Maybe emits an explicit null, which is a THIRD state no
+      -- frontend consumer handles (`readiness === undefined` is the
+      -- absent-field fallback). This asserts key absence, not null-ness.
+      app <- mkAppWithReadiness (RdReady 2)
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
+      case A.decode body :: Maybe [A.Value] of
+        Nothing -> expectationFailure "could not decode /api/providers"
+        Just arr -> forM_ arr $ \case
+          A.Object o -> case lookupK "name" o of
+            Just (A.String "ollama") -> pure ()
+            Just (A.String _) -> do
+              KeyMap.member (Key.fromText "readiness") o `shouldBe` False
+              KeyMap.member (Key.fromText "readiness_models") o `shouldBe` False
+            _ -> pure ()
+          _ -> expectationFailure "expected object"
+
     it "9: a not-running Ollama carries readiness and NO count" $ do
       app <- mkAppWithReadiness RdNotRunning
       (_, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
@@ -4590,7 +4607,20 @@ spec = describe "Seal.Gateway.API" $ do
       case A.decode setupBody :: Maybe A.Value of
         Just (A.Object o) -> do
           lookupK "required_complete" o `shouldSatisfy` isJust
-          lookupK "readiness" o `shouldBe` Nothing
+          -- The Ollama CARD carries the readiness; a non-Ollama card OMITS
+          -- both keys (absent, never null). Asserting on a card, not on the
+          -- top-level object, which has no such key either way.
+          let cards = case lookupK "providers" o of
+                Just (A.Array xs) -> [c | A.Object c <- V.toList xs]
+                _                 -> []
+              ollamaCard = [c | c <- cards, lookupK "id" c == Just (A.String "ollama")]
+              otherCard  = [c | c <- cards, lookupK "id" c /= Just (A.String "ollama")]
+          ollamaCard `shouldSatisfy` (not . null)
+          forM_ ollamaCard $ \c ->
+            lookupK "readiness" c `shouldBe` Just (A.String "no-fitting-model")
+          forM_ otherCard $ \c -> do
+            lookupK "readiness" c `shouldBe` Nothing
+            lookupK "readiness_models" c `shouldBe` Nothing
         _ -> expectationFailure "could not decode /api/setup"
 
     it "10b: a PUT mutation response carries the same readiness (test 33b)" $

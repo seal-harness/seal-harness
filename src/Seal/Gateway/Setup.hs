@@ -194,7 +194,7 @@ setupStateJson state = object
       , "detail" .= stDetail step
       , "actions" .= stActions step
       ]
-    cardJson card = object
+    cardJson card = object $
       [ "id" .= pcId card
       , "label" .= pcLabel card
       , "configured" .= pcConfigured card
@@ -203,18 +203,21 @@ setupStateJson state = object
       , "isDefault" .= pcIsDefault card
       , "default_model" .= pcDefaultModel card
       , "models" .= pcModels card
-      , "readiness" .= fmap readinessWire (pcReadiness card)
-      , "readiness_models" .= cardReadinessCount card
       ]
+      -- These two keys are OMITTED, not nulled, for a card with no readiness
+      -- (every non-Ollama provider). `(.=)` on a `Maybe` emits an explicit
+      -- `null`, which would break the contract the frontend's absent-field
+      -- fallback depends on: `readiness === undefined` must mean "no
+      -- readiness", and `null` is a third state no consumer handles.
+      <> readinessKeys card
 
-    -- The usable-model count that accompanies @readiness: "ready"@. Absent for
-    -- every non-ready state and for a non-Ollama card, so the frontend's
-    -- optional field stays optional.
-    cardReadinessCount card = case pcReadiness card of
-      Nothing -> Nothing
-      Just st -> case st of
-        RdReady n -> Just n
-        _         -> Nothing
+    readinessKeys card = case pcReadiness card of
+      Nothing -> []
+      Just st ->
+        [ "readiness" .= readinessWire st ]
+        <> case st of
+             RdReady n -> [ "readiness_models" .= n ]
+             _         -> []
 
 statusText :: StepStatus -> Text
 statusText status = case status of
