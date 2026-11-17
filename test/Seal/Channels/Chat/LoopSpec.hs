@@ -1024,6 +1024,103 @@ spec = do
       sends <- getSends inner
       length sends `shouldBe` 1
 
+  describe "ASK_HUMAN must notify (WU-4)" $ do
+    -- The operator named this explicitly: a message that needs user input must
+    -- generate a notification. The silent-create seam added for progress
+    -- bubbles is exactly the kind of thing that could silently capture an ask,
+    -- so this is a regression guard rather than a restatement.
+    let setup mkChan = do
+          ch <- mkChan
+          mgr <- newManager defaultManagerSettings
+          let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+          ss' <- newStreamingState
+          conns <- newTVarIO (Map.singleton (ConversationKey "signal" "conv1")
+                                (mkSid "s1", stubWs, ss'))
+          pendingAsks <- newPendingAsks
+          tabTracker <- newTVarIO Map.empty
+          watchState <- newWatchState
+          thinkingTabs <- newThinkingTabs
+          bg <- newBgSessions
+          let sid = mkSid "s1"
+              key = ConversationKey "signal" "conv1"
+              fire = handleServerEvent cfg ch key conns pendingAsks bg
+                       tabTracker watchState thinkingTabs sid
+          pure (ch, fire, sid)
+
+        optionsAsk = A.object
+          [ "id" .= ("abcdef12-0000-0000-0000-000000000000" :: Text)
+          , "question" .= ("Which branch?" :: Text)
+          , "options" .= [ A.object [ "label" .= ("main" :: Text)
+                                    , "description" .= ("default" :: Text) ] ]
+          ]
+        openAsk = A.object
+          [ "id" .= ("12345678-0000-0000-0000-000000000000" :: Text)
+          , "question" .= ("What next?" :: Text)
+          , "options" .= ([] :: [A.Value])
+          ]
+
+    it "sends an options ask as a notifying keyboard message" $ do
+      (ch, fire, sid) <- setup mkBubbleChan
+      fire (SeAsk sid optionsAsk)
+      let MockChan { mcWithOpts = wo, mcSilentSends = silent } =
+            case ch of BubbleChan c -> c
+      -- It went through the inline-keyboard path (a real sendMessage)...
+      opts <- readIORef wo
+      length opts `shouldBe` 1
+      -- ...and NOT through the silent progress path.
+      readIORef silent `shouldReturn` []
+
+    it "falls back to a NOTIFYING send when the keyboard send fails" $ do
+      -- The fallback fires when ccSendWithOptions returns Nothing. It must be
+      -- an ordinary send: a silent fallback would leave a pending question
+      -- with no notification.
+      inner <- mkMockChan
+      let chan = NoKeyboardChan inner
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ss' <- newStreamingState
+      conns <- newTVarIO (Map.singleton (ConversationKey "signal" "conv1")
+                            (mkSid "s1", stubWs, ss'))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "s1"
+          key = ConversationKey "signal" "conv1"
+          fire = handleServerEvent cfg chan key conns pendingAsks bg
+                   tabTracker watchState thinkingTabs sid
+      fire (SeAsk sid optionsAsk)
+      sends <- getSends inner
+      length sends `shouldBe` 1
+      -- The fallback body carries the question and the numbered options.
+      sends `shouldSatisfy` any (T.isInfixOf "Which branch?")
+      readIORef (mcSilentSends inner) `shouldReturn` []
+
+    it "sends an open-ended ask as a notifying message" $ do
+      (ch, fire, sid) <- setup mkBubbleChan
+      fire (SeAsk sid openAsk)
+      let MockChan { mcSends = snds, mcSilentSends = silent } =
+            case ch of BubbleChan c -> c
+      sends <- readIORef snds
+      length sends `shouldBe` 1
+      sends `shouldSatisfy` any (T.isInfixOf "What next?")
+      readIORef silent `shouldReturn` []
+
+    it "never uses the silent path for an ask, even mid-turn" $ do
+      -- Sequence a tool call (which opens a silent bubble) then an ask, so a
+      -- careless implementation that reuses the bubble's send for asks is
+      -- caught.
+      (ch, fire, sid) <- setup mkBubbleChan
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeAsk sid optionsAsk)
+      let MockChan { mcSilentSends = silent } = case ch of BubbleChan c -> c
+      -- Exactly one silent send: the bubble. The ask did not add another.
+      silentBodies <- readIORef silent
+      length silentBodies `shouldBe` 1
+      silentBodies `shouldSatisfy` all (T.isInfixOf "SHELL_EXEC")
+
   describe "Telegram-style turn shapes (WU-2)" $ do
     -- The operator's requirement in one place: a tool turn must notify exactly
     -- ONCE (the answer); a tools-only turn must also notify exactly once; a

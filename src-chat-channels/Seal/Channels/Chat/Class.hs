@@ -29,8 +29,8 @@ import Seal.Channels.Chat.Types (InboundMessage, ChatMessageId)
 -- single notification instead of one per tool call.
 --
 -- Deliberately opt-in per channel: it depends on the platform's edit support
--- being reliable in practice, which has only been verified for Signal.
--- Telegram keeps the default.
+-- being reliable in practice. Signal and Telegram both opt in; every other
+-- channel keeps the default.
 data ProgressStyle
   = PsSeparateMessages
   | PsSingleBubble
@@ -82,10 +82,9 @@ class ChatChannel c where
   ccLabel :: c -> Text
 
   -- | Whether the channel supports progressive message editing (streaming
-  -- text bubbles). When 'False', the loop sends the final text as a single
-  -- message after the turn completes instead of creating/editing a
-  -- streaming bubble per delta. Default: 'True' (most channels support
-  -- editing). Signal sets this to 'False' to match the old behavior.
+  -- text bubbles). Only consulted by the @PsSeparateMessages@ style - a
+  -- @PsSingleBubble@ channel always edits, so this is inert for Signal and
+  -- Telegram. Default: 'True' (most channels support editing).
   ccSupportsStreaming :: c -> Bool
   ccSupportsStreaming _ = True
 

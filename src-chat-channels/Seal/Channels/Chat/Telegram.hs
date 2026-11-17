@@ -537,15 +537,31 @@ sendViaApi mgr token chatId body = do
   eReq <- try @SomeException
     (parseRequest (T.unpack (telegramApiBase <> token <> "/sendMessage")))
   case eReq of
-    Left _ -> pure ()
+    Left _ -> logSendFailure "invalid-request"
     Right req0 -> do
       let payload = A.object [ "chat_id" .= chatId, "text" .= body ]
           req = req0 { method = methodPost
                      , requestBody = RequestBodyLBS (A.encode payload)
                      , requestHeaders = [("Content-Type", "application/json")]
                      }
-      _ <- try @SomeException (httpLbs req mgr)
-      pure ()
+      eResp <- try @SomeException (httpLbs req mgr)
+      case eResp of
+        Left _ -> logSendFailure "network-error"
+        Right resp ->
+          let code = statusCode (responseStatus resp)
+          in if code >= 200 && code <= 299
+               then pure ()
+               else logSendFailure ("http-" <> T.pack (show code))
+
+-- | Report a failed @sendMessage@ so a dropped notification is diagnosable
+-- instead of silent. Deliberately carries ONLY a fixed classifier (a status
+-- code or a category) - never the response body, the request URL, or a raw
+-- exception. The bot token is embedded in the URL, and exception text renders
+-- it; the @getUpdates@ path already leaks @show ex@ on a token-bearing URL, so
+-- do not copy that pattern here.
+logSendFailure :: Text -> IO ()
+logSendFailure reason =
+  hPutStrLn stderr ("[telegram] sendMessage failed: " <> T.unpack reason)
 
 -- | Register the bot's command menu (@setMyCommands@). This is what the
 -- Telegram client renders after the user types @\/@; registering the same
@@ -607,7 +623,9 @@ tgSendMessageViaApi mgr token chatId body silent = do
   eReq <- try @SomeException
     (parseRequest (T.unpack (telegramApiBase <> token <> "/sendMessage")))
   case eReq of
-    Left _ -> pure Nothing
+    Left _ -> do
+      logSendFailure "invalid-request"
+      pure Nothing
     Right req0 -> do
       let payload = A.object
             ( [ "chat_id" .= chatId, "text" .= body ]
@@ -619,11 +637,15 @@ tgSendMessageViaApi mgr token chatId body silent = do
                      }
       eResp <- try @SomeException (httpLbs req mgr)
       case eResp of
-        Left _ -> pure Nothing
+        Left _ -> do
+          logSendFailure "network-error"
+          pure Nothing
         Right resp ->
           if statusCode (responseStatus resp) == 200
             then pure (parseMessageId (responseBody resp))
-            else pure Nothing
+            else do
+              logSendFailure ("http-" <> T.pack (show (statusCode (responseStatus resp))))
+              pure Nothing
 
 -- | Edit a previously sent message via @editMessageText@.
 tgEditMessageViaApi :: Manager -> Text -> Text -> Text -> Text -> IO Bool

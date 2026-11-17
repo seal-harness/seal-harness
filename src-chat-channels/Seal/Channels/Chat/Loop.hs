@@ -1286,8 +1286,14 @@ spliceContent ss mPreview = do
   pure (bubbleText splices (fromMaybe accum mPreview) "")
 
 -- | Create the turn's bubble on first use, then edit it. Returns 'True' when
--- the content is on the platform (created or edited). A failed edit falls
--- back to a fresh message so content is never silently dropped.
+-- the content is on the platform (created or edited).
+--
+-- A failed EDIT deliberately does NOT fall back to sending a fresh message:
+-- the answer is delivered separately by 'finalizeSingleBubble', the body here
+-- is tool progress only, and a fresh send would both notify (the thing this
+-- style exists to avoid) and repeat on every later event. The next frame,
+-- tool call or idle re-renders the whole body from 'ssSplices' /
+-- 'ssAccumulated', which an edit never modifies - so nothing is lost.
 -- | The single-bubble edit gate. One shared bucket per conversation, so the
 -- frame and tool sources together cannot exceed one edit per interval.
 -- Interval-only: the separate-messages path's 'shouldEdit' is an @||@ whose
