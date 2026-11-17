@@ -74,6 +74,7 @@ mkHarnessTe payload = TranscriptEntry
   , tePayload = payload
   , teDurationMs = Nothing
   , teCorrelation = Nothing
+  , teConvLen = Nothing
   , teMeta = Map.empty
   }
 
@@ -270,6 +271,7 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
               ]
           , teDurationMs = Nothing
           , teCorrelation = Nothing
+          , teConvLen = Nothing
           , teMeta = Map.empty
           }
         frontendField k val = case val of
@@ -360,6 +362,7 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
               ]
           , teDurationMs = Nothing
           , teCorrelation = Nothing
+          , teConvLen = Nothing
           , teMeta = Map.empty
           }
         -- Look up the "tools" array inside a frontend payload object.

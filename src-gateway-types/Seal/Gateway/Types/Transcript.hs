@@ -32,7 +32,8 @@ instance FromJSON Direction where parseJSON = stripPrefixParseJSON
 
 -- | JSON keys (via 'stripPrefixToJSON'): @teId@→@id@, @teTimestamp@→@timestamp@,
 -- @teModel@→@model@, @teDirection@→@direction@, @tePayload@→@payload@,
--- @teDurationMs@→@durationMs@, @teCorrelation@→@correlation@, @teMeta@→@meta@.
+-- @teDurationMs@→@durationMs@, @teCorrelation@→@correlation@,
+-- @teConvLen@→@convLen@, @teMeta@→@meta@.
 data TranscriptEntry = TranscriptEntry
   { teId :: Text
   , teTimestamp :: UTCTime
@@ -41,6 +42,21 @@ data TranscriptEntry = TranscriptEntry
   , tePayload :: Value
   , teDurationMs :: Maybe Int
   , teCorrelation :: Maybe Text
+  -- | The conversation length AFTER this entry's messages — the branch
+  -- anchor. The web frontend uses it to say "branch here", and the
+  -- gateway uses it to copy that many @conversation.jsonl@ lines into a
+  -- branched session.
+  --
+  -- 'Nothing' means "no anchor": either a legacy on-disk line that
+  -- predates this field, or a row we cannot place in the conversation
+  -- (the legacy @transcript.jsonl@ renderer). Callers must treat
+  -- 'Nothing' as "branching is not offered here" rather than guessing a
+  -- position.
+  --
+  -- Deliberately 'Maybe' rather than a required 'Int': this type is
+  -- decoded from JSON on the legacy title-snippet path, so a required
+  -- field would fail to parse every pre-existing line.
+  , teConvLen :: !(Maybe Int)
   , teMeta :: Map Text Value
   } deriving stock (Eq, Show, Generic)
 
