@@ -954,6 +954,7 @@ describe('ChatArea', () => {
       {
         id: 'm1',
         entryId: 'e1',
+        convLen: 5,
         agentName: 'You',
         agentStatus: 'completed',
         timestamp: '2024-06-01 12:00:00',
@@ -970,7 +971,35 @@ describe('ChatArea', () => {
     )
     const branchBtn = screen.getByLabelText('branch session from here')
     fireEvent.click(branchBtn)
-    expect(onBranch).toHaveBeenCalledWith('e1')
+    // The callback carries the CONVERSATION ANCHOR, never the row's entryId:
+    // the entry id is a render index, and the backend needs a position in
+    // conversation.jsonl.
+    expect(onBranch).toHaveBeenCalledWith(5)
+  })
+
+  it('renders NO branch button on a row without convLen (no anchor)', () => {
+    const onBranch = vi.fn()
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        entryId: 'e1',
+        // convLen deliberately absent: legacy transcript rows, or
+        // synthesized rows with no conversation position.
+        agentName: 'You',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ id: 'b1', text: 'cannot branch here' }],
+        rawJson: '{}',
+      },
+    ]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        onBranch={onBranch}
+      />,
+    )
+    expect(screen.queryByLabelText('branch session from here')).toBeNull()
   })
 
   it('raw JSON modal toggles open/closed', () => {

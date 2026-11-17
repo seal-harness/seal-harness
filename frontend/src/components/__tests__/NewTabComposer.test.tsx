@@ -280,19 +280,21 @@ describe('NewTabComposer — attach kind', () => {
   })
 })
 
-describe('NewTabComposer — branchFrom', () => {
-  it('pre-fills the branch_from field and locks kind to provider', () => {
+describe('NewTabComposer — branch mode', () => {
+  it('shows the parent session id and locks kind to provider', () => {
     const setKind = vi.fn()
     render(
       <NewTabComposer
         spec={makeSpec({ kind: 'provider', setKind })}
         onSubmit={() => {}}
         onCancel={() => {}}
-        branchFrom="entry-abc"
+        branchParentSid="20260101-000000-000"
+        branchConvLen={7}
       />,
     )
-    // The branch-from field is shown read-only with the value.
-    expect((screen.getByLabelText('Branch From') as HTMLInputElement).value).toBe('entry-abc')
+    // The branch-from field shows the PARENT SESSION ID, read-only.
+    expect((screen.getByLabelText('Branch From') as HTMLInputElement).value)
+      .toBe('20260101-000000-000')
     // The harness + attach kind pills are disabled.
     const harnessPill = screen.getByRole('radio', { name: 'New Harness' })
     const attachPill = screen.getByRole('radio', { name: 'Existing Harness' })
@@ -302,7 +304,7 @@ describe('NewTabComposer — branchFrom', () => {
     expect(screen.getByRole('radio', { name: 'AI Provider' })).not.toBeDisabled()
   })
 
-  it('calls createTab with branch_from set on submit', async () => {
+  it('calls createTab with the parent sid AND the conversation anchor', async () => {
     const onSubmit = vi.fn()
     const buildBody = vi.fn(() => ({ kind: 'provider', provider: 'anthropic', model: 'claude-sonnet-4' }))
     render(
@@ -310,7 +312,8 @@ describe('NewTabComposer — branchFrom', () => {
         spec={makeSpec({ kind: 'provider', buildBody })}
         onSubmit={onSubmit}
         onCancel={() => {}}
-        branchFrom="entry-abc"
+        branchParentSid="20260101-000000-000"
+        branchConvLen={7}
       />,
     )
     fireEvent.click(screen.getByLabelText('Submit new tab'))
@@ -319,7 +322,8 @@ describe('NewTabComposer — branchFrom', () => {
       kind: 'provider',
       provider: 'anthropic',
       model: 'claude-sonnet-4',
-      branch_from: 'entry-abc',
+      branch_from: '20260101-000000-000',
+      branch_conv_len: 7,
     })
   })
 })

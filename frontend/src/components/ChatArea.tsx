@@ -1443,7 +1443,7 @@ const ChatMessage = memo(function ChatMessage({
   onCancel,
 }: {
   message: Message
-  onBranch?: (entryId: string) => void
+  onBranch?: (convLen: number) => void
   sending?: boolean
   /** 'rendered' (default) formats the markdown; 'raw' shows the source. */
   markdownMode?: TranscriptViewMode
@@ -1542,9 +1542,9 @@ const ChatMessage = memo(function ChatMessage({
         {message.rawJson !== undefined && (
           <JsonButton kind="message" onClick={() => setJsonOpen(true)} />
         )}
-        {onBranch !== undefined && message.entryId !== undefined && (
+        {onBranch !== undefined && message.convLen !== undefined && (
           <BranchButton
-            onClick={() => onBranch(message.entryId!)}
+            onClick={() => onBranch(message.convLen!)}
             disabled={sending}
           />
         )}
@@ -2050,6 +2050,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           messages.push({
             id: e.id + '-skillload',
             entryId: e.id,
+            convLen: e.convLen ?? undefined,
             agentName: channel ? `Skill · ${channel}` : 'Skill',
             agentStatus: 'completed',
             timestamp: ts,
@@ -2094,6 +2095,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           messages.push({
             id: e.id + '-setuprepo',
             entryId: e.id,
+            convLen: e.convLen ?? undefined,
             agentName: channel ? `Repo · ${channel}` : 'Repo',
             agentStatus: status === 'failed' ? 'idle' : 'completed',
             timestamp: ts,
@@ -2174,6 +2176,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
               messages.push({
                 id: e.id + '-user',
                 entryId: e.id,
+                convLen: e.convLen ?? undefined,
                 // Surface the originating channel (e.g. "telegram", "web")
                 // in the source label so the user can tell where a message
                 // came from. The channel is stamped into the request
@@ -2199,6 +2202,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
               messages.push({
                 id: e.id + '-asst',
                 entryId: e.id,
+                convLen: e.convLen ?? undefined,
                 agentName: e.model ?? 'Assistant',
                 agentStatus: 'completed',
                 timestamp: ts,
@@ -2255,6 +2259,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
         messages.push({
           id: e.id,
           entryId: e.id,
+          convLen: e.convLen ?? undefined,
           agentName: e.model ?? e.harness ?? 'Assistant',
           agentStatus: 'completed',
           timestamp: ts,
@@ -2522,11 +2527,11 @@ export function ChatArea({
    *  the user can type into the new session immediately without an
    *  extra click. */
   selectedId?: string | null
-  /** When defined, each transcript row that carries an `entryId` renders a
-   *  branch button wired to `onBranch(entryId)`. Supplied by App only for
+  /** When defined, each transcript row that carries a `convLen` renders a
+   *  branch button wired to `onBranch(convLen)`. Supplied by App only for
    *  persisted provider sessions; undefined for harness sessions and in
    *  compose mode, which suppresses the button entirely. */
-  onBranch?: (entryId: string) => void
+  onBranch?: (convLen: number) => void
   /** Read-only transcript prefix rendered ABOVE the composer panel in a
    *  branch-draft compose flow. These rows carry no `onBranch` so they
    *  render no branch button and offer no send affordance — the only send

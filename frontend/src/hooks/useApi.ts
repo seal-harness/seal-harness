@@ -1005,6 +1005,9 @@ export interface CreateTabBody {
   model?: string
   agent?: string
   branch_from?: string
+  /** Conversation length to inherit from `branch_from` (a parent SESSION
+   *  id). Sent only alongside `branch_from`. */
+  branch_conv_len?: number
   harness_id?: string
 }
 

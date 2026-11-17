@@ -32,3 +32,5 @@ frontend/playwright-report/
 # Release tarballs produced by scripts/package-release.sh
 /seal-*.tar.gz
 /seal-*.tar.gz.sha256
+patch_plan.py
+*.log
