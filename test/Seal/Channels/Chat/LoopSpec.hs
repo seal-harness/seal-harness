@@ -16,6 +16,7 @@ import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Time (UTCTime (..), addUTCTime, fromGregorian)
 import Data.Vector qualified as V
 import Network.HTTP.Client (Manager, newManager, defaultManagerSettings)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy, expectationFailure)
@@ -123,6 +124,23 @@ instance ChatChannel NoKeyboardChan where
   ccLabel (NoKeyboardChan c) = ccLabel c
   -- No inline-keyboard support: the loop must fall back to text rendering.
   ccSendWithOptions _ _ _ _ = pure Nothing
+
+-- | A single-bubble mock with the edit gate permanently open (interval 0).
+-- Lets a test assert per-event edit CONTENT without the rate limiter
+-- coalescing events; only for tests where the gate is not the subject.
+newtype NoGateChan = NoGateChan MockChan
+
+instance ChatChannel NoGateChan where
+  ccReceive (NoGateChan c) = ccReceive c
+  ccSend (NoGateChan c) = ccSend c
+  ccSendWithId (NoGateChan c) = ccSendWithId c
+  ccEditMessage (NoGateChan c) = ccEditMessage c
+  ccSendWithOptions (NoGateChan c) = ccSendWithOptions c
+  ccLabel (NoGateChan c) = ccLabel c
+  ccSendWithIdSilently (NoGateChan c) = ccSendWithIdSilently c
+  ccProgressStyle _ = PsSingleBubble
+  ccChunkLimit _ = Just 1998
+  ccEditIntervalMs _ = 0
 
 -- | A single-bubble mock whose silent send always fails. Used to prove the
 -- loop falls back to a notifying create rather than losing the progress
@@ -790,6 +808,27 @@ spec = do
                        pendingAsks bg tabTracker watchState thinkingTabs sid
           pure (inner, fire, sid)
 
+        -- The same harness with the edit gate permanently open, so a test can
+        -- assert per-event edit CONTENT without the rate limiter coalescing
+        -- events. Use this only where the gate is not the subject.
+        setupNoGate = do
+          inner <- mkMockChan
+          mgr <- newManager defaultManagerSettings
+          let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+          ss' <- newStreamingState
+          conns <- newTVarIO (Map.singleton (ConversationKey "signal" "conv1")
+                                (mkSid "s1", stubWs, ss'))
+          pendingAsks <- newPendingAsks
+          tabTracker <- newTVarIO Map.empty
+          watchState <- newWatchState
+          thinkingTabs <- newThinkingTabs
+          bg <- newBgSessions
+          let sid = mkSid "s1"
+              key = ConversationKey "signal" "conv1"
+              fire = handleServerEvent cfg (NoGateChan inner) key conns
+                       pendingAsks bg tabTracker watchState thinkingTabs sid
+          pure (inner, fire, sid)
+
     it "does not send a fresh message when a live edit fails" $ do
       (inner, fire, sid) <- setup
       writeIORef (mcEditFails inner) True
@@ -814,7 +853,7 @@ spec = do
       length (filter (== "the answer") sends) `shouldBe` 1
 
     it "re-renders the whole body on the next successful edit" $ do
-      (inner, fire, sid) <- setup
+      (inner, fire, sid) <- setupNoGate
       fire (SeActivity sid (statusJson "thinking"))
       fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
       -- Fail one edit, then let the next one succeed.
@@ -834,6 +873,156 @@ spec = do
           body `shouldSatisfy` T.isInfixOf "SHELL_EXEC"
           body `shouldSatisfy` T.isInfixOf "BIN_EXEC"
           body `shouldSatisfy` T.isInfixOf "PROCESS_MANAGE"
+
+  describe "single-bubble edit gate (WU-3)" $ do
+    -- Telegram allows roughly 20 messages/minute per group and about one per
+    -- second per chat. Before this gate the PsSingleBubble frame path edited on
+    -- EVERY gateway frame, and the tool path on every tool call - on a fast
+    -- model that is 100+ edits/minute. Both sources now share ONE bucket, so a
+    -- turn cannot exceed one edit per interval by alternating between them.
+    let setup = do
+          inner <- mkMockChan
+          mgr <- newManager defaultManagerSettings
+          clock <- newIORef (UTCTime (fromGregorian 2026 1 1) 0)
+          let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
+                      { cccNow = readIORef clock }
+              advance = modifyIORef' clock (addUTCTime 5)
+          ss' <- newStreamingState
+          conns <- newTVarIO (Map.singleton (ConversationKey "signal" "conv1")
+                                (mkSid "s1", stubWs, ss'))
+          pendingAsks <- newPendingAsks
+          tabTracker <- newTVarIO Map.empty
+          watchState <- newWatchState
+          thinkingTabs <- newThinkingTabs
+          bg <- newBgSessions
+          let sid = mkSid "s1"
+              key = ConversationKey "signal" "conv1"
+              fire = handleServerEvent cfg (BubbleChan inner) key conns
+                       pendingAsks bg tabTracker watchState thinkingTabs sid
+          pure (inner, fire, sid, advance)
+
+        editCount inner = length <$> readIORef (mcEdits inner)
+
+    it "coalesces a burst of tool calls into one edit" $ do
+      (inner, fire, sid, _) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      mapM_ (\n -> fire (SeActivity sid (toolCallJson ("SHELL_EXEC" <> T.pack (show n)))))
+            [1 .. 10 :: Int]
+      n <- editCount inner
+      -- The first tool call CREATES the bubble (a create, not an edit); the
+      -- other nine land inside one interval and are coalesced into at most one
+      -- edit. The invariant that matters: ten tool calls do NOT mean ten
+      -- platform round-trips.
+      n `shouldSatisfy` (<= 1)
+
+    it "loses no tool line by coalescing" $ do
+      -- Coalescing suppresses intermediate REDRAWS, never content: the body is
+      -- re-rendered from the whole splice list, and the idle close is
+      -- deliberately UNGATED, so the final bubble carries every line.
+      (inner, fire, sid, _) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      mapM_ (\n -> fire (SeActivity sid (toolCallJson ("TOOL" <> T.pack (show n)))))
+            [1 .. 10 :: Int]
+      fire (SeActivity sid (statusJson "idle"))
+      edits <- reverse <$> readIORef (mcEdits inner)
+      let body = case reverse edits of
+                   ((_, b):_) -> b
+                   []         -> ""
+      mapM_ (\n -> body `shouldSatisfy` T.isInfixOf ("TOOL" <> T.pack (show n)))
+            [1 .. 10 :: Int]
+
+    it "edits again once the interval elapses" $ do
+      (inner, fire, sid, advance) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      before <- editCount inner
+      advance
+      fire (SeActivity sid (toolCallJson "BIN_EXEC"))
+      after <- editCount inner
+      after `shouldBe` before + 1
+
+    it "shares one bucket between frames and tools" $ do
+      (inner, fire, sid, _) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      before <- editCount inner
+      -- Interleave both sources inside one interval. With two INDEPENDENT
+      -- buckets each source would get its own edit (>=2 more); with ONE shared
+      -- bucket at most one edit total is possible.
+      fire (SeEntryUpdate sid (streamingJsonFor "some text"))
+      fire (SeActivity sid (toolCallJson "BIN_EXEC"))
+      fire (SeEntryUpdate sid (streamingJsonFor "some more text"))
+      after <- editCount inner
+      after `shouldSatisfy` (<= before + 1)
+
+    it "is not blocked by the previous turn's timestamp" $ do
+      -- 'resetStreamingState' clears the bucket at turn end, so the next turn's
+      -- bubble is created and edited straight away instead of waiting out the
+      -- previous turn's interval. (A fresh turn's first tool call CREATES, so
+      -- the observable is the create count plus an immediate edit.)
+      (inner, fire, sid, _) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeEntry sid (entryJsonFor "first"))
+      fire (SeActivity sid (statusJson "idle"))
+      createsBefore <- length <$> readIORef (mcSendIds inner)
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "BIN_EXEC"))
+      createsAfter <- length <$> readIORef (mcSendIds inner)
+      -- A new bubble was created immediately (no stale interval blocked it).
+      createsAfter `shouldBe` createsBefore + 1
+
+    it "does not advance the bucket when an edit fails" $ do
+      -- A failed edit must retry on the next event rather than being
+      -- suppressed for another interval.
+      (inner, fire, sid, _) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      writeIORef (mcEditFails inner) True
+      fire (SeActivity sid (toolCallJson "BIN_EXEC"))
+      writeIORef (mcEditFails inner) False
+      before <- editCount inner
+      -- The failed edit did not open an interval, so the very next event -
+      -- still inside the window - edits immediately and recovers the content.
+      -- (Had the failure advanced the bucket, this would be suppressed and the
+      -- bubble would stay stale for another interval.)
+      fire (SeActivity sid (toolCallJson "PROCESS_MANAGE"))
+      after <- editCount inner
+      after `shouldBe` before + 1
+
+    it "keeps a StopMaxTokens continuation whole under the gate" $ do
+      -- A second recorded response entry (a continuation) must survive the
+      -- gate: coalescing affects redraws, never delivered text.
+      (inner, fire, sid, _) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeEntry sid (entryJsonFor "first part"))
+      fire (SeEntryUpdate sid (streamingJsonFor "first part second part"))
+      fire (SeEntry sid (entryJsonFor "first part second part"))
+      fire (SeActivity sid (statusJson "idle"))
+      answer <- lastOrCrash <$> getSends inner
+      answer `shouldSatisfy` T.isInfixOf "first part"
+      answer `shouldSatisfy` T.isInfixOf "second part"
+
+    it "delivers a /bg reply that never saw a frame, under the gate" $ do
+      -- A background connection receives no entry-updates at all, so the
+      -- bucket is never opened by a frame; the recorded entry must still reach
+      -- the human exactly once.
+      (inner, fire, sid, _) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntry sid (entryJsonFor "bg reply text"))
+      fire (SeActivity sid (statusJson "idle"))
+      getSends inner `shouldReturn` ["bg reply text"]
+
+    it "does not gate the watch notification (it is a send, not an edit)" $ do
+      -- /watch notifies through ccSend, so the edit gate cannot suppress it.
+      (inner, fire, sid, _) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeActivity sid (statusJson "idle"))
+      -- The tools-only close notice is a send and still arrives.
+      sends <- getSends inner
+      length sends `shouldBe` 1
 
   describe "Telegram-style turn shapes (WU-2)" $ do
     -- The operator's requirement in one place: a tool turn must notify exactly

@@ -104,6 +104,22 @@ class ChatChannel c where
   ccChunkLimit :: c -> Maybe Int
   ccChunkLimit _ = Nothing
 
+  -- | Minimum milliseconds between live edits of a turn's single progress
+  -- bubble. Both edit sources (streaming frames and tool calls) share one
+  -- bucket, so a turn cannot exceed one edit per interval.
+  --
+  -- Defaults to 'spcEditIntervalMs' of the streaming config (1500 ms), i.e.
+  -- the same cadence the separate-messages style already uses - so this is
+  -- not a second, drift-prone constant. It exists because that style's
+  -- 'shouldEdit' is an @||@: its 80-codepoint branch forces an edit on every
+  -- frame once the accumulator passes the threshold, which is unbounded. The
+  -- single-bubble path needs an interval-only gate.
+  --
+  -- Only consulted by 'PsSingleBubble'. The @idle@ closing edit is never
+  -- gated, so a turn always ends on its final content.
+  ccEditIntervalMs :: c -> Int
+  ccEditIntervalMs _ = 1500
+
   -- | Send a question with multiple-choice options as an inline keyboard
   -- (one button per option). The @askIdPrefix@ is the 8-hex prefix of the
   -- ask id — the channel embeds it in the callback_data

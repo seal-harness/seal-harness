@@ -74,7 +74,7 @@ import Data.Text (Text)
 import Data.Vector qualified as V
 import Data.Char (isDigit)
 import Data.Text qualified as T
-import Data.Time (getCurrentTime)
+import Data.Time (UTCTime, diffUTCTime, getCurrentTime)
 import System.IO (hPutStrLn, stderr)
 import Network.HTTP.Client (Manager)
 
@@ -342,6 +342,10 @@ data ChatChannelConfig = ChatChannelConfig
     -- ^ The shared HTTP manager for gateway API calls.
   , cccNewSession :: Manager -> Text -> Value -> IO (Either Text Text)
     -- ^ @POST /api/sessions/new@. The seam the @/bg@ handler uses to mint
+  , cccNow :: IO UTCTime
+    -- ^ The clock the edit gate reads. Default 'getCurrentTime'. Tests
+    -- override it with an advanceable clock so "once the interval elapses" is
+    -- assertable without a real delay.
   , cccGetLists :: Manager -> Text -> IO (Either Text ListsJson)
     -- ^ @GET /api/lists@. The seam @/tab list@ uses to render rows; the
     -- default is 'httpGetLists'.
@@ -392,6 +396,7 @@ defaultChatChannelConfig mgr gw = ChatChannelConfig
   , cccAnswerQuestion = httpAnswerQuestion
   , cccGetQuestions = httpGetQuestions
   , cccGetLists = httpGetLists
+  , cccNow = getCurrentTime
   }
 
 -- | Debug log to stderr.
@@ -1230,12 +1235,17 @@ handleEntryUpdate cfg chan ss val = do
       -- carry, so accumulating both would duplicate the answer.
       when (ccProgressStyle chan == PsSingleBubble) $ do
         hasBubble <- isJust <$> readIORef (ssMsgId ss)
-        when hasBubble $
-          updateBubble cfg chan ss
-            (spliceContent ss (Just (if T.null text then "" else addCursor (cccStreamCfg cfg) text)))
+        when hasBubble $ do
+          open <- editGateOpen cfg chan ss
+          when open $ do
+            edited <- updateBubble cfg chan ss
+              (spliceContent ss (Just (if T.null text then "" else addCursor (cccStreamCfg cfg) text)))
+            -- This branch only runs when a bubble exists, so it is always an
+            -- edit, never a create.
+            when edited (markBubbleEdited cfg ss)
       -- Separate-messages style: stream a growing bubble per segment.
       when (ccProgressStyle chan == PsSeparateMessages && ccSupportsStreaming chan) $ do
-        now <- getCurrentTime
+        now <- cccNow cfg
         mLastEdit <- readIORef (ssLastEdit ss)
         mMsgId <- readIORef (ssMsgId ss)
         -- Gate on NEW text since the last edit, not the total length
@@ -1278,13 +1288,37 @@ spliceContent ss mPreview = do
 -- | Create the turn's bubble on first use, then edit it. Returns 'True' when
 -- the content is on the platform (created or edited). A failed edit falls
 -- back to a fresh message so content is never silently dropped.
+-- | The single-bubble edit gate. One shared bucket per conversation, so the
+-- frame and tool sources together cannot exceed one edit per interval.
+-- Interval-only: the separate-messages path's 'shouldEdit' is an @||@ whose
+-- 80-codepoint branch fires on every frame, which is unbounded.
+editGateOpen
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> StreamingState -> IO Bool
+editGateOpen cfg chan ss = do
+  now <- cccNow cfg
+  mLast <- readIORef (ssLastBubbleEdit ss)
+  let intervalMs = ccEditIntervalMs chan
+      elapsedMs = case mLast of
+        Nothing  -> intervalMs          -- no edit yet this turn: edit now
+        Just last' ->
+          round (realToFrac (diffUTCTime now last') * (1000 :: Double))
+  pure (elapsedMs >= intervalMs)
+
+-- | Record that an edit landed, opening a fresh interval.
+markBubbleEdited
+  :: ChatChannelConfig -> StreamingState -> IO ()
+markBubbleEdited cfg ss = do
+  now <- cccNow cfg
+  writeIORef (ssLastBubbleEdit ss) (Just now)
+
 updateBubble
   :: ChatChannel c
-  => ChatChannelConfig -> c -> StreamingState -> IO Text -> IO ()
+  => ChatChannelConfig -> c -> StreamingState -> IO Text -> IO Bool
 updateBubble cfg chan ss mkContent = do
   content <- mkContent
   over <- shouldFallBackToChunks cfg chan content
-  unless over $ do
+  if over then pure False else do
       mMsgId <- readIORef (ssMsgId ss)
       case mMsgId of
         Nothing -> do
@@ -1298,6 +1332,7 @@ updateBubble cfg chan ss mkContent = do
             Just i  -> pure (Just i)
             Nothing -> ccSendWithId chan content
           for_ mId (writeIORef (ssMsgId ss) . Just)
+          pure (isJust mId)
         Just id' -> do
           ok <- ccEditMessage chan id' content
           unless ok $ do
@@ -1314,6 +1349,7 @@ updateBubble cfg chan ss mkContent = do
             -- The next frame, tool call or idle re-renders the whole body from
             -- 'ssSplices'/'ssAccumulated', which an edit never modifies.
             dbg "[bubble] edit failed; leaving the bubble for the next event"
+          pure ok
 
 -- | Merge one recorded response into the turn's answer.
 --
@@ -1380,7 +1416,7 @@ finalizeSingleBubble cfg chan ss = do
           Just id' -> void (ccEditMessage chan id' overLimitCloseText)
           Nothing  -> pure ()
         writeIORef (ssMsgId ss) Nothing
-      else updateBubble cfg chan ss (pure body)
+      else void (updateBubble cfg chan ss (pure body))
   -- 2. Deliver the answer as its own message. This is what notifies the
   --    human: an edit never does.
   answer <- stripCursorText (cccStreamCfg cfg) <$> readIORef (ssAccumulated ss)
@@ -1548,7 +1584,18 @@ handleToolCallActivity cfg chan ss val = do
         let mInput = extractToolInput val
             line = formatToolLine mempty toolName (fromMaybe "" mInput)
         modifyIORef' (ssSplices ss) (<> [(T.length accum, line)])
-        updateBubble cfg chan ss (spliceContent ss (Just ""))
+        -- Gated on the SAME bucket as the frame path. The first tool call of a
+        -- turn is the bubble's create ('hasBubble' is false, so this branch's
+        -- edit creates it via 'updateBubble'); a create does not consume the
+        -- bucket, so the first real edit after it lands immediately.
+        hadBubble <- isJust <$> readIORef (ssMsgId ss)
+        open <- editGateOpen cfg chan ss
+        when open $ do
+          edited <- updateBubble cfg chan ss (spliceContent ss (Just ""))
+          -- A CREATE is not an edit: it does not consume the bucket, so the
+          -- next event can edit immediately and the progress becomes visible
+          -- straight away.
+          when (edited && hadBubble) (markBubbleEdited cfg ss)
     PsSeparateMessages -> do
       mMsgId <- readIORef (ssMsgId ss)
       accum <- readIORef (ssAccumulated ss)
