@@ -122,6 +122,77 @@ describe('ProviderStep', () => {
     }))
   })
 
+  // ── Design D8: the CTA must agree with the pill (test 44) ────────────
+
+  it('44: the pill renders from readiness and the CTA stays enabled', () => {
+    const onDone = vi.fn()
+    fetchMock.mockResolvedValue(jsonResponse(200, { default_provider: 'ollama' }))
+    render(
+      <ProviderStep
+        step={step({ detail: 'ollama · llama3.2' })}
+        providers={[card({ id: 'ollama', label: 'Ollama', configured: true, readiness: 'not-running' })]}
+        onDone={onDone}
+      />,
+    )
+    // Honest pill, not "configured".
+    expect(screen.getByTestId('setup-provider-pill-ollama').textContent).toBe('Not Running')
+    // ... and the CTA still says "Use Ollama" and is still enabled: the
+    // wizard's job is credential sufficiency, and a keyless Ollama has nothing
+    // missing.
+    const useBtn = screen.getByRole('button', { name: /use ollama/i })
+    expect(useBtn).toBeEnabled()
+  })
+
+  it('44b: the hint slot renders below the pill for an actionable state', () => {
+    render(
+      <ProviderStep
+        step={step({ detail: 'ollama · llama3.2' })}
+        providers={[card({ id: 'ollama', label: 'Ollama', configured: true, readiness: 'not-running' })]}
+        onDone={() => {}}
+      />,
+    )
+    const hint = screen.getByTestId('setup-provider-hint-ollama')
+    expect(hint.textContent).toContain('ollama serve')
+  })
+
+  it('44c: a ready Ollama renders Ready · n Models and no hint', () => {
+    render(
+      <ProviderStep
+        step={step({ detail: 'ollama · llama3.2' })}
+        providers={[card({
+          id: 'ollama', label: 'Ollama', configured: true,
+          readiness: 'ready', readiness_models: 2,
+        })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('setup-provider-pill-ollama').textContent).toBe('Ready · 2 Models')
+    expect(screen.queryByTestId('setup-provider-hint-ollama')).toBeNull()
+  })
+
+  it('44d: a card with no readiness keeps the existing pill text (the fallback)', () => {
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ id: 'anthropic', configured: true })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('setup-provider-pill-anthropic').textContent).toBe('configured')
+  })
+
+  it('44e: a pending Ollama falls back rather than rendering an empty pill', () => {
+    render(
+      <ProviderStep
+        step={step({ detail: 'ollama · llama3.2' })}
+        providers={[card({ id: 'ollama', label: 'Ollama', configured: true, readiness: 'pending' })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('setup-provider-pill-ollama').textContent).toBe('configured')
+    expect(screen.queryByTestId('setup-provider-hint-ollama')).toBeNull()
+  })
+
   it('requires a base URL and a unique name for the generic OpenAI-compatible provider', async () => {
     fetchMock.mockResolvedValue(jsonResponse(201, { name: 'openai' }))
     render(

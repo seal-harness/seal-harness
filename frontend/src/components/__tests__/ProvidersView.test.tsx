@@ -203,6 +203,108 @@ describe('ProvidersView', () => {
     expect(screen.getByText('Keyless')).toBeDefined()
   })
 
+  // ── Ollama readiness (design D3.2, tests 35-38) ──────────────────────
+
+  it('35: renders Not Running in the list row instead of Keyless', () => {
+    providersState = [
+      makeProvider({ name: 'ollama', authStatus: 'keyless', readiness: 'not-running' }),
+    ]
+    render(<ProvidersView />)
+    expect(screen.getByText('Not Running')).toBeDefined()
+    // The readiness badge REPLACES the credential badge for a keyless Ollama:
+    // "Not Running" is strictly more useful than "Keyless".
+    expect(screen.queryByText('Keyless')).toBeNull()
+  })
+
+  it('36: renders Not Running in the editor pill too', () => {
+    providersState = [
+      makeProvider({ name: 'ollama', authStatus: 'keyless', readiness: 'not-running' }),
+    ]
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-row-ollama'))
+    const pill = screen.getByTestId('editor-badge-readiness')
+    expect(pill.textContent).toBe('Not Running')
+  })
+
+  it('37: absent readiness falls back to the existing auth badge', () => {
+    // A non-Ollama provider, or a newer frontend against an older backend.
+    providersState = [makeProvider({ name: 'anthropic', authStatus: 'api-key' })]
+    render(<ProvidersView />)
+    expect(screen.getByText('API Key')).toBeDefined()
+    expect(screen.queryByTestId('provider-badge-readiness')).toBeNull()
+  })
+
+  it('38a: vault-locked anthropic renders ONE badge (the readiness-present guard)', () => {
+    providersState = [makeProvider({ name: 'anthropic', authStatus: 'vault-locked' })]
+    render(<ProvidersView />)
+    const badges = screen.getByTestId('provider-badges-anthropic')
+    expect(badges.textContent).toBe('Vault Locked')
+    expect(screen.queryByTestId('provider-badge-readiness')).toBeNull()
+  })
+
+  it('38b: vault-locked ollama renders TWO badges', () => {
+    providersState = [
+      makeProvider({ name: 'ollama', authStatus: 'vault-locked', readiness: 'not-running' }),
+    ]
+    render(<ProvidersView />)
+    const badges = screen.getByTestId('provider-badges-ollama')
+    expect(badges.textContent).toBe('Not RunningVault Locked')
+  })
+
+  it('17a: cloud readiness renders TWO badges (Cloud + the auth badge)', () => {
+    // Design test 38 does not cover the cloud row; the plan adds it.
+    providersState = [
+      makeProvider({ name: 'ollama', authStatus: 'keyless', readiness: 'cloud' }),
+    ]
+    render(<ProvidersView />)
+    const badges = screen.getByTestId('provider-badges-ollama')
+    expect(badges.textContent).toBe('CloudKeyless')
+  })
+
+  it('17b: authStatus none + readiness present renders TWO badges, in the editor', () => {
+    // A `none` Ollama is excluded from the LIST (the list shows configured
+    // providers only), so this row only exists in the editor pane.
+    providersState = [
+      makeProvider({ name: 'ollama', authStatus: 'keyless', readiness: 'no-models' }),
+      makeProvider({ name: 'openai', authStatus: 'none', readiness: 'no-models' }),
+    ]
+    render(<ProvidersView />)
+    // The list row for a configured keyless Ollama: readiness replaces auth.
+    expect(screen.getByTestId('provider-badges-ollama').textContent).toBe('No Models Pulled')
+    // The `none` row is not in the list at all, which is existing behaviour.
+    expect(screen.queryByTestId('provider-badges-openai')).toBeNull()
+  })
+
+  it('17c: a specific auth (api-key) is REPLACED by readiness', () => {
+    providersState = [
+      makeProvider({ name: 'ollama', authStatus: 'api-key', readiness: 'ready', readinessModels: 3 }),
+    ]
+    render(<ProvidersView />)
+    const badges = screen.getByTestId('provider-badges-ollama')
+    expect(badges.textContent).toBe('Ready · 3 Models')
+    expect(screen.queryByText('API Key')).toBeNull()
+  })
+
+  it('16: the two badges STACK in a column container, not inline', () => {
+    // jsdom does no layout, so a "both texts are present" check cannot tell
+    // stacked from clipped. Assert the STRUCTURE: the badges are siblings
+    // inside a flex column, and each is its own block element. The row is
+    // `text-xs truncate`; two inline siblings would clip the second.
+    providersState = [
+      makeProvider({ name: 'ollama', authStatus: 'vault-locked', readiness: 'not-running' }),
+    ]
+    render(<ProvidersView />)
+    const container = screen.getByTestId('provider-badges-ollama')
+    expect(container.className).toContain('flex-col')
+    const children = Array.from(container.children)
+    expect(children).toHaveLength(2)
+    for (const child of children) {
+      expect(child.className).toContain('truncate')
+      // Each badge is a block-level row of the column, not an inline span.
+      expect(child.tagName).toBe('DIV')
+    }
+  })
+
   it('shows default badge for the default provider', async () => {
     providersState = [makeProvider({ name: 'anthropic', authStatus: 'api-key', isDefault: true })]
     defaultProviderState = 'anthropic'

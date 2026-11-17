@@ -41,6 +41,7 @@ import Seal.Tools.Exec.FileExplorer
   , mkLocalFileExplorer
   , mkFailClosedFileExplorer
   )
+import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.Cron.Store (CronStore (..))
 
 stubCronStore :: CronStore
@@ -293,6 +294,7 @@ mkDepsWithCache cacheRoot fe enabled = do
     , adAgentDefs = undefined
     , adSkills = undefined
     , adProviders = pure []
+    , adOllamaReadiness = noOllamaReadiness
     , adUiState = undefined
     , adSend = Nothing
     , adDefaultAgent = pure Nothing

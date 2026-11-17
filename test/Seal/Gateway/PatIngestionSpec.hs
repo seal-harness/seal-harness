@@ -79,6 +79,7 @@ import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.SourceControl.Registry (RepoRegistryHandle, mkRepoRegistryHandle)
 import Seal.Tabs (newTabsHandle)
 import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
+import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.Tools.Args (textBinArg, textBinName)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
 import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
@@ -263,6 +264,7 @@ mkVaultDeps vr tmp = do
         , adAgentDefs       = adb
         , adSkills          = skills
         , adProviders       = pure knownProviders
+        , adOllamaReadiness = noOllamaReadiness
         , adUiState         = uiState
         , adSend            = Nothing
         , adDefaultAgent    = pure Nothing

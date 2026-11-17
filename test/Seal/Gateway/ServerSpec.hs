@@ -46,6 +46,7 @@ import Seal.Tabs (newTabsHandle)
 import Seal.Gateway.API (ApiDeps (..))
 import Seal.Gateway.Setup (stubSetupDeps)
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
+import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.Web.UiState (newUiStateHandle)
 import Seal.Cron.Store (CronStore (..))
 
@@ -107,6 +108,7 @@ mkDeps = do
     , adAgentDefs = adb
     , adSkills = skills
     , adProviders = pure knownProviders
+    , adOllamaReadiness = noOllamaReadiness
     , adUiState = uiState
     , adSend = Nothing
     , adDefaultAgent = pure Nothing

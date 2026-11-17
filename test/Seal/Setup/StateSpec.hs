@@ -10,6 +10,7 @@
 --   that would mean a physical touch just to render the wizard (test 14).
 module Seal.Setup.StateSpec (spec) where
 
+import Control.Monad (forM_)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -18,6 +19,7 @@ import Test.Hspec
 import Test.Hspec.QuickCheck (prop)
 import Test.QuickCheck (Gen, elements, forAll, ioProperty, oneof)
 
+import Seal.Providers.OllamaReadiness (OllamaReadiness (..))
 import Seal.Config.File
   ( ProviderConfig (..), RuntimeConfig (..), defaultRuntimeConfig )
 import Seal.Config.Paths (SealPaths (..))
@@ -143,6 +145,44 @@ spec = describe "Seal.Setup.State" $ do
       stStatus (providerStep state) `shouldBe` StepReady
       fromMaybe "" (stDetail (providerStep state)) `shouldSatisfy` T.isInfixOf "llama3.2"
 
+    -- DoD 13 / design test 33 + D8. The "not ready yet" sentence is appended
+    -- to the existing detail for exactly three states, and for NO other.
+    it "33: appends the not-ready sentence only for {not-installed, not-running, no-models}" $ do
+      let detailFor readiness = do
+            state <- deriveSetupState
+              (emptySetupInputs fakePaths)
+                { siRuntime = defaultRuntimeConfig { rcDefaultProvider = Just "ollama" }
+                , siConfiguredProviders = pure [OllamaProvider]
+                , siOllamaReadiness = readiness }
+            pure (fromMaybe "" (stDetail (providerStep state)))
+      forM_ [RdNotInstalled, RdNotRunning, RdNoModels] $ \r -> do
+        d <- detailFor r
+        d `shouldSatisfy` T.isInfixOf "Ollama is not ready yet"
+        -- It is APPENDED, not substituted: the existing detail survives.
+        d `shouldSatisfy` T.isInfixOf "ollama · "
+      forM_ [RdPending, RdUnknown, RdCloud, RdNoFittingModel, RdReady 1] $ \r -> do
+        d <- detailFor r
+        d `shouldSatisfy` (not . T.isInfixOf "Ollama is not ready yet")
+        d `shouldSatisfy` T.isInfixOf "ollama · "
+
+    it "33b: the not-ready sentence is Ollama-only (never on anthropic)" $ do
+      state <- deriveSetupState
+        (emptySetupInputs fakePaths)
+          { siRuntime = defaultRuntimeConfig { rcDefaultProvider = Just "anthropic" }
+          , siConfiguredProviders = pure [AnthropicProvider]
+          , siOllamaReadiness = RdNotRunning }
+      fromMaybe "" (stDetail (providerStep state))
+        `shouldSatisfy` (not . T.isInfixOf "Ollama is not ready yet")
+
+    it "providerCards carries readiness for Ollama and nothing for other providers" $ do
+      state <- deriveSetupState
+        (emptySetupInputs fakePaths)
+          { siConfiguredProviders = pure []
+          , siOllamaReadiness = RdNotRunning }
+      let byId = Map.fromList [(pcId c, c) | c <- ssProviders state]
+      (pcReadiness =<< Map.lookup "ollama" byId) `shouldBe` Just RdNotRunning
+      (pcReadiness =<< Map.lookup "anthropic" byId) `shouldBe` Nothing
+
     it "provider: default without credential is pending, naming the provider" $ do
       state <- deriveSetupState
         (emptySetupInputs fakePaths)
@@ -265,6 +305,9 @@ data Scenario = Scenario
   , scHandle      :: Maybe Bool   -- ^ 'Nothing' = no handle; @Just locked?@
   , scIdentity    :: Maybe Bool
   , scDefaultProv :: Maybe Bool   -- ^ @Just True@ = default set and configured
+  , scReadiness   :: OllamaReadiness
+    -- ^ The observed Ollama readiness. Defaults to 'RdPending' so the generated
+    -- cases stay offline and unchanged (design test 34).
   } deriving stock (Show)
 
 genScenario :: Gen Scenario
@@ -274,6 +317,7 @@ genScenario = Scenario
   <*> oneof [pure Nothing, Just <$> elements [True, False]]
   <*> elements [Nothing, Just True, Just False]
   <*> elements [Nothing, Just True, Just False]
+  <*> pure RdPending
 
 inputsFor :: Scenario -> IO SetupInputs
 inputsFor scenario = do
@@ -309,5 +353,6 @@ inputsFor scenario = do
     , siVaultFileExists = scVaultFile scenario
     , siIdentityReadable = scIdentity scenario
     , siConfiguredProviders = configured
+    , siOllamaReadiness = scReadiness scenario
     , siHome = "/home/alice"
     }

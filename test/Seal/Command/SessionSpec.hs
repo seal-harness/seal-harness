@@ -23,6 +23,7 @@ import Seal.Core.Types (mkSessionId)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), newSession)
 import Seal.TestHelpers.FakeCaps (getSent, makeFakeCaps)
+import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.Vault.Commands (VaultRuntime (..))
 
 aTime :: UTCTime
@@ -48,7 +49,7 @@ mkPR cfgPath = do
   cntRef <- newIORef 0
   let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath cfgPath
       vrt = VaultRuntime { vrPaths = sp, vrConfigPath = cfgPath, vrHandleRef = ref }
-  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef }
+  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef, prOllamaReadiness = noOllamaReadiness }
 
 runSess :: SessionRuntime -> [String] -> ChannelCaps -> IO ()
 runSess sr argv caps =

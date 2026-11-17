@@ -52,6 +52,7 @@ import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
+import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
 import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
 import Seal.Web.UiState (newUiStateHandle)
@@ -231,6 +232,7 @@ mkApp canonicalOrigin = do
     , adAgentDefs = adb
     , adSkills = skills
     , adProviders = pure knownProviders
+    , adOllamaReadiness = noOllamaReadiness
     , adUiState = uiState
     , adSend = Nothing
     , adDefaultAgent = pure Nothing

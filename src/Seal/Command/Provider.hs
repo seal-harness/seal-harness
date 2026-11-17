@@ -36,6 +36,7 @@ import Seal.Config.File
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (CompletionRequest (..), CompletionResponse (..), Role (..), SomeProvider, ToolChoice (..), Usage (..), textMsg)
 import Seal.Providers.Ollama (defaultOllamaBaseUrl)
+import Seal.Providers.OllamaReadiness (OllamaReadiness, readinessText)
 import Seal.Providers.Registry
   ( KnownProvider, completeSome, configuredProviders, customProviderNames
   , defaultModelFor, knownProviders, parseProvider, providerLabel
@@ -84,6 +85,11 @@ data ProviderRuntime = ProviderRuntime
   , prVault       :: VaultRuntime
   , prManager     :: Manager
   , prCallCounter :: IORef Int
+  , prOllamaReadiness :: IO OllamaReadiness
+    -- ^ The observed Ollama readiness for @\/provider list@. The TUI runs in a
+    -- separate process and cannot share the gateway's cache, so the TUI builds
+    -- its own inline probes here (design D6.3); tests substitute
+    -- @pure RdPending@ so no spec touches the network or the real PATH.
   }
 
 providerCommandSpec :: ProviderRuntime -> CommandSpec
@@ -242,8 +248,9 @@ listCmd pr = commandAction $ \caps ->
     reportOne caps vh def kp = do
       eKey <- vhGet vh (vaultKeyName kp)
       auth <- authLabel vh kp eKey
+      readiness <- providerReadinessSegment pr kp
       let mark = if Just (providerLabel kp) == def then " (default)" else ""
-      ccSend caps (providerLabel kp <> mark <> " — " <> auth)
+      ccSend caps (providerLabel kp <> mark <> " — " <> auth <> readiness)
 
     authLabel vh kp eKey
       | providerLabel kp == "ollama" =
@@ -258,6 +265,22 @@ listCmd pr = commandAction $ \caps ->
             (_, Right _)          -> "auth: api-key"
             (Left VaultLocked, _) -> "auth: (vault locked)"
             _                     -> "auth: none"
+
+-- | The readiness segment for @\/provider list@: nothing for a non-Ollama
+-- provider, and nothing when the text is empty (design D4: the segment is
+-- omitted rather than printed as a stray separator).
+--
+-- The TUI runs in a /separate process/ and cannot share the gateway's cache, so
+-- this reads the inline probe the TUI built for itself (design D6.3). That is
+-- why the seam is a value on 'ProviderRuntime' rather than a gateway lookup —
+-- and why the tests substitute 'RdPending' there, keeping the suite offline.
+providerReadinessSegment :: ProviderRuntime -> KnownProvider -> IO Text
+providerReadinessSegment pr kp
+  | providerLabel kp /= "ollama" = pure ""
+  | otherwise = do
+      st <- prOllamaReadiness pr
+      let txt = readinessText st
+      pure (if T.null txt then "" else " — " <> txt)
 
 -- | OAuth login flow. Anthropic-only for this milestone. Prints the authorize
 -- URL, best-effort opens the browser, reads the pasted CODE#STATE, exchanges

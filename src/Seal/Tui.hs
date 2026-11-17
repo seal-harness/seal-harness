@@ -22,6 +22,8 @@ import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
+import Seal.Providers.OllamaReadinessProbe
+  ( mkOllamaProbes, defaultProbesConfig, oprReadiness )
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Templates (ensureConfigTemplates)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
@@ -116,11 +118,20 @@ runTui autonomy logger = do
   -- this with the chat provider's manager when the startup hardcode is removed.)
   mgr <- newTlsManager
   callCounter <- newIORef 0
+  -- The TUI probes Ollama INLINE (design D6.3): it is a separate process and
+  -- cannot share the gateway's cache, so @\/provider list@ costs at most one
+  -- 2 s probe plus one RAM read. Acceptable for an interactive command; the
+  -- "never inline" rule (D2.4) is scoped to HTTP request handlers.
+  probes <- mkOllamaProbes
+    (defaultProbesConfig mgr (loadRuntimeConfig cfgPath >>= \case
+        Left _  -> pure defaultRuntimeConfig
+        Right c -> pure c))
   let pr = ProviderRuntime
             { prConfigPath  = cfgPath
             , prVault       = rt
             , prManager     = mgr
             , prCallCounter = callCounter
+            , prOllamaReadiness = oprReadiness probes
             }
   -- The config directory is a git repo (versioning + audit for the
   -- evolutionary stores: skills, agent-defs, memory live as Markdown files

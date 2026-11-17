@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { setDefaultProvider, testProvider, type SetupResult } from '../../hooks/useSetup'
 import { providerLabel } from '../../lib/providerLabels'
+import { readinessHint, readinessLabel, readinessTone } from '../../lib/readiness'
 import type { ProviderCard, SetupStep } from '../../lib/setupSteps'
 import * as s from './styles'
 import {
@@ -36,6 +37,29 @@ type SaveState =
  *   /api/providers/default`. Without this the step offered a disabled Save
  *   button and no way forward — no amount of typing would enable it.
  */
+/** The pill's text. `readiness` wins when present; otherwise the pre-existing
+ *  `configured` / `no credential` wording. */
+function pillText(card: ProviderCard): string {
+  if (card.readiness === undefined) {
+    return card.configured ? 'configured' : 'no credential'
+  }
+  const label = readinessLabel(card.readiness, card.readiness_models)
+  // A `pending` card has no label; fall back rather than render an empty pill.
+  return label === '' ? (card.configured ? 'configured' : 'no credential') : label
+}
+
+function pillColor(card: ProviderCard): string {
+  if (card.readiness !== undefined) {
+    switch (readinessTone(card.readiness)) {
+      case 'ok': return 'var(--success)'
+      case 'warn': return 'var(--needs-input)'
+      case 'muted': return 'var(--text-muted)'
+      case 'faint': return 'var(--text-faint)'
+    }
+  }
+  return card.configured ? 'var(--text-muted)' : 'var(--text-faint)'
+}
+
 export function ProviderStep({
   step,
   providers,
@@ -184,11 +208,29 @@ export function ProviderStep({
                 {providerLabel(provider.id)}
               </span>
               {provider.isDefault ? <span className="pill" style={{ color: 'var(--success)' }}>default</span> : null}
-              <span className="pill" style={{ color: provider.configured ? 'var(--text-muted)' : 'var(--text-faint)' }}>
-                {provider.configured ? 'configured' : 'no credential'}
+              {/* Design D8: the pill renders from `readiness` when the server
+                  sent one, and falls back to today's text when it did not (a
+                  non-Ollama card). The fallback is a fallback, not a
+                  replacement. */}
+              <span
+                className="pill"
+                data-testid={`setup-provider-pill-${provider.id}`}
+                style={{ color: pillColor(provider) }}
+              >
+                {pillText(provider)}
               </span>
               {provider.default_model !== null ? (
                 <span style={{ fontSize: 12, color: 'var(--text-faint)' }}>{provider.default_model}</span>
+              ) : null}
+              {/* D8's hint slot: below the pill, and only when the state has
+                  something actionable to say. */}
+              {provider.readiness !== undefined && readinessHint(provider.readiness, provider.default_model ?? undefined) !== null ? (
+                <span
+                  data-testid={`setup-provider-hint-${provider.id}`}
+                  style={{ display: 'block', fontSize: 12, color: 'var(--text-faint)', marginTop: 2 }}
+                >
+                  {readinessHint(provider.readiness, provider.default_model ?? undefined)}
+                </span>
               ) : null}
             </label>
           </li>

@@ -42,6 +42,7 @@ import Seal.Config.File
 import Seal.Config.Paths (SealPaths (..), vaultFilePath)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig)
 import Seal.Core.Types (ModelId (..))
+import Seal.Providers.OllamaReadiness (OllamaReadiness (..))
 import Seal.Providers.Registry
   ( KnownProvider (..), knownProviders, providerLabel
   , configuredCustomProviderNames, resolveDefaultModelForName )
@@ -85,6 +86,10 @@ data ProviderCard = ProviderCard
   , pcRequiresName :: Bool
     -- ^ True for the generic OpenAI-compatible option: each instance needs its
     -- own unique name, which becomes the config key and the vault-key stem.
+  , pcReadiness :: Maybe OllamaReadiness
+    -- ^ The observed readiness of Ollama, or 'Nothing' for every other
+    -- provider. Ollama-only by design: the remote HTTPS providers' config plus
+    -- credential genuinely is their whole story (design D1).
   } deriving stock (Eq, Show)
 
 data SetupState = SetupState
@@ -118,6 +123,12 @@ data SetupInputs = SetupInputs
     -- it with the real home directory.
   , siConfiguredProviders :: IO [KnownProvider]
     -- ^ The @adProviders@ seam. Never invoked for a YubiKey vault.
+  , siOllamaReadiness :: OllamaReadiness
+    -- ^ The observed readiness, read once per 'deriveSetupState' so
+    -- 'classifyProvider' and 'providerCards' see the same value. A value, not
+    -- an action: 'deriveSetupState' is already in 'IO', and threading a value
+    -- keeps 'providerCards' pure. The stub default is 'RdPending', so no
+    -- existing test touches the network.
   }
 
 -- | An "empty install": no config files on disk, no handle, no vault, no
@@ -132,6 +143,7 @@ emptySetupInputs paths = SetupInputs
   , siVaultFileExists = False
   , siIdentityReadable = Nothing
   , siConfiguredProviders = pure []
+  , siOllamaReadiness = RdPending
   , siHome = takeDirectory (spHome paths)
   }
 
@@ -140,12 +152,13 @@ deriveSetupState :: SetupInputs -> IO SetupState
 deriveSetupState inputs = do
   vault <- classifyVault inputs
   configured <- configuredProviderIds inputs
-  let provider = classifyProvider inputs configured
+  let readiness = siOllamaReadiness inputs
+      provider = classifyProvider inputs configured readiness
       steps = [vault, provider]
   pure SetupState
     { ssRequiredComplete = all isSatisfied steps
     , ssSteps = steps
-    , ssProviders = providerCards inputs configured
+    , ssProviders = providerCards inputs configured readiness
     }
   where
     -- A future non-required step (chat channels) must not be able to block the
@@ -253,13 +266,13 @@ configuredProviderIds inputs
       customs <- configuredCustomProviderNames (siHandle inputs) (siRuntime inputs)
       pure (Set.fromList (builtins <> customs))
 
-classifyProvider :: SetupInputs -> Set Text -> SetupStep
-classifyProvider inputs configured =
+classifyProvider :: SetupInputs -> Set Text -> OllamaReadiness -> SetupStep
+classifyProvider inputs configured readiness =
   case rcDefaultProvider (siRuntime inputs) of
     Just label
       -- P1
       | isYubiKeyVault inputs || Set.member label configured ->
-          readyProvider (label <> " · " <> modelFor inputs label)
+          readyProvider (withReadinessNote label (providerDetailText inputs label))
       -- P2
       | otherwise ->
           pendingProvider ("Add credentials for " <> label <> ".") ["configure"]
@@ -273,6 +286,32 @@ classifyProvider inputs configured =
             "Add an LLM provider: anthropic, openrouter, ollama, or an \
             \OpenAI-compatible endpoint."
             ["configure"]
+  where
+    -- Design D8: the "not ready yet" sentence is appended to the existing
+    -- detail, never replacing it, and only for the three states that genuinely
+    -- mean "Ollama is present in config but not usable yet".
+    withReadinessNote label detail
+      | label == "ollama" && notReady readiness = detail <> " " <> notReadySentence
+      | otherwise = detail
+
+providerDetailText :: SetupInputs -> Text -> Text
+providerDetailText inputs label = label <> " · " <> modelFor inputs label
+
+notReadySentence :: Text
+notReadySentence =
+  "Ollama is not ready yet; you can continue and start it later."
+
+-- | The narrow set from design D8. The exclusions are deliberate:
+--
+-- * 'RdPending' — first paint has no probe result, so claiming "not ready"
+--   would be wrong in the common cold-start path (the stub default).
+-- * 'RdCloud' — an @ollama.com@ endpoint is not probed, so it is not "not ready".
+-- * 'RdNoFittingModel' — advisory by D5.4; turning it into a verdict is exactly
+--   the error the design forbids.
+-- * 'RdUnknown' — we do not know, so we make no claim.
+-- * 'RdReady' — ready.
+notReady :: OllamaReadiness -> Bool
+notReady st = st `elem` [RdNotInstalled, RdNotRunning, RdNoModels]
 
 -- | The model a session would actually use: the global default, else the
 -- provider's configured default, else the provider's hardcoded default. A
@@ -286,8 +325,8 @@ modelFor inputs label =
       let ModelId m = resolveDefaultModelForName (siRuntime inputs) label
       in m
 
-providerCards :: SetupInputs -> Set Text -> [ProviderCard]
-providerCards inputs configured =
+providerCards :: SetupInputs -> Set Text -> OllamaReadiness -> [ProviderCard]
+providerCards inputs configured readiness =
   [ ProviderCard
       { pcId = providerLabel known
       , pcLabel = providerDisplayName known
@@ -301,6 +340,9 @@ providerCards inputs configured =
       , pcRequiresName = case known of
           OpenAICompatibleProvider -> True
           _ -> False
+      , pcReadiness = case known of
+          OllamaProvider -> Just readiness
+          _ -> Nothing
       }
   | known <- knownProviders
   ]

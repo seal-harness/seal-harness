@@ -71,6 +71,7 @@ import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.TestHelpers.FakeVault (makeFakeVault)
 import Seal.TestHelpers.ScriptProvider (ScriptProvider (..))
+import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
 import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
 import Seal.Vault.Backend (ResolvedKey (..))
@@ -411,6 +412,7 @@ harnessAppWith config paths ref calls = do
         , adAgentDefs = adb
         , adSkills = skills
         , adProviders = pure []
+        , adOllamaReadiness = noOllamaReadiness
         , adUiState = uiState
         , adSend = Nothing
         , adDefaultAgent = pure Nothing

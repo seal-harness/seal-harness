@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ProviderInput, ProviderAuthStatus } from '../types'
+import type { ProviderInput, ProviderAuthStatus, ProviderReadiness } from '../types'
+import { readinessLabel, readinessTone, type ReadinessTone } from '../lib/readiness'
 import {
   ProviderFormFields,
   emptyProviderFormValues,
@@ -25,6 +26,72 @@ const AUTH_STATUS_LABELS: Record<ProviderAuthStatus, string> = {
   'keyless': 'Keyless',
   'none': 'Not Configured',
   'vault-locked': 'Vault Locked',
+}
+
+/**
+ * One rendered badge. `readiness` badges are Ollama's observed state; `auth`
+ * badges are the pre-existing credential label.
+ */
+interface ProviderBadge {
+  kind: 'readiness' | 'auth'
+  text: string
+  color: string
+}
+
+/**
+ * The D3.2 override table, as one pure function so both render sites (the list
+ * row and the editor pill) cannot drift.
+ *
+ * The order of the clauses is load-bearing:
+ *
+ * 1. `pending` is checked **first** and contributes no readiness badge, so the
+ *    "both badges" branches can never promise a badge the label table says is
+ *    blank. (A `pending` + `vault-locked` Ollama is reachable: an `ollama.com`
+ *    base URL with a locked vault.)
+ * 2. The credential clause requires readiness to be **present**. Without that
+ *    guard it would fire for anthropic/openrouter/openai rows that have no
+ *    readiness at all, drawing a blank second badge on the most common
+ *    credential-problem case (vault-locked Anthropic).
+ * 3. `cloud` keeps both badges: it is not a local verdict, so the credential
+ *    badge still carries information.
+ * 4. Any other present, specific readiness **replaces** the credential badge —
+ *    "Not Running" is strictly more useful than "Keyless".
+ * 5. Absent readiness falls back to exactly today's behaviour.
+ */
+export function providerBadges(
+  authStatus: ProviderAuthStatus,
+  readiness: ProviderReadiness | undefined,
+  usableModels?: number,
+): ProviderBadge[] {
+  const auth: ProviderBadge = {
+    kind: 'auth',
+    text: AUTH_STATUS_LABELS[authStatus],
+    color: authBadgeColor(authStatus),
+  }
+  if (readiness === undefined) return [auth]
+  if (readiness === 'pending') return [auth]
+  const rd: ProviderBadge = {
+    kind: 'readiness',
+    text: readinessLabel(readiness, usableModels),
+    color: readinessColor(readinessTone(readiness)),
+  }
+  if (readiness === 'cloud') return [rd, auth]
+  if (authStatus === 'none' || authStatus === 'vault-locked') return [rd, auth]
+  return [rd]
+}
+
+/** Map a readiness tone onto the app's existing colour variables. */
+function readinessColor(tone: ReadinessTone): string {
+  switch (tone) {
+    case 'ok':
+      return 'var(--accent)'
+    case 'warn':
+      return 'var(--needs-input)'
+    case 'muted':
+      return 'var(--text-muted)'
+    case 'faint':
+      return 'var(--text-faint)'
+  }
 }
 
 const PROVIDER_LABELS: Record<string, string> = {
@@ -344,11 +411,23 @@ export function ProvidersView() {
                     </span>
                   )}
                 </div>
+                {/* The badges STACK (a column), they do not sit inline. The
+                    row is `text-xs truncate`, so two inline badges would clip
+                    the second one out of view entirely. */}
                 <div
-                  className="text-xs mt-0.5 truncate"
-                  style={{ color: authBadgeColor(p.authStatus) }}
+                  className="flex flex-col mt-0.5"
+                  data-testid={`provider-badges-${p.name}`}
                 >
-                  {AUTH_STATUS_LABELS[p.authStatus]}
+                  {providerBadges(p.authStatus, p.readiness, p.readinessModels).map((badge) => (
+                    <div
+                      key={badge.kind}
+                      className="text-xs truncate"
+                      data-testid={`provider-badge-${badge.kind}`}
+                      style={{ color: badge.color }}
+                    >
+                      {badge.text}
+                    </div>
+                  ))}
                 </div>
               </div>
             )
@@ -392,19 +471,21 @@ export function ProvidersView() {
                   default
                 </span>
               )}
-              {selected && (
+              {selected && providerBadges(selected.authStatus, selected.readiness, selected.readinessModels).map((badge) => (
                 <span
+                  key={badge.kind}
                   className="pill"
+                  data-testid={`editor-badge-${badge.kind}`}
                   style={{
                     background: 'var(--bg-elevated)',
-                    color: authBadgeColor(selected.authStatus),
+                    color: badge.color,
                     fontSize: 11,
                     padding: '0 6px',
                   }}
                 >
-                  {AUTH_STATUS_LABELS[selected.authStatus]}
+                  {badge.text}
                 </span>
-              )}
+              ))}
             </div>
 
             {creating && (

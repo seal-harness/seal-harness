@@ -72,6 +72,7 @@ import Seal.Config.Security
   ( SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig )
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (SomeProvider)
+import Seal.Providers.OllamaReadiness (OllamaReadiness (..), readinessWire)
 import Seal.Providers.Registry
   ( KnownProvider, customProviderNames, listSome, parseProvider
   , resolveDefaultModelForName )
@@ -113,6 +114,10 @@ data SetupEnv = SetupEnv
   , seConfigPath   :: FilePath
   , seSecurityPath :: FilePath
   , seProviders    :: IO [KnownProvider]
+  , seOllamaReadiness :: IO OllamaReadiness
+    -- ^ The observed Ollama readiness. Read once per @GET \/api\/setup@ so the
+    -- card and the provider step's detail agree, and so the handler never
+    -- probes inline (design D2.4). @pure RdPending@ in tests.
   , seDeps         :: SetupDeps
   }
 
@@ -151,6 +156,7 @@ handleSetupState env = do
   security <- loadSecurityConfig (seSecurityPath env)
   runtime <- loadRuntimeConfig (seConfigPath env)
   mhandle <- readIORef (seHandleRef env)
+  readiness <- seOllamaReadiness env
   let sec = fromRight defaultSecurityConfig security
       rt = fromRight defaultRuntimeConfig runtime
       vaultPath = maybe (vaultFilePath (sePaths env)) T.unpack (scVaultPath sec)
@@ -167,6 +173,7 @@ handleSetupState env = do
     , siVaultFileExists = vaultExists
     , siIdentityReadable = identityReadable
     , siConfiguredProviders = seProviders env
+    , siOllamaReadiness = readiness
     -- The seal home's parent is the user's home for the default ~/.seal
     -- layout, which is what the tilde form in a detail is measured from.
     , siHome = takeDirectory (spHome (sePaths env))
@@ -196,7 +203,18 @@ setupStateJson state = object
       , "isDefault" .= pcIsDefault card
       , "default_model" .= pcDefaultModel card
       , "models" .= pcModels card
+      , "readiness" .= fmap readinessWire (pcReadiness card)
+      , "readiness_models" .= cardReadinessCount card
       ]
+
+    -- The usable-model count that accompanies @readiness: "ready"@. Absent for
+    -- every non-ready state and for a non-Ollama card, so the frontend's
+    -- optional field stays optional.
+    cardReadinessCount card = case pcReadiness card of
+      Nothing -> Nothing
+      Just st -> case st of
+        RdReady n -> Just n
+        _         -> Nothing
 
 statusText :: StepStatus -> Text
 statusText status = case status of

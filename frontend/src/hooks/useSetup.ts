@@ -122,5 +122,16 @@ export function useSetupState(): SetupStateResult {
   }, [nonce])
 
   const reload = useCallback(() => setNonce((n) => n + 1), [])
+
+  // Design D2.5: the wizard's cards carry readiness, and this endpoint is
+  // otherwise fetched on mount + mutation only. Without a focus refetch, an
+  // operator who starts Ollama in another window would see "Not Running" until
+  // they reloaded the page.
+  useEffect(() => {
+    const onFocus = () => setNonce((n) => n + 1)
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [])
+
   return { state, status, error, hint, reload }
 }
