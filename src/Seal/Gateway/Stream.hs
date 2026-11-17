@@ -38,8 +38,8 @@ module Seal.Gateway.Stream
   ) where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (concurrently_)
-import Control.Exception (SomeException, catch)
+import Control.Concurrent.Async (race_)
+import Control.Exception (SomeException, catch, finally)
 import Control.Monad (forM_, forever)
 import Data.Maybe (fromMaybe)
 import Data.Aeson (object, (.=))
@@ -66,7 +66,7 @@ import Seal.Core.Types (mkSessionId, sessionIdText, SessionId)
 import Seal.Core.TurnEngine (loadSessionMeta)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker
-  ( BrokerEvent (..), StreamBroker, subscribe, updateSubscriberSession )
+  ( BrokerEvent (..), StreamBroker, subscribe, unsubscribe, updateSubscriberSession )
 import Seal.Gateway.Transcript (readTranscriptEntriesTimed, ttEntryCount, showIso, ReadLimit (..))
 import Seal.Gateway.AccessControl
   ( AccessControlHandle, AuthDecision (..), accessControlAuthorize )
@@ -240,35 +240,47 @@ streamApp guard broker pending = do
       -- is in the broker's subscriber list and actually receives the frame.
       -- Without this, the snapshot is broadcast to zero subscribers, the
       -- frontend never flips wsLive, and REST /api/lists polling stays on.
-      broadcastListsSnapshot broker (sgTabsHandle guard) (sgPaths guard)
-      -- Keep-alives, at one interval: the protocol-level PING ('withPingThread')
-      -- so intermediaries and dead-peer detection stay honest, and the
-      -- application-level heartbeat frame ('heartbeatLoop') because that is
-      -- the only one a browser's JavaScript can observe. The heartbeat is
-      -- cancelled as soon as the reader loop ends (peer closed), so it never
-      -- outlives the connection.
-      let hbSeconds = sgHeartbeatSeconds guard
-      withPingThread conn hbSeconds (pure ()) $ do
-        let readerLoop = forever $ do
-              msg <- receiveData conn
-              case A.decode msg :: Maybe ClientMessage of
-                Just (CmFocus focusOp) ->
-                  case mkSessionId (foSession focusOp) of
-                    Right s  -> do
-                      globalLogIO InfoS ("[ws] focus → " <> ls (sessionIdText s))
-                      updateSubscriberSession subSessionRef s
-                      -- When the client sends a `since` entry id, replay
-                      -- all transcript entries after that id from disk so
-                      -- entries broadcast during the WS gap are recovered.
-                      forM_ (foSince focusOp) $ \sinceId ->
-                        replayEntriesSince conn (sgPaths guard) s sinceId
-                    Left _e  -> sendErrorFrame conn "invalid session id"
-                Just (CmRequestEntries reqOp) ->
-                  handleRequestEntries conn (sgPaths guard) reqOp
-                Nothing -> sendErrorFrame conn "unknown op"
-        concurrently_
-          (heartbeatLoop conn hbSeconds)
-          (readerLoop `catch` \(_e :: SomeException) -> pure ())
+      (do
+        broadcastListsSnapshot broker (sgTabsHandle guard) (sgPaths guard)
+        -- Keep-alives, at one interval: the protocol-level PING ('withPingThread')
+        -- so intermediaries and dead-peer detection stay honest, and the
+        -- application-level heartbeat frame ('heartbeatLoop') because that is
+        -- the only one a browser's JavaScript can observe. The heartbeat is
+        -- cancelled as soon as the reader loop ends (peer closed), so it never
+        -- outlives the connection.
+        let hbSeconds = sgHeartbeatSeconds guard
+        withPingThread conn hbSeconds (pure ()) $ do
+          let readerLoop = forever $ do
+                msg <- receiveData conn
+                case A.decode msg :: Maybe ClientMessage of
+                  Just (CmFocus focusOp) ->
+                    case mkSessionId (foSession focusOp) of
+                      Right s  -> do
+                        globalLogIO InfoS ("[ws] focus → " <> ls (sessionIdText s))
+                        updateSubscriberSession subSessionRef s
+                        -- When the client sends a `since` entry id, replay
+                        -- all transcript entries after that id from disk so
+                        -- entries broadcast during the WS gap are recovered.
+                        forM_ (foSince focusOp) $ \sinceId ->
+                          replayEntriesSince conn (sgPaths guard) s sinceId
+                      Left _e  -> sendErrorFrame conn "invalid session id"
+                  Just (CmRequestEntries reqOp) ->
+                    handleRequestEntries conn (sgPaths guard) reqOp
+                  Nothing -> sendErrorFrame conn "unknown op"
+          -- 'race_', not 'concurrently_'. The reader loop catches its own
+          -- exception and returns normally when the peer goes away, so
+          -- 'concurrently_' would keep waiting on 'heartbeatLoop' forever:
+          -- the handler thread (and its broker subscriber) would outlive
+          -- every disconnected client. 'race_' cancels the loser.
+          race_
+            (heartbeatLoop conn hbSeconds)
+            (readerLoop `catch` \(_e :: SomeException) -> pure ()))
+        -- Remove the subscriber however this ends: clean close, reader
+        -- exception, or a throw from the connect-side work above
+        -- ('broadcastListsSnapshot' walks every subscriber and reads the
+        -- session tree, so it can throw). Scoping 'finally' to just the
+        -- 'withPingThread' block would leak on any of those.
+        `finally` unsubscribe broker subSessionRef
 
 -- | Push a content-free @{"type":"heartbeat"}@ frame every
 -- @intervalSeconds@ for as long as the connection lives.
