@@ -4567,6 +4567,32 @@ spec = describe "Seal.Gateway.API" $ do
       -- dropdowns.
       results `shouldBe` replicate 8 (Just True)
 
+    it "WU-B DoD 10: RdNoFittingModel is advisory — configured and required_complete unchanged" $ do
+      -- The advisory state must never gate the wizard or flip `configured`.
+      app <- mkAppWithReadiness RdNoFittingModel
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
+      case A.decode body :: Maybe [A.Value] of
+        Nothing -> expectationFailure "could not decode /api/providers"
+        Just arr -> do
+          let ollamaCfg = listToMaybe
+                [ c | A.Object o <- arr
+                    , lookupK "name" o == Just (A.String "ollama")
+                    , Just (A.Bool c) <- [lookupK "configured" o] ]
+          ollamaCfg `shouldBe` Just True
+          let ollamaRd = listToMaybe
+                [ r | A.Object o <- arr
+                    , lookupK "name" o == Just (A.String "ollama")
+                    , Just (A.String r) <- [lookupK "readiness" o] ]
+          ollamaRd `shouldBe` Just "no-fitting-model"
+      -- And the setup gate is unaffected.
+      (setupStatus, setupBody) <- runAppBody app (testRequest methodGet ["api", "setup"])
+      setupStatus `shouldBe` 200
+      case A.decode setupBody :: Maybe A.Value of
+        Just (A.Object o) -> do
+          lookupK "required_complete" o `shouldSatisfy` isJust
+          lookupK "readiness" o `shouldBe` Nothing
+        _ -> expectationFailure "could not decode /api/setup"
+
     it "10b: a PUT mutation response carries the same readiness (test 33b)" $
       -- providerDetailJsonFor is shared by /all and both mutations, so this
       -- pins that a saved Ollama cannot flip back to Keyless.

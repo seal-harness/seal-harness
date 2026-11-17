@@ -54,6 +54,21 @@ describe('readinessLabel (test 40)', () => {
   })
 })
 
+describe('no-fitting-model is reachable and advisory (WU-B)', () => {
+  // In WU-A this state was declared and labelled but unreachable: there was no
+  // size data, so every returned model counted as usable. WU-B's fit predicate
+  // makes it reachable, so the label/hint/tone must already be right.
+  it('labels and hints it without turning it into a verdict', () => {
+    expect(readinessLabel('no-fitting-model')).toBe('May Not Fit in RAM')
+    expect(readinessTone('no-fitting-model')).toBe('muted')
+    // A possibility, not a claim: the hint says "may", never "cannot".
+    const hint = readinessHint('no-fitting-model')
+    expect(hint).toBeTruthy()
+    expect(hint).not.toContain('cannot')
+    expect(hint).not.toContain('No ')
+  })
+})
+
 describe('readinessHint', () => {
   it('names the remedy for each actionable state', () => {
     expect(readinessHint('not-running')).toContain('ollama serve')

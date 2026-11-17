@@ -31,6 +31,8 @@ module Seal.Providers.OllamaReadiness
   , OllamaTag (..)
   , OllamaProbe (..)
   , classifyOllamaReadiness
+  , isCloudModel
+  , parseMemTotal
   , readinessText
   , readinessWire
   , readinessUsableCount
@@ -94,12 +96,16 @@ data OllamaHostKind
 
 -- | One installed model, as @\/api\/tags@ reports it.
 --
--- WU-A declares 'otName' only. The RAM-fit work (WU-B) adds the size and
--- @remote_host@ fields, which is why 'classifyOllamaReadiness' here counts
--- every returned model as usable: with no size data there is no evidence of a
--- problem, and "no evidence" must not become "not fitting" (design D5.3).
-newtype OllamaTag = OllamaTag
-  { otName :: Text
+-- The two optional fields are what make the fit judgement hedgeable rather
+-- than assertive: an absent size or an absent RAM figure is /no evidence/, and
+-- no evidence must never become a claim (design D5.3).
+data OllamaTag = OllamaTag
+  { otName       :: !Text
+  , otSizeBytes  :: !(Maybe Word64)
+    -- ^ 'Nothing' = the daemon reported no size.
+  , otRemoteHost :: !(Maybe Text)
+    -- ^ 'Just' = the model runs server-side (cloud), so it is never sized
+    --   against local RAM.
   } deriving stock (Eq, Show)
 
 -- | The pure inputs to classification. Assembled by the I/O module.
@@ -121,7 +127,7 @@ classifyOllamaReadiness p = case opHostKind p of
   OhCloud -> RdCloud
   _ -> case opTags p of
     Right [] -> RdNoModels
-    Right tags -> RdReady (length tags)
+    Right tags -> classifyTags (opTotalRam p) tags
     Left OpeRefused
       -- A refusal is evidence about *this* machine only when the URL points
       -- at this machine. For a LAN or remote host, our own PATH says nothing.
@@ -131,6 +137,81 @@ classifyOllamaReadiness p = case opHostKind p of
     -- Everything else — blocked, timed out, malformed, an HTTP status, a
     -- reset, TLS, DNS — is "we do not know", never "not running".
     Left _ -> RdUnknown
+
+-- | Count the usable models, or report that none of the /sized/ ones fit.
+--
+-- The rules, all from design D5.3, are deliberately symmetric — RAM and size
+-- are treated the same way, because an asymmetry would emit
+-- @May Not Fit in RAM@ with zero evidence on one side:
+--
+-- * A /cloud/ model is always usable and is never sized locally
+--   ('isCloudModel').
+-- * An unknown size counts as usable: we cannot substantiate a problem.
+-- * Unknown RAM means /every/ local model is usable, and never
+--   'RdNoFittingModel'.
+-- * 'RdNoFittingModel' requires at least one /known/ size, and none of the
+--   known-size local models fitting.
+--
+-- The "at least one known size" requirement is satisfied /by construction/
+-- rather than by a separate guard, which is worth stating because it is the
+-- kind of thing that looks like a missing case: 'isUsable' returns 'True' for
+-- an unknown size, so @usable == 0@ can only happen when /every/ tag had a
+-- known size and none of them fit. If a size is ever unknown, the model counts
+-- as usable and we take the @RdReady@ branch — exactly the D5.3 rule
+-- ("every size unknown ⇒ RdReady with the full count"), reached without an
+-- extra test. An explicit @any hasKnownSize@ guard here would be dead code.
+classifyTags :: Maybe Word64 -> [OllamaTag] -> OllamaReadiness
+classifyTags mRam tags =
+  case mRam of
+    -- No RAM figure: nothing to judge against, so everything is usable.
+    Nothing -> RdReady (length tags)
+    Just ram ->
+      let usable = length (filter (isUsable ram) tags)
+      in if usable > 0
+           then RdReady usable
+           else RdNoFittingModel
+
+-- | Is a model usable at the given total RAM?
+--
+-- Cloud models always are. A local model is usable when its size is unknown
+-- (no evidence) or when 1.25x its size still fits in RAM. The comparison is
+-- exact integer arithmetic — @size * 5 < ram * 4@ — so the predicate stays
+-- pure and exact, and never rounds in the operator's favour or against it.
+isUsable :: Word64 -> OllamaTag -> Bool
+isUsable ram t
+  | isCloudModel t = True
+  | otherwise = case otSizeBytes t of
+      Nothing   -> True
+      Just size -> size * 5 < ram * 4
+
+-- | Is this model served remotely?
+--
+-- True when @remote_host@ is present /or/ the name carries the @:cloud@
+-- suffix. @remote_host@ is authoritative when the two disagree: the suffix
+-- alone is a naming convention, while the field is what the daemon actually
+-- does.
+isCloudModel :: OllamaTag -> Bool
+isCloudModel t = case otRemoteHost t of
+  Just _  -> True
+  Nothing -> ":cloud" `T.isSuffixOf` otName t
+
+-- | Parse @MemTotal:@ from one @\/proc\/meminfo@ line, as bytes.
+--
+-- @kB@ is the only accepted unit. A non-kB suffix yields 'Nothing' rather than
+-- a silent rescale: a wrong 1000x guess would be worse than "RAM unknown",
+-- which degrades safely to "assume usable". @MemTotal: 0 kB@ is 'Just 0' — a
+-- real (if pathological) kernel value, not an absence.
+parseMemTotal :: Text -> Maybe Word64
+parseMemTotal line = do
+  rest <- T.stripPrefix "MemTotal:" line
+  case T.words rest of
+    [valueT, unitT]
+      | unitT == "kB" -> (* 1024) <$> readDecimal valueT
+    _ -> Nothing
+  where
+    readDecimal t = case reads (T.unpack t) of
+      [(n, "")] -> Just n
+      _         -> Nothing
 
 -- | How many models 'RdReady' counts. Exposed so the wire and the label
 -- cannot disagree.

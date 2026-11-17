@@ -7,6 +7,7 @@ import Data.Either (isLeft, isRight)
 import Data.ByteString qualified as B
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Word (Word64)
 import Foreign.C.Error (Errno (..), eCONNRESET)
 import GHC.IO.Exception
   ( IOErrorType (ResourceVanished), IOException (..) )
@@ -15,6 +16,8 @@ import Network.HTTP.Client
   , defaultManagerSettings, httpNoBody, newManager, parseRequest
   , responseTimeout, responseTimeoutMicro )
 import Test.Hspec
+import Test.QuickCheck
+  ( Gen, choose, elements, forAll, listOf, oneof, resize, (==>) )
 
 import Seal.Providers.OllamaReadiness
 import Seal.TestHelpers.FreePort (withFreePort)
@@ -134,6 +137,139 @@ spec = describe "Seal.Providers.OllamaReadiness" $ do
       readinessText (RdReady 1) `shouldBe` "Ready · 1 Model"
       readinessText (RdReady 3) `shouldBe` "Ready · 3 Models"
 
+  -- ── WU-B: the RAM-fit judgement (design D5) ──────────────────────────
+
+  describe "isCloudModel (15: four explicit assertions)" $ do
+
+    it "15a: remote_host set -> cloud" $
+      isCloudModel (OllamaTag "gemma4:latest" Nothing (Just "https://ollama.com"))
+        `shouldBe` True
+
+    it "15b: a :cloud suffix -> cloud" $
+      isCloudModel (OllamaTag "deepseek-v4.1-flash:cloud" Nothing Nothing)
+        `shouldBe` True
+
+    it "15c: both -> cloud" $
+      isCloudModel (OllamaTag "glm-5.2:cloud" Nothing (Just "https://ollama.com"))
+        `shouldBe` True
+
+    it "15d: neither -> not cloud" $
+      isCloudModel (OllamaTag "gemma4:latest" (Just 9_600_000_000) Nothing)
+        `shouldBe` False
+
+    it "15e: remote_host is authoritative when the suffix disagrees" $ do
+      -- A daemon build that omits remote_host but names the model ':cloud'.
+      isCloudModel (OllamaTag "x:cloud" Nothing Nothing) `shouldBe` True
+      -- And one that reports a remote host without the suffix.
+      isCloudModel (OllamaTag "x:latest" Nothing (Just "https://ollama.com"))
+        `shouldBe` True
+
+  describe "the fit predicate (13, D5.2: exact integers, 1.25x headroom)" $ do
+
+    -- 1.25x headroom: fits iff size * 5 < ram * 4. 10 GB on 16 GB RAM fits
+    -- (50 < 64); 13 GB on 16 GB does not (65 >= 64).
+    it "13: a model that does not fit with RAM known -> RdNoFittingModel" $
+      classifyOllamaReadiness (probeWithRam (Just 16_000_000_000)
+        (Right [OllamaTag "big" (Just 51_000_000_000) Nothing]))
+        `shouldBe` RdNoFittingModel
+
+    it "13b: exactly at the boundary does not fit (size * 5 >= ram * 4)" $
+      -- size * 5 == ram * 4 exactly: 12.8 GB on 16 GB.
+      classifyOllamaReadiness (probeWithRam (Just 16_000_000_000)
+        (Right [OllamaTag "edge" (Just 12_800_000_000) Nothing]))
+        `shouldBe` RdNoFittingModel
+
+    it "12: only :cloud models -> RdReady n (cloud models are usable and unsized)" $
+      classifyOllamaReadiness (probeWithRam (Just 8_000_000_000)
+        (Right [ OllamaTag "a:cloud" (Just 336) (Just "https://ollama.com")
+               , OllamaTag "b:cloud" (Just 336) Nothing ]))
+        `shouldBe` RdReady 2
+
+    it "one fitting local model among clouds counts in n (n is USABLE, D4)" $
+      classifyOllamaReadiness (probeWithRam (Just 64_000_000_000)
+        (Right [ OllamaTag "a:cloud" (Just 336) Nothing
+               , OllamaTag "local" (Just 9_600_000_000) Nothing ]))
+        `shouldBe` RdReady 2
+
+    it "a mixed list counts only the fitting models" $
+      classifyOllamaReadiness (probeWithRam (Just 16_000_000_000)
+        (Right [ OllamaTag "small" (Just 4_000_000_000) Nothing
+               , OllamaTag "huge" (Just 51_000_000_000) Nothing ]))
+        `shouldBe` RdReady 1
+
+  describe "the symmetric size rule (14b, 14c, D5.3)" $ do
+
+    it "14b: every size unknown -> RdReady with count = all models (no size evidence)" $
+      classifyOllamaReadiness (probeWithRam (Just 16_000_000_000)
+        (Right [ OllamaTag "a" Nothing Nothing
+               , OllamaTag "b" Nothing Nothing ]))
+        `shouldBe` RdReady 2
+
+    it "14c: mixed known/unknown -> the unknown-size model counts as usable" $
+      -- One known size that does NOT fit, one unknown. Because we cannot
+      -- substantiate a problem with the second, we do not claim one.
+      classifyOllamaReadiness (probeWithRam (Just 16_000_000_000)
+        (Right [ OllamaTag "huge" (Just 51_000_000_000) Nothing
+               , OllamaTag "unsized" Nothing Nothing ]))
+        `shouldBe` RdReady 1
+
+    it "14b(ii): RdNoFittingModel requires at least one KNOWN size" $
+      classifyOllamaReadiness (probeWithRam (Just 1_000_000_000)
+        (Right [OllamaTag "a" Nothing Nothing]))
+        `shouldBe` RdReady 1
+
+  describe "14/18: unknown RAM never produces a claim (D5.3)" $ do
+
+    it "14: models exist, RAM unknown -> RdReady (assume usable)" $
+      classifyOllamaReadiness (probeWithRam Nothing
+        (Right [OllamaTag "huge" (Just 51_000_000_000) Nothing]))
+        `shouldBe` RdReady 1
+
+    it "18: forAll over tag lists, opTotalRam = Nothing => never RdNoFittingModel" $
+      forAll (resize 8 arbitraryTags) $ \tags ->
+        tags /= []
+          ==> classifyOllamaReadiness (probeWithRam Nothing (Right tags))
+                `shouldSatisfy` (/= RdNoFittingModel)
+
+  describe "19: monotonicity over the exported classifier" $ do
+
+    it "19: more RAM never yields a smaller usable count" $
+      forAll (resize 6 arbitraryTags) $ \tags ->
+        forAll (choose (1_000_000_000, 128_000_000_000)) $ \r ->
+          forAll (choose (1_000_000_000, 128_000_000_000)) $ \r' ->
+            let n  = usableCountAt r tags
+                m  = usableCountAt r' tags
+            in r' >= r ==> m >= n
+
+  describe "20: otRemoteHost = Just _ => usable regardless of size" $ do
+
+    it "20: forAll over sizes, a remote-host model is always usable" $
+      forAll (choose (1, 1_000_000_000_000)) $ \size ->
+        classifyOllamaReadiness
+          (probeWithRam (Just 1_000_000)
+            (Right [OllamaTag "remote" (Just size) (Just "https://ollama.com")]))
+          `shouldBe` RdReady 1
+
+  describe "21: parseMemTotal (kW -> bytes, no silent rescale)" $ do
+
+    it "21a: converts kB to bytes" $
+      parseMemTotal "MemTotal:       16384000 kB" `shouldBe` Just 16_777_216_000
+
+    it "21b: rejects an empty line" $
+      parseMemTotal "" `shouldBe` Nothing
+
+    it "21c: a zero total is Just 0 (a real kernel value, not unknown)" $
+      parseMemTotal "MemTotal: 0 kB" `shouldBe` Just 0
+
+    it "21d: rejects garbage" $
+      parseMemTotal "garbage" `shouldBe` Nothing
+
+    it "21e: rejects a non-kB unit rather than rescaling" $
+      parseMemTotal "MemTotal: 16 MB" `shouldBe` Nothing
+
+    it "21f: rejects a kB value that is not a plain decimal" $
+      parseMemTotal "MemTotal: 1.5 kB" `shouldBe` Nothing
+
   describe "classifyProbeFailure (16: only errno separates a refusal from a DNS failure)" $ do
 
     -- (a) A REAL refused connect to a definitely-closed loopback port.
@@ -233,8 +369,29 @@ probe kind tags binary = OllamaProbe
   , opTotalRam      = Nothing
   }
 
+-- | A probe on the default loopback URL with an explicit RAM figure.
+probeWithRam :: Maybe Word64 -> Either OllamaProbeError [OllamaTag] -> OllamaProbe
+probeWithRam ram tags = (probe OhDefaultLoopback tags True) { opTotalRam = ram }
+
+-- | The usable count a probe would report at a given RAM figure, or 0 when the
+-- state is not 'RdReady' (monotonicity is stated over the count).
+usableCountAt :: Word64 -> [OllamaTag] -> Int
+usableCountAt ram tags = case classifyOllamaReadiness (probeWithRam (Just ram) (Right tags)) of
+  RdReady n -> n
+  _         -> 0
+
+-- | Bounded tag lists: a name, an optional size, an optional remote host. Sizes
+-- span the interesting boundary (a few GB to a few tens of GB) so the
+-- monotonicity property exercises both sides of the predicate.
+arbitraryTags :: Gen [OllamaTag]
+arbitraryTags = listOf (OllamaTag <$> genName <*> genSize <*> genRemote)
+  where
+    genName = elements ["a", "b:cloud", "gemma4:latest", "qwen3-coder-next:latest"]
+    genSize = oneof [pure Nothing, Just <$> choose (1, 64_000_000_000)]
+    genRemote = oneof [pure Nothing, pure (Just "https://ollama.com")]
+
 tag :: Text -> OllamaTag
-tag name = OllamaTag { otName = name }
+tag name = OllamaTag { otName = name, otSizeBytes = Nothing, otRemoteHost = Nothing }
 
 authorityHeaderName :: CI.CI B.ByteString
 authorityHeaderName = "authorization"

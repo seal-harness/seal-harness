@@ -35,7 +35,7 @@ spec = describe "Seal.Providers.OllamaReadinessProbe" $ do
 
     it "decodes a two-segment model list fully" $
       parseTagsBody "{\"models\":[{\"name\":\"llama3.2\"},{\"name\":\"qwen3:8b\"}]}"
-        `shouldBe` Right [OllamaTag "llama3.2", OllamaTag "qwen3:8b"]
+        `shouldBe` Right [OllamaTag "llama3.2" Nothing Nothing, OllamaTag "qwen3:8b" Nothing Nothing]
 
     it "an absent models key is an empty list (a daemon with nothing pulled)" $
       parseTagsBody "{}" `shouldBe` Right []
@@ -225,6 +225,41 @@ spec = describe "Seal.Providers.OllamaReadinessProbe" $ do
       _ <- oprReadiness probes
       names <- readIORef calls
       names `shouldSatisfy` all (== "ollama")
+
+  describe "size + remote_host decoding (WU-B)" $ do
+
+    it "decodes size and remote_host, and omits them when absent" $
+      parseTagsBody
+        "{\"models\":[{\"name\":\"big\",\"size\":51000000000,\"remote_host\":\"https://ollama.com\"},{\"name\":\"plain\"}]}"
+        `shouldBe` Right
+          [ OllamaTag "big" (Just 51_000_000_000) (Just "https://ollama.com")
+          , OllamaTag "plain" Nothing Nothing ]
+
+  describe "the RAM reader (WU-B DoD 9: memoise ONLY Just)" $ do
+
+    it "a transient failure does NOT permanently disable the judgement" $ do
+      -- First read misses (a PATH-less launchd environment), later reads
+      -- succeed. If the miss were memoised, the fit judgement would be dead
+      -- for the process lifetime.
+      attempts <- newIORef (0 :: Int)
+      probes <- probesWithSeams $ \cfg -> cfg
+        { pcTotalRam = do
+            n <- readIORef attempts
+            modifyIORef' attempts (+ 1)
+            pure (if n == 0 then Nothing else Just 32_000_000_000) }
+      first <- oprTotalRam probes
+      first `shouldBe` Nothing
+      second <- oprTotalRam probes
+      second `shouldBe` Just 32_000_000_000
+
+    it "a success IS memoised (one read, not one per call)" $ do
+      attempts <- newIORef (0 :: Int)
+      probes <- probesWithSeams $ \cfg -> cfg
+        { pcTotalRam = modifyIORef' attempts (+ 1) >> pure (Just 16_000_000_000) }
+      _ <- oprTotalRam probes
+      _ <- oprTotalRam probes
+      n <- readIORef attempts
+      n `shouldBe` 1
 
   describe "the RAM seam (WU-B's input; memoised only on success)" $ do
 

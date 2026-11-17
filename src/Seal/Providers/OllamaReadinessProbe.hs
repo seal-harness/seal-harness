@@ -42,7 +42,6 @@ module Seal.Providers.OllamaReadinessProbe
   , probeOnce
   , findOllamaExecutable
   , readTotalRam
-  , parseMemTotal
   , memTotalPath
   ) where
 
@@ -75,8 +74,8 @@ import Seal.Providers.Ollama (defaultOllamaBaseUrl)
 import Seal.Providers.OllamaReadiness
   ( OllamaHostKind (..), OllamaProbe (..), OllamaProbeError (..)
   , OllamaReadiness (..), OllamaTag (..), classifyOllamaReadiness
-  , classifyProbeFailure, hostKindFor, probeTargetFor, probeTimeoutMicro
-  , singleFlightKey )
+  , classifyProbeFailure, hostKindFor, parseMemTotal, probeTargetFor
+  , probeTimeoutMicro, singleFlightKey )
 
 -- | The seam record. Every field is a seam so each rule above is testable in
 -- isolation; 'defaultProbesConfig' fills in production values.
@@ -299,7 +298,14 @@ parseTagsBody raw = do
 parseTags :: Value -> Parser [OllamaTag]
 parseTags = withObject "tags" $ \o -> do
   models <- o .:? "models" .!= []
-  traverse (withObject "model" (\m -> OllamaTag <$> m .: "name")) models
+  traverse parseOne models
+  where
+    -- `size` and `remote_host` are both optional: a daemon build may omit
+    -- either, and an absent field must become `Nothing` (no evidence) rather
+    -- than a decode failure, or a single odd model would collapse the whole
+    -- list into "unknown" (design D5.3).
+    parseOne = withObject "model" $ \m ->
+      OllamaTag <$> m .: "name" <*> m .:? "size" <*> m .:? "remote_host"
 
 -- | @findExecutable "ollama"@, tolerant of a missing PATH.
 findOllamaExecutable :: IO (Maybe FilePath)
@@ -307,6 +313,13 @@ findOllamaExecutable = findExecutable "ollama"
 
 -- | Memoise the RAM reader, but /only/ on success: a transient PATH miss must
 -- not permanently disable the judgement (WU-B DoD 9).
+--
+-- The "only on success" half is guaranteed by the representation, which is
+-- worth stating so the missing guard does not read as an oversight: the cache
+-- is a @Maybe Word64@, so there is no way to record "I fetched this and got
+-- Nothing". A miss simply leaves the ref empty and the next call retries. The
+-- test below therefore pins the /observed/ behaviour (a miss does not
+-- short-circuit) rather than an unreachable branch.
 memoisedRam :: ProbesConfig -> IORef (Maybe Word64) -> IO (Maybe Word64)
 memoisedRam cfg ref = do
   cached <- readIORef ref
@@ -364,19 +377,3 @@ firstMatch (Nothing : rest) = firstMatch rest
 memTotalPath :: FilePath
 memTotalPath = "/proc/meminfo"
 
--- | Parse @MemTotal:@ from one @\/proc\/meminfo@ line. @kB@ is the only unit
--- accepted: a non-kB suffix yields 'Nothing' rather than a silent 1000x
--- rescale, because "RAM unknown" degrades safely while a wrong scale does not.
-parseMemTotal :: Text -> Maybe Word64
-parseMemTotal line = do
-  rest0 <- T.stripPrefix "MemTotal:" line
-  let fields = T.words rest0
-  case fields of
-    [valueT, unitT] -> do
-      value <- readDecimal valueT
-      if unitT == "kB" then Just (value * 1024) else Nothing
-    _ -> Nothing
-  where
-    readDecimal t = case reads (T.unpack t) of
-      [(n, "")] -> Just n
-      _         -> Nothing
