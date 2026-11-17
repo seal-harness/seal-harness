@@ -1176,6 +1176,18 @@ spec = do
       -- ...and it is a close notice, not an answer.
       sends `shouldSatisfy` not . any (T.isInfixOf "SHELL_EXEC")
 
+    it "does not repeat the close notice on a duplicate idle" $ do
+      -- Idle can arrive more than once (a withheld idle for background
+      -- children, then the real one). ssFinalized must stop a second close
+      -- notice, or the operator gets the same ping twice.
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeActivity sid (statusJson "idle"))
+      fire (SeActivity sid (statusJson "idle"))
+      sends <- getSends inner
+      length sends `shouldBe` 1
+
     it "notifies exactly once for a plain Q&A turn, with no bubble" $ do
       (inner, fire, sid) <- setup
       fire (SeActivity sid (statusJson "thinking"))
