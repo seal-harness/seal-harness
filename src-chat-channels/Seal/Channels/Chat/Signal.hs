@@ -167,8 +167,24 @@ mkRealSignalChatTransport account = do
           pure (Right SignalChatTransport
             { sctReceive = receiveBlocking inbox readerDead
             , sctSend = \recipient body -> do
+                -- MUST await the response before returning, exactly like
+                -- 'sctSendWithId'. signal-cli >= 0.12.3 executes JSON-RPC
+                -- requests in PARALLEL, and the timestamp it assigns is the
+                -- message id: two sends in flight at once can be committed out
+                -- of order, and two that land on the same millisecond cause
+                -- the Signal apps to discard all but one (signal-cli #1783,
+                -- fixed upstream in 0.13.16 by "ensure every sent message gets
+                -- a unique timestamp"). 'ccSend' chunks a long answer and
+                -- 'mapM_'s over the chunks, so a fire-and-forget 'sctSend'
+                -- wrote every chunk frame back-to-back with nothing awaited
+                -- between them - which split the answer across messages and
+                -- delivered them in the wrong order. Awaiting here makes that
+                -- 'mapM_' a strict sequence.
                 let frame = signalSendFrame recipient body Nothing
-                writeFrame frame
+                mResp <- sendRequest frame
+                case mResp of
+                  Just _  -> pure ()
+                  Nothing -> logSendFailure "no-response"
             , sctSendWithId = \recipient body -> do
                 let frame = signalSendFrame recipient body Nothing
                 mResp <- sendRequest frame
@@ -192,6 +208,14 @@ mkRealSignalChatTransport account = do
                 _ <- timeout 5000000 (waitForProcess ph)
                 pure ()
             })
+
+-- | Report a failed @send@ so a dropped message is diagnosable instead of
+-- silent. Carries ONLY a fixed classifier - never the message body, the
+-- recipient (a phone number or group id), or a raw exception, since this
+-- value reaches stderr and stderr reaches the operator's logs.
+logSendFailure :: Text -> IO ()
+logSendFailure reason =
+  hPutStrLn stderr ("[signal] send failed: " <> T.unpack reason)
 
 -- | The background demux reader: reads all lines from signal-cli's
 -- stdout and classifies each:
