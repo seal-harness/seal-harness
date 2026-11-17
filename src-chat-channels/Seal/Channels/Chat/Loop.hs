@@ -1293,11 +1293,19 @@ updateBubble cfg chan ss mkContent = do
         Just id' -> do
           ok <- ccEditMessage chan id' content
           unless ok $ do
-            -- An edit failure used to be invisible: the fallback sent a new
-            -- message, so the text still arrived but the single-bubble
-            -- guarantee was silently lost.
-            dbg "[bubble] edit failed; sending a fresh message instead"
-            void (ccSendWithId chan content)
+            -- Do NOT send a fresh message. Three reasons, all load-bearing:
+            --
+            -- * the answer is delivered separately by 'finalizeSingleBubble',
+            --   and this body is tool progress only, so nothing is lost;
+            -- * a fresh send NOTIFIES, which is the very thing this style
+            --   exists to avoid;
+            -- * the returned id used to be discarded, so 'ssMsgId' kept
+            --   naming the dead message and every later tool call re-sent the
+            --   entire body - an unbounded notifying loop, not one duplicate.
+            --
+            -- The next frame, tool call or idle re-renders the whole body from
+            -- 'ssSplices'/'ssAccumulated', which an edit never modifies.
+            dbg "[bubble] edit failed; leaving the bubble for the next event"
 
 -- | Merge one recorded response into the turn's answer.
 --

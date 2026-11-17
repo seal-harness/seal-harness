@@ -64,6 +64,20 @@ class ChatChannel c where
   -- 'True' on success, 'False' on failure (or unsupported).
   ccEditMessage :: c -> ChatMessageId -> Text -> IO Bool
 
+  -- | Send a message that must NOT raise a platform notification, returning
+  -- its id so it can be edited later. Used for a turn's progress bubble: the
+  -- progress should be visible without pinging the human.
+  --
+  -- 'Nothing' means the platform cannot send silently, or the send failed; the
+  -- loop then falls back to 'ccSendWithId' (which notifies) so progress is
+  -- never lost. Default: 'ccSendWithId' — i.e. a channel that cannot send
+  -- silently keeps today's behaviour exactly.
+  --
+  -- Deliberately NOT used for @ASK_HUMAN@ (or any message that must reach the
+  -- human): those always use the notifying path.
+  ccSendWithIdSilently :: c -> Text -> IO (Maybe ChatMessageId)
+  ccSendWithIdSilently c t = ccSendWithId c t
+
   -- | The channel's label (e.g. @"signal"@, @"telegram"@).
   ccLabel :: c -> Text
 

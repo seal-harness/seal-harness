@@ -56,6 +56,13 @@ data MockChan = MockChan
     -- ^ (question, option labels) pairs passed to 'ccSendWithOptions', in
     -- order.
   , mcNextId   :: IORef Int
+  , mcEditFails :: IORef Bool
+    -- ^ When 'True', 'ccEditMessage' reports failure. Used to pin the
+    -- no-resend-on-failed-edit policy: a failed edit must NOT be turned into
+    -- a fresh notifying message.
+  , mcSilentSends :: IORef [Text]
+    -- ^ Bodies sent through 'ccSendWithIdSilently'. Recorded separately so a
+    -- test can distinguish a silent (non-notifying) send from a normal one.
   }
 
 instance ChatChannel MockChan where
@@ -67,11 +74,18 @@ instance ChatChannel MockChan where
     modifyIORef' (mcSendIds ch) ((t, T.pack (show n)) :)
     pure (Just (ChatMessageId (T.pack (show n))))
   ccEditMessage ch (ChatMessageId i) content = do
-    modifyIORef' (mcEdits ch) ((i, content) :)
-    pure True
+    fails <- readIORef (mcEditFails ch)
+    if fails
+      then pure False
+      else do
+        modifyIORef' (mcEdits ch) ((i, content) :)
+        pure True
   ccSendWithOptions ch question opts _prefix = do
     modifyIORef' (mcWithOpts ch) ((question, map qoLabel opts) :)
     pure (Just (ChatMessageId "with-options"))
+  ccSendWithIdSilently ch t = do
+    modifyIORef' (mcSilentSends ch) (t :)
+    ccSendWithId ch t
   ccLabel _ = "mock"
 
 -- | A second mock that opts into the single-edited-bubble style. Used to
@@ -88,6 +102,7 @@ instance ChatChannel BubbleChan where
   ccSendWithId (BubbleChan c) = ccSendWithId c
   ccEditMessage (BubbleChan c) = ccEditMessage c
   ccSendWithOptions (BubbleChan c) = ccSendWithOptions c
+  ccSendWithIdSilently (BubbleChan c) = ccSendWithIdSilently c
   ccLabel (BubbleChan c) = ccLabel c
   ccProgressStyle _ = PsSingleBubble
   ccChunkLimit _ = Just 1998
@@ -104,6 +119,7 @@ instance ChatChannel NoKeyboardChan where
   ccSend (NoKeyboardChan c) = ccSend c
   ccSendWithId (NoKeyboardChan c) = ccSendWithId c
   ccEditMessage (NoKeyboardChan c) = ccEditMessage c
+  ccSendWithIdSilently (NoKeyboardChan c) = ccSendWithIdSilently c
   ccLabel (NoKeyboardChan c) = ccLabel c
   -- No inline-keyboard support: the loop must fall back to text rendering.
   ccSendWithOptions _ _ _ _ = pure Nothing
@@ -115,6 +131,8 @@ mkMockChan = MockChan
   <*> newIORef []
   <*> newIORef []
   <*> newIORef 0
+  <*> newIORef False
+  <*> newIORef []
 
 getSends :: MockChan -> IO [Text]
 getSends ch = reverse <$> readIORef (mcSends ch)
@@ -730,6 +748,76 @@ spec = do
       T.length (T.concat sends) `shouldSatisfy` (>= 3000)
       -- ...exactly once, not once per event that hit the overflow branch.
       T.length (T.concat sends) `shouldSatisfy` (<= 3100)
+
+  describe "failed bubble edit does not resend (WU-1)" $ do
+    -- A bubble holds tool progress only; the answer is delivered separately
+    -- ('finalizeSingleBubble' step 2). So when an edit fails - a 429 flood
+    -- control, a deleted message, a lost right - re-sending the body is pure
+    -- loss: it notifies, duplicates, and (because the new id used to be
+    -- discarded) repeats on EVERY later tool call. The policy is now: leave
+    -- the bubble alone; the next event re-renders the whole body.
+    let setup = do
+          inner <- mkMockChan
+          mgr <- newManager defaultManagerSettings
+          let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+          ss' <- newStreamingState
+          conns <- newTVarIO (Map.singleton (ConversationKey "signal" "conv1")
+                                (mkSid "s1", stubWs, ss'))
+          pendingAsks <- newPendingAsks
+          tabTracker <- newTVarIO Map.empty
+          watchState <- newWatchState
+          thinkingTabs <- newThinkingTabs
+          bg <- newBgSessions
+          let sid = mkSid "s1"
+              key = ConversationKey "signal" "conv1"
+              fire = handleServerEvent cfg (BubbleChan inner) key conns
+                       pendingAsks bg tabTracker watchState thinkingTabs sid
+          pure (inner, fire, sid)
+
+    it "does not send a fresh message when a live edit fails" $ do
+      (inner, fire, sid) <- setup
+      writeIORef (mcEditFails inner) True
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeActivity sid (toolCallJson "BIN_EXEC"))
+      created <- reverse <$> readIORef (mcSendIds inner)
+      -- Exactly one create (the bubble) and NO fallback sends.
+      length created `shouldBe` 1
+
+    it "still delivers the answer after a failed edit" $ do
+      (inner, fire, sid) <- setup
+      writeIORef (mcEditFails inner) True
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeEntry sid (entryJsonFor "the answer"))
+      fire (SeActivity sid (statusJson "idle"))
+      sends <- getSends inner
+      -- The answer is its own message, unaffected by the edit outcome.
+      sends `shouldSatisfy` elem "the answer"
+      -- ...and it is delivered exactly once.
+      length (filter (== "the answer") sends) `shouldBe` 1
+
+    it "re-renders the whole body on the next successful edit" $ do
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      -- Fail one edit, then let the next one succeed.
+      writeIORef (mcEditFails inner) True
+      fire (SeActivity sid (toolCallJson "BIN_EXEC"))
+      writeIORef (mcEditFails inner) False
+      fire (SeActivity sid (toolCallJson "PROCESS_MANAGE"))
+      edits <- reverse <$> readIORef (mcEdits inner)
+      let lastEdit = case reverse edits of
+                       (x:_) -> Just x
+                       []    -> Nothing
+      -- The recovered edit carries ALL three tool lines, not just the newest,
+      -- so a failed edit loses no progress.
+      case lastEdit of
+        Nothing -> expectationFailure "expected a successful edit after recovery"
+        Just (_, body) -> do
+          body `shouldSatisfy` T.isInfixOf "SHELL_EXEC"
+          body `shouldSatisfy` T.isInfixOf "BIN_EXEC"
+          body `shouldSatisfy` T.isInfixOf "PROCESS_MANAGE"
 
   describe "final answer is a NEW message (so it notifies)" $ do
     -- A Signal edit does not notify, so a final answer edited into the
