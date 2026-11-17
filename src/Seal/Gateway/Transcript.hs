@@ -498,6 +498,9 @@ teLineToFrontend rawLine =
      [ "id"        .= lookupT "id"
      , "timestamp" .= lookupT "timestamp"
      , "direction" .= lookupT "direction"
+     -- No convLen: a legacy transcript.jsonl line carries no trustworthy
+     -- position in conversation.jsonl, so these rows offer no branch
+     -- button rather than guessing one.
      , "payload"   .= payloadVal
      , "harness"   .= lookupT "correlation"
      , "model"     .= lookupT "model"
@@ -577,6 +580,10 @@ convLineToFrontend model entryTimestamps fallbackTs idx rawLine =
        , "payload"   .= payloadJson
        , "harness"   .= (Nothing :: Maybe Text)
        , "model"     .= model
+       -- The branch anchor. This path has no entries.jsonl, so the line
+       -- index IS the position: after consuming line `idx`, the
+       -- conversation is `idx + 1` messages long.
+       , "convLen"   .= (idx + 1 :: Int)
        , "channel"   .= originField "channel"
        , "userId"    .= originField "userId"
       , "internal"  .= (Nothing :: Maybe Bool)
@@ -772,6 +779,11 @@ reconEntryToFrontend idx te =
          -- "Assistant". Null for entries that have no model (non-LLM
          -- events, and legacy lines that never recorded one).
          , "model"     .= teModel te
+         -- The branch anchor: the conversation length AFTER this entry.
+         -- The web frontend needs a position in conversation.jsonl to
+         -- branch from; its row `id` is only a render index. Null when
+         -- the entry has no trustworthy position (legacy lines).
+         , "convLen"   .= teConvLen te
          , "channel"   .= mChannel
          , "userId"    .= mUserId
         , "internal"  .= mInternal
