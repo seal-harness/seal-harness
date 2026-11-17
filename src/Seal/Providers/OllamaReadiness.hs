@@ -177,12 +177,19 @@ classifyTags mRam tags =
 -- (no evidence) or when 1.25x its size still fits in RAM. The comparison is
 -- exact integer arithmetic — @size * 5 < ram * 4@ — so the predicate stays
 -- pure and exact, and never rounds in the operator's favour or against it.
+--
+-- The arithmetic is done in 'Integer', not 'Word64'. @size@ comes from the
+-- daemon, so it is untrusted input: a size near @2^64@ would wrap a 'Word64'
+-- multiplication and make an absurd model compare as fitting. @Integer@ is
+-- arbitrary-precision, so that cannot happen. RAM is bounded in practice, but
+-- widening both sides keeps the comparison obviously exact rather than
+-- exact-by-luck.
 isUsable :: Word64 -> OllamaTag -> Bool
 isUsable ram t
   | isCloudModel t = True
   | otherwise = case otSizeBytes t of
       Nothing   -> True
-      Just size -> size * 5 < ram * 4
+      Just size -> (toInteger size * 5) < (toInteger ram * 4)
 
 -- | Is this model served remotely?
 --

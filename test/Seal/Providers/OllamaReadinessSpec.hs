@@ -179,6 +179,16 @@ spec = describe "Seal.Providers.OllamaReadiness" $ do
         (Right [OllamaTag "edge" (Just 12_800_000_000) Nothing]))
         `shouldBe` RdNoFittingModel
 
+    it "13c: a wrapping Word64 size is not reported as fitting" $
+      -- A hostile or buggy daemon reports a size of 2^64/5 + 1. In Word64
+      -- arithmetic `size * 5` wraps to exactly 4, which is smaller than
+      -- ram * 4, so the model would compare as FITTING — the worst possible
+      -- direction for an absurd size. The comparison is therefore done in
+      -- Integer. (Verified: this test fails if the Word64 form is restored.)
+      classifyOllamaReadiness (probeWithRam (Just 16_000_000_000)
+        (Right [OllamaTag "absurd" (Just 3_689_348_814_741_910_324) Nothing]))
+        `shouldBe` RdNoFittingModel
+
     it "12: only :cloud models -> RdReady n (cloud models are usable and unsized)" $
       classifyOllamaReadiness (probeWithRam (Just 8_000_000_000)
         (Right [ OllamaTag "a:cloud" (Just 336) (Just "https://ollama.com")
