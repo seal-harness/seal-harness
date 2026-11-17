@@ -6,12 +6,13 @@ module Seal.Gateway.ApiSpec (spec) where
 import Control.Exception (try, SomeException)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent (threadDelay)
-import Control.Monad (forM_, replicateM_, void)
+import Control.Monad (forM_, replicateM_, void, when)
 import Data.Aeson ((.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Builder qualified as BSB
+import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
@@ -28,7 +29,9 @@ import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus
   , queryString, setRequestBodyChunks )
 import Network.Wai.Internal (Response (..), ResponseReceived (..))
-import System.Directory (createDirectoryIfMissing, doesFileExist, findExecutable, removeDirectoryRecursive)
+import System.Directory
+  ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist, findExecutable
+  , removeDirectoryRecursive )
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.IO.Unsafe (unsafePerformIO)
@@ -46,7 +49,9 @@ import Seal.Core.ChannelKind (ChannelKind (..))
 import Seal.Telegram.Config (TelegramConfig (..), defaultTelegramConfig)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerModels, saveRuntimeConfig)
-import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath, sshAgentsDir)
+import Seal.Config.Paths
+  ( SealPaths (..), sessionConversationPath, sessionDir, sessionMetaPath
+  , sessionWorkdir, sshAgentsDir )
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types
@@ -224,6 +229,14 @@ runAppStatus app req = do
 -- | Run the app against a test request, capturing the status code and body.
 -- The API builds responses with `responseLBS` (a `ResponseBuilder`), so we
 -- pattern-match on the constructor and run the builder to a lazy ByteString.
+-- | A conversation.jsonl line carrying a single user text message.
+userConvLine :: T.Text -> BS.ByteString
+userConvLine t =
+  BL.toStrict (A.encode (A.object
+    [ "role" .= ("user" :: T.Text)
+    , "content" .= [ A.object [ "tag" .= ("CbText" :: T.Text), "contents" .= t ] ]
+    ])) <> "\n"
+
 runAppBody :: Application -> Request -> IO (Int, BL.ByteString)
 runAppBody app req = do
   mv <- newEmptyMVar
@@ -657,6 +670,115 @@ spec = describe "Seal.Gateway.API" $ do
     -- session, so any on-disk session here is an orphan from this call.
     sessions <- listSessions paths
     sessions `shouldSatisfy` null
+
+  it "POST /api/tabs/new {branch_from} WITHOUT branch_conv_len returns 400 (never a silent empty session)" $ do
+    app <- mkApp
+    req <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("provider" :: T.Text)
+        , "provider" .= ("anthropic" :: T.Text)
+        , "model" .= ("claude-sonnet-4" :: T.Text)
+        , "branch_from" .= ("20260101-000000-000" :: T.Text)
+        ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "POST /api/tabs/new {branch_from} naming an unknown session returns 404" $ do
+    app <- mkApp
+    req <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("provider" :: T.Text)
+        , "provider" .= ("anthropic" :: T.Text)
+        , "model" .= ("claude-sonnet-4" :: T.Text)
+        , "branch_from" .= ("20260101-000000-000" :: T.Text)
+        , "branch_conv_len" .= (3 :: Int)
+        ]))
+    status <- runAppStatus app req
+    status `shouldBe` 404
+
+  it "POST /api/tabs/new with NEITHER branch field is a plain provider session (unchanged)" $ do
+    dir <- withSystemTempDirectory "seal-api-plain" $ \d -> do
+      createDirectoryIfMissing True (d </> "sessions")
+      pure d
+    let pathsPlain = fakePaths { spState = dir }
+    deps <- mkDepsFor pathsPlain
+    let appPlain = apiApp deps
+    req <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("provider" :: T.Text)
+        , "provider" .= ("anthropic" :: T.Text)
+        , "model" .= ("claude-sonnet-4" :: T.Text)
+        ]))
+    status <- runAppStatus appPlain req
+    status `shouldBe` 200
+    sessionsPlain <- listSessions pathsPlain
+    length sessionsPlain `shouldBe` (1 :: Int)
+
+  it "END-TO-END: branching copies the parent transcript prefix into the child" $ do
+    dir <- withSystemTempDirectory "seal-api-branch-e2e" $ \d -> do
+      createDirectoryIfMissing True (d </> "sessions")
+      pure d
+    let pathsB = fakePaths { spState = dir }
+    deps <- mkDepsFor pathsB
+    let appB = apiApp deps
+    -- 1. Create a parent session via the real endpoint.
+    reqParent <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("provider" :: T.Text)
+        , "provider" .= ("anthropic" :: T.Text)
+        , "model" .= ("claude-sonnet-4" :: T.Text)
+        ]))
+    (statusParent, bodyParent) <- runAppBody appB reqParent
+    statusParent `shouldBe` 200
+    parentSidText <- case A.decode bodyParent of
+      Just (A.Object o) -> case KeyMap.lookup (Key.fromText "session_id") o of
+        Just (A.String t) -> pure t
+        _                 -> expectationFailure "no session_id" >> pure ""
+      _ -> expectationFailure "bad body" >> pure ""
+    parentSid <- case mkSessionId parentSidText of
+      Right x  -> pure x
+      Left err -> expectationFailure (T.unpack err) >> fail "bad sid"
+    -- 2. Give the parent a conversation.
+    createDirectoryIfMissing True (sessionDir pathsB parentSid)
+    BS.writeFile (sessionConversationPath pathsB parentSid)
+      (BS.concat [ userConvLine "one", userConvLine "two", userConvLine "three" ])
+    -- 2b. Session ids are timestamp-derived to the MILLISECOND, so minting
+    -- the child in the same millisecond as the parent yields the SAME id —
+    -- and branchSession refuses to clobber an existing session (a
+    -- deliberate guard). Pause past a millisecond before branching. Real
+    -- usage always has a human click between the two.
+    threadDelay 20000
+    -- 3. Branch from it at 2 lines.
+    reqBranch <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("provider" :: T.Text)
+        , "provider" .= ("anthropic" :: T.Text)
+        , "model" .= ("claude-sonnet-4" :: T.Text)
+        , "branch_from" .= parentSidText
+        , "branch_conv_len" .= (2 :: Int)
+        ]))
+    (statusBranch, bodyBranch) <- runAppBody appB reqBranch
+    when (statusBranch /= 200) $
+      expectationFailure
+        ("branch failed: status=" <> show statusBranch
+         <> " body=" <> show bodyBranch)
+    childSidText <- case A.decode bodyBranch of
+      Just (A.Object o) -> case KeyMap.lookup (Key.fromText "session_id") o of
+        Just (A.String t) -> pure t
+        _                 -> expectationFailure "no child session_id" >> pure ""
+      _ -> expectationFailure "bad body" >> pure ""
+    childSid <- case mkSessionId childSidText of
+      Right x  -> pure x
+      Left err -> expectationFailure (T.unpack err) >> fail "bad child sid"
+    -- 4. The child has exactly the first two conversation lines.
+    childConv <- BS.readFile (sessionConversationPath pathsB childSid)
+    childConv `shouldBe` BS.concat [ userConvLine "one", userConvLine "two" ]
+    -- 5. The child's workdir does not exist (empty by construction).
+    wdExists <- doesDirectoryExist (sessionWorkdir pathsB childSid)
+    wdExists `shouldBe` False
+    -- 6. The child does not inherit the parent's repo metadata.
+    meta <- readSessionMeta pathsB childSid
+    smRepoUrl meta `shouldBe` Nothing
 
   it "POST /api/tabs/new with kind=shell returns 501" $ do
     app <- mkApp

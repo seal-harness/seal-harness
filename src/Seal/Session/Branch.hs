@@ -30,7 +30,7 @@ import System.Directory
 
 import Seal.Config.Paths
   ( SealPaths, sessionConversationIndexPath, sessionConversationPath
-  , sessionDir, sessionEntriesPath )
+  , sessionDir, sessionEntriesPath, sessionMetaPath )
 import Seal.Core.Types (SessionId, sessionIdText)
 import Seal.Session.Meta (readSessionMeta)
 import Seal.Transcript.ConvIndex (ensureIndex)
@@ -92,9 +92,16 @@ branchSession
   -> IO (Either Text ())
 branchSession paths parentSid childSid requestedLen = do
   mParentMeta <- readSessionMeta paths parentSid
-  case mParentMeta of
-    Nothing -> pure (Left ("parent session not found: " <> sessionIdText parentSid))
-    Just _  -> do
+  -- Refuse if the child id already names a real session. Session ids are
+  -- timestamp-derived to the millisecond, so a same-millisecond mint could
+  -- collide; clobbering an existing session's transcript would be
+  -- unacceptable, so this is a hard guard rather than an overwrite.
+  childExists <- doesFileExist (sessionMetaPath paths childSid)
+  case (mParentMeta, childExists) of
+    (Nothing, _) -> pure (Left ("parent session not found: " <> sessionIdText parentSid))
+    (Just _, True) ->
+      pure (Left ("refusing to branch into an existing session: " <> sessionIdText childSid))
+    (Just _, False) -> do
       let parentConv  = sessionConversationPath paths parentSid
           parentEntry = sessionEntriesPath paths parentSid
           childDir    = sessionDir paths childSid
