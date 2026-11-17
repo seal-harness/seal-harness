@@ -24,7 +24,9 @@ import Data.Text qualified as T
 
 import System.IO (hPutStrLn, stderr)
 
-import Seal.Channels.Chat.Class (ChatChannel (..), ProgressStyle (..), QuestionOption (..))
+import Seal.Channels.Chat.Bubble qualified as Bubble
+import Seal.Channels.Chat.Class
+  (ChunkUnit (..), ChatChannel (..), ProgressStyle (..), QuestionOption (..))
 import Seal.Channels.Chat.TelegramCommands
   (BotCommand, commandsPayload)
 import Seal.Channels.Chat.Types
@@ -87,17 +89,15 @@ instance A.ToJSON TelegramButton where
     , "callback_data" A..= cbd
     ]
 
--- | Chunk a message to the given character limit. Telegram's hard limit
--- is 4096; we leave headroom.
+-- | Split a reply to Telegram's message budget, breaking at the most natural
+-- boundary that fits (paragraph, line, sentence, clause, word).
+--
+-- Delegates to 'Seal.Channels.Chat.Bubble.chunkMessage'. The unit is UTF-16
+-- CODE UNITS, which is what Telegram's 4096 limit is expressed in -- not bytes
+-- (Signal's unit) and not code points ('T.length', which undercounts an emoji
+-- by half).
 chunkMessage :: Int -> Text -> [Text]
-chunkMessage limit msg
-  | T.length msg <= limit = [msg]
-  | otherwise = go msg
-  where
-    go t
-      | T.null t = []
-      | T.length t <= limit = [t]
-      | otherwise = T.take limit t : go (T.drop limit t)
+chunkMessage = Bubble.chunkMessage ChunkUtf16Units
 
 -- | A mock transport backed by a 'TQueue' of inbound messages and an
 -- 'IORef' of captured sends. For testing.
@@ -282,6 +282,11 @@ instance ChatChannel TelegramChatChannel where
   -- idea when its body has outgrown a message and would keep editing until the
   -- platform rejected it.
   ccChunkLimit ch = Just (tccChunkLimit ch)
+
+  -- Telegram's 4096 limit is in UTF-16 CODE UNITS -- one per BMP character,
+  -- two per astral one (an emoji). Counting code points ('T.length')
+  -- undercounts an emoji by half.
+  ccChunkUnit _ = ChunkUtf16Units
 
 -- | Send one chunk verbatim to the last chat.
 sendRaw :: TelegramChatChannel -> Text -> IO ()

@@ -13,6 +13,7 @@
 -- mock) fall back to the text-based question rendering.
 module Seal.Channels.Chat.Class
   ( ChatChannel (..)
+  , ChunkUnit (..)
   , QuestionOption (..)
   , ProgressStyle (..)
   ) where
@@ -34,6 +35,24 @@ import Seal.Channels.Chat.Types (InboundMessage, ChatMessageId)
 data ProgressStyle
   = PsSeparateMessages
   | PsSingleBubble
+  deriving stock (Eq, Show)
+
+-- | The unit a platform expresses its maximum message length in.
+--
+-- This is not cosmetic. Signal's limit is a byte budget (it inlines the first
+-- ~2048 /utf-8 bytes/ and moves the rest to an attachment), while Telegram's
+-- 4096 is measured in /utf-16 code units/. Counting code points — 'T.length' —
+-- is correct for neither: an emoji is 4 bytes and 2 UTF-16 units but a single
+-- code point. Chunking a multi-byte message by code-point count silently
+-- overruns the platform's real limit and the tail gets truncated or demoted to
+-- an attachment.
+--
+-- Lives here rather than in "Seal.Channels.Chat.Bubble" so the 'ChatChannel'
+-- class can name it without an import cycle ('Bubble' already imports this
+-- module).
+data ChunkUnit
+  = ChunkUtf8Bytes
+  | ChunkUtf16Units
   deriving stock (Eq, Show)
 
 -- | One discrete choice offered alongside an ASK_HUMAN question. Mirrors
@@ -102,6 +121,17 @@ class ChatChannel c where
   -- channel-specific record field.
   ccChunkLimit :: c -> Maybe Int
   ccChunkLimit _ = Nothing
+
+  -- | The unit 'ccChunkLimit' is expressed in. Only consulted by the chunked
+  -- send path ('Seal.Channels.Chat.Bubble.chunkMessage').
+  --
+  -- Defaults to 'ChunkUtf8Bytes', the stricter of the two: a byte budget
+  -- never overruns a platform that actually counts UTF-16 units only for
+  -- characters outside the BMP, whereas counting code points overruns both.
+  -- A channel whose documented limit is in code units should say so, because
+  -- a byte budget then splits earlier than it needs to.
+  ccChunkUnit :: c -> ChunkUnit
+  ccChunkUnit _ = ChunkUtf8Bytes
 
   -- | Minimum milliseconds between live edits of a turn's single progress
   -- bubble. Both edit sources (streaming frames and tool calls) share one

@@ -39,7 +39,8 @@ import System.Process
     waitForProcess, withCreateProcess)
 import System.Timeout (timeout)
 
-import Seal.Channels.Chat.Class (ChatChannel (..), ProgressStyle (..))
+import Seal.Channels.Chat.Bubble qualified as Bubble
+import Seal.Channels.Chat.Class (ChunkUnit (..), ChatChannel (..), ProgressStyle (..))
 import Seal.Channels.Chat.Types
   (InboundMessage (..), ChatMessageId (..), ReceivedMessage (..))
 import Seal.Gateway.Types.AllowList (AllowList (..))
@@ -62,17 +63,15 @@ data SignalChatTransport = SignalChatTransport
   , sctClose   :: IO ()
   }
 
--- | Chunk a message to the given character limit. Splits on word
--- boundaries when possible.
+-- | Split a reply to Signal's byte budget, breaking at the most natural
+-- boundary that fits (paragraph, line, sentence, clause, word).
+--
+-- Delegates to 'Seal.Channels.Chat.Bubble.chunkMessage' and measures in UTF-8
+-- BYTES: Signal inlines only the first ~2048 bytes of a message and moves the
+-- rest to an attachment, so a code-point budget would overrun it by up to 4x
+-- for emoji or CJK text and silently demote the tail to a file.
 chunkMessage :: Int -> Text -> [Text]
-chunkMessage limit msg
-  | T.length msg <= limit = [msg]
-  | otherwise = go msg
-  where
-    go t
-      | T.null t = []
-      | T.length t <= limit = [t]
-      | otherwise = T.take limit t : go (T.drop limit t)
+chunkMessage = Bubble.chunkMessage ChunkUtf8Bytes
 
 -- | A mock transport backed by a 'TQueue' of inbound messages and an
 -- 'IORef's of captured sends and captured edits. For testing. The third
@@ -480,6 +479,11 @@ instance ChatChannel SignalChatChannel where
   ccProgressStyle _ = PsSingleBubble
 
   ccChunkLimit ch = Just (sccChunkLimit ch)
+
+  -- Signal's budget is UTF-8 BYTES: it inlines the first ~2048 bytes and
+  -- moves the remainder to an attachment, so a code-point count undercounts
+  -- multi-byte text by up to 4x.
+  ccChunkUnit _ = ChunkUtf8Bytes
 
 -- | Send one chunk verbatim to the last sender.
 sendRaw :: SignalChatChannel -> Text -> IO ()
