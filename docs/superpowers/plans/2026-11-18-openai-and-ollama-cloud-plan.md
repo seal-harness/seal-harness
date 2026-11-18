@@ -3,7 +3,7 @@
 <!-- design: docs/superpowers/specs/2026-11-18-openai-and-ollama-cloud-provider-design.md (revision 6 — approved, re-ratified) -->
 <!-- branch: providers/openai-and-ollama-cloud -->
 <!-- drafted: 2026-11-18, rewritten for revision 6 -->
-<!-- gate: plan gate re-run required (revision 6 is a strict scope REMOVAL) -->
+<!-- gate: Plan Review Gate PASSED 3/3 on revision 6 (feasibility, completeness, scope) -->
 
 ## Verified baseline (measured on this branch, not assumed)
 
