@@ -1,9 +1,19 @@
 # Design — OpenAI and Ollama Cloud provider types
 
-**Status:** draft - revision 5. Gate history: round 1 (4/5 NEEDS_REVISION),
-round 2 (3/5 NEEDS_REVISION), round 3 (in progress; all blockers from every
-round addressed in `…-revision-{2,3,4}.md` and the round-3 commits). Not
-approved until 5/5 reviewers return APPROVED on this text.
+**Status:** draft - revision 5, round 4 in progress.
+
+Gate history:
+
+| Round | Result |
+|---|---|
+| 1 | 4/5 NEEDS_REVISION (Security APPROVED) |
+| 2 | 3/5 NEEDS_REVISION, 2 APPROVED |
+| 3 | 2 APPROVED, 3 NEEDS_REVISION (all blockers fixed) |
+| 4 | Designer **APPROVED**, Product Manager **APPROVED**; Architect, CTO and Security outstanding |
+
+All blockers from rounds 1-3 are addressed and each is pinned by a numbered
+test. Round 4 re-review is running against this text; the design is not approved
+until 5/5 return APPROVED.
 **Date:** 2026-11-18
 **Branch:** `providers/openai-and-ollama-cloud`
 
