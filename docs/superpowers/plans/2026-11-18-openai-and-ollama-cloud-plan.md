@@ -21,7 +21,7 @@ Every row was produced by running a command in this worktree while drafting.
 | `providerLabel` for the other three | `Registry.hs:85,86,87` | `anthropic`, `ollama`, `openrouter` |
 | `vaultKeyName OpenAICompatibleProvider` | `Registry.hs:143` | `= "OPENAI_API_KEY"` |
 | `defaultModelFor OpenAICompatibleProvider` | `Registry.hs:163` | `= ModelId "gpt-4o-mini"` |
-| `providerBaseUrlFor`/`resolveProvider` call sites for the generic type | `Registry.hs:244,373` | `resolveProvider` passes literal `"openai"`; `configuredProviders` uses `vaultKeyName` |
+| `resolveProvider` passes a literal for the generic type | `Registry.hs:241-244` | `resolveOpenAICompatible mvh mgr "openai" …` — the string that names the config section |
 
 ## Gate status — read this first
 

@@ -856,8 +856,8 @@ The rename is not a forced big-bang, but WU3 is irreducible.
   | 2 | `vaultKeyName` | `Registry.hs:140` |
   | 3 | `defaultModelFor` | `Registry.hs:157` |
   | 4 | `builtInBaseUrl` (local to `providerBaseUrlFor`) | `Registry.hs:295` |
-  | 5 | `resolveProvider` (4 equations) | `Registry.hs:193+` |
-  | 6 | `isConfigured` (local case in `configuredProviders`) | `Registry.hs:357+` |
+  | 5 | `resolveProvider` (5 equations: `Nothing`+4 constructors) | `Registry.hs:188-247` |
+  | 6 | `isConfigured` (local case in `configuredProviders`) | `Registry.hs:360` |
   | 7 | `providerAuthStatus` | `API.hs:3259` |
   | 8 | `staticModelsFor` | `API.hs:3824` |
   | 9 | `providerDisplayName` | `State.hs:352` |
