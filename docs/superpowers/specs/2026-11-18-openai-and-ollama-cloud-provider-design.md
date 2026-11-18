@@ -351,7 +351,7 @@ Before this change, `[providers.openai]` meant a *generic* endpoint. After,
    |---|---|
    | No `[providers.openai]` section | **Use the built-in default.** Fresh install; nothing pre-existing to leak. |
    | Section **with** `base_url` | Use it. Case 1 - unchanged. |
-   | Section **without** `base_url` | **Fail closed**: "this key predates the OpenAI provider type - run `/provider add openai` to confirm it belongs to OpenAI." |
+   | Section **without** `base_url` | **Fail closed**: "this key predates the OpenAI provider type - run `/provider add openai`, or add `base_url` to `[providers.openai]` in config.toml, to confirm it belongs to OpenAI." |
 
    Once the create path writes the built-in URL (§4), the `POST` / `PUT`
    response's `baseUrl` is non-null for these types. That is intended and
@@ -389,6 +389,26 @@ Before this change, `[providers.openai]` meant a *generic* endpoint. After,
      is a **no-op**: `seedProviderDefaults` (`Command/Provider.hs:163-169`) sets
      only `rcDefaultProvider` and `pcDefaultModel`, never `pcBaseUrl`, so the
      operator would be told to run a command that cannot clear the guard.
+   - `PUT /api/providers/openai` (Providers-page edit) → must **repair** a case-3
+     section, since the UI cannot send the URL (D7 hides it). Today
+     `handleProviderUpdate` writes `pcBaseUrl` only when the request supplies one
+     (`API.hs:3429-3431`), so editing from the UI leaves the guard set while
+     `POST` and `/provider add` both clear it. The repair is **conditional**:
+
+     ```haskell
+     -- an existing value always wins; only an ABSENT one is repaired
+     cfg1 = case mBaseUrl >>= nonEmpty of
+              Just u  -> setBaseUrl u                    -- explicit update
+              Nothing | isNothing (providerBaseUrl cfg lbl) && hasBuiltInEndpoint lbl
+                      -> setBaseUrl (builtInBaseUrl lbl)  -- repair case 3
+                      | otherwise -> cfg                  -- preserve case 1
+     ```
+
+     An **unconditional** "PUT injects the built-in" would be a credential
+     misdirection bug: an operator on case 1 (`base_url = localhost`) who edits
+     any other field would have their stored key silently redirected to
+     `api.openai.com` — precisely the failure this design exists to prevent.
+     Item 35j pins both halves.
 
    `OllamaCloudProvider` needs no guard: it is a brand-new id, so no legacy
    section can exist. It still gets the same explicit `base_url` write, for
@@ -661,6 +681,11 @@ able to **finish**. These are the acceptance criteria for §1's benefit claim.
      `providerBaseUrl` — a `providerBaseUrl`-only check fails this item because
      it returns `Nothing` for both the absent-section and section-without-field
      states (`Config/File.hs:742`).
+35j. **RED** `PUT /api/providers/openai` repairs a case-3 section: after `PUT`
+     with no `base_url`, `resolveProviderByName "openai"` returns `Right`. **And**
+     `PUT` on a **case-1** section (`base_url = http://localhost:8000/v1`) leaves
+     that value untouched — the repair must never overwrite an existing endpoint,
+     or it would redirect a self-hosted key to `api.openai.com`.
 35i. **RED** **Case 1 through the guard**: with a `[providers.openai]` section
      that HAS a `base_url` (e.g. `http://localhost:8000/v1`), `resolveProvider
      OpenAIProvider` returns `Right` and uses **that** URL, not the built-in.
