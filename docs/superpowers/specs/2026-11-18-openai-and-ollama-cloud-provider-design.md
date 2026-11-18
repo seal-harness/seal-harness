@@ -674,10 +674,12 @@ The rename is not a forced big-bang, but WU3 is irreducible.
   alone — the new cards render as raw ids until WU3 lands the frontend labels,
   which is degraded, not broken.
 - **WU3** The atomic unit: `resolveCreateTarget` / `resolveExistingTarget` /
-  `customProviderDetailJson` / `providerAuthStatus` / `staticModelsFor` /
-  `providerDetailJsonFor` (`API.hs`) + `types.ts` + `ProvidersView.tsx` +
+  `customProviderDetailJson` / `providerDetailJsonFor` / the `customInfos`
+  `"type"` literal (`:715`) / the readiness guard (`:3246`) / the create-path
+  `base_url` injection (`API.hs`) + `types.ts` + `ProvidersView.tsx` +
   `ProviderStep.tsx` + `ProviderFormFields.tsx` + label maps + `ActiveTabs.tsx`
-  + items 25-39 and their test updates.
+  + items 25-39 and their test updates. (`providerAuthStatus` and
+  `staticModelsFor` are WU1 - see above.)
 
   WU3 **cannot** be split: the frontend is embedded via `file-embed`, so client
   and server ship together, and `type: "openai"` for a custom name must start
