@@ -460,6 +460,42 @@ describe('ProvidersView', () => {
     expect(payload.name).toBe('ollama-cloud')
   })
 
+  // OpenRouter supplies a specific endpoint (https://openrouter.ai/api/v1), so
+  // the form must not ask for one. It keeps its Unique-name field: like the
+  // other built-ins its name is its id, but the field remains hidden for the
+  // same reason it is hidden for openai - only the generic type needs one.
+  it('OpenRouter hides the Base URL field and submits no base_url', async () => {
+    providersState = [makeProvider({ name: 'openrouter', authStatus: 'none' })]
+    createProvider.mockResolvedValue({ ok: true, provider: makeProvider({ name: 'openrouter' }) })
+    render(<ProvidersView />)
+    fireEvent.click(screen.getByTestId('provider-new-btn'))
+    const select = screen.getByTestId('provider-form-new').querySelector('select')
+    fireEvent.change(select!, { target: { value: 'openrouter' } })
+    expect(screen.queryByTestId('provider-base-url-input')).toBeNull()
+    fireEvent.change(screen.getByTestId('provider-api-key-input'), { target: { value: 'sk-or' } })
+    expect(screen.getByTestId('provider-save')).toBeEnabled()
+    fireEvent.click(screen.getByTestId('provider-save'))
+    await waitFor(() => expect(createProvider).toHaveBeenCalled())
+    const payload = createProvider.mock.calls[0]?.[0] as Record<string, unknown>
+    expect(payload.base_url).toBeUndefined()
+    expect(payload.name).toBe('openrouter')
+  })
+
+  // The counterpart that keeps the change honest: Anthropic and Ollama still
+  // SHOW the field. A predicate that hid it for every built-in endpoint would
+  // pass the OpenRouter test above and silently break remote-Ollama.
+  it('Anthropic and Ollama still show an editable Base URL', () => {
+    for (const id of ['anthropic', 'ollama']) {
+      cleanup()
+      providersState = [makeProvider({ name: id, authStatus: 'none' })]
+      render(<ProvidersView />)
+      fireEvent.click(screen.getByTestId('provider-new-btn'))
+      const select = screen.getByTestId('provider-form-new').querySelector('select')
+      fireEvent.change(select!, { target: { value: id } })
+      expect(screen.getByTestId('provider-base-url-input')).toBeInTheDocument()
+    }
+  })
+
   it('items 34/34a: OpenAI hides both fields in create and edit mode', async () => {
     providersState = [
       makeProvider({ name: 'openai', authStatus: 'api-key', baseUrl: 'https://api.openai.com/v1' }),

@@ -272,12 +272,15 @@ export function ProvidersView() {
   //
   // When the row is unresolved, treat the field as hidden for the PAYLOAD (an
   // unloaded list must not re-send a stale value) but keep today's render
-  // default. `openai` and `ollama-cloud` have built-in endpoints, so the form
-  // never asks for one.
+  // default. `openai`, `ollama-cloud` and `openrouter` each supply a specific
+  // endpoint, so the form never asks for one. `anthropic` and `ollama` keep a
+  // visible field: anthropic's is inert (its endpoint is fixed inside the
+  // provider) and ollama's is the only GUI path to a remote daemon.
+  const hiddenBaseUrlIds = ['openai', 'ollama-cloud', 'openrouter']
   const isHiddenBaseUrl =
     formRow === undefined
-      ? formName === 'openai' || formName === 'ollama-cloud'
-      : formRow.name === 'openai' || formRow.name === 'ollama-cloud'
+      ? hiddenBaseUrlIds.includes(formName)
+      : hiddenBaseUrlIds.includes(formRow.name)
   const showBaseUrl = !isHiddenBaseUrl
   const showUniqueName = formRow === undefined
     ? formName === 'openai-compatible'

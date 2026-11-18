@@ -174,8 +174,8 @@ Files:
   `providerStep.test.tsx`.
 - `CHANGELOG.md`, `config/templates/config.toml`, `scripts/setup-walkthrough.sh`.
 
-TDD order: write design items **25-27, 27b, 28-39, 34a-34d, 35b-35d, 41b, 41c,
-45** failing,
+TDD order: write design items **25-27, 27b, 28-39, 34a-34d, 35b-35d, 35-or,
+35-or-wizard, 35-keep, 41b, 41c, 45** failing,
 then implement. GUARD item **42** (the Providers page still renders both fields
 for `openai-compatible`, and Save stays disabled until both are valid) must stay
 green throughout — it is the regression guard for D7 in create mode.

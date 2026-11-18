@@ -122,6 +122,31 @@ describe('ProviderStep', () => {
     expect(body).toContain('192.168.1.9:11434')
   })
 
+  // OpenRouter supplies a specific endpoint, so the wizard must not ask.
+  it('OpenRouter hides the Base URL field in the wizard', () => {
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ id: 'openrouter', label: 'OpenRouter', requires_base_url: false })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.queryByLabelText(/base url/i)).not.toBeInTheDocument()
+  })
+
+  // ...while Anthropic still shows it (its endpoint is fixed inside the
+  // provider, so the field is inert but historically visible).
+  it('Anthropic still shows the Base URL field in the wizard', () => {
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ id: 'anthropic', label: 'Anthropic' })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.getByLabelText(/base url/i)).toBeInTheDocument()
+  })
+
   // The counterpart: a built-in endpoint means the wizard must NOT ask.
   it('item 44 (wizard): an openai card renders no Base URL field', () => {
     render(

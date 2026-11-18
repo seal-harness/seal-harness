@@ -227,14 +227,29 @@ So visibility needs its **own** predicate, and the two must never be conflated:
 
 | Type | `requiresBaseUrl` (validation) | visible (UI) |
 |---|---|---|
-| `openai`, `ollama-cloud` | `false` | **`false`** — hidden entirely |
+| `openai`, `ollama-cloud`, `openrouter` | `false` | **`false`** — hidden entirely |
 | `openai-compatible` | `true` | `true` — required, so shown |
 | `ollama` | `false` | **`true`** — optional, still shown |
-| `anthropic`, `openrouter` | `false` | `true` (today's behaviour) |
+| `anthropic` | `false` | `true` (today's behaviour) |
+
+The rule is **"does this type supply a specific endpoint?"**, not "does it have
+a default". `openai`, `ollama-cloud` and `openrouter` each name one concrete
+service, so the operator has nothing to usefully type and the field is hidden.
+`openrouter` was originally left visible "as today's behaviour"; that was
+inconsistent with `openai` and `ollama-cloud`, which are the same shape, and it
+was corrected on operator instruction.
+
+`anthropic` keeps a visible, inert field: its endpoint is fixed *inside* the
+provider, so nothing reads `[providers.anthropic] base_url` — but hiding it is a
+separate change, and `anthropic` is not a service whose URL the operator could
+plausibly redirect.
+
+`ollama` keeps it for a substantive reason: optional but essential, it is the
+only GUI path to a remote daemon.
 
 Concretely `showBaseUrl = not isHiddenBaseUrl`, where `isHiddenBaseUrl` is true
-for exactly `openai` and `ollama-cloud`. `requiresBaseUrl` keeps its existing job
-— deciding whether a non-empty URL is **required** before Save is enabled (the
+for exactly those three ids. `requiresBaseUrl` keeps its existing job —
+deciding whether a non-empty URL is **required** before Save is enabled (the
 item 42 guard) — and is never used to decide whether the field renders.
 
 **Both surfaces, both modes.** "Hidden entirely" applies to the Providers page
@@ -256,9 +271,9 @@ select OpenAI-compatible, type `http://localhost:8000/v1`, switch to OpenAI, and
 Save writes that stale URL into `[providers.openai]` — contradicting D4 and
 item 28. The same applies to `uniqueName`.
 
-Therefore: send `base_url` when **`!isHiddenBaseUrl`** — i.e. `openai` and
-`ollama-cloud` send nothing; `ollama`, `openai-compatible`, `anthropic`,
-`openrouter` and custom instances send their non-empty value. Keying the gate on
+Therefore: send `base_url` when **`!isHiddenBaseUrl`** — i.e. `openai`,
+`ollama-cloud` and `openrouter` send nothing; `ollama`, `openai-compatible`,
+`anthropic` and custom instances send their non-empty value. Keying the gate on
 `requiresBaseUrl` instead would be the same required-vs-visible conflation this
 section exists to prevent: `ollama` has `requiresBaseUrl = false` but a visible,
 essential field, so an operator could type a remote daemon URL and have it
@@ -657,6 +672,19 @@ covered without editing the test. Enumerating six values is not a property.
     `provider-base-url-input` nor `provider-instance-name-input`; Save is
     enabled with only an API key.
 35. **RED** Providers page: selecting **Ollama Cloud** likewise renders neither.
+35-or. **RED** Providers page: selecting **OpenRouter** renders **no**
+    `provider-base-url-input`, and the submitted payload carries no `base_url`.
+    OpenRouter supplies a specific endpoint (`https://openrouter.ai/api/v1`), so
+    it belongs with `openai` and `ollama-cloud` rather than with `anthropic`.
+35-or-wizard. **RED** Wizard: an `openrouter` card renders no Base URL field.
+    The wizard half is a separate assertion because the two forms read
+    different data (server flags vs the card's own id) and a fix applied to one
+    is invisible to the other — the exact split that let the earlier
+    remote-Ollama bug survive.
+35-keep. **GUARD** Providers page: **`anthropic` and `ollama` still render** an
+    editable Base URL. This is the counterexample that keeps the predicate
+    honest: a rule that hid the field for every built-in *endpoint* would pass
+    `35-or` and silently delete remote-Ollama configuration.
 36. **RED** Providers page: the id→flags helper classifies exactly
     `openai-compatible` as custom-capable (`requiresBaseUrl`/`requiresName`
     true) and every other built-in as not — the anti-drift guard for D7's

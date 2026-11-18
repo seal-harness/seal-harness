@@ -137,9 +137,11 @@ export function ProviderStep({
   const needsName = card?.requires_name === true
   // D7: `requires_base_url` means REQUIRED, not VISIBLE. Ollama's base URL is
   // optional yet essential - it is the only GUI path to a remote daemon - so
-  // visibility gets its own predicate. `openai` and `ollama-cloud` carry a
-  // built-in endpoint, so the wizard never asks for one.
-  const isHiddenBaseUrl = effectiveId === 'openai' || effectiveId === 'ollama-cloud'
+  // visibility gets its own predicate. `openai`, `ollama-cloud` and
+  // `openrouter` each supply a specific endpoint, so the wizard never asks for
+  // one. `anthropic` and `ollama` keep a visible field.
+  const HIDDEN_BASE_URL_IDS = ['openai', 'ollama-cloud', 'openrouter']
+  const isHiddenBaseUrl = HIDDEN_BASE_URL_IDS.includes(effectiveId)
   const showBaseUrl = !isHiddenBaseUrl
   const baseUrlOk = !needsBaseUrl || /^https?:\/\/\S+$/.test(form.baseUrl.trim())
   const nameOk = !needsName || (
