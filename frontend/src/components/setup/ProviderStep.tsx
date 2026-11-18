@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { setDefaultProvider, testProvider, type SetupResult } from '../../hooks/useSetup'
 import { providerLabel } from '../../lib/providerLabels'
+import { readinessHint } from '../../lib/readiness'
 import type { ProviderCard, SetupStep } from '../../lib/setupSteps'
+import type { ProviderReadiness } from '../../types'
 import * as s from './styles'
 import {
   ProviderFormFields,
@@ -36,6 +38,33 @@ type SaveState =
  *   /api/providers/default`. Without this the step offered a disabled Save
  *   button and no way forward — no amount of typing would enable it.
  */
+/**
+ * Does this readiness state mean "cannot be used right now"?
+ *
+ * Deliberately narrow. Only the three states that positively mean *the thing is
+ * absent* block selection:
+ *
+ * - `pending` — nothing has been observed yet. Blocking here would disable the
+ *   button on first paint for every provider, before any probe finished.
+ * - `unknown` — the probe ran and failed unexplainably. We do not know, so we
+ *   do not block (and we certainly do not claim).
+ * - `cloud` — an `ollama.com` endpoint is not probed; it is not a local
+ *   absence.
+ * - `no-fitting-model` — advisory only (design D5.4). Turning it into a
+ *   verdict is exactly the error the design forbids.
+ * - `ready`, and absent readiness (a non-Ollama card) — usable.
+ */
+function readinessBlocksSelection(readiness: ProviderReadiness | undefined): boolean {
+  return readiness === 'not-installed' || readiness === 'not-running' || readiness === 'no-models'
+}
+
+/** Every built-in type id is reserved as an instance name (D9). Keeping it in
+ *  one list means adding a provider type cannot leave a stale copy behind. */
+const RESERVED_INSTANCE_NAMES = [
+  'all', 'default',
+  'anthropic', 'ollama', 'ollama-cloud', 'openrouter', 'openai', 'openai-compatible',
+]
+
 export function ProviderStep({
   step,
   providers,
@@ -60,10 +89,25 @@ export function ProviderStep({
   const [save, setSave] = useState<SaveState>({ status: 'idle' })
   const [ping, setPing] = useState<SetupResult | null>(null)
   const [pinging, setPinging] = useState(false)
+  // Confirm-before-skip: the escape hatch asks once rather than silently
+  // letting the operator through to a product that cannot answer.
+  const [finishingAnyway, setFinishingAnyway] = useState(false)
 
   const fallback = defaultCard ?? providers.find((p) => p.configured) ?? firstProvider
   const effectiveId = providers.some((p) => p.id === selected) ? selected : (fallback?.id ?? '')
   const card = providers.find((p) => p.id === effectiveId)
+
+  // The selected provider cannot be used right now. Only meaningful for a card
+  // the wizard would otherwise let through via `Use <provider>` — i.e. one the
+  // server already counts as configured.
+  const blocked = card !== undefined
+    && card.configured
+    && !card.isDefault
+    && readinessBlocksSelection(card.readiness)
+  const blockedReason =
+    card !== undefined && card.readiness !== undefined && readinessBlocksSelection(card.readiness)
+      ? readinessHint(card.readiness, card.default_model ?? undefined)
+      : null
 
   // Seed the shared fields from the selected card. In particular, an existing
   // frequent-model list must be shown (and round-tripped) instead of being
@@ -91,11 +135,19 @@ export function ProviderStep({
 
   const needsBaseUrl = card?.requires_base_url === true
   const needsName = card?.requires_name === true
+  // D7: `requires_base_url` means REQUIRED, not VISIBLE. Ollama's base URL is
+  // optional yet essential - it is the only GUI path to a remote daemon - so
+  // visibility gets its own predicate. `openai`, `ollama-cloud` and
+  // `openrouter` each supply a specific endpoint, so the wizard never asks for
+  // one. `anthropic` and `ollama` keep a visible field.
+  const HIDDEN_BASE_URL_IDS = ['openai', 'ollama-cloud', 'openrouter']
+  const isHiddenBaseUrl = HIDDEN_BASE_URL_IDS.includes(effectiveId)
+  const showBaseUrl = !isHiddenBaseUrl
   const baseUrlOk = !needsBaseUrl || /^https?:\/\/\S+$/.test(form.baseUrl.trim())
   const nameOk = !needsName || (
     /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(instanceName.trim())
     && !instanceName.includes('--')
-    && !['all', 'default', 'anthropic', 'ollama', 'openrouter'].includes(instanceName.trim())
+    && !RESERVED_INSTANCE_NAMES.includes(instanceName.trim())
   )
   const canSaveKey = dirty && baseUrlOk && nameOk
   const saveDisabled = save.status === 'saving' || !canSaveKey
@@ -107,9 +159,12 @@ export function ProviderStep({
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name: needsName ? instanceName.trim() : effectiveId,
-        ...(needsName ? { type: 'openai' } : {}),
+        ...(needsName ? { type: 'openai-compatible' } : {}),
         api_key: form.apiKey,
-        ...(needsBaseUrl ? { base_url: form.baseUrl.trim() } : {}),
+        // Gated on VISIBILITY, not on needsBaseUrl: that flag is false for
+        // Ollama, so keying the payload on it would silently drop a typed
+        // remote-daemon URL (D7).
+        ...(showBaseUrl && form.baseUrl.trim() ? { base_url: form.baseUrl.trim() } : {}),
         ...(form.defaultModel.trim() ? { default_model: form.defaultModel.trim() } : {}),
         models: modelsFromText(form.modelsText),
       }),
@@ -184,9 +239,6 @@ export function ProviderStep({
                 {providerLabel(provider.id)}
               </span>
               {provider.isDefault ? <span className="pill" style={{ color: 'var(--success)' }}>default</span> : null}
-              <span className="pill" style={{ color: provider.configured ? 'var(--text-muted)' : 'var(--text-faint)' }}>
-                {provider.configured ? 'configured' : 'no credential'}
-              </span>
               {provider.default_model !== null ? (
                 <span style={{ fontSize: 12, color: 'var(--text-faint)' }}>{provider.default_model}</span>
               ) : null}
@@ -220,7 +272,7 @@ export function ProviderStep({
           onChange={(patch) => { setForm((f) => ({ ...f, ...patch })); setDirty(true) }}
           layout="stacked"
           creating
-          showBaseUrl={needsBaseUrl}
+          showBaseUrl={showBaseUrl}
           baseUrlError={needsBaseUrl && !baseUrlOk ? 'Enter an http:// or https:// URL.' : null}
         />
       )}
@@ -229,7 +281,7 @@ export function ProviderStep({
         {card !== undefined && card.configured ? (
           <button
             type="button"
-            disabled={save.status === 'saving' || card.isDefault}
+            disabled={save.status === 'saving' || card.isDefault || blocked}
             onClick={() => { void useAsDefault() }}
             className={s.primaryButtonClass}
           >
@@ -258,6 +310,49 @@ export function ProviderStep({
           Test connection
         </button>
       </div>
+
+      {/* Why the CTA above is disabled, and how to get unstuck.
+          The escape hatch is not decoration: Ollama's `configured` is true from
+          config alone (Registry.hs), so on a machine that has never installed
+          it `required_complete` is already true and the wizard is the ONLY
+          screen the operator sees. A disabled button with no way forward would
+          hard-block them out of the product. `onDone` refreshes the setup
+          state, and the gate then renders the app. */}
+      {blocked ? (
+        <div style={{ marginTop: 12 }} data-testid="setup-provider-blocked">
+          <p role="alert" style={{ ...s.warningStyle }}>
+            {blockedReason ?? `${providerLabel(card?.id ?? '')} is not ready.`}
+          </p>
+          {/* The secondary finish path. Kept separate from the primary CTA so
+              the explanation stays adjacent to the disabled button. */}
+          {!finishingAnyway ? (
+            <button
+              type="button"
+              onClick={() => setFinishingAnyway(true)}
+              className={s.ghostButtonClass}
+              style={{ marginTop: 8 }}
+              data-testid="setup-provider-skip"
+            >
+              Continue without a working provider
+            </button>
+          ) : (
+            <div style={{ marginTop: 8 }}>
+              <p style={{ ...s.mutedStyle }}>
+                Finish setup now? Messages will fail until{' '}
+                {providerLabel(card?.id ?? '')} is available.
+              </p>
+              <button
+                type="button"
+                onClick={onDone}
+                className={s.ghostButtonClass}
+                data-testid="setup-provider-skip-confirm"
+              >
+                Finish setup
+              </button>
+            </div>
+          )}
+        </div>
+      ) : null}
 
       {save.status === 'failed' ? (
         <p role="alert" style={{ ...s.errorStyle, marginTop: 12 }}>

@@ -24,6 +24,8 @@ module Seal.Providers.Registry
   , resolveProviderByName
   , providerBaseUrlFor
   , providerBaseUrlForName
+  , providerRequiresBaseUrl
+  , providerRequiresName
   , customProviderNames
   , configuredCustomProviderNames
   , configuredProviderNames
@@ -69,12 +71,21 @@ anthropicOAuthKey = "ANTHROPIC_OAUTH_TOKENS"
 data KnownProvider
   = AnthropicProvider
   | OllamaProvider
+  | OllamaCloudProvider
+    -- ^ Ollama's hosted inference over the OpenAI-compatible API
+    -- (@https://ollama.com/v1@). Unlike 'OllamaProvider' this is a remote HTTPS
+    -- endpoint with no keyless mode and no readiness probe. Same client as
+    -- OpenRouter; the difference is a built-in endpoint.
   | OpenRouterProvider
+  | OpenAIProvider
+    -- ^ Real OpenAI (@https://api.openai.com/v1@), with a built-in endpoint.
+    -- The generic 'OpenAICompatibleProvider' used to carry this id; the rename
+    -- gives it to the thing the name always described.
   | OpenAICompatibleProvider
     -- ^ Any OpenAI-compatible @/v1/chat/completions@ endpoint the operator
-    -- names (a self-hosted vLLM, LM Studio, api.openai.com, …). Same client as
-    -- OpenRouter ('mkOpenAICompatible'); the difference is that it has **no**
-    -- built-in base URL — the endpoint is required input, not a default.
+    -- names (a self-hosted vLLM, LM Studio, …). Same client as OpenRouter
+    -- ('mkOpenAICompatible'); the difference is that it has **no** built-in base
+    -- URL — the endpoint is required input, not a default.
   deriving stock (Eq, Show, Enum, Bounded)
 
 knownProviders :: [KnownProvider]
@@ -83,9 +94,11 @@ knownProviders = [minBound .. maxBound]
 -- | The user-facing id typed at the @/provider@ prompt.
 providerLabel :: KnownProvider -> Text
 providerLabel AnthropicProvider = "anthropic"
-providerLabel OllamaProvider    = "ollama"
+providerLabel OllamaProvider = "ollama"
+providerLabel OllamaCloudProvider = "ollama-cloud"
 providerLabel OpenRouterProvider = "openrouter"
-providerLabel OpenAICompatibleProvider = "openai"
+providerLabel OpenAIProvider = "openai"
+providerLabel OpenAICompatibleProvider = "openai-compatible"
 
 providerId :: KnownProvider -> ProviderId
 providerId = ProviderId . providerLabel
@@ -115,8 +128,9 @@ validateProviderName name
       Left "provider name must not start or end with \"-\""
   | "--" `T.isInfixOf` name =
       Left "provider name must not contain \"--\""
-  | name `elem` ["anthropic", "ollama", "openrouter"] =
-      Left (name <> " is a built-in provider type; choose another name")
+  | name `elem` map providerLabel knownProviders =
+      Left (name <> " is a built-in provider type; choose another name"
+              <> " (for example \"my-openai-endpoint\")")
   | otherwise = Right ()
   where
     badChar c =
@@ -138,9 +152,11 @@ providerTypeForName name = fromMaybe OpenAICompatibleProvider (parseProvider nam
 -- | The vault secret name under which this provider's API key is stored.
 vaultKeyName :: KnownProvider -> Text
 vaultKeyName AnthropicProvider = "ANTHROPIC_API_KEY"
-vaultKeyName OllamaProvider    = "OLLAMA_API_KEY"
+vaultKeyName OllamaProvider = "OLLAMA_API_KEY"
+vaultKeyName OllamaCloudProvider = "OLLAMA_CLOUD_API_KEY"
 vaultKeyName OpenRouterProvider = "OPENROUTER_API_KEY"
-vaultKeyName OpenAICompatibleProvider = "OPENAI_API_KEY"
+vaultKeyName OpenAIProvider = "OPENAI_API_KEY"
+vaultKeyName OpenAICompatibleProvider = "OPENAI_COMPATIBLE_API_KEY"
 
 -- | The vault key for a provider name. Built-ins keep their legacy key; a
 -- custom OpenAI-compatible instance uses a name-derived key so two instances
@@ -155,11 +171,17 @@ vaultKeyNameForName name = case parseProvider name of
 -- | The model used when the user has not chosen one.
 defaultModelFor :: KnownProvider -> ModelId
 defaultModelFor AnthropicProvider = ModelId "claude-opus-4-8"
-defaultModelFor OllamaProvider    = ModelId "llama3.2"
+defaultModelFor OllamaProvider = ModelId "llama3.2"
+-- | Ollama Cloud's documented DIRECT-request identifier form (@gemma4:31b@;
+-- the @:cloud@ suffix is the signed-in-local-server form).
+defaultModelFor OllamaCloudProvider = ModelId "gemma4:31b"
 defaultModelFor OpenRouterProvider = ModelId "deepseek/deepseek-v4.1-flash-1017"
+-- | Real OpenAI. This was the generic type's default before the rename; it
+-- describes OpenAI, which is what it always meant.
+defaultModelFor OpenAIProvider = ModelId "gpt-4o-mini"
 -- | A starting point only: a generic endpoint's real model ids are its own, so
--- the operator overrides this in @[providers.openai] default_model@ or in the
--- setup wizard.
+-- the operator overrides this in @[providers.openai-compatible] default_model@
+-- or in the setup wizard.
 defaultModelFor OpenAICompatibleProvider = ModelId "gpt-4o-mini"
 
 -- | A provider's default model: the configured value if given, else the
@@ -238,8 +260,27 @@ resolveProvider mvh mgr cfg OpenRouterProvider model _ =
   where
     baseUrl = providerBaseUrlFor cfg OpenRouterProvider
 
+resolveProvider mvh mgr cfg OllamaCloudProvider model _ =
+  -- Remote HTTPS endpoint, key required: no keyless mode (D5, D6). Reuses the
+  -- shared OpenAI-compatible client. No readiness probe.
+  resolveOpenAICompatible mvh mgr
+    (providerLabel OllamaCloudProvider)
+    (providerBaseUrlFor cfg OllamaCloudProvider)
+    (vaultKeyName OllamaCloudProvider) model
+
+resolveProvider mvh mgr cfg OpenAIProvider model _ =
+  -- Built-in endpoint, key required. A [providers.openai] base_url still wins
+  -- (D4); an explicitly empty one fails closed in the shared helper (item 21b).
+  resolveOpenAICompatible mvh mgr
+    (providerLabel OpenAIProvider)
+    (providerBaseUrlFor cfg OpenAIProvider)
+    (vaultKeyName OpenAIProvider) model
+
 resolveProvider mvh mgr cfg OpenAICompatibleProvider model _ =
-  resolveOpenAICompatible mvh mgr "openai"
+  -- 'providerLabel' rather than a literal: this string names the config section
+  -- in the fail-closed error, so it must track the rename (item 20).
+  resolveOpenAICompatible mvh mgr
+    (providerLabel OpenAICompatibleProvider)
     (providerBaseUrlFor cfg OpenAICompatibleProvider)
     (vaultKeyName OpenAICompatibleProvider) model
 
@@ -292,15 +333,32 @@ providerBaseUrlFor :: RuntimeConfig -> KnownProvider -> Text
 providerBaseUrlFor cfg kp =
   fromMaybe (builtInBaseUrl kp) (providerBaseUrl cfg (providerLabel kp))
   where
-    builtInBaseUrl OllamaProvider     = defaultOllamaBaseUrl
+    builtInBaseUrl OllamaProvider = defaultOllamaBaseUrl
+    builtInBaseUrl OllamaCloudProvider = "https://ollama.com/v1"
     builtInBaseUrl OpenRouterProvider = defaultOpenRouterBaseUrl
-    builtInBaseUrl AnthropicProvider  = "https://api.anthropic.com"
+    builtInBaseUrl AnthropicProvider = "https://api.anthropic.com"
+    builtInBaseUrl OpenAIProvider = "https://api.openai.com/v1"
     -- Deliberately empty: a generic endpoint has no default (see
     -- 'resolveProvider'), and callers treat "" as "not configured".
     builtInBaseUrl OpenAICompatibleProvider = ""
 
 -- | The effective base URL for a provider name. Custom names have no
 -- built-in default: the empty string means "not configured".
+-- | Must the operator SUPPLY a base URL for this type? This is a *validation*
+-- question, not a visibility one: Ollama's base URL is optional yet must still
+-- be shown, because it is the only GUI path to a remote daemon (D7). Keeping
+-- this in the registry means the setup wizard, the Providers page and the
+-- resolver all read one definition instead of three hardcoded lists.
+providerRequiresBaseUrl :: KnownProvider -> Bool
+providerRequiresBaseUrl OpenAICompatibleProvider = True
+providerRequiresBaseUrl _ = False
+
+-- | Must the operator supply an instance name? Only the generic type does: a
+-- built-in's name is its id.
+providerRequiresName :: KnownProvider -> Bool
+providerRequiresName OpenAICompatibleProvider = True
+providerRequiresName _ = False
+
 providerBaseUrlForName :: RuntimeConfig -> Text -> Text
 providerBaseUrlForName cfg name
   | Just kp <- parseProvider name = providerBaseUrlFor cfg kp
@@ -367,6 +425,12 @@ configuredProviders mvh cfg = filterM isConfigured knownProviders
           ||^ hasVaultKey mvh anthropicOAuthKey
       OpenRouterProvider ->
         hasVaultKey mvh (vaultKeyName OpenRouterProvider)
+      -- Each new type reads its OWN vault key (D3 injectivity): the local
+      -- OLLAMA_API_KEY must never make Ollama Cloud look configured.
+      OllamaCloudProvider ->
+        hasVaultKey mvh (vaultKeyName OllamaCloudProvider)
+      OpenAIProvider ->
+        hasVaultKey mvh (vaultKeyName OpenAIProvider)
       OpenAICompatibleProvider -> do
         -- BOTH halves are required: a base URL with no credential fails on the
         -- first call, and a credential with no base URL has nowhere to go.

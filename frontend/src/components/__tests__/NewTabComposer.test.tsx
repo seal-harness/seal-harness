@@ -89,6 +89,47 @@ describe('NewTabComposer — provider kind', () => {
     expect(screen.queryByLabelText('Agent')).toBeNull()
   })
 
+  // Test 42, the second ProviderSelect consumer. This is the other live render
+  // of the SHARED component, so the annotation is pinned here as well as in
+  // CronView — a change to ProviderSelect must not silently lose it in one.
+  it('42: annotates Ollama with its readiness and keeps it selectable', () => {
+    render(
+      <NewTabComposer
+        spec={makeSpec({
+          configuredProviders: [
+            makeProvider({ name: 'anthropic', isDefault: true, configured: true }),
+            makeProvider({ name: 'ollama', isDefault: false, configured: true, readiness: 'not-running' }),
+          ],
+          provider: 'anthropic',
+        })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    const sel = screen.getByLabelText('Provider') as HTMLSelectElement
+    const ollama = Array.from(sel.options).find((o) => o.value === 'ollama')!
+    expect(ollama.textContent).toBe('Ollama (Not Running)')
+    expect(ollama.disabled).toBe(false)
+  })
+
+  it('42b: a ready Ollama carries its model count here too', () => {
+    render(
+      <NewTabComposer
+        spec={makeSpec({
+          configuredProviders: [
+            makeProvider({ name: 'ollama', isDefault: false, configured: true, readiness: 'ready', readiness_models: 4 }),
+          ],
+          provider: 'ollama',
+        })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    const sel = screen.getByLabelText('Provider') as HTMLSelectElement
+    expect(Array.from(sel.options).find((o) => o.value === 'ollama')!.textContent)
+      .toBe('Ollama (Ready · 4 Models)')
+  })
+
   it('shows only configured providers in the provider dropdown', () => {
     render(
       <NewTabComposer

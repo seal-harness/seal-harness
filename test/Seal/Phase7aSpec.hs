@@ -5,7 +5,7 @@
 -- API responds. The 7a milestone gate.
 module Seal.Phase7aSpec (spec) where
 
-import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Data.Aeson qualified as A
 import Data.ByteString.Lazy qualified as BL
@@ -18,7 +18,7 @@ import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, requestMethod
   , responseLBS, responseStatus )
 import Network.Wai.Internal (ResponseReceived (..))
-import Network.Wai.Handler.Warp (run)
+import Network.Wai.Handler.Warp (testWithApplication)
 import Network.WebSockets (ClientApp, runClient, receiveData)
 import Test.Hspec
 
@@ -47,6 +47,7 @@ import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime)
+import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.Web.UiState (newUiStateHandle)
 
 -- | A shared test abort registry (top-level, created once via unsafePerformIO).
@@ -119,6 +120,7 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adAgentDefs = adb
           , adSkills = skills
           , adProviders = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState = uiState
           , adSend = Nothing
           , adDefaultAgent = pure Nothing
@@ -147,29 +149,44 @@ spec = describe "Seal.Phase7aSpec" $ do
     status <- runAppStatus app (defaultRequest { requestMethod = methodGet, pathInfo = ["api", "health"] })
     status `shouldBe` 200
 
+  -- This test used to be a fixed race, in three ways, and it flaked in CI:
+  --
+  --   1. a HARDCODED port (18095), shared by every concurrent run;
+  --   2. a fixed `threadDelay 200000` instead of waiting for the socket to
+  --      actually accept — any scheduling hiccup in that window produced a
+  --      permanent `ConnectionException ConnectionClosed`, which is exactly
+  --      the failure that was observed;
+  --   3. a `forkIO`'d server that was never cancelled, so the listener
+  --      outlived the test and could still hold the port for the next run.
+  --
+  -- Now: an ephemeral port via `testWithApplication` (which binds, runs the
+  -- action, then tears the server down), and hspec's own timeout as the
+  -- backstop. Nothing to race with, and nothing to leak.
   it "a WS client connects, receives hello + a broadcastLists event" $ do
     broker <- newStreamBroker 10
     tabsH <- newTabsHandle
     let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 3600, sgAccessControl = Nothing }
-        port = 18095
     -- The WS stream is mounted in the HTTP app (single-port gateway).
-    _ <- forkIO (run port (streamMiddleware guard broker fallbackApp))
-    threadDelay 200000
-    let client :: ClientApp ()
-        client conn = do
-          hello <- receiveData conn :: IO BL.ByteString
-          case A.decode hello :: Maybe A.Value of
-            Just _ -> pure ()
-            Nothing -> error "expected hello JSON"
-          -- The server sends an initial lists snapshot after hello.
-          _lists <- receiveData conn :: IO BL.ByteString
-          broadcastLists broker (A.object ["tabs" A..= ([] :: [String])])
-          threadDelay 100000
-          msg <- receiveData conn :: IO BL.ByteString
-          case A.decode msg :: Maybe A.Value of
-            Just _ -> pure ()
-            Nothing -> error "expected an event JSON"
-    runClient "127.0.0.1" port "/" client
+    testWithApplication (pure (streamMiddleware guard broker fallbackApp)) $ \port -> do
+      let client :: ClientApp ()
+          client conn = do
+            hello <- receiveData conn :: IO BL.ByteString
+            case A.decode hello :: Maybe A.Value of
+              Just _ -> pure ()
+              Nothing -> error "expected hello JSON"
+            -- The server sends an initial lists snapshot after hello.
+            _lists <- receiveData conn :: IO BL.ByteString
+            broadcastLists broker (A.object ["tabs" A..= ([] :: [String])])
+            -- Give the server's per-connection subscription a moment to
+            -- register before the frame is broadcast; without it the frame is
+            -- sent to zero subscribers. This is a protocol-ordering wait, not
+            -- a startup race — the connection is already established here.
+            threadDelay 100000
+            msg <- receiveData conn :: IO BL.ByteString
+            case A.decode msg :: Maybe A.Value of
+              Just _ -> pure ()
+              Nothing -> error "expected an event JSON"
+      runClient "127.0.0.1" port "/" client
 
   it "GET /api/tabs returns 200 via the assembled gateway" $ do
     tabsH <- newTabsHandle
@@ -188,6 +205,7 @@ spec = describe "Seal.Phase7aSpec" $ do
           , adAgentDefs = adb
           , adSkills = skills
           , adProviders = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState = uiState
           , adSend = Nothing
           , adDefaultAgent = pure Nothing

@@ -85,6 +85,80 @@ describe('ProviderStep', () => {
     }
   })
 
+  // D7: requires_base_url means REQUIRED, not VISIBLE. Ollama's base URL is
+  // optional but it is the only GUI path to a remote daemon, so the wizard
+  // must render the field for it. Driving showBaseUrl off requires_base_url
+  // hides it, which is the conflation D7 exists to forbid.
+  it('item 41b (wizard): Ollama still shows an editable Base URL', () => {
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ id: 'ollama', label: 'Ollama', requires_base_url: false })]}
+        onDone={() => {}}
+      />,
+    )
+    // The list auto-selects the first provider, so this card drives the form.
+    expect(screen.getByLabelText(/base url/i)).toBeInTheDocument()
+  })
+
+  // Rendering alone is NOT enough: a payload gated on requires_base_url would
+  // render the field and then silently drop the typed URL, and only an
+  // assertion on the SUBMITTED BODY can see that.
+  it('item 41b (wizard): the typed Ollama base URL is SUBMITTED', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, {}))
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ id: 'ollama', label: 'Ollama', requires_base_url: false })]}
+        onDone={() => {}}
+      />,
+    )
+    fireEvent.change(screen.getByLabelText(/base url/i), {
+      target: { value: 'http://192.168.1.9:11434' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /^save$/i }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+    const body = (fetchMock.mock.calls[0]?.[1] as RequestInit).body as string
+    expect(body).toContain('192.168.1.9:11434')
+  })
+
+  // OpenRouter supplies a specific endpoint, so the wizard must not ask.
+  it('OpenRouter hides the Base URL field in the wizard', () => {
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ id: 'openrouter', label: 'OpenRouter', requires_base_url: false })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.queryByLabelText(/base url/i)).not.toBeInTheDocument()
+  })
+
+  // ...while Anthropic still shows it (its endpoint is fixed inside the
+  // provider, so the field is inert but historically visible).
+  it('Anthropic still shows the Base URL field in the wizard', () => {
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ id: 'anthropic', label: 'Anthropic' })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.getByLabelText(/base url/i)).toBeInTheDocument()
+  })
+
+  // The counterpart: a built-in endpoint means the wizard must NOT ask.
+  it('item 44 (wizard): an openai card renders no Base URL field', () => {
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ id: 'openai', label: 'OpenAI', requires_base_url: false, requires_name: false })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.queryByLabelText(/base url/i)).not.toBeInTheDocument()
+  })
+
   it('renders loading, fetch-error and empty states', async () => {
     const { rerender } = render(<ProviderStep step={step()} providers={[]} onDone={() => {}} />)
     expect(screen.getByText(/no providers are available/i)).toBeInTheDocument()
@@ -122,12 +196,167 @@ describe('ProviderStep', () => {
     }))
   })
 
+  // ── The provider list carries no status pills ────────────────────────
+  //
+  // The operator is choosing between names here. "configured" / "no
+  // credential" / "Ready · 10 Models" are not decision inputs: readiness is
+  // acted on at the point it matters — the CTA for the chosen provider — not
+  // as decoration beside every name.
+
+  it('renders no status pill beside any provider name', () => {
+    render(
+      <ProviderStep
+        step={step({ detail: 'ollama · llama3.2' })}
+        providers={[
+          card({ id: 'ollama', label: 'Ollama', configured: true, readiness: 'ready', readiness_models: 10 }),
+          card({ id: 'anthropic', configured: true }),
+          card({ id: 'openrouter', configured: false }),
+        ]}
+        onDone={() => {}}
+      />,
+    )
+    for (const id of ['ollama', 'anthropic', 'openrouter']) {
+      expect(screen.queryByTestId(`setup-provider-pill-${id}`)).toBeNull()
+      expect(screen.queryByTestId(`setup-provider-hint-${id}`)).toBeNull()
+    }
+    // The stale strings must not appear anywhere in the list either.
+    expect(screen.queryByText('no credential')).toBeNull()
+    expect(screen.queryByText('configured')).toBeNull()
+    expect(screen.queryByText(/Ready · 10 Models/)).toBeNull()
+  })
+
+  it('still shows each provider name and the default marker', () => {
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[
+          card({ id: 'anthropic', configured: true, isDefault: true }),
+          card({ id: 'ollama', label: 'Ollama', configured: true, readiness: 'ready', readiness_models: 10 }),
+        ]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.getByText('Anthropic')).toBeDefined()
+    expect(screen.getByText('Ollama')).toBeDefined()
+    // `default` is the one badge that IS a decision input, so it stays.
+    expect(screen.getByText('default')).toBeDefined()
+  })
+
+  // ── Unusable provider: disable the CTA, explain, and stay escapable ──
+
+  it('disables `Use Ollama` when Ollama is not running', () => {
+    render(
+      <ProviderStep
+        step={step({ detail: 'ollama · llama3.2' })}
+        providers={[card({ id: 'ollama', label: 'Ollama', configured: true, readiness: 'not-running' })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.getByRole('button', { name: /use ollama/i })).toBeDisabled()
+  })
+
+  it('explains why, and names the remedy', () => {
+    render(
+      <ProviderStep
+        step={step({ detail: 'ollama · llama3.2' })}
+        providers={[card({ id: 'ollama', label: 'Ollama', configured: true, readiness: 'not-running' })]}
+        onDone={() => {}}
+      />,
+    )
+    const note = screen.getByTestId('setup-provider-blocked')
+    expect(note.textContent).toContain('ollama serve')
+  })
+
+  it.each(['not-installed', 'not-running', 'no-models'] as const)(
+    'blocks selection for %s',
+    (readiness) => {
+      render(
+        <ProviderStep
+          step={step({ detail: 'ollama · llama3.2' })}
+          providers={[card({ id: 'ollama', label: 'Ollama', configured: true, readiness })]}
+          onDone={() => {}}
+        />,
+      )
+      expect(screen.getByRole('button', { name: /use ollama/i })).toBeDisabled()
+      expect(screen.getByTestId('setup-provider-blocked')).toBeDefined()
+    },
+  )
+
+  it.each(['pending', 'unknown', 'cloud', 'no-fitting-model'] as const)(
+    'does NOT block selection for %s (not a claim of absence, or advisory)',
+    (readiness) => {
+      render(
+        <ProviderStep
+          step={step({ detail: 'ollama · llama3.2' })}
+          providers={[card({ id: 'ollama', label: 'Ollama', configured: true, readiness })]}
+          onDone={() => {}}
+        />,
+      )
+      expect(screen.getByRole('button', { name: /use ollama/i })).toBeEnabled()
+      expect(screen.queryByTestId('setup-provider-blocked')).toBeNull()
+    },
+  )
+
+  it('a ready Ollama is selectable', () => {
+    render(
+      <ProviderStep
+        step={step({ detail: 'ollama · llama3.2' })}
+        providers={[card({
+          id: 'ollama', label: 'Ollama', configured: true,
+          readiness: 'ready', readiness_models: 10,
+        })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.getByRole('button', { name: /use ollama/i })).toBeEnabled()
+  })
+
+  it('a card with no readiness at all stays selectable (non-Ollama)', () => {
+    render(
+      <ProviderStep step={step()} providers={[card({ id: 'anthropic', configured: true })]} onDone={() => {}} />,
+    )
+    expect(screen.getByRole('button', { name: /use anthropic/i })).toBeEnabled()
+  })
+
+  it('offers a two-step escape hatch so an unusable Ollama cannot hard-block setup', async () => {
+    // Ollama's `configured` is true from config alone, so on a machine that
+    // never installed it `required_complete` is already true and this wizard is
+    // the only screen the operator sees. A disabled button with no way forward
+    // would lock them out of the product.
+    const onDone = vi.fn()
+    render(
+      <ProviderStep
+        step={step({ detail: 'ollama · llama3.2' })}
+        providers={[card({ id: 'ollama', label: 'Ollama', configured: true, readiness: 'not-running' })]}
+        onDone={onDone}
+      />,
+    )
+    fireEvent.click(screen.getByTestId('setup-provider-skip'))
+    // Asks once, and says what the consequence is.
+    expect(screen.getByTestId('setup-provider-skip-confirm')).toBeDefined()
+    expect(screen.getByText(/messages will fail until/i)).toBeDefined()
+    expect(onDone).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByTestId('setup-provider-skip-confirm'))
+    expect(onDone).toHaveBeenCalled()
+  })
+
+  it('the escape hatch is absent when the provider is usable', () => {
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ id: 'anthropic', configured: true })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.queryByTestId('setup-provider-skip')).toBeNull()
+  })
+
   it('requires a base URL and a unique name for the generic OpenAI-compatible provider', async () => {
     fetchMock.mockResolvedValue(jsonResponse(201, { name: 'openai' }))
     render(
       <ProviderStep
         step={step()}
-        providers={[card({ id: 'openai', label: 'OpenAI-compatible', requires_base_url: true, requires_name: true })]}
+        providers={[card({ id: 'openai-compatible', label: 'OpenAI-compatible', requires_base_url: true, requires_name: true })]}
         onDone={() => {}}
       />,
     )
@@ -148,7 +377,7 @@ describe('ProviderStep', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/providers', expect.objectContaining({
       body: JSON.stringify({
         name: 'local-vllm',
-        type: 'openai',
+        type: 'openai-compatible',
         api_key: 'sk-local',
         base_url: 'http://localhost:8000/v1',
         models: [],
@@ -181,10 +410,14 @@ describe('ProviderStep', () => {
     expect(models.value).toBe('claude-opus-4-8\nclaude-sonnet-4')
   })
 
-  it('sends no base_url for providers that have a built-in endpoint', async () => {
+  // D7's visibility table: anthropic's base URL is VISIBLE (today's behaviour)
+  // even though it is not required, and an empty one is not sent. The old
+  // version of this test asserted the field was absent, encoding the
+  // over-broad "hidden for every built-in endpoint" rule that D7 replaces.
+  it('sends no base_url for a provider whose field was left empty', async () => {
     fetchMock.mockResolvedValue(jsonResponse(201, { name: 'anthropic' }))
     render(<ProviderStep step={step()} providers={[card()]} onDone={() => {}} />)
-    expect(screen.queryByLabelText(/api endpoint/i)).toBeNull()
+    expect(screen.getByLabelText(/api endpoint/i)).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText(/api key/i), { target: { value: 'sk-ant' } })
     fireEvent.click(screen.getByRole('button', { name: /^save$/i }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalled())

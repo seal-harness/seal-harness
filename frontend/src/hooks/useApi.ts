@@ -740,6 +740,15 @@ export function useConfiguredProviders() {
     return () => window.removeEventListener(PROVIDERS_CHANGED_EVENT, handler)
   }, [refresh])
 
+  // Design D2.5: re-fetch on window focus, for the same reason as
+  // useAllProviders — the dropdowns annotate Ollama's observed readiness, and
+  // that changes while the page sits idle.
+  useEffect(() => {
+    const onFocus = () => refresh()
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [refresh])
+
   return { providers, loaded, refresh }
 }
 
@@ -891,6 +900,16 @@ export function useAllProviders() {
     })
     return () => { cancelled = true }
   }, [refreshCount])
+
+  // Design D2.5: re-fetch when the window regains focus. Readiness is observed
+  // state that changes out of band (the operator starts or stops the daemon),
+  // and this endpoint is otherwise only fetched on mount + mutation — so
+  // without this a healthy daemon stays shown as "Not Running" indefinitely.
+  useEffect(() => {
+    const onFocus = () => refresh()
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [refresh])
 
   return { providers, loaded, error, refresh }
 }

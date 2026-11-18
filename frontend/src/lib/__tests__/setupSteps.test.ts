@@ -77,6 +77,49 @@ describe('parseSetupState', () => {
     expect(parsed.unknownStatuses).toEqual(['waiting-for-godot'])
   })
 
+  // Test 41: the destructure whitelist would otherwise silently drop the new
+  // fields, and every card would render as if the server had sent nothing.
+  it('preserves readiness and readiness_models (test 41)', () => {
+    const parsed = parseSetupState({
+      ...wire,
+      providers: [
+        {
+          id: 'ollama', label: 'Ollama', configured: true, isDefault: false,
+          default_model: 'llama3.2', requires_base_url: false, requires_name: false,
+          readiness: 'ready', readiness_models: 3,
+        },
+      ],
+    })
+    expect(parsed?.providers[0]?.readiness).toBe('ready')
+    expect(parsed?.providers[0]?.readiness_models).toBe(3)
+  })
+
+  it('preserves a readiness state with no count', () => {
+    const parsed = parseSetupState({
+      ...wire,
+      providers: [
+        { id: 'ollama', label: 'Ollama', configured: true, isDefault: false, default_model: null, readiness: 'not-running' },
+      ],
+    })
+    expect(parsed?.providers[0]?.readiness).toBe('not-running')
+    expect(parsed?.providers[0]?.readiness_models).toBeUndefined()
+  })
+
+  it('omits readiness entirely for a non-Ollama card (the absent-field fallback)', () => {
+    const parsed = parseSetupState(wire)
+    expect(parsed?.providers[0]?.readiness).toBeUndefined()
+  })
+
+  it('drops an unrecognised readiness value rather than passing it through', () => {
+    const parsed = parseSetupState({
+      ...wire,
+      providers: [
+        { id: 'ollama', label: 'Ollama', configured: true, isDefault: false, default_model: null, readiness: 'sentient' },
+      ],
+    })
+    expect(parsed?.providers[0]?.readiness).toBeUndefined()
+  })
+
   it('rejects a malformed payload', () => {
     expect(parseSetupState(null)).toBeNull()
     expect(parseSetupState('nope')).toBeNull()

@@ -76,20 +76,20 @@ call PUT /api/providers/default '{"provider":"anthropic"}'; show
 say "8. POST /api/providers/nope/test (unknown provider: 400)"
 call POST /api/providers/nope/test '{}'; show
 
-say "8b. POST /api/providers {name:openai, api_key} with NO base_url"
-call POST /api/providers '{"name":"openai","api_key":"sk-local"}'; show
+say "8b. POST /api/providers {name:local-vllm, type:openai-compatible} with NO base_url (400: the endpoint is required)"
+call POST /api/providers '{"name":"local-vllm","type":"openai-compatible","api_key":"sk-local"}'; show
 
-say "8c. POST /api/providers/openai/test (fails closed: the endpoint is required)"
-call POST /api/providers/openai/test '{}'; show
+say "8c. POST /api/providers/local-vllm/test (unknown: the create was refused)"
+call POST /api/providers/local-vllm/test '{}'; show
 
-say "8d. POST /api/providers {name:openai, base_url: a local endpoint}"
-call POST /api/providers '{"name":"openai","api_key":"sk-local","base_url":"http://127.0.0.1:18090/v1"}'; show
+say "8d. POST /api/providers {name:local-vllm, type:openai-compatible, base_url: a local endpoint}"
+call POST /api/providers '{"name":"local-vllm","type":"openai-compatible","api_key":"sk-local","base_url":"http://127.0.0.1:18090/v1"}'; show
 
-say "8e. GET /api/setup (the OpenAI-compatible card is now configured)"
+say "8e. GET /api/setup (the openai-compatible type is keyed; local-vllm is a custom instance)"
 call GET /api/setup; show
 
-say "8f. POST /api/providers/openai/test (nothing listening: 200 ok:false)"
-call POST /api/providers/openai/test '{}'; show
+say "8f. POST /api/providers/local-vllm/test (nothing listening: 200 ok:false)"
+call POST /api/providers/local-vllm/test '{}'; show
 
 say "9. POST /api/setup/vault/reopen (on_demand: already openable)"
 call POST /api/setup/vault/reopen '{}'; show

@@ -200,6 +200,9 @@ import qualified Seal.Providers.ClassSpec
 import qualified Seal.Channels.ConfigSpec
 import qualified Seal.Providers.OpenRouterSpec
 import qualified Seal.Providers.OllamaSpec
+import qualified Seal.Providers.OllamaReadinessSpec
+import qualified Seal.Providers.OllamaReadinessProbeSpec
+import qualified Seal.Command.ServeWiringSpec
 import qualified Seal.Providers.ContextWindowSpec
 import qualified Seal.Providers.RegistrySpec
 import qualified Seal.Agent.LoopSpec
@@ -428,6 +431,9 @@ specs = do
   Seal.Providers.ClassSpec.spec
   Seal.Providers.ContextWindowSpec.spec
   Seal.Providers.OllamaSpec.spec
+  Seal.Providers.OllamaReadinessSpec.spec
+  Seal.Providers.OllamaReadinessProbeSpec.spec
+  Seal.Command.ServeWiringSpec.spec
   Seal.Providers.OpenRouterSpec.spec
   Seal.Providers.RegistrySpec.spec
   Seal.Agent.LoopSpec.spec

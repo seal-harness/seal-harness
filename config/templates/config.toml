@@ -102,7 +102,10 @@ orchestrator_enabled = true
 # Route every child to a different provider or model, or to a direct
 # OpenAI-compatible endpoint (base_url + api_key + api_mode, where api_mode is
 # "chat_completions" or "anthropic_messages").
-# provider = "openai"
+#
+# For a self-hosted endpoint the provider id is the generic type,
+# "openai-compatible" ("openai" is real OpenAI and needs no base_url):
+# provider = "openai-compatible"
 # model    = "gpt-5"
 # base_url = "http://localhost:11434/v1"
 # api_key  = "<key>"
