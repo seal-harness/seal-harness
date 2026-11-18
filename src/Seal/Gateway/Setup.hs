@@ -371,7 +371,7 @@ handleProviderTest env rawName req = do
   if not known
     then pure (setupErr status400
       ("unknown provider: " <> rawName)
-      (Just "known providers: anthropic, openrouter, ollama, or a configured OpenAI-compatible instance"))
+      (Just "known providers: anthropic, ollama, ollama-cloud, openrouter, openai, or a configured OpenAI-compatible instance"))
     else do
       mhandle <- readIORef (seHandleRef env)
       case mhandle of

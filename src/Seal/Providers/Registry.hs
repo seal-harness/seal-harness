@@ -24,6 +24,8 @@ module Seal.Providers.Registry
   , resolveProviderByName
   , providerBaseUrlFor
   , providerBaseUrlForName
+  , providerRequiresBaseUrl
+  , providerRequiresName
   , customProviderNames
   , configuredCustomProviderNames
   , configuredProviderNames
@@ -342,6 +344,21 @@ providerBaseUrlFor cfg kp =
 
 -- | The effective base URL for a provider name. Custom names have no
 -- built-in default: the empty string means "not configured".
+-- | Must the operator SUPPLY a base URL for this type? This is a *validation*
+-- question, not a visibility one: Ollama's base URL is optional yet must still
+-- be shown, because it is the only GUI path to a remote daemon (D7). Keeping
+-- this in the registry means the setup wizard, the Providers page and the
+-- resolver all read one definition instead of three hardcoded lists.
+providerRequiresBaseUrl :: KnownProvider -> Bool
+providerRequiresBaseUrl OpenAICompatibleProvider = True
+providerRequiresBaseUrl _ = False
+
+-- | Must the operator supply an instance name? Only the generic type does: a
+-- built-in's name is its id.
+providerRequiresName :: KnownProvider -> Bool
+providerRequiresName OpenAICompatibleProvider = True
+providerRequiresName _ = False
+
 providerBaseUrlForName :: RuntimeConfig -> Text -> Text
 providerBaseUrlForName cfg name
   | Just kp <- parseProvider name = providerBaseUrlFor cfg kp

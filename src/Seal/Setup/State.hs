@@ -45,6 +45,7 @@ import Seal.Core.Types (ModelId (..))
 import Seal.Providers.OllamaReadiness (OllamaReadiness (..))
 import Seal.Providers.Registry
   ( KnownProvider (..), knownProviders, providerLabel
+  , providerRequiresBaseUrl, providerRequiresName
   , configuredCustomProviderNames, resolveDefaultModelForName )
 import Seal.Security.Vault (VaultHandle (vhStatus), VaultStatus (..))
 
@@ -334,12 +335,8 @@ providerCards inputs configured readiness =
       , pcIsDefault = rcDefaultProvider (siRuntime inputs) == Just (providerLabel known)
       , pcDefaultModel = providerDefaultModel (siRuntime inputs) (providerLabel known)
       , pcModels = providerModels (siRuntime inputs) (providerLabel known)
-      , pcRequiresBaseUrl = case known of
-          OpenAICompatibleProvider -> True
-          _ -> False
-      , pcRequiresName = case known of
-          OpenAICompatibleProvider -> True
-          _ -> False
+      , pcRequiresBaseUrl = providerRequiresBaseUrl known
+      , pcRequiresName = providerRequiresName known
       , pcReadiness = case known of
           OllamaProvider -> Just readiness
           _ -> Nothing

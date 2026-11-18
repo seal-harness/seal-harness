@@ -16,7 +16,7 @@ import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromJust, isJust, listToMaybe, mapMaybe)
+import Data.Maybe (fromJust, fromMaybe, isJust, listToMaybe, mapMaybe)
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -4515,6 +4515,95 @@ spec = describe "Seal.Gateway.API" $ do
     status `shouldBe` 200
     (A.decode body :: Maybe [A.Value]) `shouldBe` Just []
 
+  -- Items 26-27: /api/providers/all carries the two 1:1 booleans, and a custom
+  -- instance is typed openai-compatible. Uses the real temp-config harness so
+  -- the routes see a genuine install.
+  it "items 26-27: /api/providers/all carries requiresBaseUrl/requiresName" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      (status, body) <- runAppBody (apiApp deps)
+        (testRequest methodGet ["api", "providers", "all"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode providers/all: " ++ show body)
+          row n = [ o | A.Object o <- arr, lookupK "name" o == Just (A.String n) ]
+          boolAt n k = case row n of
+            (o:_) -> case lookupK k o of
+              Just (A.Bool b) -> Just b
+              _ -> Nothing
+            [] -> Nothing
+      -- Only the generic type requires an operator-supplied endpoint and name.
+      boolAt "openai-compatible" "requiresBaseUrl" `shouldBe` Just True
+      boolAt "openai-compatible" "requiresName" `shouldBe` Just True
+      boolAt "openai" "requiresBaseUrl" `shouldBe` Just False
+      boolAt "openai" "requiresName" `shouldBe` Just False
+      boolAt "ollama-cloud" "requiresBaseUrl" `shouldBe` Just False
+      boolAt "ollama-cloud" "requiresName" `shouldBe` Just False
+      -- Ollama's base URL is optional but STILL SHOWN, so the flag is False
+      -- while the field renders (D7: required is not visible).
+      boolAt "ollama" "requiresBaseUrl" `shouldBe` Just False
+
+  -- Item 27b: the PUT path's typeId (resolveExistingTarget) is a SECOND
+  -- literal from the create path's; a create-only test cannot see it.
+  it "item 27b: a PUT on a custom instance echoes type openai-compatible" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("local-vllm" :: T.Text)
+          , "type" .= ("openai-compatible" :: T.Text)
+          , "api_key" .= ("sk-local" :: T.Text)
+          , "base_url" .= ("http://localhost:8000/v1" :: T.Text)
+          ]))
+      (createStatus, _) <- runAppBody app req
+      createStatus `shouldBe` 201
+      putReq <- testPut ["api", "providers", "local-vllm"]
+        (A.encode (A.object [ "default_model" .= ("my-model" :: T.Text) ]))
+      (status, body) <- runAppBody app putReq
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) ->
+          lookupK "type" o `shouldBe` Just (A.String "openai-compatible")
+        _ -> expectationFailure "expected a JSON object"
+
+  -- Item 33: a custom instance must NOT inherit Ollama readiness. The typeId
+  -- guard at API.hs:3246 becomes a tautology if it still says "openai".
+  it "item 33: a custom instance carries no readiness keys" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("local-vllm" :: T.Text)
+          , "type" .= ("openai-compatible" :: T.Text)
+          , "api_key" .= ("sk-local" :: T.Text)
+          , "base_url" .= ("http://localhost:8000/v1" :: T.Text)
+          ]))
+      (createStatus, _) <- runAppBody app req
+      createStatus `shouldBe` 201
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "providers", "all"])
+      let arr = fromMaybe [] (A.decode body :: Maybe [A.Value])
+          row = [ o | A.Object o <- arr, lookupK "name" o == Just (A.String "local-vllm") ]
+      case row of
+        (o:_) -> do
+          lookupK "readiness" o `shouldBe` Nothing
+          lookupK "readinessModels" o `shouldBe` Nothing
+        [] -> expectationFailure "custom instance missing from providers/all"
+
   it "GET /api/providers/unknown/models returns 200 with []" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "providers", "unknown", "models"])
@@ -4874,7 +4963,7 @@ spec = describe "Seal.Gateway.API" $ do
       req <- testPost ["api", "providers"]
         (A.encode (A.object
           [ "name" .= ("local-vllm" :: T.Text)
-          , "type" .= ("openai" :: T.Text)
+          , "type" .= ("openai-compatible" :: T.Text)
           , "api_key" .= ("sk-local" :: T.Text)
           , "base_url" .= ("http://localhost:8000/v1" :: T.Text)
           ]))
@@ -4883,7 +4972,7 @@ spec = describe "Seal.Gateway.API" $ do
       case A.decode body :: Maybe A.Value of
         Just (A.Object o) -> do
           lookupK "name" o `shouldBe` Just (A.String "local-vllm")
-          lookupK "type" o `shouldBe` Just (A.String "openai")
+          lookupK "type" o `shouldBe` Just (A.String "openai-compatible")
           lookupK "authStatus" o `shouldBe` Just (A.String "api-key")
         _ -> expectationFailure "expected JSON object"
       eCfg <- loadRuntimeConfig (cfgRoot </> "config.toml")
@@ -4922,7 +5011,7 @@ spec = describe "Seal.Gateway.API" $ do
       req <- testPost ["api", "providers"]
         (A.encode (A.object
           [ "name" .= ("local-vllm" :: T.Text)
-          , "type" .= ("openai" :: T.Text)
+          , "type" .= ("openai-compatible" :: T.Text)
           , "api_key" .= ("sk-local" :: T.Text)
           , "base_url" .= ("http://localhost:9000/v1" :: T.Text)
           ]))
@@ -4936,7 +5025,7 @@ spec = describe "Seal.Gateway.API" $ do
     req <- testPost ["api", "providers"]
       (A.encode (A.object
         [ "name" .= ("Bad Name" :: T.Text)
-        , "type" .= ("openai" :: T.Text)
+        , "type" .= ("openai-compatible" :: T.Text)
         , "api_key" .= ("k" :: T.Text)
         , "base_url" .= ("http://localhost:8000/v1" :: T.Text)
         ]))

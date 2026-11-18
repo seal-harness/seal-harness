@@ -11,8 +11,17 @@ const LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
   openrouter: 'OpenRouter',
   ollama: 'Ollama',
-  openai: 'OpenAI-compatible',
+  'ollama-cloud': 'Ollama Cloud',
+  openai: 'OpenAI',
+  // The generic type. Its id no longer disambiguates it from real OpenAI, so
+  // dropdowns use the longer form (see DISAMBIGUATED below).
+  'openai-compatible': 'OpenAI-compatible',
 }
+
+/** The dropdown option text for the generic type. Kept separate from the short
+ *  label so the two strings cannot be confused for one another (design item
+ *  39). */
+export const OPENAI_COMPATIBLE_OPTION = 'OpenAI-compatible (custom / self-hosted)'
 
 export function providerLabel(id: string): string {
   const known = LABELS[id.toLowerCase()]

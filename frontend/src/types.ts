@@ -298,9 +298,10 @@ export interface ProviderDetail {
   /** The usable-model count for `readiness: 'ready'`. camelCase here: this
    *  endpoint is a 1:1 wire mapping like `authStatus`/`isDefault`. */
   readinessModels?: number
-  /** The provider implementation ("anthropic", "ollama", "openrouter",
-   *  "openai"). For a custom OpenAI-compatible instance `name` is the
-   *  operator-chosen unique name and `type` is "openai". */
+  /** The provider implementation ("anthropic", "ollama", "ollama-cloud",
+   *  "openrouter", "openai", "openai-compatible"). For a custom
+   *  OpenAI-compatible instance `name` is the operator-chosen unique name and
+   *  `type` is "openai-compatible". */
   type?: string
   isDefault: boolean
   defaultModel: string | null
@@ -308,6 +309,12 @@ export interface ProviderDetail {
   models: string[]
   baseUrl: string | null
   authStatus: ProviderAuthStatus
+  /** Whether the operator must SUPPLY a base URL / unique name. This is a
+   *  validation question, NOT a visibility one: Ollama's base URL is optional
+   *  yet must still be shown, because it is the only GUI path to a remote
+   *  daemon (design D7). */
+  requiresBaseUrl: boolean
+  requiresName: boolean
 }
 
 /** The body for POST /api/providers and PUT /api/providers/:name. The
