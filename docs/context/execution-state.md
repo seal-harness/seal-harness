@@ -1,24 +1,26 @@
 # Execution State
-<!-- updated: 2026-11-14 -->
+<!-- updated: 2026-11-18 -->
 
 ## Current Position
-- Active work unit: none — all work units done
-- Current phase: —
-- Retry count: 0
+- Active work unit: final review
+- Current phase: FINAL REVIEW (cross-unit)
+- Retry count: 0 (WU1 closed on retry 1)
 
 ## Work Unit Status
-| WU | Status | Phase | Retries | Commit |
-|----|--------|-------|---------|--------|
-| WU-1 | COMPLETE | COMMITTED | 1 | e4d8e50 |
-| WU-2 | COMPLETE | COMMITTED | 0 | df18a2d |
-| WU-3 | COMPLETE | COMMITTED | 0 | 7fe6ed7 |
-| WU-4 | COMPLETE | COMMITTED | 0 | 8e979a6 |
-| WU-5 | COMPLETE | COMMITTED | 0 | cdc56ec |
-| WU-6 | COMPLETE | COMMITTED | 0 | (this file + handoff) |
+| WU | Status | Phase | Retries |
+|----|--------|-------|---------|
+| WU1 KnownProvider vocabulary sweep | COMPLETE | COMMITTED a049a32 | 1 |
+| WU2 setup state (P4 copy, cards) | COMPLETE | COMMITTED 62cd96b | 0 |
+| WU3 wire rename + both forms | COMPLETE | COMMITTED 80f702b | 0 |
 
-## Gate status
-- `cabal build all` clean
-- `cabal test`: 4310 examples, 0 failures, 41 pending
-- `hlint src/ test/ src-gateway-types/`: No hints
-- `tsc --noEmit`: clean
-- `vitest run`: 1031 tests, 43 files, all pass
+## Carried into WU3
+- Wizard Base URL visibility fix (ProviderStep.tsx:257) + parked tests in
+  /tmp/carry_wizard_tests.txt. D7's "wizard needs no change" claim was false;
+  corrected, item 41b-wizard added as RED.
+
+## Completed
+All three units committed. make check green: 4693 backend / 0 failures,
+1135 frontend tests, hlint "No hints".
+
+## Blocked / Escalated
+none

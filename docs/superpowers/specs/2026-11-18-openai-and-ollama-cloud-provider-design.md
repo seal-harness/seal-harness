@@ -197,10 +197,20 @@ provider list in TypeScript.
   otherwise need its own hardcoded `type` map — a second source of truth that
   can drift from the registry. For custom instances both are `True`.
 
-Consequence: the wizard needs **no** change to its field-visibility logic
-(`needsBaseUrl` / `needsName` already gate `showBaseUrl` and the Unique name
-input). The Providers page replaces its hardcoded `formName === 'openai'`
-special-cases with these two flags.
+**The wizard DOES need a change, and this paragraph previously claimed it did
+not — that claim was false.** `ProviderStep.tsx:257` passes
+`showBaseUrl={needsBaseUrl}` where `needsBaseUrl = card?.requires_base_url ===
+true` (`:129`). Since `requires_base_url` is `False` for Ollama, that drives
+visibility off *required* and **hides the remote-daemon field in the wizard** —
+verbatim the conflation the table below forbids. Confirmed empirically: a test
+rendering the wizard with an Ollama card finds no Base URL field.
+
+`needsName` is correct as-is (`requires_name` *is* the visibility question for
+the unique-name input: only a custom instance has one). Only the Base URL
+predicate is wrong. Both forms therefore take `showBaseUrl` from a single
+`isHiddenBaseUrl` predicate (true for exactly `openai` and `ollama-cloud`), and
+`requiresBaseUrl` keeps its validation job. Item 41b pins the wizard half; the
+Providers page half was already pinned.
 
 **`requiresBaseUrl` means REQUIRED, not VISIBLE — they are different questions.**
 `pcRequiresBaseUrl` is true only for `OpenAICompatibleProvider` (`State.hs:337-342`);
@@ -483,7 +493,7 @@ the new types), `Seal.Providers.ContextWindow` (D10), the ISA, any opcode.
 | `frontend/src/lib/providerLabels.ts` | labels for `openai` / `ollama-cloud` / `openai-compatible`. The generic row renders **"OpenAI-compatible (custom / self-hosted)"** in dropdowns, since the id no longer disambiguates it from real OpenAI. |
 | `frontend/src/components/ProvidersView.tsx` | label map; drive Base URL visibility from `isHiddenBaseUrl` and Unique name from `requiresName` (when creating, both from the dropdown's own `ProviderDetail` row — D7), **not** from a generic 'flags' notion that could be misread as `requiresBaseUrl` instead of `formName === 'openai'`; **pass `showBaseUrl` explicitly at the `ProviderFormFields` call site** (and `showModels`/`showDefaultModel` as `true` — no flag drives them and no behavioural change is intended) (it currently omits `showBaseUrl`, which defaults to `true`, so edit renders Base URL for every provider); **gate the submitted payload on `!isHiddenBaseUrl` (not `requiresBaseUrl`), and clear `baseUrl`/`uniqueName` when `formName` changes** (RG-2); custom-instance `type: 'openai-compatible'`; reserved-name set. |
 | `frontend/src/components/ProviderFormFields.tsx` | `isOpenAIType` → `isOpenAICompatible` (the generic type's placeholder/hint); no visibility logic change — `showBaseUrl` already exists. |
-| `frontend/src/components/setup/ProviderStep.tsx` | reserved-name array **and the `saveKey` POST body (~`:147`)**, which sends `type: 'openai'` for a custom instance and becomes a 400 after D8. Field visibility already correct via `requires_base_url` / `requires_name`. |
+| `frontend/src/components/setup/ProviderStep.tsx` | reserved-name array; the `saveKey` POST body (~`:147`), which sends `type: 'openai'` for a custom instance and becomes a 400 after D8; **and the `showBaseUrl` predicate (~`:257`)**, which currently drives *visibility* off `requires_base_url` and so hides Ollama's optional-but-essential Base URL (D7, item 41b-wizard). |
 | `frontend/src/components/ProviderModelFields.tsx`, `frontend/src/components/AgentsView.tsx` | label maps. |
 | `frontend/src/components/ActiveTabs.tsx` | badge specs for `openai` and `ollama-cloud`. `ollama-cloud` reuses the bundled Ollama mark (same brand). `openai` needs a bundled mark; if none is available, a lettered chip (`char: 'O'`) is the established pattern (Anthropic uses `char: 'A'`). This is **load-bearing, not cosmetic**: `handleProviderIconWith` reads the config-only `providerBaseUrl`, so a provider with only a built-in default 404s on icon fetch (pre-existing — Anthropic behaves this way today). |
 | `frontend/src/lib/setupSteps.ts` | comment only (`requires_*` parsing unchanged). |
@@ -552,6 +562,10 @@ covered without editing the test. Enumerating six values is not a property.
 13. **RED** `validateProviderName` rejects every built-in label — *property* over
     `map providerLabel knownProviders` (D9). This item auto-covers a future
     constructor.
+13b. **RED** The rejection **message** names a concrete alternative (D9:
+    "choose another name (for example \"my-openai-endpoint\")"). `isLeft` alone
+    lets the guidance be deleted with the suite green — a reviewer caught that
+    in WU1 round 1.
 14. **RED** `configuredProviders` with `OPENAI_API_KEY` stored ⇒ includes `OpenAIProvider`.
 15. **RED** `configuredProviders` with `OLLAMA_CLOUD_API_KEY` stored ⇒ includes `OllamaCloudProvider`.
 16. **RED** `configuredProviders` with no keys ⇒ neither new type (no keyless mode).
@@ -576,7 +590,9 @@ covered without editing the test. Enumerating six values is not a property.
      which is the reachable case.
 
 21b. **RED** An explicitly **empty** `base_url` fails closed, and does so for both
-    new types: `resolveProvider OpenAIProvider` with `[providers.openai] base_url = ""`
+    new types (two separate fixtures — `[providers.openai]` and
+    `[providers.ollama-cloud]`, since testing only one leaves the other path
+    unexercised; a reviewer caught exactly that omission in WU1 round 1): `resolveProvider OpenAIProvider` with `[providers.openai] base_url = ""`
     returns `Left` (it does **not** silently fall back to the built-in), and
     likewise for `ollama-cloud`. This is the one state in which the built-in
     default is *not* used, so it is worth pinning separately from item 11 —
@@ -587,6 +603,13 @@ covered without editing the test. Enumerating six values is not a property.
 21. **RED** `staticModelsFor OpenAIProvider` is non-empty and every id satisfies
     `modelContextWindow id > 0` (`Int`, so "non-zero" — the function returns
     `Int`, not `Maybe`). `staticModelsFor OllamaCloudProvider == []`.
+    **`staticModelsFor` is not exported**, so this item is reached through
+    `GET /api/providers/openai/models` (which emits `name` + `contextWindow`
+    per entry). Stating the route here is deliberate: this item went
+    unimplemented in WU1 round 1 precisely because "no exported function" was
+    mistaken for "not testable". The assertion must be written so publishing
+    the bare id `gpt-4o` fails it — `ContextWindow.hs:22`'s clause is
+    `"gpt-4o-"` with a trailing dash, so the bare id scores 0.
 
 ### 5.2 RED — setup state and HTTP surfaces
 
@@ -706,8 +729,18 @@ able to **finish**. These are the acceptance criteria for §1's benefit claim.
     fields and Save stays disabled until both are valid.
 43. **GUARD** Wizard: an `openai-compatible` card still renders both fields.
 44. **GUARD** Wizard: an `openai` / `ollama-cloud` card renders no base-URL and
-    no unique-name field (D7 says this already holds because the wizard gates on
-    the server flags — a guard, not new behaviour).
+    no unique-name field. (This genuinely already holds — the wizard hides both
+    for those ids — so it is a guard. **It passes today for the wrong reason**:
+    the field is hidden because `requires_base_url` is false for *every*
+    built-in endpoint, not because the id is OpenAI. Item 41b is what
+    distinguishes the two.)
+41b-wizard. **RED** Wizard: an `ollama` card **renders** an editable Base URL.
+    This **fails today**: `ProviderStep.tsx:257` drives `showBaseUrl` off
+    `needsBaseUrl` = `requires_base_url === true`, which is `false` for Ollama,
+    so a fresh-install operator cannot point at a remote daemon through the GUI
+    at all. D7 previously claimed the wizard needed no change; that claim was
+    false and is corrected in D7. Confirmed by a test that could not find the
+    field.
 
 ### 5.4b RED — vault retention and injectivity (security)
 

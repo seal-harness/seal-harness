@@ -106,16 +106,26 @@ Files:
   additive equations.
 - `test/Seal/Providers/RegistrySpec.hs` — items 1-21 (less removed 20b/20c) plus
   the four `RegistrySpec` updates.
+- `test/Seal/Gateway/ApiSpec.hs` and `test/Seal/Setup/StateSpec.hs` — **found
+  during execution, not in the original WU1 file list.** The 4-entry `byName`
+  provider map (`ApiSpec.hs:4460-4466`) and the 4-card vector
+  (`StateSpec.hs:118-131`) assert the OLD provider list, so they go red the
+  moment the constructors exist — exactly the `providerDisplayName` argument
+  one bullet down. Leaving them for WU2/WU3 would make WU1 an ungreen commit,
+  which is the thing WU1 exists to avoid. They are **updates to existing
+  assertions**, not new work, and their substantive new assertions (per-card
+  flags, `GET /api/setup` shapes) remain WU2's.
 
 TDD order (RED then GREEN, per item):
-1. Write the failing assertions for design items **1-21, 21b** and GUARD items **40, 41**
+1. Write the failing assertions for design items **1-13, 13b, 14-21, 21b** and
+   GUARD items **40, 41**
    (the generic type keeps `providerBaseUrlFor == ""`), plus the `RegistrySpec`
    updates in design §5.5.
 2. Add the constructors and make each site total until the suite is green.
 3. `make build && make test && make lint`.
 
 **DoD:** `make build` clean under `-Werror`; `make test` green; `make lint`
-reports "No hints"; design items 1-21, 21b and GUARD items 40, 41 pass.
+reports "No hints"; design items 1-21, 21b, 13b and GUARD items 40, 41 pass.
 
 **Explicitly NOT in WU1:** `resolveCreateTarget`, `resolveExistingTarget`,
 `customProviderDetailJson`, the `:715` literal, the `:3246` readiness guard (all
@@ -145,6 +155,14 @@ Files:
   `providerDetailJsonFor` gains `requiresBaseUrl`/`requiresName`.
   **Not** `handleProviderCreate` / `handleProviderUpdate` — unchanged (§3.1).
 - `src/Seal/Gateway/Setup.hs` — the "known providers" hint text (`:374`).
+- **`frontend/src/components/setup/ProviderStep.tsx` — the `showBaseUrl`
+  predicate (`:257`).** Found during WU2's adversarial review, confirmed by a
+  failing wizard test: the wizard drives Base URL *visibility* off
+  `requires_base_url`, which is `false` for Ollama, so **a fresh-install
+  operator cannot point at a remote Ollama daemon through the GUI at all**.
+  D7 previously asserted the wizard needed no change; that was false and is
+  corrected. Carry the parked tests (item 41b-wizard RED, item 44 GUARD) into
+  this unit.
 - `frontend/src/types.ts`, `lib/providerLabels.ts`, `ProvidersView.tsx`,
   `ProviderFormFields.tsx`, `setup/ProviderStep.tsx`, `ProviderModelFields.tsx`,
   `AgentsView.tsx`, `ActiveTabs.tsx`.
