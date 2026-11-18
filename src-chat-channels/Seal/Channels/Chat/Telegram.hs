@@ -24,7 +24,9 @@ import Data.Text qualified as T
 
 import System.IO (hPutStrLn, stderr)
 
-import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
+import Seal.Channels.Chat.Bubble qualified as Bubble
+import Seal.Channels.Chat.Class
+  (ChunkUnit (..), ChatChannel (..), ProgressStyle (..), QuestionOption (..))
 import Seal.Channels.Chat.TelegramCommands
   (BotCommand, commandsPayload)
 import Seal.Channels.Chat.Types
@@ -55,6 +57,11 @@ data TelegramChatTransport = TelegramChatTransport
     -- ^ Send a message: chat id, body.
   , tctSendWithId :: Text -> Text -> IO (Maybe Text)
     -- ^ Send a message and return the message_id.
+  , tctSendWithIdSilently :: Text -> Text -> IO (Maybe Text)
+    -- ^ Send a message with @disable_notification: true@ and return the
+    -- message_id. Used for a turn's progress bubble so that creating it does
+    -- not ping the human. 'Nothing' means the platform refused or the send
+    -- failed; the caller falls back to 'tctSendWithId' (which notifies).
   , tctSendWithKeyboard :: Text -> Text -> [[TelegramButton]] -> IO (Maybe Text)
     -- ^ Send a message with an inline keyboard: chat id, body, keyboard
     -- rows. Returns the message_id (for later keyboard removal).
@@ -82,25 +89,31 @@ instance A.ToJSON TelegramButton where
     , "callback_data" A..= cbd
     ]
 
--- | Chunk a message to the given character limit. Telegram's hard limit
--- is 4096; we leave headroom.
+-- | Split a reply to Telegram's message budget, breaking at the most natural
+-- boundary that fits (paragraph, line, sentence, clause, word).
+--
+-- Delegates to 'Seal.Channels.Chat.Bubble.chunkMessage'. The unit is UTF-16
+-- CODE UNITS, which is what Telegram's 4096 limit is expressed in -- not bytes
+-- (Signal's unit) and not code points ('T.length', which undercounts an emoji
+-- by half).
 chunkMessage :: Int -> Text -> [Text]
-chunkMessage limit msg
-  | T.length msg <= limit = [msg]
-  | otherwise = go msg
-  where
-    go t
-      | T.null t = []
-      | T.length t <= limit = [t]
-      | otherwise = T.take limit t : go (T.drop limit t)
+chunkMessage = Bubble.chunkMessage ChunkUtf16Units
 
 -- | A mock transport backed by a 'TQueue' of inbound messages and an
 -- 'IORef' of captured sends. For testing.
-mkMockTelegramChatTransport :: [ReceivedMessage] -> IO (TelegramChatTransport, IO [Text])
+--
+-- Returns the transport, a getter for the bodies sent through
+-- 'tctSend'/'tctSendWithId', and a getter for the @(id, body)@ edits — so a
+-- test can assert an edit landed on the message that was created.
+mkMockTelegramChatTransport
+  :: [ReceivedMessage]
+  -> IO (TelegramChatTransport, IO [Text], IO [(Text, Text)])
 mkMockTelegramChatTransport scripted = do
   q <- newTQueueIO
   mapM_ (atomically . writeTQueue q) scripted
   capRef <- newIORef []
+  editRef <- newIORef ([] :: [(Text, Text)])
+  silentRef <- newIORef ([] :: [(Bool, Text)])
   msgIdRef <- newIORef (0 :: Int)
   let transport = TelegramChatTransport
         { tctReceive = do
@@ -112,6 +125,12 @@ mkMockTelegramChatTransport scripted = do
         , tctSendWithId = \_c _b -> do
             n <- readIORef msgIdRef
             writeIORef msgIdRef (n + 1)
+            modifyIORef' silentRef ((False, _b) :)
+            pure (Just (T.pack (show (n + 1))))
+        , tctSendWithIdSilently = \_c _b -> do
+            n <- readIORef msgIdRef
+            writeIORef msgIdRef (n + 1)
+            modifyIORef' silentRef ((True, _b) :)
             pure (Just (T.pack (show (n + 1))))
         , tctSendWithKeyboard = \_c _b _kb -> do
             n <- readIORef msgIdRef
@@ -119,11 +138,14 @@ mkMockTelegramChatTransport scripted = do
             pure (Just (T.pack (show (n + 1))))
         , tctAnswerCallback = \_cbId -> pure ()
         , tctEditReplyMarkup = \_c _mid -> pure ()
-        , tctEditMessage = \_c _mid _content -> pure True
+        , tctEditMessage = \_c mid content -> do
+            modifyIORef' editRef ((mid, content) :)
+            pure True
         , tctClose = pure ()
         }
       getCaptured = reverse <$> readIORef capRef
-  pure (transport, getCaptured)
+      getEdits = reverse <$> readIORef editRef
+  pure (transport, getCaptured, getEdits)
 
 -- ---------------------------------------------------------------------------
 -- Real transport — Telegram Bot API over HTTPS
@@ -146,6 +168,7 @@ mkRealTelegramChatTransport token mgr = do
     { tctReceive = fillAndReceive buffer offsetRef
     , tctSend = sendViaApi mgr token
     , tctSendWithId = tgSendWithIdViaApi mgr token
+    , tctSendWithIdSilently = tgSendWithIdSilentlyViaApi mgr token
     , tctSendWithKeyboard = tgSendWithKeyboardViaApi mgr token
     , tctAnswerCallback = answerCallbackQueryViaApi mgr token
     , tctEditReplyMarkup = editReplyMarkupViaApi mgr token
@@ -209,6 +232,19 @@ instance ChatChannel TelegramChatChannel where
         mId <- tctSendWithId (tccTransport ch) chatId t
         pure (ChatMessageId <$> mId)
 
+  -- A turn's progress bubble is created WITHOUT a notification: the progress
+  -- should be visible without pinging the human. Editing it afterwards is
+  -- silent anyway, so the whole bubble costs zero notifications - which is
+  -- what makes "tool calls don't notify" exact rather than approximate on
+  -- Telegram.
+  ccSendWithIdSilently ch t = do
+    mChat <- readIORef (tccLastChat ch)
+    case mChat of
+      Nothing -> pure Nothing
+      Just chatId -> do
+        mId <- tctSendWithIdSilently (tccTransport ch) chatId t
+        pure (ChatMessageId <$> mId)
+
   ccEditMessage ch (ChatMessageId msgId) content = do
     mChat <- readIORef (tccLastChat ch)
     case mChat of
@@ -235,6 +271,22 @@ instance ChatChannel TelegramChatChannel where
       Just chatId -> tctEditReplyMarkup (tccTransport ch) chatId msgId
 
   ccLastChatId ch = readIORef (tccLastChat ch)
+
+  -- One edited message per turn instead of one message per text segment and
+  -- per tool call. On Telegram an edit does not notify, so this is what turns
+  -- a 5-tool turn from ~6 pushes into exactly one (the answer).
+  ccProgressStyle _ = PsSingleBubble
+
+  -- Telegram enforces a hard 4096-character limit (we leave headroom via
+  -- 'tccChunkLimit', default 3900). Without this the single-bubble path has no
+  -- idea when its body has outgrown a message and would keep editing until the
+  -- platform rejected it.
+  ccChunkLimit ch = Just (tccChunkLimit ch)
+
+  -- Telegram's 4096 limit is in UTF-16 CODE UNITS -- one per BMP character,
+  -- two per astral one (an emoji). Counting code points ('T.length')
+  -- undercounts an emoji by half.
+  ccChunkUnit _ = ChunkUtf16Units
 
 -- | Send one chunk verbatim to the last chat.
 sendRaw :: TelegramChatChannel -> Text -> IO ()
@@ -490,15 +542,31 @@ sendViaApi mgr token chatId body = do
   eReq <- try @SomeException
     (parseRequest (T.unpack (telegramApiBase <> token <> "/sendMessage")))
   case eReq of
-    Left _ -> pure ()
+    Left _ -> logSendFailure "invalid-request"
     Right req0 -> do
       let payload = A.object [ "chat_id" .= chatId, "text" .= body ]
           req = req0 { method = methodPost
                      , requestBody = RequestBodyLBS (A.encode payload)
                      , requestHeaders = [("Content-Type", "application/json")]
                      }
-      _ <- try @SomeException (httpLbs req mgr)
-      pure ()
+      eResp <- try @SomeException (httpLbs req mgr)
+      case eResp of
+        Left _ -> logSendFailure "network-error"
+        Right resp ->
+          let code = statusCode (responseStatus resp)
+          in if code >= 200 && code <= 299
+               then pure ()
+               else logSendFailure ("http-" <> T.pack (show code))
+
+-- | Report a failed @sendMessage@ so a dropped notification is diagnosable
+-- instead of silent. Deliberately carries ONLY a fixed classifier (a status
+-- code or a category) - never the response body, the request URL, or a raw
+-- exception. The bot token is embedded in the URL, and exception text renders
+-- it; the @getUpdates@ path already leaks @show ex@ on a token-bearing URL, so
+-- do not copy that pattern here.
+logSendFailure :: Text -> IO ()
+logSendFailure reason =
+  hPutStrLn stderr ("[telegram] sendMessage failed: " <> T.unpack reason)
 
 -- | Register the bot's command menu (@setMyCommands@). This is what the
 -- Telegram client renders after the user types @\/@; registering the same
@@ -542,24 +610,47 @@ telegramErrorText code body =
 
 -- | Send a message and return the @message_id@.
 tgSendWithIdViaApi :: Manager -> Text -> Text -> Text -> IO (Maybe Text)
-tgSendWithIdViaApi mgr token chatId body = do
+tgSendWithIdViaApi mgr token chatId body =
+  tgSendMessageViaApi mgr token chatId body False
+
+-- | Send a message with @disable_notification: true@ and return its
+-- @message_id@. Used for progress bubbles: the turn's progress should be
+-- visible without pinging the human.
+tgSendWithIdSilentlyViaApi :: Manager -> Text -> Text -> Text -> IO (Maybe Text)
+tgSendWithIdSilentlyViaApi mgr token chatId body =
+  tgSendMessageViaApi mgr token chatId body True
+
+-- | The one @sendMessage@ call both variants use. @silent@ adds
+-- @disable_notification: true@ so the platform stores the message without
+-- raising a push notification.
+tgSendMessageViaApi :: Manager -> Text -> Text -> Text -> Bool -> IO (Maybe Text)
+tgSendMessageViaApi mgr token chatId body silent = do
   eReq <- try @SomeException
     (parseRequest (T.unpack (telegramApiBase <> token <> "/sendMessage")))
   case eReq of
-    Left _ -> pure Nothing
+    Left _ -> do
+      logSendFailure "invalid-request"
+      pure Nothing
     Right req0 -> do
-      let payload = A.object [ "chat_id" .= chatId, "text" .= body ]
+      let payload = A.object
+            ( [ "chat_id" .= chatId, "text" .= body ]
+              <> [ "disable_notification" .= True | silent ]
+            )
           req = req0 { method = methodPost
                      , requestBody = RequestBodyLBS (A.encode payload)
                      , requestHeaders = [("Content-Type", "application/json")]
                      }
       eResp <- try @SomeException (httpLbs req mgr)
       case eResp of
-        Left _ -> pure Nothing
+        Left _ -> do
+          logSendFailure "network-error"
+          pure Nothing
         Right resp ->
           if statusCode (responseStatus resp) == 200
             then pure (parseMessageId (responseBody resp))
-            else pure Nothing
+            else do
+              logSendFailure ("http-" <> T.pack (show (statusCode (responseStatus resp))))
+              pure Nothing
 
 -- | Edit a previously sent message via @editMessageText@.
 tgEditMessageViaApi :: Manager -> Text -> Text -> Text -> Text -> IO Bool

@@ -35,6 +35,8 @@ module Seal.Channels.Chat.HttpClient
   , httpAnswerQuestion
   , answerBodyJson
   , httpCancelQuestion
+  , httpGetQuestions
+  , PendingQuestionJson (..)
     -- * Helpers
   , parseJsonBody
   , parseErrorBody
@@ -341,6 +343,51 @@ httpAnswerQuestion mgr apiBase sid qid answer = do
   doRequest mgr url methodPost (Just (answerBodyJson answer)) >>= \case
     Left e -> pure (Left e)
     Right body -> pure (Right (acceptedFrom body))
+
+-- | One pending question as @GET /api/sessions/:id/questions@ reports it.
+-- The id and options are what a chat channel needs to render the question and
+-- to answer it later by plain text.
+data PendingQuestionJson = PendingQuestionJson
+  { pqjId       :: !Text
+  , pqjQuestion :: !Text
+  , pqjOptions  :: ![Value]
+    -- ^ The raw @options@ objects (@{label, description}@); kept as 'Value'
+    -- so the caller reuses the same decoder the ask event uses.
+  } deriving stock (Eq, Show)
+
+-- | @GET /api/sessions/:id/questions@ — the session's pending ASK_HUMAN
+-- questions, oldest first. An empty list means the session is not waiting on
+-- anyone. Used by the @\/watch@ path to tell "needs your input" apart from
+-- "finished thinking": both surface as a @harness-status idle@ activity, so
+-- the activity alone cannot distinguish them.
+httpGetQuestions :: Manager -> Text -> SessionId -> IO (Either Text [PendingQuestionJson])
+httpGetQuestions mgr apiBase sid = do
+  let url = T.unpack apiBase <> "/sessions/" <> T.unpack (sessionIdText sid)
+            <> "/questions"
+  doRequest mgr url methodGet Nothing >>= \case
+    Left e -> pure (Left e)
+    Right body -> pure (Right (questionsFrom body))
+
+-- | Decode the questions array. Tolerant: questions without an @id@ cannot be
+-- answered, so they are dropped. Pure.
+questionsFrom :: BL.ByteString -> [PendingQuestionJson]
+questionsFrom body =
+  case A.decode body :: Maybe Value of
+    Just (A.Array arr) -> mapMaybe parseOne (foldr (:) [] arr)
+    _                  -> []
+  where
+    parseOne (A.Object o) = do
+      qid <- lookupText "id" o
+      let question = fromMaybe "" (lookupText "question" o)
+          opts = case KeyMap.lookup (Key.fromText "options") o of
+            Just (A.Array os) -> foldr (:) [] os
+            _                 -> []
+      pure (PendingQuestionJson qid question opts)
+    parseOne _ = Nothing
+
+    lookupText k o = case KeyMap.lookup (Key.fromText k) o of
+      Just (A.String t) -> Just t
+      _                 -> Nothing
 
 -- | Read the @accepted@ flag from an answer response. Absent/malformed
 -- (e.g. a server that predates the flag) counts as accepted.

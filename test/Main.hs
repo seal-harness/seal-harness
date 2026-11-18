@@ -126,6 +126,7 @@ import qualified Seal.Channels.Chat.RateLimitSpec
 import qualified Seal.Channels.Chat.HttpClientSpec
 import qualified Seal.Channels.Chat.WsClientSpec
 import qualified Seal.Channels.Chat.WatchPersistSpec
+import qualified Seal.Channels.Chat.BubbleSpec
 import qualified Seal.Channels.Chat.LoopSpec
 import qualified Seal.Channels.Chat.SignalAdapterSpec
 import qualified Seal.Channels.Chat.TelegramAdapterSpec
@@ -354,6 +355,7 @@ specs = do
   Seal.Channels.Chat.HttpClientSpec.spec
   Seal.Channels.Chat.WsClientSpec.spec
   Seal.Channels.Chat.WatchPersistSpec.spec
+  Seal.Channels.Chat.BubbleSpec.spec
   Seal.Channels.Chat.LoopSpec.spec
   Seal.Channels.Chat.SignalAdapterSpec.spec
   Seal.Channels.Chat.TelegramAdapterSpec.spec
