@@ -3276,6 +3276,12 @@ providerAuthStatus mh cfg kp = case kp of
   OpenRouterProvider -> case mh of
     Nothing   -> pure "none"
     Just vh   -> probeVault vh (vaultKeyName OpenRouterProvider)
+  OllamaCloudProvider -> case mh of
+    Nothing   -> pure "none"
+    Just vh   -> probeVault vh (vaultKeyName OllamaCloudProvider)
+  OpenAIProvider -> case mh of
+    Nothing   -> pure "none"
+    Just vh   -> probeVault vh (vaultKeyName OpenAIProvider)
   OpenAICompatibleProvider -> case mh of
     Nothing   -> pure "none"
     Just vh   -> probeVault vh (vaultKeyName OpenAICompatibleProvider)
@@ -3829,6 +3835,13 @@ staticModelsFor AnthropicProvider =
   ]
 staticModelsFor OllamaProvider = ["llama3.2", "llama3.1"]
 staticModelsFor OpenRouterProvider = ["deepseek/deepseek-v4.1-flash-1017"]
+-- | Both ids are sized by 'Seal.Providers.ContextWindow' ("gpt-4o-" prefix and
+-- "gpt-4-turbo"). Bare @gpt-4o@ is deliberately absent: the table's clause has
+-- a trailing dash, so it would score 0 and render no percentage.
+staticModelsFor OpenAIProvider = ["gpt-4o-mini", "gpt-4-turbo"]
+-- | Empty for the same reason the generic type's is: Ollama Cloud's live
+-- catalogue is the operator's own, and 'listModels' already fetches it.
+staticModelsFor OllamaCloudProvider = []
 -- | Empty on purpose: a generic endpoint owns its catalogue, and inventing
 -- model ids here would be a guess the UI would present as fact.
 staticModelsFor OpenAICompatibleProvider = []

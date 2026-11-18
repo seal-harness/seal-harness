@@ -115,17 +115,21 @@ spec = describe "Seal.Setup.State" $ do
       -- provider cards must still be emitted.
       state <- deriveSetupState (emptySetupInputs fakePaths)
       map pcId (ssProviders state)
-        `shouldBe` ["anthropic", "ollama", "openrouter", "openai"]
-      map pcConfigured (ssProviders state) `shouldBe` [False, False, False, False]
+        `shouldBe` [ "anthropic", "ollama", "ollama-cloud"
+                   , "openrouter", "openai", "openai-compatible" ]
+      map pcConfigured (ssProviders state)
+        `shouldBe` [False, False, False, False, False, False]
       -- Branding is a display name, not a mechanical capitalise.
       map pcLabel (ssProviders state)
-        `shouldBe` ["Anthropic", "Ollama", "OpenRouter", "OpenAI-compatible"]
-      -- Only the generic endpoint needs a URL from the operator.
+        `shouldBe` [ "Anthropic", "Ollama", "Ollama Cloud"
+                   , "OpenRouter", "OpenAI", "OpenAI-compatible" ]
+      -- Only the generic endpoint needs a URL from the operator: OpenAI and
+      -- Ollama Cloud have built-in endpoints, and Ollama's is optional.
       map pcRequiresBaseUrl (ssProviders state)
-        `shouldBe` [False, False, False, True]
+        `shouldBe` [False, False, False, False, False, True]
       -- ...and only it needs an operator-chosen unique name.
       map pcRequiresName (ssProviders state)
-        `shouldBe` [False, False, False, True]
+        `shouldBe` [False, False, False, False, False, True]
 
   describe "provider step" $ do
 

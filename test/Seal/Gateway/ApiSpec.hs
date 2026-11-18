@@ -66,6 +66,7 @@ import Seal.Ingest (emptyChain)
 import Seal.Providers.Class
   ( ContentBlock (..), Message, pattern Message, Role (..), ToolResultPart (..)
   , SomeProvider (..), Provider (..), CompletionResponse (..), StopReason (..), Usage (..) )
+import Seal.Providers.ContextWindow (modelContextWindow)
 import Seal.Providers.OllamaReadiness (OllamaReadiness (..))
 import Seal.Providers.Registry (KnownProvider (..), knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
@@ -4447,7 +4448,7 @@ spec = describe "Seal.Gateway.API" $ do
     let arr = case A.decode body :: Maybe [A.Value] of
           Just xs -> xs
           Nothing -> error ("could not decode providers body: " ++ show body)
-    -- Every known provider is present (anthropic, ollama, openrouter, openai).
+    -- Every known provider is present (all six, in D2 order).
     length arr `shouldBe` length knownProviders
     -- Each entry has a name; build a name -> configured map.
     let entries = [ (n, c) | e <- arr, A.Object o <- [e]
@@ -4461,8 +4462,10 @@ spec = describe "Seal.Gateway.API" $ do
     byName `shouldBe` Map.fromList
               [ ("anthropic", False)
               , ("ollama", True)
+              , ("ollama-cloud", False)
               , ("openrouter", False)
               , ("openai", False)
+              , ("openai-compatible", False)
               ]
 
   it "GET /api/providers/anthropic/models returns 200" $ do
@@ -4475,6 +4478,42 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app (testRequest methodGet
       ["api", "providers", "anthropic", "models", "claude-sonnet-4-20250514", "context"])
     status `shouldBe` 200
+
+  -- Design item 21: the OpenAI static list is non-empty, and EVERY id in it is
+  -- sized by ContextWindow.hs (modelContextWindow returns Int, not Maybe, so
+  -- an unknown id scores 0 and the UI would render no percentage). Also pins
+  -- that Ollama Cloud's list stays empty - its catalogue is the operator's own.
+  it "item 21: the OpenAI static model list is non-empty and every id is sized" $ do
+    app <- mkApp
+    (status, body) <- runAppBody app
+      (testRequest methodGet ["api", "providers", "openai", "models"])
+    status `shouldBe` 200
+    let entries = case A.decode body :: Maybe [A.Value] of
+          Just xs -> xs
+          Nothing -> error ("could not decode models body: " ++ show body)
+        ids = [ i | A.Object o <- entries, Just (A.String i) <- [lookupK "name" o] ]
+    ids `shouldSatisfy` (not . null)
+    -- Every published id must resolve to a positive context window, or the UI
+    -- shows a model it cannot size.
+    forM_ ids $ \i ->
+      modelContextWindow i `shouldSatisfy` (> 0)
+    -- The contextWindow field the wire carries agrees with the lookup.
+    forM_ entries $ \case
+      A.Object o -> case (lookupK "name" o, lookupK "contextWindow" o) of
+        (Just (A.String i), Just (A.Number w)) ->
+          w `shouldBe` fromIntegral (modelContextWindow i)
+        _ -> expectationFailure "expected name + contextWindow"
+      _ -> expectationFailure "expected object"
+    -- gpt-4o is deliberately absent: ContextWindow's clause is "gpt-4o-" with a
+    -- trailing dash, so the bare id scores 0.
+    ids `shouldSatisfy` notElem "gpt-4o"
+
+  it "item 21: the Ollama Cloud static model list is empty" $ do
+    app <- mkApp
+    (status, body) <- runAppBody app
+      (testRequest methodGet ["api", "providers", "ollama-cloud", "models"])
+    status `shouldBe` 200
+    (A.decode body :: Maybe [A.Value]) `shouldBe` Just []
 
   it "GET /api/providers/unknown/models returns 200 with []" $ do
     app <- mkApp

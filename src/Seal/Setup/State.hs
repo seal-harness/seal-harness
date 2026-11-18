@@ -353,7 +353,9 @@ providerDisplayName :: KnownProvider -> Text
 providerDisplayName known = case known of
   AnthropicProvider  -> "Anthropic"
   OllamaProvider     -> "Ollama"
+  OllamaCloudProvider -> "Ollama Cloud"
   OpenRouterProvider -> "OpenRouter"
+  OpenAIProvider     -> "OpenAI"
   OpenAICompatibleProvider -> "OpenAI-compatible"
 
 isYubiKeyVault :: SetupInputs -> Bool
