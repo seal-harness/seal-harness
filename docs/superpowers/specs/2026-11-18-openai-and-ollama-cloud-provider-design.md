@@ -582,6 +582,10 @@ covered without editing the test. Enumerating six values is not a property.
      to case 1 and only `resolveOpenAICompatible`'s null check rejects it. Same
      outcome, wrong path — and a refactor of either site would split them. The
      `usable u = not (T.null (T.strip u))` test in §3.1 is what this pins.
+     Because *both* paths return `Left`, item 20c must assert on the **message**
+     (the guard's "predates the OpenAI provider type" wording), not merely that
+     a `Left` came back — otherwise it, like the naive pseudo-code, cannot tell
+     which branch fired.
 20b. **RED** Section-key vs display-noun separation: `resolveProvider
      OllamaCloudProvider` with `providerBaseUrl = Just ""` returns a `Left`
      whose text contains **`[providers.ollama-cloud]`** and **not**
@@ -671,10 +675,12 @@ able to **finish**. These are the acceptance criteria for §1's benefit claim.
 35e. **RED** `resolveProvider OpenAIProvider` when a `[providers.openai]` section
      exists **without** `base_url` returns `Left` naming `/provider add openai`
      (§3.1 case 3), and makes no network call.
-35f. **RED** Round-trip consistency: `POST {"name":"openai","api_key":…}` and then
-     `resolveProviderByName "openai"` returns `Right`. This is the dead-end guard
-     — it fails if a create path forgets to inject the built-in `base_url`,
-     because `upsertProvider` would still have written the section (§3.1).
+35f. **RED** Round-trip consistency, **stored form**: after
+     `POST {"name":"openai","api_key":…}`, the persisted config has
+     `pcBaseUrl = Just "https://api.openai.com/v1"`. This is the half 35b does
+     not cover and the one that fails if a create path forgets to inject the
+     URL — `upsertProvider` writes the section regardless (§3.1), so 35b alone
+     can pass while the guard is silently re-armed.
 35g. **RED** **Case 2 (fresh install)**: with *no* `[providers.openai]` section,
      `resolveProvider OpenAIProvider` (key present) returns `Right` and uses
      `https://api.openai.com/v1`. Pins that the guard keys off `Map.member`, not
@@ -743,22 +749,51 @@ as work, not discover them mid-implementation.
 
 The rename is not a forced big-bang, but WU3 is irreducible.
 
-- **WU1** `Registry.hs` + `RegistrySpec` (items 1-21 plus the four
-  `RegistrySpec` updates) **plus the two exhaustive `KnownProvider` cases that
-  live in `API.hs`**: `providerAuthStatus` (`API.hs:3259`) and
-  `staticModelsFor` (`API.hs:3828`).
+- **WU1** the entire `KnownProvider` vocabulary: `Registry.hs` + `RegistrySpec`
+  (items 1-21 plus the four `RegistrySpec` updates) **plus every wildcard-free
+  match over `KnownProvider` outside `Registry.hs`**.
 
-  Those two must be in WU1, not WU3. Both are wildcard-free `case` expressions
-  over `KnownProvider`, so `+2` constructors makes the **library fail to
-  compile** under `-Werror`/`-Wincomplete-patterns` before any test can run.
-  Adding the constructors without them is not a green commit at all.
+  This must be an *exhaustive sweep*, not a spot fix. `-Wall` (in the shared
+  `settings` stanza, `seal-harness.cabal:31-32`) implies
+  `-Wincomplete-patterns`, and `-Werror` is on for the whole `library`, so `+2`
+  constructors fails the build at **every** site that matches without a `_ ->`.
+  There are **nine**:
 
-  So WU1's independence is "green modulo two *pure, additive* exhaustive cases
-  in `API.hs`" - they touch no route, no JSON shape, and no HTTP path, which is
-  why they belong with the vocabulary rather than with the wire work.
-- **WU2** `Setup/State.hs` + `StateSpec` + `SetupApiSpec` (items 22-24). Green
-  alone — the new cards render as raw ids until WU3 lands the frontend labels,
-  which is degraded, not broken.
+  | # | Site | File |
+  |---|---|---|
+  | 1 | `providerLabel` | `Registry.hs:85` |
+  | 2 | `vaultKeyName` | `Registry.hs:140` |
+  | 3 | `defaultModelFor` | `Registry.hs:157` |
+  | 4 | `builtInBaseUrl` (local to `providerBaseUrlFor`) | `Registry.hs:295` |
+  | 5 | `resolveProvider` (4 equations) | `Registry.hs:193+` |
+  | 6 | `isConfigured` (local case in `configuredProviders`) | `Registry.hs:357+` |
+  | 7 | `providerAuthStatus` | `API.hs:3259` |
+  | 8 | `staticModelsFor` | `API.hs:3824` |
+  | 9 | `providerDisplayName` | `State.hs:352` |
+
+  Sites 1-6 are inside WU1's own file. Sites 7-8 are two extra equations in
+  `API.hs`. **Site 9 lives in `Setup/State.hs`, which is WU2's file** — so WU2's
+  "green alone" cannot hold unless WU1 carries it too. `providerDisplayName` is
+  pure and additive (two `Text` literals), so it belongs in WU1 for exactly the
+  reason sites 7-8 do.
+
+  WU1's independence is therefore: **green modulo three pure, additive
+  exhaustive matches outside `Registry.hs`** (`providerAuthStatus`,
+  `staticModelsFor`, `providerDisplayName`) — none of which touches a route, a
+  JSON shape, or an HTTP path.
+
+  Sites that are **not** in this set because they use a `_ ->` wildcard and so
+  compile fine: `providerCards` (`State.hs:337-346` — its wildcards already
+  yield the correct defaults for the new types, `requiresBaseUrl = False`,
+  `pcReadiness = Nothing`), `providerReadinessSegment`, and the `"ollama"`
+  label comparisons. Those are behavioural, not compile-time, and are covered by
+  tests instead (§7).
+- **WU2** the remainder of `Setup/State.hs` + `StateSpec` + `SetupApiSpec`
+  (items 22-24, the P4 copy, and the card-flag assertions). Green **once WU1
+  has landed** `providerDisplayName`'s two cases — WU2 is downstream of WU1 by
+  construction, not parallel to it. After that it stands alone: the new cards
+  render as raw ids until WU3 lands the frontend labels, which is degraded, not
+  broken.
 - **WU3** The atomic unit: `resolveCreateTarget` / `resolveExistingTarget` /
   `customProviderDetailJson` / `providerDetailJsonFor` / the `customInfos`
   `"type"` literal (`:715`) / the readiness guard (`:3246`) / the create-path
@@ -770,6 +805,14 @@ The rename is not a forced big-bang, but WU3 is irreducible.
   WU3 **cannot** be split: the frontend is embedded via `file-embed`, so client
   and server ship together, and `type: "openai"` for a custom name must start
   and stop being valid in the same commit.
+
+**Unowned files, assigned.** §4 lists five files that no work unit above names:
+`Gateway/Setup.hs` (the "known providers" hint text), `Command/Provider.hs`
+(**load-bearing** — item 35h fails without `addCmd`'s `base_url` write),
+`CHANGELOG.md`, `config/templates/config.toml`, and
+`scripts/setup-walkthrough.sh`. All five go to **WU3**, which is already the
+"touch everything that must ship atomically" unit. In particular item 35h is
+WU3 work, not WU1, despite being a backend test.
 
 Completion gate: `make check` (build + test + lint) plus the frontend test
 suite, per the Makefile, and `.coverage-thresholds.json`'s enforcement command.
