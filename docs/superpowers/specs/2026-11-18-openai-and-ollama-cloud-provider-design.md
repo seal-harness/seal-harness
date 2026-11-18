@@ -604,6 +604,13 @@ covered without editing the test. Enumerating six values is not a property.
 26. **RED** `GET /api/providers/all`: `requiresBaseUrl`/`requiresName` are
     `false`/`false` for `openai` and `ollama-cloud`; `true`/`true` for
     `openai-compatible`.
+27b. **RED** `PUT /api/providers/local-vllm` on an existing custom instance
+     echoes `type: "openai-compatible"` in the returned detail. This is the
+     `resolveExistingTarget` (`API.hs:3387`) half of item 27 — create goes
+     through `resolveCreateTarget`, and a PUT-only test is the only thing that
+     exercises this second literal. Without it, item 27 passes while the edit
+     path still claims `type: "openai"`.
+
 27. **RED** `GET /api/providers/all` for a custom instance reports
     `type: "openai-compatible"`, `requiresBaseUrl: true`, `requiresName: true`.
 28. **RED** `POST {"name":"openai","api_key":"sk-…"}` ⇒ 201, and **no**
@@ -852,7 +859,9 @@ suite, per the Makefile, and `.coverage-thresholds.json`'s enforcement command.
 | Risk | Mitigation |
 |---|---|
 | A missed site in a **total function over `KnownProvider`** | `-Werror` + `-Wincomplete-patterns`: the compiler names every such site. This holds **only while those functions have no `_ ->` fallback** — adding one silently opts every future constructor out of the compiler's help. All **nine** sites enumerated in §5.6 must stay wildcard-free — `providerLabel`, `vaultKeyName`, `defaultModelFor`, `builtInBaseUrl`, `resolveProvider`, `isConfigured`, `providerAuthStatus`, `staticModelsFor`, `providerDisplayName`. The two lists must not drift: §5.6 is the authority, and a tenth site added later belongs in both. |
-| A missed **label string comparison** — the compiler is blind to these | Enumerated exhaustively and each given a test: `Registry.hs:242` (the fail-closed section name, item 20), `API.hs:715` (custom `type`), `API.hs:3246` (readiness guard), `Registry.hs:118` (reserved names, item 13), `ProvidersView.tsx:247` (custom-ness, item 36). The `"ollama"` comparisons at `State.hs:294`, `Provider.hs:175/256/279`, `API.hs:3182` are **correct as-is** (Ollama-only semantics) and are pinned by guard items. |
+| A missed **label string comparison** — the compiler is blind to these | Enumerated below and each given a test. **This list is the authority**; a site not on it is a defect, not a judgement call. |
+| ... (see the table immediately below) | |
+
 | Frontend and backend disagree on which types hide the fields | Server-driven flags (D7) plus item 36 pinning the creating-state helper. |
 | Secret egress to a third party after the `openai` rename | **Unreachable, not guarded**: the only affected state is a *pre-existing* `[providers.openai]` section, and there are no users (§3.1). Selecting OpenAI and pasting an OpenAI key resolving to `api.openai.com` is the happy path; a self-hosted endpoint must use `openai-compatible`, which still requires an explicit `base_url` (item 42). §3.3 removes the one place a developer would reproduce the stale shape. |
 | A write path clobbering an operator's configured endpoint | No write path fills `base_url` any more — the create path, `PUT` and `addCmd` are unchanged and never write it unless the request supplies one (§3.1). There is nothing to clobber. |
@@ -862,3 +871,33 @@ suite, per the Makefile, and `.coverage-thresholds.json`'s enforcement command.
 | A stale tab POSTs the old `type: "openai"` | 400 with a clear message; reload fixes it (D8). |
 | Six rows make the wizard list long | Acceptable at this count; vendor-adjacent grouping (D2) keeps it readable. |
 | A 0 context window looking like a bug | It renders as *no percentage* (`BottomBar.tsx:37`), which is honest (D10). |
+
+### 7.1 Every runtime `openai` string comparison (the compiler cannot see these)
+
+`-Werror` catches constructor scrutiny only. These compare provider ids as text
+and change meaning silently after the rename. Verified by
+`grep -rn '"openai"' src/` and the TypeScript equivalent; comments and
+`ProviderId` provenance excluded.
+
+| # | Site | Current | After | Pinned by |
+|---|---|---|---|---|
+| 1 | `Registry.hs:88` `providerLabel` | `"openai"` | `"openai-compatible"` | items 6, 20 |
+| 2 | `Registry.hs:118` reserved names | 3 ids | all 6 | item 13 |
+| 3 | `Registry.hs:242` helper's section key | `"openai"` | `providerLabel OpenAICompatibleProvider` | item 20 |
+| 4 | `API.hs:715` `customInfos` `type` | `"openai"` | `"openai-compatible"` | item 25, 27 |
+| 5 | `API.hs:3221` `customProviderDetailJson` typeId | `"openai"` | `"openai-compatible"` | item 27 |
+| 6 | `API.hs:3246` readiness guard | `typeId /= "openai"` | `/= "openai-compatible"` | item 33 |
+| 7 | `API.hs:3367` `resolveCreateTarget` required type | `Just "openai"` | `Just "openai-compatible"` | items 30, 31, 32 |
+| 8 | `API.hs:3377` `resolveCreateTarget` typeId result | `"openai"` | `"openai-compatible"` | item 30 |
+| 9 | `API.hs:3387` `resolveExistingTarget` typeId result | `"openai"` | `"openai-compatible"` | **item 27b (new)** |
+| 10 | `ProviderStep.tsx:147` wizard POST `type` | `'openai'` | `'openai-compatible'` | item 38 |
+| 11 | `ProvidersView.tsx:251-253, 264, 267` custom-ness/`type` | `=== 'openai'` | `=== 'openai-compatible'` | item 36, 37 |
+| 12 | `ProvidersView.tsx:516, 577` unique-name render conditions | `=== 'openai'` | `=== 'openai-compatible'` | items 34, 36 |
+
+`ProvidersView.tsx:247` (`PROVIDER_LABELS[p.name] === undefined`, the registry
+membership test) is the same class and is item 36.
+
+**Deliberately unchanged:** `Session/Kind.hs:79` maps `gpt*` → `ProviderId
+"openai"`, which after the rename correctly means real OpenAI. It has no
+callers (§6). The `"ollama"` comparisons at `State.hs:294`,
+`Command/Provider.hs:175/256/279` and `API.hs:3182` keep Ollama-only semantics.

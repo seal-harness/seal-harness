@@ -140,7 +140,8 @@ Files:
   `providerStep.test.tsx`.
 - `CHANGELOG.md`, `config/templates/config.toml`, `scripts/setup-walkthrough.sh`.
 
-TDD order: write design items **25-39, 34a-34d, 35b-35d, 41b, 41c, 45** failing,
+TDD order: write design items **25-27, 27b, 28-39, 34a-34d, 35b-35d, 41b, 41c,
+45** failing,
 then implement. GUARD item **42** (the Providers page still renders both fields
 for `openai-compatible`, and Save stays disabled until both are valid) must stay
 green throughout — it is the regression guard for D7 in create mode.
@@ -206,7 +207,7 @@ claiming a number it cannot produce.
 | Risk | Mitigation |
 |---|---|
 | A missed wildcard-free site breaks the build | WU1 is one commit precisely so the compiler reports them together; the nine are enumerated in design §5.6 and §7. |
-| The rename breaks a runtime string comparison the compiler cannot see | The five such sites are enumerated in design §7 and each has a test (items 20, 33, 36, 37, 38). |
+| The rename breaks a runtime string comparison the compiler cannot see | Twelve such sites, enumerated authoritatively in design §7.1; each has a numbered test (items 6, 13, 20, 25, 27, 27b, 30-33, 34, 36-38). A site absent from that table is a defect. |
 | A hidden field leaks a stale value into the payload | Payload gated on `!isHiddenBaseUrl`; `formName` changes clear the fields (D7, RG-2). Items 35d, 41b. |
 | Secret egress after the rename | Unreachable, not guarded: the only affected state needed a *pre-existing* `[providers.openai]` section, and there are no users (design §3.1). A self-hosted endpoint must use `openai-compatible`, which still requires an explicit `base_url` (item 42). |
 | **Rollback** | Additive plus one rename. Reverting the WU3 commit restores the old `openai` meaning; WU1/WU2 can be reverted independently *only* as a set (the constructors are what break the build if reverted alone). |
