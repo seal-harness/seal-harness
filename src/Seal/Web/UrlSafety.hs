@@ -102,7 +102,11 @@ isAlwaysBlockedUrl url =
     Nothing -> False
     Just host ->
       host `elem` blockedHostnames
-      || any (`T.isPrefixOf` host) alwaysBlockedIps
+      -- Exact membership, not a prefix match. Now that 'extractHost' strips
+      -- userinfo, the port and the IPv6 brackets, a prefix match only invites
+      -- misleading collisions (@fd00:ec2::2540@). 'preCheck' and 'isSafeHost'
+      -- already compare exactly.
+      || host `elem` alwaysBlockedIps
 
 -- | Resolve the hostname via DNS and check each resolved IP. Fails closed
 -- on DNS errors.
@@ -223,9 +227,34 @@ breakScheme url =
     (sch, _) -> (T.toLower sch, T.drop 3 (snd (T.breakOn "://" url)))
 
 -- | Extract the host from the post-scheme part of a URL. Handles
--- @host/path@, @host:port/path@, @host?query@, @host#fragment@.
+-- @host/path@, @host:port/path@, @host?query@, @host#fragment@, a
+-- @[::1]@-bracketed IPv6 literal, and a @user:pass@@-prefixed authority.
+--
+-- The userinfo strip and the bracket handling are each load-bearing for the
+-- SSRF floor, not cosmetic:
+--
+-- * Without the userinfo strip, @http:\/\/x\@169.254.169.254\/@ yielded the
+--   host @x\@169.254.169.254@, which matched nothing — the metadata IP
+--   reached the request.
+-- * Without bracket handling, the authority was cut at the /first/ @:@, so
+--   @[fd00:ec2::254]@ became @[fd00@ and the @fd00:ec2::254@ entry in
+--   'alwaysBlockedIps' was unreachable dead code.
 extractHost :: Text -> Maybe Text
 extractHost afterScheme =
   let authority = T.takeWhile (\c -> c /= '/' && c /= '?' && c /= '#') afterScheme
-      host = T.takeWhile (/= ':') authority  -- strip port
+      -- Userinfo is everything up to the LAST '@' in the authority (a
+      -- password may itself contain '@'; RFC 3986 puts the host last).
+      afterUserinfo = case T.breakOnEnd "@" authority of
+        ("", rest) -> rest
+        (_, rest)  -> rest
+      host = case T.uncons afterUserinfo of
+        Just ('[', rest) ->
+          -- A bracketed IPv6 literal: the host is the bracket contents, and
+          -- the brackets are dropped so the value compares against
+          -- 'alwaysBlockedIps'. A missing ']' falls back to the pre-':' cut.
+          case T.breakOn "]" rest of
+            (inner, close)
+              | not (T.null close) -> inner
+              | otherwise          -> T.takeWhile (/= ':') afterUserinfo
+        _ -> T.takeWhile (/= ':') afterUserinfo  -- strip port
   in if T.null host then Nothing else Just (T.toLower host)

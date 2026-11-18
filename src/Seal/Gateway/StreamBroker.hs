@@ -13,6 +13,7 @@ module Seal.Gateway.StreamBroker
   , StreamBroker (..)
   , newStreamBroker
   , subscribe
+  , unsubscribe
   , updateSubscriberSession
   , broadcast
   , takeNewEntries
@@ -137,11 +138,33 @@ subscribe broker session sendfn closefn = do
       writeTVar (sbSubs broker) (subs <> [Subscriber ref sendfn closefn])
   pure ref
 
+-- | Remove a subscriber by identity (the 'TVar SessionId' that 'subscribe'
+-- returned). Idempotent and commutative with concurrent 'subscribe' /
+-- 'broadcast': removal is a filtered 'modifyTVar'' rather than a whole-list
+-- write, so a fan-out in flight cannot resurrect the removed entry.
+--
+-- Called from the WS connection teardown so 'sbSubs' cannot accumulate dead
+-- entries — without it, a subscriber is only ever reaped opportunistically
+-- by a later broadcast that happens to send to it (cheap if the send raises,
+-- the full per-send timeout if it blocks), and past 'sbCap' the silent no-op
+-- in 'subscribe' leaves new connections added to nothing at all.
+unsubscribe :: StreamBroker -> TVar SessionId -> IO ()
+unsubscribe broker ref =
+  atomically $ modifyTVar' (sbSubs broker) (filter (\s -> subSessionRef s /= ref))
+
 -- | Update a subscriber's focused session. Called when the client sends a
 -- @focus@ op so subsequent 'BeEntryRecorded' events for the new session are
 -- delivered.
 updateSubscriberSession :: TVar SessionId -> SessionId -> IO ()
 updateSubscriberSession ref sid = atomically (writeTVar ref sid)
+
+-- | Fan-out duration (microseconds) above which 'broadcast' logs at Warning.
+-- 100 ms is far above a healthy fan-out (tens of subscribers deliver in
+-- microseconds) and far below both client timeouts (the web frontend aborts
+-- at 20 s, the chat-channel client at http-client's 30 s default), so it
+-- flags a stall without flooding the log on a busy but healthy server.
+broadcastSlowThresholdUs :: Int
+broadcastSlowThresholdUs = 100_000
 
 -- | Fan one event to every subscriber whose focused session matches. For
 -- 'BeListsSnapshot' (a broadcast to all), every subscriber receives it
@@ -166,15 +189,44 @@ broadcast :: StreamBroker -> BrokerEvent -> IO ()
 broadcast broker event = do
   forM_ (eventSession event) (touchThinking broker)
   subs <- readTVarIO (sbSubs broker)
+  startedAt <- getCurrentTime
   live <- filterM (deliverTo event) subs
+  finishedAt <- getCurrentTime
   -- Drop any subscribers whose send threw OR timed out (dead / slow
   -- connections). Call their close actions so the WS socket is actively
   -- closed and the client reconnects. The length check avoids a needless
   -- STM write when everyone survived.
+  --
+  -- Removal is by IDENTITY, never a whole-list write-back of @live@. The
+  -- snapshot above is taken before the fan-out, which can take up to the
+  -- per-send timeout, so writing the whole list back would clobber any
+  -- 'subscribe' or 'unsubscribe' that landed in that window: a subscriber
+  -- removed while the fan-out was in flight would be resurrected — and
+  -- because its connection is gone it can never unsubscribe again, so it
+  -- would leak permanently — while one added mid-flight would be silently
+  -- dropped (it receives no frames, the frontend never flips @wsLive@,
+  -- and the tab looks alive while being inert). 'modifyTVar'' re-reads
+  -- under STM, so the two operations commute.
   when (length live < length subs) $ do
     let dead = filter (\s -> subSessionRef s `notElem` map subSessionRef live) subs
+    -- Surface prunes at Warning: a silently shrinking subscriber list is how
+    -- a stuck peer used to hide. Ids and counts only — never event content.
+    globalLogIO WarningS (ls ("[broadcast] pruning "
+      <> T.pack (show (length dead)) <> " of " <> T.pack (show (length subs))
+      <> " subscriber(s)"))
     forM_ dead $ \s -> subClose s `catch` \(_ :: SomeException) -> pure ()
-    atomically $ writeTVar (sbSubs broker) live
+    let deadRefs = map subSessionRef dead
+    atomically $ modifyTVar' (sbSubs broker)
+      (filter (\s -> subSessionRef s `notElem` deadRefs))
+  -- A fan-out slower than this threshold is evidence worth keeping: it is
+  -- the signal the stall investigation needs, and it is invisible today
+  -- because every request/response log line is emitted only AFTER a handler
+  -- returns. Warning, not Debug, so it survives the default Info filter.
+  let elapsedUs = round (realToFrac (diffUTCTime finishedAt startedAt) * 1e6 :: Double) :: Int
+  when (elapsedUs >= broadcastSlowThresholdUs) $
+    globalLogIO WarningS (ls ("[broadcast] fan-out took "
+      <> T.pack (show elapsedUs) <> "us across "
+      <> T.pack (show (length subs)) <> " subscriber(s)"))
   where
     deliverTo ev s =
       (do

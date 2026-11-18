@@ -13,7 +13,7 @@ module Seal.Gateway.API
   ) where
 
 import Data.Aeson (Value (..), object, (.:), (.=), (.:?), withObject)
-import Data.Aeson.Types (parseMaybe)
+import Data.Aeson.Types (Pair, parseMaybe)
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
@@ -129,8 +129,11 @@ import Seal.Providers.Registry
   ( KnownProvider (..), anthropicOAuthKey, defaultModelFor, knownProviders
   , parseProvider, providerLabel, vaultKeyName
   , customProviderNames, configuredCustomProviderNames, validateProviderName
+  , providerRequiresBaseUrl, providerRequiresName
   , vaultKeyNameForName )
 import Seal.Providers.Ollama (defaultOllamaBaseUrl, ollamaNeedsKey)
+import Seal.Providers.OllamaReadiness
+  ( OllamaReadiness (..), readinessWire )
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
 import Seal.Session.Meta (SessionMeta (..))
@@ -168,6 +171,19 @@ data ApiDeps = ApiDeps
   , adAgentDefs       :: AgentDefBackend      -- ^ for /api/agents (T11) + /api/agents CRUD
   , adSkills          :: SkillBackend         -- ^ for /api/skills CRUD
   , adProviders       :: IO [KnownProvider]   -- ^ for /api/providers; an action that yields the *configured* provider subset (T11). The handler emits all 'knownProviders', flagging each as @configured@ by membership here.
+  , adOllamaReadiness :: IO OllamaReadiness
+    -- ^ Ollama's *observed* readiness — the read side of the probe cache
+    -- ('Seal.Providers.OllamaReadinessProbe.OllamaProbes.oprReadiness').
+    --
+    -- A handler reads the cached value and never probes inline (design D2.4):
+    -- an outbound HTTP round-trip inside a request handler would put a
+    -- 2 s-latency, single-flight-capped probe on the request path and let a
+    -- stalled daemon starve every later request. Refreshes happen out of band
+    -- (the startup warm plus the TTL check inside @oprReadiness@).
+    --
+    -- @pure RdPending@ in tests (see @noOllamaReadiness@ in
+    -- @Seal.TestHelpers.ApiTestHarness@), so no spec touches the network or
+    -- the real PATH.
   , adUiState         :: UiStateHandle        -- ^ for /api/ui/state + /api/ui/custom-models (persisted UI recall)
   , adSend            :: Maybe SendDeps       -- ^ the agent-loop plumbing for POST /send; Nothing = stub responses (tests)
   , adDefaultAgent    :: IO (Maybe Text)        -- ^ re-read @default_agent@ from config.toml on each call (so a PUT /api/agents/default is reflected without a restart)
@@ -255,6 +271,7 @@ setupEnv deps = SetupEnv
   , seConfigPath   = srConfigPath (adSessionRuntime deps)
   , seSecurityPath = securityFilePath (adPaths deps)
   , seProviders    = adProviders deps
+  , seOllamaReadiness = adOllamaReadiness deps
   , seDeps         = adSetup deps
   }
 
@@ -696,14 +713,16 @@ dispatchApi deps req respond =
           customInfos =
             [ object
                 [ "name" .= name
-                , "type" .= ("openai" :: Text)
+                , "type" .= ("openai-compatible" :: Text)
                 , "configured" .= True
                 , "models" .= providerModels cfg name
                 ]
             | name <- customs
             ]
+      readiness <- adOllamaReadiness deps
       respond (jsonLBS status200 (A.encode
-        (map (providerInfoJson cfg cfgSet) knownProviders <> customInfos)))
+        (map (providerInfoJson cfg cfgSet (Just readiness)) knownProviders
+          <> customInfos)))
     -- GET /api/providers/all -> ALL known providers with full status
     -- details (authStatus, isDefault, defaultModel, baseUrl) for the
     -- ProvidersView CRUD page. Literal "all" must precede :p/models.
@@ -3139,13 +3158,37 @@ jsonCreated v = responseLBS status201 [jsonHeader] (A.encode v)
 -- | Map a 'KnownProvider' to the frontend's 'ProviderInfo' JSON shape:
 -- @name@ + @configured@ (membership in the configured-provider set) plus the
 -- operator's frequently-used @models@ for the new-tab model combobox.
-providerInfoJson :: RuntimeConfig -> Set.Set Text -> KnownProvider -> Value
-providerInfoJson cfg cfgSet p =
-  object
+providerInfoJson
+  :: RuntimeConfig -> Set.Set Text -> Maybe OllamaReadiness -> KnownProvider -> Value
+providerInfoJson cfg cfgSet mReadiness p =
+  object $
     [ "name" .= providerLabel p
     , "configured" .= Set.member (providerLabel p) cfgSet
     , "models" .= providerModels cfg (providerLabel p)
     ]
+    <> readinessFields mReadiness (providerLabel p) SnakeCaseKeys
+
+-- | Which casing an endpoint's count key uses. Each endpoint keeps its own
+-- existing convention (design "Wire format"): @\/api\/providers@ is lowercase
+-- snake_case, @\/api\/providers\/all@ is camelCase 1:1, @\/api\/setup@ is
+-- snake_case.
+data ReadinessKeyCasing = SnakeCaseKeys | CamelCaseKeys
+
+-- | The two readiness fields, emitted for **Ollama only**. A non-Ollama row,
+-- and a custom OpenAI-compatible instance (@typeId = "openai-compatible"@), emits neither
+-- key — absent, not null — so the frontend's absent-field fallback covers them
+-- and no consumer has to distinguish "no readiness" from "readiness is null".
+readinessFields :: Maybe OllamaReadiness -> Text -> ReadinessKeyCasing -> [Pair]
+readinessFields mReadiness name casing = case (name, mReadiness) of
+  (n, Just st) | n == "ollama" ->
+    [ Key.fromText "readiness" .= readinessWire st
+    ] <> case st of
+      RdReady count -> [ Key.fromText (countKey casing) .= count ]
+      _             -> []
+  _ -> []
+  where
+    countKey SnakeCaseKeys = "readiness_models"
+    countKey CamelCaseKeys = "readinessModels"
 
 -- | Handle GET /api/providers/all — returns ALL known providers with full
 -- status details for the ProvidersView CRUD page. Each provider object
@@ -3156,35 +3199,48 @@ handleProvidersAll deps = do
   eCfg <- loadRuntimeConfig cfgPath
   let cfg = fromRight defaultRuntimeConfig eCfg
   mh <- readIORef (vrHandleRef (adVault deps))
-  details <- mapM (providerDetailJson cfg mh) knownProviders
-  custom <- mapM (customProviderDetailJson cfg mh) (customProviderNames cfg)
+  readiness <- adOllamaReadiness deps
+  details <- mapM (providerDetailJson cfg mh (Just readiness)) knownProviders
+  custom <- mapM (customProviderDetailJson cfg mh Nothing) (customProviderNames cfg)
   pure (jsonLBS status200 (A.encode (details <> custom)))
 
 -- | Build the detailed JSON object for a single built-in provider, including
 -- its auth status (derived from the vault + config), default-model, base-URL,
 -- and whether it is the configured default provider.
-providerDetailJson :: RuntimeConfig -> Maybe VaultHandle -> KnownProvider -> IO Value
-providerDetailJson cfg mh kp =
-  providerDetailJsonFor cfg mh lbl lbl
+providerDetailJson
+  :: RuntimeConfig -> Maybe VaultHandle -> Maybe OllamaReadiness
+  -> KnownProvider -> IO Value
+providerDetailJson cfg mh mReadiness kp =
+  providerDetailJsonFor cfg mh mReadiness lbl lbl
   where
     lbl = providerLabel kp
 
 -- | Build the detailed JSON object for a custom OpenAI-compatible instance.
-customProviderDetailJson :: RuntimeConfig -> Maybe VaultHandle -> Text -> IO Value
-customProviderDetailJson cfg mh name =
-  providerDetailJsonFor cfg mh name "openai"
+customProviderDetailJson
+  :: RuntimeConfig -> Maybe VaultHandle -> Maybe OllamaReadiness -> Text -> IO Value
+customProviderDetailJson cfg mh mReadiness name =
+  providerDetailJsonFor cfg mh mReadiness name "openai-compatible"
 
 -- | The shared detail object. @typeId@ is the implementation ("anthropic",
--- "ollama", "openrouter", "openai"); @name@ is the instance name.
+-- "ollama", "ollama-cloud", "openrouter", "openai", "openai-compatible");
+-- @name@ is the instance name.
 providerDetailJsonFor
-  :: RuntimeConfig -> Maybe VaultHandle -> Text -> Text -> IO Value
-providerDetailJsonFor cfg mh name typeId = do
+  :: RuntimeConfig -> Maybe VaultHandle -> Maybe OllamaReadiness
+  -> Text -> Text -> IO Value
+providerDetailJsonFor cfg mh mReadiness name typeId = do
   authStatus <- providerAuthStatusByName mh cfg name
   let isDef = rcDefaultProvider cfg == Just name
       dModel = providerDefaultModel cfg name
       bUrl = providerBaseUrl cfg name
       models = providerModels cfg name
-  pure $ object
+      -- Whether the operator must SUPPLY these, not whether the form shows
+      -- them (D7: required and visible are different questions). A built-in
+      -- carries its own answer; an unresolved/unknown name is a custom
+      -- OpenAI-compatible instance, which requires both by definition.
+      builtIn = parseProvider name
+      requiresBaseUrl = maybe True providerRequiresBaseUrl builtIn
+      requiresName = maybe True providerRequiresName builtIn
+  pure $ object $
     [ "name" .= name
     , "type" .= typeId
     , "isDefault" .= isDef
@@ -3192,7 +3248,13 @@ providerDetailJsonFor cfg mh name typeId = do
     , "models" .= models
     , "baseUrl" .= bUrl
     , "authStatus" .= authStatus
+    , "requiresBaseUrl" .= requiresBaseUrl
+    , "requiresName" .= requiresName
     ]
+    -- A custom OpenAI-compatible instance must NOT carry readiness (design
+    -- non-goal #1); the name check inside readinessFields already excludes it
+    -- unless the instance is literally named "ollama", hence the typeId guard.
+    <> [ r | typeId /= "openai-compatible" || name == "ollama", r <- readinessFields mReadiness name CamelCaseKeys ]
 
 -- | Auth status for an instance name.
 providerAuthStatusByName :: Maybe VaultHandle -> RuntimeConfig -> Text -> IO Text
@@ -3225,6 +3287,12 @@ providerAuthStatus mh cfg kp = case kp of
   OpenRouterProvider -> case mh of
     Nothing   -> pure "none"
     Just vh   -> probeVault vh (vaultKeyName OpenRouterProvider)
+  OllamaCloudProvider -> case mh of
+    Nothing   -> pure "none"
+    Just vh   -> probeVault vh (vaultKeyName OllamaCloudProvider)
+  OpenAIProvider -> case mh of
+    Nothing   -> pure "none"
+    Just vh   -> probeVault vh (vaultKeyName OpenAIProvider)
   OpenAICompatibleProvider -> case mh of
     Nothing   -> pure "none"
     Just vh   -> probeVault vh (vaultKeyName OpenAICompatibleProvider)
@@ -3243,7 +3311,7 @@ probeVault vh key = do
 -- key in the vault (when present) and seeds config defaults
 -- (default_provider if unset, per-provider default_model if unset). Built-in
 -- providers keep their upsert semantics; a custom OpenAI-compatible instance
--- (sent with @type: "openai"@) must have a unique name. Returns 201 + the
+-- (sent with @type: "openai-compatible"@) must have a unique name. Returns 201 + the
 -- provider detail on success, 400 on an unknown/invalid name, 409 on a
 -- duplicate custom name, 500 on vault error.
 handleProviderCreate :: ApiDeps -> BL.ByteString -> IO Response
@@ -3292,7 +3360,8 @@ handleProviderCreate deps body =
                     eCfg <- loadRuntimeConfig cfgPath
                     let cfg = fromRight defaultRuntimeConfig eCfg
                     mh <- readIORef (vrHandleRef (adVault deps))
-                    detail <- providerDetailJsonFor cfg mh lbl typeId
+                    readiness <- adOllamaReadiness deps
+                    detail <- providerDetailJsonFor cfg mh (Just readiness) lbl typeId
                     pure (jsonLBS status201 (A.encode detail))
 
 -- | Trim and drop blank entries from the operator's frequent-model list.
@@ -3300,7 +3369,7 @@ normalizeModels :: [Text] -> [Text]
 normalizeModels = filter (not . T.null) . map T.strip
 
 -- | Resolve a POST target. Built-ins keep their own name/key; a custom
--- instance requires @type: "openai"@, a valid name, and a name not already in
+-- instance requires @type: "openai-compatible"@, a valid name, and a name not already in
 -- the config.
 resolveCreateTarget
   :: RuntimeConfig -> Text -> Maybe Text -> Maybe Text
@@ -3312,7 +3381,7 @@ resolveCreateTarget cfg name mType mBaseUrl = case parseProvider name of
     | otherwise ->
         Right (providerLabel kp, providerLabel kp, vaultKeyName kp, defaultModelFor kp)
   Nothing
-    | mType /= Just "openai" ->
+    | mType /= Just "openai-compatible" ->
         Left (status400, "unknown provider: " <> name)
     | otherwise -> case validateProviderName name of
         Left e -> Left (status400, e)
@@ -3322,7 +3391,7 @@ resolveCreateTarget cfg name mType mBaseUrl = case parseProvider name of
           | maybe True (T.null . T.strip) mBaseUrl ->
               Left (status400, "base_url is required for an OpenAI-compatible provider")
           | otherwise ->
-              Right ( name, "openai", vaultKeyNameForName name
+              Right ( name, "openai-compatible", vaultKeyNameForName name
                     , defaultModelFor OpenAICompatibleProvider )
 
 -- | Resolve an existing provider name (built-in or custom) to its config key,
@@ -3332,7 +3401,7 @@ resolveExistingTarget cfg name = case parseProvider name of
   Just kp -> Just (providerLabel kp, providerLabel kp, vaultKeyName kp)
   Nothing
     | name `elem` customProviderNames cfg ->
-        Just (name, "openai", vaultKeyNameForName name)
+        Just (name, "openai-compatible", vaultKeyNameForName name)
     | otherwise -> Nothing
 
 -- | Store a non-empty API key in the vault. An absent/empty key is a no-op.
@@ -3391,7 +3460,8 @@ handleProviderUpdate deps name body = do
                 eCfg <- loadRuntimeConfig cfgPath
                 let cfg = fromRight defaultRuntimeConfig eCfg
                 mh <- readIORef (vrHandleRef (adVault deps))
-                detail <- providerDetailJsonFor cfg mh lbl typeId
+                readiness <- adOllamaReadiness deps
+                detail <- providerDetailJsonFor cfg mh (Just readiness) lbl typeId
                 pure (jsonOk detail)
 
 -- | Handle DELETE /api/providers/:name — remove all vault credentials for
@@ -3776,6 +3846,13 @@ staticModelsFor AnthropicProvider =
   ]
 staticModelsFor OllamaProvider = ["llama3.2", "llama3.1"]
 staticModelsFor OpenRouterProvider = ["deepseek/deepseek-v4.1-flash-1017"]
+-- | Both ids are sized by 'Seal.Providers.ContextWindow' ("gpt-4o-" prefix and
+-- "gpt-4-turbo"). Bare @gpt-4o@ is deliberately absent: the table's clause has
+-- a trailing dash, so it would score 0 and render no percentage.
+staticModelsFor OpenAIProvider = ["gpt-4o-mini", "gpt-4-turbo"]
+-- | Empty for the same reason the generic type's is: Ollama Cloud's live
+-- catalogue is the operator's own, and 'listModels' already fetches it.
+staticModelsFor OllamaCloudProvider = []
 -- | Empty on purpose: a generic endpoint owns its catalogue, and inventing
 -- model ids here would be a guess the UI would present as fact.
 staticModelsFor OpenAICompatibleProvider = []

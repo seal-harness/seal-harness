@@ -10,9 +10,13 @@ import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Time (getCurrentTime, addUTCTime)
-import Control.Concurrent (threadDelay)
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar')
 import Control.Exception (Exception, throwIO)
+import Katip (Severity (..), Scribe (..), permitItem, jsonFormat, Verbosity (V2))
+import Seal.Logging.Global (setGlobalLogger, unsetGlobalLogger)
+import Seal.Logging.Logger (closeSealLogger, newSealLoggerWithScribe)
 import Control.Monad (void)
 import System.Timeout (timeout)
 import Test.Hspec
@@ -30,6 +34,34 @@ data DeadConnection = DeadConnection
   deriving stock (Show)
 
 instance Exception DeadConnection
+
+-- | A send action that throws, simulating a connection that dropped.
+dieOnEvent :: BrokerEvent -> IO ()
+dieOnEvent _ = throwIO DeadConnection
+
+-- | Install a capture scribe as the global logger at the given permit
+-- severity, run an action, then restore the no-op default. The permit is
+-- the whole point: with 'permitItem InfoS' this mirrors the production
+-- logger built from the default config level, so a Debug-severity line
+-- would be dropped and a Warning would survive — which is exactly what
+-- Unit 2b's DoD has to prove.
+withCaptureLoggerAt :: Severity -> IO a -> IO (a, [T.Text])
+withCaptureLoggerAt permit action = do
+  ref <- newIORef []
+  let scribe = Scribe
+        { liPush = \item -> do
+            let rendered = jsonFormat False V2 item
+            modifyIORef' ref (T.pack (show rendered) :)
+        , scribePermitItem = permitItem permit
+        , scribeFinalizer = pure ()
+        }
+  logger <- newSealLoggerWithScribe scribe DebugS
+  setGlobalLogger logger
+  result <- action
+  closeSealLogger logger
+  captured <- readIORef ref
+  unsetGlobalLogger
+  pure (result, captured)
 
 -- | Subscribe with a no-op close action (tests don't need real WS close).
 subscribeTest :: StreamBroker -> SessionId -> (BrokerEvent -> IO ()) -> IO (TVar SessionId)
@@ -188,6 +220,136 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
     length h `shouldBe` 1
     count <- subscriberCount broker
     count `shouldBe` 1
+
+  -- ── unsubscribe / remove-by-identity (Unit 1) ───────────────────────
+  --
+  -- Nothing ever removed a subscriber from 'sbSubs': 'acceptConn' subscribes
+  -- and, when the peer goes away, simply returns. Dead entries were reaped
+  -- only opportunistically by a later broadcast that tried to send to them —
+  -- cheaply if the send raised, but the full per-send timeout if it blocked.
+  -- Measured on a process that had been up ~22h: 15 connect events and zero
+  -- teardowns. Past 'sbCap' the silent no-op in 'subscribe' means a new tab
+  -- connects, receives nothing, and looks alive while being inert.
+  describe "Seal.Gateway.StreamBroker.unsubscribe" $ do
+    it "removes the subscriber, and a later broadcast does not reach it" $ do
+      broker <- newStreamBroker 10
+      ref <- newIORef ([] :: [BrokerEvent])
+      subRef <- subscribeTest broker (mkSid "a") (\e -> modifyIORef' ref (e :))
+      count <- subscriberCount broker
+      count `shouldBe` 1
+      unsubscribe broker subRef
+      count' <- subscriberCount broker
+      count' `shouldBe` 0
+      broadcast broker (BeEntryRecorded (mkSid "a") (object ["id" .= ("e1" :: T.Text)]))
+      events <- readIORef ref
+      length events `shouldBe` 0
+
+    it "is idempotent (a second call is a no-op)" $ do
+      broker <- newStreamBroker 10
+      subRef <- subscribeTest broker (mkSid "a") (\_ -> pure ())
+      unsubscribe broker subRef
+      unsubscribe broker subRef
+      count <- subscriberCount broker
+      count `shouldBe` 0
+
+    -- The lost-update race. 'broadcast' snapshots the subscriber list at
+    -- :168 and writes the WHOLE list back at :177, inside a guard that only
+    -- fires when some send FAILED. So this test needs a throwing subscriber
+    -- to arm that guard — with every send succeeding, no write happens and
+    -- the test would pass vacuously on the buggy code.
+    --
+    -- Order: B (succeeds) first, then F (throws, arming the guard), then A
+    -- (blocks, giving the main thread a deterministic window). Unsubscribing
+    -- B while A is blocked leaves B in the stale snapshot, so the buggy
+    -- write-back resurrects it.
+    it "does not resurrect a subscriber unsubscribed during a fan-out" $ do
+      broker <- newStreamBroker 10
+      bHits <- newIORef (0 :: Int)
+      subB <- subscribeTest broker (mkSid "a") (\_ -> modifyIORef' bHits (+ 1))
+      void $ subscribeTest broker (mkSid "a") dieOnEvent
+      entered <- newEmptyMVar
+      release <- newEmptyMVar
+      void $ subscribeTest broker (mkSid "a") $ \_ -> do
+        putMVar entered ()
+        takeMVar release
+      let entry = object ["id" .= ("e1" :: T.Text)]
+      void $ forkIO (broadcast broker (BeEntryRecorded (mkSid "a") entry))
+      -- Wait until A's send has been entered: B and F have already run.
+      takeMVar entered
+      unsubscribe broker subB
+      putMVar release ()
+      -- Let the fan-out finish (F's throw + the write-back).
+      threadDelay 200_000
+      count <- subscriberCount broker
+      count `shouldBe` 1  -- only A remains; B must stay gone
+      hitsAfter <- readIORef bHits
+      broadcast broker (BeEntryRecorded (mkSid "a") entry)
+      threadDelay 200_000
+      hitsFinal <- readIORef bHits
+      hitsFinal `shouldBe` hitsAfter  -- no further delivery to B
+
+    -- A concurrently-added subscriber must survive the write-back. This also
+    -- needs the guard armed (F throws), otherwise no write happens and the
+    -- test proves nothing on the buggy code.
+    it "does not drop a subscriber added during a fan-out" $ do
+      broker <- newStreamBroker 10
+      void $ subscribeTest broker (mkSid "a") dieOnEvent
+      entered <- newEmptyMVar
+      release <- newEmptyMVar
+      void $ subscribeTest broker (mkSid "a") $ \_ -> do
+        putMVar entered ()
+        takeMVar release
+      let entry = object ["id" .= ("e1" :: T.Text)]
+      void $ forkIO (broadcast broker (BeEntryRecorded (mkSid "a") entry))
+      takeMVar entered
+      void $ subscribeTest broker (mkSid "a") (\_ -> pure ())
+      putMVar release ()
+      threadDelay 200_000
+      count <- subscriberCount broker
+      count `shouldBe` 2  -- the blocked one + the one added mid-flight
+
+  -- ── broadcast diagnostics (Unit 2b) ─────────────────────────────────
+  --
+  -- A blocked handler used to leave NO trace: 'requestTimingMiddleware'
+  -- logs only inside the 'respond' continuation, so a handler that never
+  -- produced a Response logged nothing at all. The consequence was visible
+  -- in the incident this work came from — a 42 MB log with no POST line for
+  -- a session that HAD been created on disk. These lines are Warning (not
+  -- Debug) so they survive the default Info filter.
+  describe "Seal.Gateway.StreamBroker.broadcast diagnostics" $ do
+    it "logs a Warning when it prunes a failed subscriber" $ do
+      broker <- newStreamBroker 10
+      void $ subscribeTest broker (mkSid "a") dieOnEvent
+      (_, logs) <- withCaptureLoggerAt InfoS $
+        broadcast broker (BeEntryRecorded (mkSid "a") (object ["id" .= ("e1" :: T.Text)]))
+      let joined = T.intercalate "\n" logs
+      joined `shouldSatisfy` T.isInfixOf "pruning"
+      -- Severity check: the line survives a permitItem InfoS scribe, i.e. it
+      -- is an Info-or-above item, not a Debug one.
+      joined `shouldSatisfy` T.isInfixOf "Warning"
+
+    it "stays silent for a fast fan-out with no failures" $ do
+      broker <- newStreamBroker 10
+      ref <- newIORef ([] :: [BrokerEvent])
+      void $ subscribeTest broker (mkSid "a") (\e -> modifyIORef' ref (e :))
+      (_, logs) <- withCaptureLoggerAt InfoS $
+        broadcast broker (BeEntryRecorded (mkSid "a") (object ["id" .= ("e1" :: T.Text)]))
+      let joined = T.intercalate "\n" logs
+      -- A healthy fan-out must not warn. (The subscriber count is 1 and the
+      -- send is instantaneous, so neither the prune branch nor the slow
+      -- branch fires.)
+      joined `shouldNotSatisfy` T.isInfixOf "[broadcast]"
+
+    it "does not leak event content into the diagnostics" $ do
+      broker <- newStreamBroker 10
+      void $ subscribeTest broker (mkSid "a") dieOnEvent
+      let secret = "SUPER-SECRET-PAYLOAD-xyzzy" :: T.Text
+      (_, logs) <- withCaptureLoggerAt InfoS $
+        broadcast broker (BeEntryRecorded (mkSid "a") (object ["id" .= secret]))
+      let joined = T.intercalate "\n" logs
+      joined `shouldSatisfy` T.isInfixOf "pruning"
+      -- Ids and counts only — the event payload must never reach the log.
+      joined `shouldNotSatisfy` T.isInfixOf secret
 
   -- ── reconcileStaleThinking ──────────────────────────────────────────
   --

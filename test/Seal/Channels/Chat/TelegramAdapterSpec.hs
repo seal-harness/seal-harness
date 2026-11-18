@@ -7,7 +7,7 @@ import Data.IORef (newIORef, modifyIORef', readIORef)
 import Data.Maybe (isJust)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 
-import Seal.Channels.Chat.Class (ChatChannel (..))
+import Seal.Channels.Chat.Class (ChatChannel (..), ProgressStyle (..))
 import Seal.Channels.Chat.Telegram
   ( TelegramChatTransport (..)
   , withTelegramChatChannel
@@ -52,12 +52,41 @@ spec = do
 
   describe "ChatChannel TelegramChatChannel" $ do
     it "has label 'telegram'" $ do
-      (transport, _) <- mkMockTelegramChatTransport [dummyMsg]
+      (transport, _, _) <- mkMockTelegramChatTransport [dummyMsg]
       withTelegramChatChannel AllowAll 1000 testBackoff transport $ \ch -> do
         ccLabel ch `shouldBe` "telegram"
 
+    it "opts into the single-edited-bubble style" $ do
+      -- One message per turn, edited in place. On Telegram an edit does not
+      -- notify, so this is what turns a 5-tool turn from ~6 pushes into one.
+      (transport, _, _) <- mkMockTelegramChatTransport [dummyMsg]
+      withTelegramChatChannel AllowAll 1000 testBackoff transport $ \ch ->
+        ccProgressStyle ch `shouldBe` PsSingleBubble
+
+    it "reports the configured chunk limit" $ do
+      -- Without this the single-bubble path cannot tell when its body has
+      -- outgrown one message, and keeps editing until the platform rejects it.
+      (transport, _, _) <- mkMockTelegramChatTransport [dummyMsg]
+      withTelegramChatChannel AllowAll 1234 testBackoff transport $ \ch ->
+        ccChunkLimit ch `shouldBe` Just 1234
+
+    it "sends a progress bubble silently, returning an editable id" $ do
+      -- A progress bubble must not ping the human: that is what makes a tool
+      -- turn notify exactly once (the answer).
+      (transport, getCaptured, _) <- mkMockTelegramChatTransport [dummyMsg]
+      withTelegramChatChannel AllowAll 1000 testBackoff transport $ \ch -> do
+        waitForSeed
+        -- Seed the last chat id via a normal send first.
+        _ <- ccSendWithId ch "seed"
+        sent <- getCaptured
+        sent `shouldSatisfy` const True
+        mId <- ccSendWithIdSilently ch "progress"
+        case mId of
+          Just (ChatMessageId _) -> pure ()
+          Nothing -> fail "expected the silent send to return an id"
+
     it "sends messages via the transport" $ do
-      (transport, getCaptured) <- mkMockTelegramChatTransport [dummyMsg]
+      (transport, getCaptured, _) <- mkMockTelegramChatTransport [dummyMsg]
       withTelegramChatChannel AllowAll 1000 testBackoff transport $ \ch -> do
         waitForSeed
         ccSend ch "hello world"
@@ -65,7 +94,7 @@ spec = do
         captured `shouldBe` ["hello world"]
 
     it "sends with id and returns a ChatMessageId" $ do
-      (transport, _) <- mkMockTelegramChatTransport [dummyMsg]
+      (transport, _, _) <- mkMockTelegramChatTransport [dummyMsg]
       withTelegramChatChannel AllowAll 1000 testBackoff transport $ \ch -> do
         waitForSeed
         mId <- ccSendWithId ch "test"
@@ -74,14 +103,14 @@ spec = do
           Nothing -> fail "expected a message id"
 
     it "edits messages via the transport" $ do
-      (transport, _) <- mkMockTelegramChatTransport [dummyMsg]
+      (transport, _, _) <- mkMockTelegramChatTransport [dummyMsg]
       withTelegramChatChannel AllowAll 1000 testBackoff transport $ \ch -> do
         waitForSeed
         ok <- ccEditMessage ch (ChatMessageId "123") "new content"
         ok `shouldBe` True
 
     it "chunks long sends" $ do
-      (transport, getCaptured) <- mkMockTelegramChatTransport [dummyMsg]
+      (transport, getCaptured, _) <- mkMockTelegramChatTransport [dummyMsg]
       withTelegramChatChannel AllowAll 5 testBackoff transport $ \ch -> do
         waitForSeed
         ccSend ch "abcdefghij"
@@ -104,6 +133,7 @@ spec = do
                   _ -> pure (Left "inbox empty")
             , tctSend = \_c _b -> pure ()
             , tctSendWithId = \_c _b -> pure (Just "1")
+            , tctSendWithIdSilently = \_c _b -> pure (Just "1")
             , tctSendWithKeyboard = \_c _b _kb -> pure (Just "1")
             , tctAnswerCallback = \_ -> pure ()
             , tctEditReplyMarkup = \_c _mid -> pure ()
@@ -134,6 +164,7 @@ spec = do
                   else if n == 3 then pure (Right dummyMsg) else pure (Left "inbox empty")
             , tctSend = \_c _b -> pure ()
             , tctSendWithId = \_c _b -> pure (Just "1")
+            , tctSendWithIdSilently = \_c _b -> pure (Just "1")
             , tctSendWithKeyboard = \_c _b _kb -> pure (Just "1")
             , tctAnswerCallback = \_ -> pure ()
             , tctEditReplyMarkup = \_c _mid -> pure ()

@@ -45,6 +45,7 @@ import {
   stopSession,
   fetchSessionAgents,
   useConfiguredProviders,
+  useAllProviders,
   notifyProvidersChanged,
   setSessionDescription,
   setSessionArchived,
@@ -589,6 +590,41 @@ describe('useConfiguredProviders', () => {
     act(() => notifyProvidersChanged())
     await waitFor(() => expect(result.current.providers).toHaveLength(2))
     expect(result.current.providers.map((p) => p.name)).toContain('local-vllm')
+  })
+})
+
+describe('readiness focus refetch (test 43, design D2.5)', () => {
+  it('useConfiguredProviders re-fetches when the window regains focus', async () => {
+    setNextResponse([{ name: 'ollama', readiness: 'not-running' }])
+    const before = fetchCalls.length
+    const { result } = renderHook(() => useConfiguredProviders())
+    await waitFor(() => expect(result.current.providers).toHaveLength(1))
+    expect(result.current.providers[0]!.readiness).toBe('not-running')
+
+    // The operator starts the daemon in another window; coming back fires
+    // `focus`, and the annotation must update without a reload.
+    setNextResponse([{ name: 'ollama', readiness: 'ready', readiness_models: 2 }])
+    act(() => { window.dispatchEvent(new Event('focus')) })
+    await waitFor(() =>
+      expect(result.current.providers[0]?.readiness).toBe('ready'),
+    )
+    expect(result.current.providers[0]!.readiness_models).toBe(2)
+    // A second fetch actually happened (not just a state reshuffle).
+    expect(fetchCalls.length).toBeGreaterThan(before + 1)
+  })
+
+  it('useAllProviders re-fetches when the window regains focus', async () => {
+    setNextResponse([{ name: 'ollama', authStatus: 'keyless', readiness: 'not-running' }])
+    const { result } = renderHook(() => useAllProviders())
+    await waitFor(() => expect(result.current.loaded).toBe(true))
+    expect(result.current.providers[0]!.readiness).toBe('not-running')
+
+    setNextResponse([{ name: 'ollama', authStatus: 'keyless', readiness: 'ready', readinessModels: 3 }])
+    act(() => { window.dispatchEvent(new Event('focus')) })
+    await waitFor(() =>
+      expect(result.current.providers[0]?.readiness).toBe('ready'),
+    )
+    expect(result.current.providers[0]!.readinessModels).toBe(3)
   })
 })
 

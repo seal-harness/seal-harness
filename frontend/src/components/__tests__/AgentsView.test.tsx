@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import { AgentsView } from '../AgentsView'
-import type { AgentDefInfo } from '../../types'
+import type { AgentDefInfo, ProviderInfo } from '../../types'
 
 // ── Mocks ────────────────────────────────────────────────────────────────
 
@@ -12,6 +12,7 @@ const fetchDefaultAgent = vi.fn(async (): Promise<string | null> => null)
 const setDefaultAgent = vi.fn(async (_agent: string | null): Promise<boolean> => false)
 
 let agentDefsState: AgentDefInfo[] = []
+let providersState: ProviderInfo[] = [{ name: 'anthropic' }, { name: 'ollama' }]
 let agentDefsError = false
 let agentDefsLoaded = true
 let defaultAgentIdState: string | null = null
@@ -29,7 +30,7 @@ vi.mock('../../hooks/useApi', () => ({
     refresh: vi.fn(),
   }),
   useConfiguredProviders: () => ({
-    providers: [{ name: 'anthropic' }, { name: 'ollama' }],
+    providers: providersState,
     loaded: true,
   }),
 }))
@@ -56,6 +57,7 @@ function makeAgent(overrides: Partial<AgentDefInfo> = {}): AgentDefInfo {
 
 beforeEach(() => {
   agentDefsState = []
+  providersState = [{ name: 'anthropic' }, { name: 'ollama' }]
   agentDefsError = false
   agentDefsLoaded = true
   defaultAgentIdState = null
@@ -106,6 +108,46 @@ describe('AgentsView', () => {
     agentDefsError = true
     render(<AgentsView />)
     expect(screen.getByTestId('agents-load-error')).toBeTruthy()
+  })
+
+  // Test 42, the AgentsView half. This view HAND-ROLLS its own <select> and
+  // never renders ProviderSelect, so the shared component's annotation does not
+  // reach it — it needs its own.
+  it('42: annotates Ollama with its readiness in the agent provider select', () => {
+    providersState = [
+      { name: 'anthropic' },
+      { name: 'ollama', readiness: 'not-running' },
+    ]
+    agentDefsState = []
+    render(<AgentsView />)
+    fireEvent.click(screen.getByLabelText('New agent'))
+    const sel = document.getElementById('agent-provider') as HTMLSelectElement
+    const opts = Array.from(sel.options)
+    expect(opts.find((o) => o.value === 'ollama')!.textContent).toBe('Ollama (Not Running)')
+    // Annotation, not gating: still selectable.
+    expect(opts.find((o) => o.value === 'ollama')!.disabled).toBe(false)
+    fireEvent.change(sel, { target: { value: 'ollama' } })
+    expect(sel.value).toBe('ollama')
+  })
+
+  it('42b: a ready Ollama carries its model count here too', () => {
+    providersState = [
+      { name: 'ollama', readiness: 'ready', readiness_models: 2 },
+    ]
+    agentDefsState = []
+    render(<AgentsView />)
+    fireEvent.click(screen.getByLabelText('New agent'))
+    const opts = Array.from((document.getElementById('agent-provider') as HTMLSelectElement).options)
+    expect(opts.find((o) => o.value === 'ollama')!.textContent).toBe('Ollama (Ready · 2 Models)')
+  })
+
+  it('42c: a non-Ollama provider carries no annotation', () => {
+    providersState = [{ name: 'anthropic' }]
+    agentDefsState = []
+    render(<AgentsView />)
+    fireEvent.click(screen.getByLabelText('New agent'))
+    const opts = Array.from((document.getElementById('agent-provider') as HTMLSelectElement).options)
+    expect(opts.find((o) => o.value === 'anthropic')!.textContent).toBe('Anthropic')
   })
 
   it('clicking + opens the New agent form', () => {

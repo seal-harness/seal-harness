@@ -109,6 +109,50 @@ spec = describe "Seal.Web.UrlSafety" $ do
     it "does NOT block example.com" $
       isAlwaysBlockedUrl "https://example.com/x" `shouldBe` False
 
+    -- The bracket-aware / userinfo-stripping host parse (design D2.2). Before
+    -- the fix, extractHost truncated the authority at the first ':', so
+    -- "[fd00:ec2::254]" became "[fd00" and the alwaysBlockedIps entry for
+    -- fd00:ec2::254 was unreachable dead code.
+    it "blocks the bracketed IPv6 metadata literal [fd00:ec2::254]" $
+      isAlwaysBlockedUrl "http://[fd00:ec2::254]/x" `shouldBe` True
+
+    it "blocks a metadata IP carrying userinfo" $
+      isAlwaysBlockedUrl "http://x@169.254.169.254/" `shouldBe` True
+
+    it "blocks a metadata IP carrying a port" $
+      isAlwaysBlockedUrl "http://169.254.169.254:80/" `shouldBe` True
+
+  -- The same fix observed through isSafeUrl, which is the surface
+  -- Seal.Web.Fetch actually calls. A userinfo-carrying private URL used to
+  -- slip past the IPv4 literal check entirely and surface as UseDnsFailed.
+  describe "isSafeUrl host parsing (D2.2)" $ do
+
+    it "rejects a private IPv4 carrying userinfo as a blocked IP (not UseDnsFailed)" $ do
+      e <- isSafeUrl "http://x@192.168.1.1/"
+      e `shouldSatisfy` isLeftWith' (UseBlockedIp "192.168.1.1")
+
+    it "rejects a bracketed IPv6 metadata literal as a blocked IP" $ do
+      e <- isSafeUrl "http://[fd00:ec2::254]/x"
+      e `shouldSatisfy` isLeftWith' (UseBlockedIp "fd00:ec2::254")
+
+    -- Guard against over-blocking: the fix must not turn legitimate hosts
+    -- into false positives.
+    it "still allows 172.32.0.1 (outside 172.16/12)" $ do
+      e <- isSafeUrl "http://172.32.0.1/page"
+      e `shouldSatisfy` isRight
+
+    it "still allows 100.128.0.1 (outside CGNAT)" $ do
+      e <- isSafeUrl "http://100.128.0.1/page"
+      e `shouldSatisfy` isRight
+
+    it "still allows the public 93.184.216.34" $ do
+      e <- isSafeUrl "http://93.184.216.34/"
+      e `shouldSatisfy` isRight
+
+    it "still allows a userinfo-carrying public host" $ do
+      e <- isSafeUrl "http://user:pw@93.184.216.34/"
+      e `shouldSatisfy` isRight
+
 -- | Assert the 'Either' is 'Left' with a specific error constructor.
 isLeftWith :: (UrlSafetyError -> Bool) -> Either UrlSafetyError a -> Bool
 isLeftWith p (Left e) = p e

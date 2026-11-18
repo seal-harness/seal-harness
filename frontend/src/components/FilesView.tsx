@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import type { FileEntry, FileListing, FileContent } from '../types'
 import { fetchFileListing, fetchFileListingWithRail, fetchFileContent, fetchFileStat } from '../hooks/useApi'
 import { useFileDownload } from '../hooks/useFileDownload'
+import { copyTextToClipboard } from '../lib/clipboard'
 import { DownloadProgressUI } from './DownloadProgress'
 import { FileTree, type FileTreeNode } from './FileTree'
 import { DownloadConfirmDialog } from './DownloadConfirmDialog'
@@ -211,7 +212,17 @@ const rowStyle: React.CSSProperties = {
 
 // ── Sub-components ──────────────────────────────────────────────────────
 
-function Breadcrumbs({ path, children }: { path: string; children?: React.ReactNode }) {
+function Breadcrumbs({
+  path,
+  actions,
+  children,
+}: {
+  path: string
+  /** Affordances that belong to the path itself, rendered immediately after
+   *  the last segment (e.g. the copy-path button). */
+  actions?: React.ReactNode
+  children?: React.ReactNode
+}) {
   const segs = breadcrumbSegments(path)
   return (
     <div style={headerStyle} data-testid="breadcrumbs">
@@ -234,8 +245,61 @@ function Breadcrumbs({ path, children }: { path: string; children?: React.ReactN
           )}
         </span>
       ))}
+      {actions}
       {children}
     </div>
+  )
+}
+
+/** Copy-to-clipboard button for the full path shown at the top of the page.
+ *  Sits immediately to the right of the breadcrumb trail; on click it copies
+ *  the *full* path (not the breadcrumb's possibly-collapsed rendering) and
+ *  flips to a check glyph with a "Copied" label for ~1.5s. */
+function CopyPathButton({ path }: { path: string }) {
+  const [copied, setCopied] = useState(false)
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => () => { if (timeoutRef.current) clearTimeout(timeoutRef.current) }, [])
+
+  // A stale "Copied" tick from the previous path would be a lie about the
+  // path now on screen.
+  useEffect(() => {
+    setCopied(false)
+    if (timeoutRef.current) clearTimeout(timeoutRef.current)
+  }, [path])
+
+  const onClick = async () => {
+    const ok = await copyTextToClipboard(path)
+    if (!ok) return
+    setCopied(true)
+    if (timeoutRef.current) clearTimeout(timeoutRef.current)
+    timeoutRef.current = setTimeout(() => setCopied(false), 1500)
+  }
+
+  return (
+    <button
+      type="button"
+      className={`icon-btn${copied ? ' icon-btn-success' : ''}`}
+      data-testid="copy-path"
+      title={copied ? 'Copied!' : `Copy path: ${path}`}
+      aria-label={copied ? 'Path copied to clipboard' : `Copy path to clipboard: ${path}`}
+      onClick={() => { void onClick() }}
+    >
+      {copied ? (
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+          stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
+          aria-hidden="true">
+          <path d="M3 8 L7 12 L13 4" />
+        </svg>
+      ) : (
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
+          stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
+          aria-hidden="true">
+          <rect x="5" y="5" width="8" height="8" rx="1.5" />
+          <path d="M3 11 V3.5 A1.5 1.5 0 0 1 4.5 2 H11" />
+        </svg>
+      )}
+    </button>
   )
 }
 
@@ -825,6 +889,11 @@ export function FilesView() {
   const listingForPane: FileListing | undefined =
     path === null ? listings.get(null) : listings.get(path)
 
+  /** The full path currently on screen. A null `path` means the backend
+   *  resolved $HOME, so read it from the listing it returned — copying the
+   *  literal '/' there would hand the user a useless string. */
+  const displayPath = path ?? listings.get(null)?.path ?? rootListing?.path ?? '/'
+
   return (
     <div style={sectionStyle}>
       <div style={railStyle}>
@@ -865,7 +934,10 @@ export function FilesView() {
       </div>
 
       <div className="flex-1 overflow-y-auto" style={{ minWidth: 0 }}>
-        <Breadcrumbs path={path ?? rootListing?.path ?? '/'}>
+        <Breadcrumbs
+          path={displayPath}
+          actions={<CopyPathButton path={displayPath} />}
+        >
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: 'auto', fontSize: '0.85em', color: 'var(--text-muted)' }}>
             <input
               type="checkbox"

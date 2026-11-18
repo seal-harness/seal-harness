@@ -13,6 +13,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Channel.Caps (ChannelCaps)
+import Seal.Providers.OllamaReadiness (OllamaReadiness (..))
 import Seal.Command.Help (renderHelpIndex)
 import Seal.Command.Provider (ProviderRuntime (..), formatTestResult, pingRequest, providerCommandSpec)
 import Seal.Command.Spec (CommandSpec (..), mkRegistry, runCommandAction)
@@ -24,6 +25,7 @@ import Seal.Providers.Class
   , StopReason (..), ToolChoice (..), Usage (..) )
 import Seal.Security.Vault (VaultHandle, vhGet)
 import Seal.TestHelpers.FakeCaps (getSent, makeFakeCaps)
+import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.TestHelpers.FakeVault (makeFakeVault)
 import Seal.Vault.Commands (VaultRuntime (..))
 
@@ -38,7 +40,7 @@ mkPR cfgPath mvh = do
   cntRef <- newIORef 0
   let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath cfgPath   -- unused by /provider
       vrt = VaultRuntime { vrPaths = sp, vrConfigPath = cfgPath, vrHandleRef = ref }
-  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef }
+  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef, prOllamaReadiness = noOllamaReadiness }
 
 runProv :: ProviderRuntime -> [String] -> ChannelCaps -> IO ()
 runProv pr argv caps =
@@ -104,6 +106,49 @@ spec = do
         T.unlines sent `shouldSatisfy` ("anthropic" `T.isInfixOf`)
         T.unlines sent `shouldSatisfy` ("default" `T.isInfixOf`)
         T.unlines sent `shouldSatisfy` ("api-key" `T.isInfixOf`)
+
+    -- DoD 12: /provider list renders the readiness segment. Design test 17
+    -- alone is not enough — `readinessText` is a pure function that never runs
+    -- `listCmd`, so without this the segment could be wired to nothing.
+    it "12: list renders the Ollama readiness segment" $
+      withSystemTempDirectory "seal-prov-readiness" $ \dir -> do
+        let cfgPath = dir </> "config.toml"
+        vh <- makeFakeVault [("ANTHROPIC_API_KEY", "sk")]
+        pr <- mkPR cfgPath (Just vh)
+        (fc, caps) <- makeFakeCaps []
+        runProv pr { prOllamaReadiness = pure RdNotRunning } ["list"] caps
+        sent <- getSent fc
+        T.unlines sent `shouldSatisfy` ("Not Running" `T.isInfixOf`)
+
+    it "12b: list omits the segment when readiness renders empty (pending)" $
+      withSystemTempDirectory "seal-prov-pending" $ \dir -> do
+        let cfgPath = dir </> "config.toml"
+        vh <- makeFakeVault [("ANTHROPIC_API_KEY", "sk")]
+        pr <- mkPR cfgPath (Just vh)
+        (fc, caps) <- makeFakeCaps []
+        runProv pr { prOllamaReadiness = pure RdPending } ["list"] caps
+        sent <- getSent fc
+        let ollamaLines = [l | l <- sent, "ollama" `T.isInfixOf` l]
+        length ollamaLines `shouldBe` 1
+        -- No stray trailing separator for an empty segment.
+        (case ollamaLines of (l : _) -> l; [] -> "")
+          `shouldSatisfy` (not . T.isSuffixOf " — ")
+
+    it "12c: only the Ollama row carries the readiness segment" $
+      -- NB: a keyless local Ollama is ALWAYS `configured` (Registry.hs), so a
+      -- `list` legitimately contains an Ollama row and legitimately reads the
+      -- seam. What must hold is that the ANTHROPIC row carries no segment.
+      withSystemTempDirectory "seal-prov-nonollama" $ \dir -> do
+        let cfgPath = dir </> "config.toml"
+        vh <- makeFakeVault [("ANTHROPIC_API_KEY", "sk")]
+        pr <- mkPR cfgPath (Just vh)
+        (fc, caps) <- makeFakeCaps []
+        runProv pr { prOllamaReadiness = pure RdNotRunning } ["list"] caps
+        sent <- getSent fc
+        let anthropicLines = [l | l <- sent, "anthropic" `T.isInfixOf` l]
+        length anthropicLines `shouldBe` 1
+        (case anthropicLines of (l : _) -> l; [] -> "")
+          `shouldSatisfy` (not . T.isInfixOf "Not Running")
 
     it "remove deletes the credential and clears a matching default" $
       withSystemTempDirectory "seal-prov" $ \dir -> do

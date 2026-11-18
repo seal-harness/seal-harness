@@ -23,6 +23,7 @@ import { nextScrollIntent, type ScrollIntent } from '../lib/scrollIntent'
 import { isAtBottom, isNearTop, isSyntheticScroll } from '../lib/transcriptScroll'
 import { openModalStack } from '../lib/modalStack'
 import type { LoadResult } from '../types/stream'
+import { copyTextToClipboard } from '../lib/clipboard'
 
 /** The connection-state banner shown above the transcript when the
  *  WebSocket stream is not live.
@@ -395,44 +396,6 @@ function OpenWorkdirButton({ sessionId }: { sessionId: string }) {
       </svg>
     </button>
   )
-}
-
-/** Best-effort clipboard copy that survives non-secure contexts. Returns a
- *  Promise<boolean> that resolves true if either the modern Clipboard API
- *  or the legacy execCommand path succeeded. */
-async function copyTextToClipboard(text: string): Promise<boolean> {
-  if (navigator.clipboard?.writeText) {
-    try {
-      await navigator.clipboard.writeText(text)
-      return true
-    } catch {
-      // Fall through to the execCommand fallback (permissions / non-secure
-      // context / Firefox-on-some-pages all reject the same way).
-    }
-  }
-  return execCommandCopy(text)
-}
-
-function execCommandCopy(text: string): boolean {
-  const ta = document.createElement('textarea')
-  ta.value = text
-  // Off-screen but still focusable.
-  ta.style.position = 'fixed'
-  ta.style.top = '0'
-  ta.style.left = '0'
-  ta.style.opacity = '0'
-  ta.style.pointerEvents = 'none'
-  ta.setAttribute('readonly', '')
-  document.body.appendChild(ta)
-  ta.select()
-  let ok = false
-  try {
-    ok = document.execCommand('copy')
-  } catch {
-    ok = false
-  }
-  document.body.removeChild(ta)
-  return ok
 }
 
 function copyAnchorLink(anchorId: string) {

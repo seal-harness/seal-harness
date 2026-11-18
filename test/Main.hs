@@ -125,6 +125,7 @@ import qualified Seal.Channels.Chat.RateLimitSpec
 import qualified Seal.Channels.Chat.HttpClientSpec
 import qualified Seal.Channels.Chat.WsClientSpec
 import qualified Seal.Channels.Chat.WatchPersistSpec
+import qualified Seal.Channels.Chat.BubbleSpec
 import qualified Seal.Channels.Chat.LoopSpec
 import qualified Seal.Channels.Chat.SignalAdapterSpec
 import qualified Seal.Channels.Chat.TelegramAdapterSpec
@@ -199,6 +200,9 @@ import qualified Seal.Providers.ClassSpec
 import qualified Seal.Channels.ConfigSpec
 import qualified Seal.Providers.OpenRouterSpec
 import qualified Seal.Providers.OllamaSpec
+import qualified Seal.Providers.OllamaReadinessSpec
+import qualified Seal.Providers.OllamaReadinessProbeSpec
+import qualified Seal.Command.ServeWiringSpec
 import qualified Seal.Providers.ContextWindowSpec
 import qualified Seal.Providers.RegistrySpec
 import qualified Seal.Agent.LoopSpec
@@ -352,6 +356,7 @@ specs = do
   Seal.Channels.Chat.HttpClientSpec.spec
   Seal.Channels.Chat.WsClientSpec.spec
   Seal.Channels.Chat.WatchPersistSpec.spec
+  Seal.Channels.Chat.BubbleSpec.spec
   Seal.Channels.Chat.LoopSpec.spec
   Seal.Channels.Chat.SignalAdapterSpec.spec
   Seal.Channels.Chat.TelegramAdapterSpec.spec
@@ -426,6 +431,9 @@ specs = do
   Seal.Providers.ClassSpec.spec
   Seal.Providers.ContextWindowSpec.spec
   Seal.Providers.OllamaSpec.spec
+  Seal.Providers.OllamaReadinessSpec.spec
+  Seal.Providers.OllamaReadinessProbeSpec.spec
+  Seal.Command.ServeWiringSpec.spec
   Seal.Providers.OpenRouterSpec.spec
   Seal.Providers.RegistrySpec.spec
   Seal.Agent.LoopSpec.spec

@@ -9,6 +9,10 @@
 module Seal.Gateway.SetupApiSpec (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Data.Aeson (Value (..))
+import Data.Aeson qualified as A
+import Data.Aeson.Key qualified as Key
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Base64.URL qualified as B64Url
@@ -71,6 +75,7 @@ import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.TestHelpers.FakeVault (makeFakeVault)
 import Seal.TestHelpers.ScriptProvider (ScriptProvider (..))
+import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
 import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
 import Seal.Vault.Backend (ResolvedKey (..))
@@ -123,18 +128,32 @@ spec = describe "Seal.Gateway.Setup API" $ do
         -- Path-free: the temp home never appears in a web-readable body.
         body `shouldSatisfy` (not . contains (T.pack (spHome (hPaths h))))
 
-    it "includes requires_base_url on each provider card" $
+    -- Item 24: asserted PER CARD BY id, not by whole-body substring. The old
+    -- hasBoolField check was a `contains` over the entire body, so
+    -- "requires_base_url":true anywhere satisfied it while the per-provider
+    -- semantics silently inverted - a paired True/False test passes even if
+    -- every card's flag is wrong.
+    it "item 24: carries the right requires_base_url/requires_name per card" $
       withHarness defaultHarness $ \h -> do
         (_, _, body) <- runAppBody (hApp h) =<< getReq "/api/setup" []
-        -- The generic OpenAI-compatible provider has no built-in endpoint,
-        -- so its card must carry requires_base_url:true — without it the
-        -- wizard never renders the endpoint field.
-        body `shouldSatisfy` contains "\"openai\""
-        body `shouldSatisfy` hasBoolField "requires_base_url" True
-        -- Providers with a built-in endpoint (anthropic, ollama, openrouter)
-        -- carry requires_base_url:false.
-        body `shouldSatisfy` contains "\"anthropic\""
-        body `shouldSatisfy` hasBoolField "requires_base_url" False
+        let cards = maybe [] cardObjects
+                      (A.decodeStrict (BL.toStrict body))
+        -- Every known provider is present exactly once.
+        map (cardText "id") cards `shouldBe`
+          [ "anthropic", "ollama", "ollama-cloud"
+          , "openrouter", "openai", "openai-compatible" ]
+        -- Only the generic type requires the operator to supply the endpoint
+        -- and a unique name. A built-in endpoint means the wizard must not ask.
+        forM_ cards $ \c -> do
+          let i = cardText "id" c
+              wantsBoth = i == "openai-compatible"
+          cardBool "requires_base_url" c `shouldBe` wantsBoth
+          cardBool "requires_name" c `shouldBe` wantsBoth
+        -- Ollama's base URL is optional but must still be OFFERED, so
+        -- requires_base_url is False for it while the field renders: the flag
+        -- means REQUIRED, not VISIBLE (D7).
+        let ollamaCard = [ c | c <- cards, cardText "id" c == "ollama" ]
+        length ollamaCard `shouldBe` 1
 
     it "never 500s on missing or undecodable files" $
       withHarness defaultHarness $ \h -> do
@@ -411,6 +430,7 @@ harnessAppWith config paths ref calls = do
         , adAgentDefs = adb
         , adSkills = skills
         , adProviders = pure []
+        , adOllamaReadiness = noOllamaReadiness
         , adUiState = uiState
         , adSend = Nothing
         , adDefaultAgent = pure Nothing
@@ -624,6 +644,26 @@ hasField name = contains ("\"" <> name <> "\"")
 hasBoolField :: Text -> Bool -> BL.ByteString -> Bool
 hasBoolField name value =
   contains ("\"" <> name <> "\":" <> (if value then "true" else "false"))
+
+-- | The @providers@ array of a @GET /api/setup@ body, as objects. Reading the
+-- cards out lets a test assert PER CARD; a whole-body substring cannot tell
+-- which card a flag belongs to.
+cardObjects :: Value -> [KeyMap.KeyMap Value]
+cardObjects v = case v of
+  Object o -> case KeyMap.lookup "providers" o of
+    Just (Array arr) -> [ o' | Object o' <- foldr (:) [] arr ]
+    _ -> []
+  _ -> []
+
+cardText :: Text -> KeyMap.KeyMap Value -> Text
+cardText k o = case KeyMap.lookup (Key.fromText k) o of
+  Just (String t) -> t
+  _ -> ""
+
+cardBool :: Text -> KeyMap.KeyMap Value -> Bool
+cardBool k o = case KeyMap.lookup (Key.fromText k) o of
+  Just (Bool b) -> b
+  _ -> False
 
 contains :: Text -> BL.ByteString -> Bool
 contains needle haystack =
