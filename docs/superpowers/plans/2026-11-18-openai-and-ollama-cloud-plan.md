@@ -137,6 +137,37 @@ mode, and it is the item that fails if the visibility work over-reaches.
 **DoD:** all of those pass; `make check` green end to end (build + test + lint +
 frontend-test).
 
+## Why the guard is not scope creep (evidence)
+
+A scope review is entitled to ask whether the conditional-migration machinery is
+unrequested work. It is requested by *no word of the ask* — and it is still
+**necessary**, because the operator's chosen id makes it so. The chain is
+measured, not argued:
+
+1. `resolveCreateTarget` lets `POST {"name":"openai","api_key":…}` succeed with
+   **no** `base_url`: the built-in branch (`API.hs:3360-3365`) performs no
+   base-URL check at all — `base_url` is required only for a *custom* name
+   (`:3375-3376`).
+2. `handleProviderCreate` then always calls `upsertProvider` (to seed
+   `default_model`), which materialises `[providers.openai]` **regardless**
+   (`Config/File.hs:828-830`).
+3. `addCmd` (`Command/Provider.hs:171-186`) stored a key and called
+   `seedProviderDefaults`, which sets only `rcDefaultProvider`/`pcDefaultModel`
+   — never `pcBaseUrl`. So `/provider add openai` produced the same state.
+4. Once `openai` means real OpenAI with a built-in endpoint, that state resolves
+   to `api.openai.com`. Without a guard, **both** of the product's own write
+   paths would transmit a possibly-self-hosted key to a third party.
+
+So the guard is not a subsystem bolted onto the feature; it is the smallest
+thing that makes the *rename* safe given the product's existing write paths. The
+alternative that avoids it entirely — giving the new type a different id — was
+offered to the operator and declined in favour of the rename.
+
+What that means for review: the guard's *size* is the correct thing to attack.
+If it can be expressed in fewer moving parts than the design's three write
+points plus a guard, that is a real finding. Replacing it with nothing is not
+available, because point 4 above is the original credential-egress bug.
+
 ## Requirement → item mapping
 
 | Operator requirement (verbatim) | Plan item(s) |
@@ -178,11 +209,13 @@ plainly rather than claiming a number it cannot produce.
 | The rename breaks a runtime string comparison the compiler cannot see | The five such sites are enumerated in design §7 and each has a test. |
 | A hidden field leaks a stale value into the payload | Payload gated on `!isHiddenBaseUrl`; items 35d, 41b. |
 | **Rollback** | The change is additive plus one rename. Reverting the WU3 commit restores the old `openai` meaning; WU1/WU2 can be reverted independently *only* as a set (the constructors are what break the build if reverted alone). |
-| Backward compatibility | The one behaviour change is documented in `CHANGELOG.md` as four facts; no automatic config migration (design §3.1). |
+| Backward compatibility | The one behaviour change is documented in `CHANGELOG.md` as four facts. There is **no automatic migration of a user's existing `[providers.openai]` section** (design §3.1) - but the plan *does* write `base_url` at three write points (create, `/provider add`, `PUT` repair). Those are **writes on new operator actions**, not a migration of existing config: an untouched legacy section is never rewritten, it fails closed until the operator acts. The distinction is stated here because the earlier wording ("no config migration") read more broadly than the behaviour. |
 
 ## Out of scope
 
 Everything in the approved design's §6 non-goals. Notably: no readiness probing
-for Ollama Cloud, no config migration, no label-map consolidation, no
+for Ollama Cloud, **no automatic migration of existing config** (see the
+Backward-compatibility row above for why the three write points are not a
+migration), no label-map consolidation, no
 `ContextWindow` change, no `authLabel` fix, no `handleProviderDelete`
 `anthropicOAuthKey` fix, no `inferProviderId` change, no streaming work.
