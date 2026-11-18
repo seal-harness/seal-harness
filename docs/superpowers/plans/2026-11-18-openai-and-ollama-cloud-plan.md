@@ -5,6 +5,22 @@
 <!-- drafted: 2026-11-18, rewritten for revision 6 -->
 <!-- gate: Plan Review Gate PASSED 3/3 on revision 6 (feasibility, completeness, scope) -->
 
+## Gate status
+
+**Plan Review Gate: 3/3 PASS** on this text.
+
+| Reviewer | Verdict | Independently re-verified here, not taken on trust |
+|---|---|---|
+| Feasibility | PASS | `-Wall -Werror` is in `common settings` (`seal-harness.cabal:33`) and imported by all three library stanzas (`:116`, `:45`, `:79`); no `-Wno-error` override anywhere; no `OPTIONS_GHC` in the three touched files. Proven empirically as well: a 3-constructor/2-equation module compiled under these exact flags fails with `[-Wincomplete-patterns, Werror=...]`. The plan's central "no smaller green commit" premise therefore rests on the build system, not on assertion. |
+| Completeness | PASS | `frontend/src/lib/setupSteps.ts` carries no provider-id literal (comments only); `src/Seal/Command/Provider.hs` has no `case kp of` at all — only runtime string comparisons, which `-Wincomplete-patterns` cannot see — so the two new constructors provably cannot break it; `scripts/setup-walkthrough.sh` 8b-8f exist and POST `name:openai` at `:80` and `:86`; the removed items (20b, 20c, 35e-35k, 45b) pinned only deleted work, so no requirement is orphaned. |
+| Scope & Alignment | PASS | All three units trace to the request or the nine-site compile prerequisite. `handleProviderCreate`, `handleProviderUpdate`, `Command/Provider.hs` and any case-3 guard appear only in the deletion table, the UNCHANGED assertion, and the out-of-scope list — never in a unit's file list. |
+
+Note on the gate itself, recorded rather than hidden: feasibility and
+completeness each timed out on their first, broad prompt and returned PASS on a
+narrowed one; scope timed out twice. The verdicts above are from the narrowed
+runs. Two of three reviewers producing no verdict is not a gate, so the retries
+were narrowed to a single question each instead of re-run identically.
+
 ## Verified baseline (measured on this branch, not assumed)
 
 Every row was produced by running a command in this worktree.
