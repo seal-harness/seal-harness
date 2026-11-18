@@ -179,6 +179,18 @@ Consequence: the wizard needs **no** change to its field-visibility logic
 input). The Providers page replaces its hardcoded `formName === 'openai'`
 special-cases with these two flags.
 
+**Both surfaces, both modes.** "Hidden entirely" applies to the Providers page
+in **create and edit** alike. Verified gap: `ProvidersView.tsx:544` invokes
+`ProviderFormFields` **without** `showBaseUrl`, which defaults to `true`
+(`ProviderFormFields.tsx:144`) — only the wizard passes it
+(`ProviderStep.tsx:257`). So today the edit path renders Base URL for every
+provider. Left alone, editing an OpenAI provider would *display*
+`https://api.openai.com/v1` (pre-filled by `providerFormValuesFrom` from the
+`base_url` the create path now writes), and offer to let the operator change a
+value the request says is fixed. Both `showBaseUrl` **and** `showModels`/
+`showDefaultModel` must therefore be passed explicitly at **both** call sites,
+derived from the flags for the selected provider.
+
 **Hiding a field is not enough — the payload must be gated too.** Verified
 hazard: `ProvidersView.tsx:496` sets `formName` without resetting `form`, and
 `:269` sends `base_url` whenever it is non-empty *regardless of visibility*. So
@@ -413,7 +425,7 @@ the new types), `Seal.Providers.ContextWindow` (D10), the ISA, any opcode.
 |---|---|
 | `frontend/src/types.ts` | `ProviderDetail` +`requiresBaseUrl` / `requiresName`; comment updates on `type`. |
 | `frontend/src/lib/providerLabels.ts` | labels for `openai` / `ollama-cloud` / `openai-compatible`. The generic row renders **"OpenAI-compatible (custom / self-hosted)"** in dropdowns, since the id no longer disambiguates it from real OpenAI. |
-| `frontend/src/components/ProvidersView.tsx` | label map; drive Base URL + Unique name visibility from the detail flags (when creating: the dropdown's own `ProviderDetail` row — D7) instead of `formName === 'openai'`; **gate the submitted payload on those flags too, and clear `baseUrl`/`uniqueName` when `formName` changes** (RG-2); custom-instance `type: 'openai-compatible'`; reserved-name set. |
+| `frontend/src/components/ProvidersView.tsx` | label map; drive Base URL + Unique name visibility from the detail flags (when creating: the dropdown's own `ProviderDetail` row — D7) instead of `formName === 'openai'`; **pass `showBaseUrl`/`showModels`/`showDefaultModel` explicitly at the `ProviderFormFields` call site** (it currently omits `showBaseUrl`, which defaults to `true`, so edit renders Base URL for every provider); **gate the submitted payload on those flags too, and clear `baseUrl`/`uniqueName` when `formName` changes** (RG-2); custom-instance `type: 'openai-compatible'`; reserved-name set. |
 | `frontend/src/components/ProviderFormFields.tsx` | `isOpenAIType` → `isOpenAICompatible` (the generic type's placeholder/hint); no visibility logic change — `showBaseUrl` already exists. |
 | `frontend/src/components/setup/ProviderStep.tsx` | reserved-name array **and the `saveKey` POST body (~`:147`)**, which sends `type: 'openai'` for a custom instance and becomes a 400 after D8. Field visibility already correct via `requires_base_url` / `requires_name`. |
 | `frontend/src/components/ProviderModelFields.tsx`, `frontend/src/components/AgentsView.tsx` | label maps. |
@@ -551,6 +563,12 @@ covered without editing the test. Enumerating six values is not a property.
 The items above mostly assert that fields are *absent*. An operator must also be
 able to **finish**. These are the acceptance criteria for §1's benefit claim.
 
+34a. **RED** Providers page, **edit** mode: selecting an existing **OpenAI**
+     provider renders **no** `provider-base-url-input` and **no**
+     `provider-instance-name-input`, even though the stored detail carries a
+     `baseUrl` (pre-filled by `providerFormValuesFrom`). This is the case the
+     first draft missed — `showBaseUrl` defaults to `true` and the Providers
+     page never passed it.
 34b. **RED** Providers page: for **OpenAI**, entering only an API key leaves
      Save **enabled**, and submitting succeeds.
 34c. **RED** Providers page: for **Ollama Cloud**, likewise.
@@ -682,6 +700,7 @@ suite, per the Makefile, and `.coverage-thresholds.json`'s enforcement command.
 | Frontend and backend disagree on which types hide the fields | Server-driven flags (D7) plus item 36 pinning the creating-state helper. |
 | The §3.1 case-3 key transmission (secret egress to a third party) | **Guarded, not just documented**: a pre-existing `[providers.openai]` section without `base_url` fails closed (§3.1). The create path always writes `base_url`, so product-configured providers never hit it. §3.3 removes the one place a developer would reproduce it. Items 35e and 34b-35d pin it. |
 | The §3.1 guard dead-ending a provider created through the UI (because `upsertProvider` always writes a section) | The create path injects the built-in `base_url` server-side; item 35f round-trips create → `resolveProviderByName` and fails if it does not. |
+| A hidden field still being *shown* in edit mode (`showBaseUrl` defaults to `true`; only the wizard passes it) | Both call sites pass `showBaseUrl`/`showModels`/`showDefaultModel` from the flags; item 34a asserts the edit path specifically. |
 | A hidden field still leaking a value into the payload (stale `base_url`) | The payload is gated on `requiresBaseUrl`/`requiresName`, and `formName` changes clear the fields (D7, RG-2). Item 35d pins it. |
 | A legacy `OPENAI_API_KEY` outliving deletion of `openai-compatible` | Deliberate retention, documented in the CHANGELOG and pinned by item 45b; §3.1's guard is what stops it being transmitted unconfirmed. |
 | A stale tab POSTs the old `type: "openai"` | 400 with a clear message; reload fixes it (D8). |
