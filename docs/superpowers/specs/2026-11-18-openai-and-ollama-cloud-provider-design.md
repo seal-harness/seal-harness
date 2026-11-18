@@ -346,6 +346,11 @@ Before this change, `[providers.openai]` meant a *generic* endpoint. After,
    | Section **with** `base_url` | Use it. Case 1 - unchanged. |
    | Section **without** `base_url` | **Fail closed**: "this key predates the OpenAI provider type - run `/provider add openai` to confirm it belongs to OpenAI." |
 
+   Once the create path writes the built-in URL (§4), the `POST` / `PUT`
+   response's `baseUrl` is non-null for these types. That is intended and
+   harmless: it is a compiled-in **public** endpoint, already exposed for every
+   configured provider, and carries no credential.
+
    **`Map.member` is load-bearing, not stylistic.** `providerBaseUrl`
    (`Config/File.hs:742`) is `pcBaseUrl =<< Map.lookup lbl (rcProviders cfg)`,
    so it returns `Nothing` for *both* "no section" and "section without the
@@ -432,7 +437,7 @@ endpoint still requires an explicit base URL and still fails closed without one
 | `src/Seal/Gateway/Setup.hs` | `handleProviderTest`'s "known providers" hint text. Card JSON already emits both booleans — no change. |
 | `src/Seal/Gateway/API.hs` (create path) | `handleProviderCreate` injects `providerBaseUrlFor cfg OpenAIProvider` as `base_url` **server-side** when creating an OpenAI or Ollama Cloud provider, so `upsertProvider` (`Config/File.hs:828-830`) never materialises a section without one. Without this the §3.1 guard would immediately dead-end a provider created through the UI. Pinned by item 35f. |
 | `src/Seal/Command/Provider.hs` | `addCmd`'s generic path already prompts for a key for any non-`ollama` type, so both new types work — **but it must also write the built-in `base_url`** for `openai`/`ollama-cloud` (via `providerBaseUrlFor`), or the §3.1 guard's named remedy is a no-op (`seedProviderDefaults` sets only `rcDefaultProvider`/`pcDefaultModel`). Pinned by item 35h. `providerReadinessSegment` already returns "" for non-`ollama`. The help text listing known ids is generated from `knownProviders`, so it needs no edit. **Not fixed here:** `authLabel` (`:255-266`) probes `anthropicOAuthKey` in its `otherwise` branch, so it reports `auth: oauth` for any non-Ollama provider when Anthropic OAuth exists — pre-existing, already wrong for OpenRouter, and made more visible by two more rows. Separate PR (§6). |
-| `CHANGELOG.md` | A `0.1.0.0` bullet documenting **both** migrations: `[providers.openai]` now means real OpenAI (move a self-hosted section to a named `openai-compatible` instance), and `[providers.ollama] base_url = "https://ollama.com"` gains the OpenAI-compatible path as `ollama-cloud`. |
+| `CHANGELOG.md` | One `0.1.0.0` bullet stating **all three facts**: (a) `OPENAI_API_KEY` / `[providers.openai]` now name **real OpenAI** — move a self-hosted section to a named `openai-compatible` instance and re-enter the key there; (b) `[providers.ollama] base_url = "https://ollama.com"` gains the OpenAI-compatible path as `ollama-cloud`; (c) **deleting `openai-compatible` does not remove a legacy `OPENAI_API_KEY`** — that secret is retained deliberately. |
 | `scripts/setup-walkthrough.sh` | Steps 8b–8f re-keyed from `name: "openai"` to a custom name with `type: "openai-compatible"`. See §3.3 — leaving it as-is turns the script into the case-3 egress. |
 | `config/templates/config.toml` | Comment block gains the new ids; the generic example is re-keyed to `openai-compatible` with the D2 migration note. |
 
@@ -532,6 +537,13 @@ covered without editing the test. Enumerating six values is not a property.
     `"[providers.openai-compatible]" isInfixOf e` **and**
     `"[providers.openai]" notInfixOf e`. A bare `openai` substring check passes
     when it should fail, because `"openai-compatible"` contains `"openai"`.
+20c. **RED** An **empty-string** `base_url` also fails closed:
+     `resolveProvider OpenAIProvider` with `providerBaseUrl = Just ""` returns
+     `Left`. Note which branch handles it — `providerBaseUrl` yields `Just ""`,
+     so the *value* test must treat empty as absent rather than letting it reach
+     `resolveOpenAICompatible`'s null check (which would also fire, but for a
+     different reason, and a future refactor could merge the two branches
+     wrongly).
 20b. **RED** Section-key vs display-noun separation: `resolveProvider
      OllamaCloudProvider` with `providerBaseUrl = Just ""` returns a `Left`
      whose text contains **`[providers.ollama-cloud]`** and **not**
