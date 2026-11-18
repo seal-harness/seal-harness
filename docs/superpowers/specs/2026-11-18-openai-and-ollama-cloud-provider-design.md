@@ -317,46 +317,52 @@ Before this change, `[providers.openai]` meant a *generic* endpoint. After,
    Before: `resolveOpenAICompatible` failed closed with "needs a base URL - set
    [providers.openai] base_url". Nothing was ever transmitted.
 
-   After: **fail closed again**, with an actionable message. The rule is
-   decidable from config with no new field:
+   After: **fail closed again**, with an actionable message. The rule needs BOTH
+   an existence test and a value test, because they are different questions:
+
+   ```haskell
+   let sectionExists = Map.member (providerLabel OpenAIProvider) (rcProviders cfg)
+   in case providerBaseUrl cfg (providerLabel OpenAIProvider) of
+        Just u  -> use u                     -- case 1 (and every product create)
+        Nothing | sectionExists -> fail closed   -- case 3: a legacy section, unconfirmed
+                | otherwise     -> use (builtInBaseUrl OpenAIProvider)  -- case 2
+   ```
 
    | State | Behaviour |
    |---|---|
-   | No `[providers.openai]` section | Use the built-in default. Fresh install; nothing pre-existing to leak. |
+   | No `[providers.openai]` section | **Use the built-in default.** Fresh install; nothing pre-existing to leak. |
    | Section **with** `base_url` | Use it. Case 1 - unchanged. |
    | Section **without** `base_url` | **Fail closed**: "this key predates the OpenAI provider type - run `/provider add openai` to confirm it belongs to OpenAI." |
 
-   The create path (wizard, Providers page, and the `/provider add` branch) now
-   writes `base_url` **explicitly** when it creates an OpenAI provider — and it
-   must inject the built-in default **server-side**, from
-   `providerBaseUrlFor cfg OpenAIProvider`, never from client input (the client
-   sends nothing: the field is hidden).
+   **`Map.member` is load-bearing, not stylistic.** `providerBaseUrl`
+   (`Config/File.hs:742`) is `pcBaseUrl =<< Map.lookup lbl (rcProviders cfg)`,
+   so it returns `Nothing` for *both* "no section" and "section without the
+   field". Keying the guard off `providerBaseUrl` alone would therefore fail
+   closed on a **fresh install** - breaking case 2 and the feature's own happy
+   path. Item 35g pins case 2 specifically.
 
-   That detail is load-bearing. `upsertProvider` (`Config/File.hs:828-830`)
-   creates a section **whenever it is called**, regardless of whether a
-   `base_url` was supplied — `handleProviderCreate` seeds `default_model` and
-   therefore always materialises the section. So a create path that omitted the
-   base URL would manufacture precisely the section that fails closed, and the
-   operator would hit "run `/provider add openai`" immediately after configuring
-   it through the UI. Injecting the default guarantees the invariant: **a
-   product-configured OpenAI provider always has a section with a base_url**,
-   and only a pre-existing, never-confirmed section fails closed.
+   **Every write path must leave a section WITH a base_url**, so the guard only
+   ever trips on a genuinely pre-existing config:
+   - Providers page / wizard → `handleProviderCreate` injects the built-in
+     `base_url` **server-side** (§4), never from client input (the field is
+     hidden, so the client sends nothing).
+   - `/provider add openai` → `addCmd`'s non-Ollama branch now writes the
+     built-in `base_url` too. Without it the fail-closed message's named remedy
+     is a **no-op**: `seedProviderDefaults` (`Command/Provider.hs:163-169`) sets
+     only `rcDefaultProvider` and `pcDefaultModel`, never `pcBaseUrl`, so the
+     operator would be told to run a command that cannot clear the guard.
 
    `OllamaCloudProvider` needs no guard: it is a brand-new id, so no legacy
-   section can exist.
+   section can exist. It still gets the same explicit `base_url` write, for
+   consistency.
 
-   **Why this, and not just documenting it:** review converged on the point that
-   a 401 does not make the transmission harmless - it is *evidence* that bytes
-   already reached a third party. Neither the CHANGELOG nor a config-template
-   comment reaches an operator whose config predates the change. A decidable
-   guard is the only mitigation that does.
-
-   **Why not a `key_namespace` marker field:** this gives the same guarantee
-   without new config surface - `providerBaseUrl cfg name` already distinguishes
-   "no section" from "section without the field".
-
-   **Why not always require key re-entry:** that would break case 1, a *working*
-   config, for no benefit.
+   **Why a guard at all, and not just documenting it:** review converged on the
+   point that a 401 does not make the transmission harmless - it is *evidence*
+   that bytes already reached a third party. Neither the CHANGELOG nor a
+   config-template comment reaches an operator whose config predates the change.
+   A decidable guard is the only mitigation that does. The earlier `key_namespace`
+   marker suggestion reaches the same guarantee; `Map.member` reuses existing
+   config machinery at lower cost.
 
 
 **The inverse case, also documented.** An operator whose *old generic* provider
@@ -405,12 +411,12 @@ endpoint still requires an explicit base URL and still fails closed without one
 
 | File | Change |
 |---|---|
-| `src/Seal/Providers/Registry.hs` | +2 constructors; every total function updated: `providerLabel`, `vaultKeyName`, `defaultModelFor`, `providerBaseUrlFor`, `resolveProvider`, `configuredProviders`, `validateProviderName`. Also `resolveProvider OpenAICompatibleProvider`'s hardcoded `"openai"` argument → `providerLabel OpenAICompatibleProvider` (that string names the config section in its fail-closed error). And the **§3.1 case-3 guard** in `resolveProvider OpenAIProvider`: fail closed when a `[providers.openai]` section exists without `base_url`. And `resolveOpenAICompatible`'s fixed error nouns ("the OpenAI-compatible provider … the setup wizard asks for it", `:269-270`) are parameterised by display label and by whether the type has a built-in endpoint, so the message is not false for the new types. `providerTypeForName` needs **no** change (already `fromMaybe OpenAICompatibleProvider`). `knownProviders` order (D2). |
+| `src/Seal/Providers/Registry.hs` | +2 constructors; every total function updated: `providerLabel`, `vaultKeyName`, `defaultModelFor`, `providerBaseUrlFor`, `resolveProvider`, `configuredProviders`, `validateProviderName`. Also `resolveProvider OpenAICompatibleProvider`'s hardcoded `"openai"` argument → `providerLabel OpenAICompatibleProvider` (that string names the config section in its fail-closed error). And the **§3.1 case-3 guard** in `resolveProvider OpenAIProvider`: fail closed when a `[providers.openai]` section exists without `base_url`. The guard uses `Map.member` on `rcProviders`, **not** `providerBaseUrl` alone (which returns `Nothing` for both an absent section and a section without the field). And `resolveOpenAICompatible`'s fixed error nouns ("the OpenAI-compatible provider … the setup wizard asks for it", `:269-270`) are parameterised by display label and by whether the type has a built-in endpoint, so the message is not false for the new types. `providerTypeForName` needs **no** change (already `fromMaybe OpenAICompatibleProvider`). `knownProviders` order (D2). |
 | `src/Seal/Setup/State.hs` | `providerDisplayName` +2; `providerCards` raises no flags for the new types (already constructor-keyed); P4 copy. |
 | `src/Seal/Gateway/API.hs` | `providerAuthStatus` +2; `staticModelsFor` +2; `providerDetailJsonFor` gains `requiresBaseUrl`/`requiresName`; `customProviderDetailJson` type id → `openai-compatible`; **`:715`** the `customInfos` `"type"` literal → `openai-compatible`; **`:3246`** the readiness guard `typeId /= "openai"` → `typeId /= "openai-compatible"` (otherwise it becomes a tautology and custom instances inherit Ollama readiness); `resolveCreateTarget` / `resolveExistingTarget` type ids and the required-type check; `handleProvidersAll` unchanged (mapM over `knownProviders` picks up the new rows). |
 | `src/Seal/Gateway/Setup.hs` | `handleProviderTest`'s "known providers" hint text. Card JSON already emits both booleans — no change. |
 | `src/Seal/Gateway/API.hs` (create path) | `handleProviderCreate` injects `providerBaseUrlFor cfg OpenAIProvider` as `base_url` **server-side** when creating an OpenAI or Ollama Cloud provider, so `upsertProvider` (`Config/File.hs:828-830`) never materialises a section without one. Without this the §3.1 guard would immediately dead-end a provider created through the UI. Pinned by item 35f. |
-| `src/Seal/Command/Provider.hs` | `addCmd`'s generic path already prompts for a key for any non-`ollama` type, so both new types work; `providerReadinessSegment` already returns "" for non-`ollama`. The help text listing known ids is generated from `knownProviders`, so it needs no edit. **Not fixed here:** `authLabel` (`:255-266`) probes `anthropicOAuthKey` in its `otherwise` branch, so it reports `auth: oauth` for any non-Ollama provider when Anthropic OAuth exists — pre-existing, already wrong for OpenRouter, and made more visible by two more rows. Separate PR (§6). |
+| `src/Seal/Command/Provider.hs` | `addCmd`'s generic path already prompts for a key for any non-`ollama` type, so both new types work — **but it must also write the built-in `base_url`** for `openai`/`ollama-cloud` (via `providerBaseUrlFor`), or the §3.1 guard's named remedy is a no-op (`seedProviderDefaults` sets only `rcDefaultProvider`/`pcDefaultModel`). Pinned by item 35h. `providerReadinessSegment` already returns "" for non-`ollama`. The help text listing known ids is generated from `knownProviders`, so it needs no edit. **Not fixed here:** `authLabel` (`:255-266`) probes `anthropicOAuthKey` in its `otherwise` branch, so it reports `auth: oauth` for any non-Ollama provider when Anthropic OAuth exists — pre-existing, already wrong for OpenRouter, and made more visible by two more rows. Separate PR (§6). |
 | `CHANGELOG.md` | A `0.1.0.0` bullet documenting **both** migrations: `[providers.openai]` now means real OpenAI (move a self-hosted section to a named `openai-compatible` instance), and `[providers.ollama] base_url = "https://ollama.com"` gains the OpenAI-compatible path as `ollama-cloud`. |
 | `scripts/setup-walkthrough.sh` | Steps 8b–8f re-keyed from `name: "openai"` to a custom name with `type: "openai-compatible"`. See §3.3 — leaving it as-is turns the script into the case-3 egress. |
 | `config/templates/config.toml` | Comment block gains the new ids; the generic example is re-keyed to `openai-compatible` with the D2 migration note. |
@@ -530,9 +536,12 @@ covered without editing the test. Enumerating six values is not a property.
     `openai-compatible`.
 27. **RED** `GET /api/providers/all` for a custom instance reports
     `type: "openai-compatible"`, `requiresBaseUrl: true`, `requiresName: true`.
-28. **RED** `POST {"name":"openai","api_key":"sk-…"}` ⇒ 201, and no `base_url`
-    is stored for it (the default is implicit).
-29. **RED** `POST {"name":"ollama-cloud","api_key":"…"}` ⇒ 201.
+28. **RED** `POST {"name":"openai","api_key":"sk-…"}` ⇒ 201, and a `base_url` **is**
+    stored for it, equal to `providerBaseUrlFor cfg OpenAIProvider`. (The client
+    sends none - the field is hidden - so the server injects it. Item 28 and the
+    §3.1 guard must agree: a create must never leave a section without a
+    base_url, or 35b fails.)
+29. **RED** `POST {"name":"ollama-cloud","api_key":"…"}` ⇒ 201, likewise with the injected `base_url` (`https://ollama.com/v1`).
 30. **RED** `POST {"name":"local-vllm","type":"openai-compatible","base_url":…}`
     ⇒ 201 with `type: "openai-compatible"` echoed.
 31. **RED** `POST {"name":"local-vllm","type":"openai"}` ⇒ 400 (no legacy
@@ -586,8 +595,18 @@ able to **finish**. These are the acceptance criteria for §1's benefit claim.
      (§3.1 case 3), and makes no network call.
 35f. **RED** Round-trip consistency: `POST {"name":"openai","api_key":…}` and then
      `resolveProviderByName "openai"` returns `Right`. This is the dead-end guard
-     — it fails if the create path forgets to inject the built-in `base_url`,
+     — it fails if a create path forgets to inject the built-in `base_url`,
      because `upsertProvider` would still have written the section (§3.1).
+35g. **RED** **Case 2 (fresh install)**: with *no* `[providers.openai]` section,
+     `resolveProvider OpenAIProvider` (key present) returns `Right` and uses
+     `https://api.openai.com/v1`. Pins that the guard keys off `Map.member`, not
+     `providerBaseUrl` — a `providerBaseUrl`-only check fails this item because
+     it returns `Nothing` for both the absent-section and section-without-field
+     states (`Config/File.hs:742`).
+35h. **RED** `/provider add openai` **clears** the case-3 guard: after the
+     fail-closed state, the command writes `base_url` and
+     `resolveProviderByName "openai"` returns `Right`. Fails today, because
+     `seedProviderDefaults` never touches `pcBaseUrl`.
 
 ### 5.4 GUARD — passing today, must stay green
 
@@ -699,7 +718,8 @@ suite, per the Makefile, and `.coverage-thresholds.json`'s enforcement command.
 | A missed **label string comparison** — the compiler is blind to these | Enumerated exhaustively and each given a test: `Registry.hs:242` (the fail-closed section name, item 20), `API.hs:715` (custom `type`), `API.hs:3246` (readiness guard), `Registry.hs:118` (reserved names, item 13), `ProvidersView.tsx:247` (custom-ness, item 36). The `"ollama"` comparisons at `State.hs:294`, `Provider.hs:175/256/279`, `API.hs:3182` are **correct as-is** (Ollama-only semantics) and are pinned by guard items. |
 | Frontend and backend disagree on which types hide the fields | Server-driven flags (D7) plus item 36 pinning the creating-state helper. |
 | The §3.1 case-3 key transmission (secret egress to a third party) | **Guarded, not just documented**: a pre-existing `[providers.openai]` section without `base_url` fails closed (§3.1). The create path always writes `base_url`, so product-configured providers never hit it. §3.3 removes the one place a developer would reproduce it. Items 35e and 34b-35d pin it. |
-| The §3.1 guard dead-ending a provider created through the UI (because `upsertProvider` always writes a section) | The create path injects the built-in `base_url` server-side; item 35f round-trips create → `resolveProviderByName` and fails if it does not. |
+| The §3.1 guard dead-ending a provider created through the UI (because `upsertProvider` always writes a section) | Both write paths (create + `/provider add`) inject the built-in `base_url` server-side; items 35f/35h round-trip and fail if they do not. |
+| The §3.1 guard failing closed on a **fresh install** (the case-2 regression) | The guard tests `Map.member (rcProviders cfg)`, not `providerBaseUrl`, which cannot distinguish the two states. Item 35g pins case 2. |
 | A hidden field still being *shown* in edit mode (`showBaseUrl` defaults to `true`; only the wizard passes it) | Both call sites pass `showBaseUrl`/`showModels`/`showDefaultModel` from the flags; item 34a asserts the edit path specifically. |
 | A hidden field still leaking a value into the payload (stale `base_url`) | The payload is gated on `requiresBaseUrl`/`requiresName`, and `formName` changes clear the fields (D7, RG-2). Item 35d pins it. |
 | A legacy `OPENAI_API_KEY` outliving deletion of `openai-compatible` | Deliberate retention, documented in the CHANGELOG and pinned by item 45b; §3.1's guard is what stops it being transmitted unconfirmed. |
