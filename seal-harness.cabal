@@ -86,6 +86,7 @@ library seal-chat-channels
         Seal.Channels.Chat.Class
         Seal.Channels.Chat.Loop
         Seal.Channels.Chat.ToolRender
+        Seal.Channels.Chat.Bubble
         Seal.Channels.Chat.TabRender
         Seal.Channels.Chat.Signal
         Seal.Channels.Chat.Telegram
@@ -571,6 +572,7 @@ test-suite tests
         Seal.Channels.Chat.WsClientSpec
         Seal.Channels.Chat.WatchPersistSpec
         Seal.Channels.Chat.LoopSpec
+        Seal.Channels.Chat.BubbleSpec
         Seal.Channels.CursorSpec
         Seal.Channels.Chat.SignalAdapterSpec
         Seal.Channels.Chat.TelegramAdapterSpec
