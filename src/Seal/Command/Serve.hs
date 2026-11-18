@@ -691,8 +691,8 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
             -- inputs are re-read: the vault handle from the same ref the
             -- commands use, and config.toml from disk — a provider whose
             -- *credential* arrives through the vault, but whose *endpoint*
-            -- (`[providers.openai] base_url`) arrives through the config, is
-            -- only "configured" once both are visible.
+            -- (`[providers.openai-compatible] base_url`) arrives through the
+            -- config, is only "configured" once both are visible.
             mh <- readIORef (vrHandleRef rt)
             cfg' <- loadCfg
             configuredProviders mh cfg'

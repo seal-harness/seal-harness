@@ -7,7 +7,9 @@ import { readinessLabel } from '../lib/readiness'
  *  as itself, never as an empty string and never as an error. */
 export const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
-  openai: 'OpenAI-compatible',
+  'ollama-cloud': 'Ollama Cloud',
+  openai: 'OpenAI',
+  'openai-compatible': 'OpenAI-compatible',
   openrouter: 'OpenRouter',
   ollama: 'Ollama',
 }

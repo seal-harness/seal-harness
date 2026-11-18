@@ -16,7 +16,9 @@ import { type AgentGroup, groupAgents } from '../lib/agentGroups'
 
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
-  openai: 'OpenAI-compatible',
+  'ollama-cloud': 'Ollama Cloud',
+  openai: 'OpenAI',
+  'openai-compatible': 'OpenAI-compatible',
   openrouter: 'OpenRouter',
   ollama: 'Ollama',
 }

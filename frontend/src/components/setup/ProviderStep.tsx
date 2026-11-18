@@ -58,6 +58,13 @@ function readinessBlocksSelection(readiness: ProviderReadiness | undefined): boo
   return readiness === 'not-installed' || readiness === 'not-running' || readiness === 'no-models'
 }
 
+/** Every built-in type id is reserved as an instance name (D9). Keeping it in
+ *  one list means adding a provider type cannot leave a stale copy behind. */
+const RESERVED_INSTANCE_NAMES = [
+  'all', 'default',
+  'anthropic', 'ollama', 'ollama-cloud', 'openrouter', 'openai', 'openai-compatible',
+]
+
 export function ProviderStep({
   step,
   providers,
@@ -128,11 +135,19 @@ export function ProviderStep({
 
   const needsBaseUrl = card?.requires_base_url === true
   const needsName = card?.requires_name === true
+  // D7: `requires_base_url` means REQUIRED, not VISIBLE. Ollama's base URL is
+  // optional yet essential - it is the only GUI path to a remote daemon - so
+  // visibility gets its own predicate. `openai`, `ollama-cloud` and
+  // `openrouter` each supply a specific endpoint, so the wizard never asks for
+  // one. `anthropic` and `ollama` keep a visible field.
+  const HIDDEN_BASE_URL_IDS = ['openai', 'ollama-cloud', 'openrouter']
+  const isHiddenBaseUrl = HIDDEN_BASE_URL_IDS.includes(effectiveId)
+  const showBaseUrl = !isHiddenBaseUrl
   const baseUrlOk = !needsBaseUrl || /^https?:\/\/\S+$/.test(form.baseUrl.trim())
   const nameOk = !needsName || (
     /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(instanceName.trim())
     && !instanceName.includes('--')
-    && !['all', 'default', 'anthropic', 'ollama', 'openrouter'].includes(instanceName.trim())
+    && !RESERVED_INSTANCE_NAMES.includes(instanceName.trim())
   )
   const canSaveKey = dirty && baseUrlOk && nameOk
   const saveDisabled = save.status === 'saving' || !canSaveKey
@@ -144,9 +159,12 @@ export function ProviderStep({
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name: needsName ? instanceName.trim() : effectiveId,
-        ...(needsName ? { type: 'openai' } : {}),
+        ...(needsName ? { type: 'openai-compatible' } : {}),
         api_key: form.apiKey,
-        ...(needsBaseUrl ? { base_url: form.baseUrl.trim() } : {}),
+        // Gated on VISIBILITY, not on needsBaseUrl: that flag is false for
+        // Ollama, so keying the payload on it would silently drop a typed
+        // remote-daemon URL (D7).
+        ...(showBaseUrl && form.baseUrl.trim() ? { base_url: form.baseUrl.trim() } : {}),
         ...(form.defaultModel.trim() ? { default_model: form.defaultModel.trim() } : {}),
         models: modelsFromText(form.modelsText),
       }),
@@ -254,7 +272,7 @@ export function ProviderStep({
           onChange={(patch) => { setForm((f) => ({ ...f, ...patch })); setDirty(true) }}
           layout="stacked"
           creating
-          showBaseUrl={needsBaseUrl}
+          showBaseUrl={showBaseUrl}
           baseUrlError={needsBaseUrl && !baseUrlOk ? 'Enter an http:// or https:// URL.' : null}
         />
       )}

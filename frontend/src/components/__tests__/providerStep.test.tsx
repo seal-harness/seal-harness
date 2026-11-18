@@ -85,6 +85,80 @@ describe('ProviderStep', () => {
     }
   })
 
+  // D7: requires_base_url means REQUIRED, not VISIBLE. Ollama's base URL is
+  // optional but it is the only GUI path to a remote daemon, so the wizard
+  // must render the field for it. Driving showBaseUrl off requires_base_url
+  // hides it, which is the conflation D7 exists to forbid.
+  it('item 41b (wizard): Ollama still shows an editable Base URL', () => {
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ id: 'ollama', label: 'Ollama', requires_base_url: false })]}
+        onDone={() => {}}
+      />,
+    )
+    // The list auto-selects the first provider, so this card drives the form.
+    expect(screen.getByLabelText(/base url/i)).toBeInTheDocument()
+  })
+
+  // Rendering alone is NOT enough: a payload gated on requires_base_url would
+  // render the field and then silently drop the typed URL, and only an
+  // assertion on the SUBMITTED BODY can see that.
+  it('item 41b (wizard): the typed Ollama base URL is SUBMITTED', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, {}))
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ id: 'ollama', label: 'Ollama', requires_base_url: false })]}
+        onDone={() => {}}
+      />,
+    )
+    fireEvent.change(screen.getByLabelText(/base url/i), {
+      target: { value: 'http://192.168.1.9:11434' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /^save$/i }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+    const body = (fetchMock.mock.calls[0]?.[1] as RequestInit).body as string
+    expect(body).toContain('192.168.1.9:11434')
+  })
+
+  // OpenRouter supplies a specific endpoint, so the wizard must not ask.
+  it('OpenRouter hides the Base URL field in the wizard', () => {
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ id: 'openrouter', label: 'OpenRouter', requires_base_url: false })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.queryByLabelText(/base url/i)).not.toBeInTheDocument()
+  })
+
+  // ...while Anthropic still shows it (its endpoint is fixed inside the
+  // provider, so the field is inert but historically visible).
+  it('Anthropic still shows the Base URL field in the wizard', () => {
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ id: 'anthropic', label: 'Anthropic' })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.getByLabelText(/base url/i)).toBeInTheDocument()
+  })
+
+  // The counterpart: a built-in endpoint means the wizard must NOT ask.
+  it('item 44 (wizard): an openai card renders no Base URL field', () => {
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[card({ id: 'openai', label: 'OpenAI', requires_base_url: false, requires_name: false })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.queryByLabelText(/base url/i)).not.toBeInTheDocument()
+  })
+
   it('renders loading, fetch-error and empty states', async () => {
     const { rerender } = render(<ProviderStep step={step()} providers={[]} onDone={() => {}} />)
     expect(screen.getByText(/no providers are available/i)).toBeInTheDocument()
@@ -282,7 +356,7 @@ describe('ProviderStep', () => {
     render(
       <ProviderStep
         step={step()}
-        providers={[card({ id: 'openai', label: 'OpenAI-compatible', requires_base_url: true, requires_name: true })]}
+        providers={[card({ id: 'openai-compatible', label: 'OpenAI-compatible', requires_base_url: true, requires_name: true })]}
         onDone={() => {}}
       />,
     )
@@ -303,7 +377,7 @@ describe('ProviderStep', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/providers', expect.objectContaining({
       body: JSON.stringify({
         name: 'local-vllm',
-        type: 'openai',
+        type: 'openai-compatible',
         api_key: 'sk-local',
         base_url: 'http://localhost:8000/v1',
         models: [],
@@ -336,10 +410,14 @@ describe('ProviderStep', () => {
     expect(models.value).toBe('claude-opus-4-8\nclaude-sonnet-4')
   })
 
-  it('sends no base_url for providers that have a built-in endpoint', async () => {
+  // D7's visibility table: anthropic's base URL is VISIBLE (today's behaviour)
+  // even though it is not required, and an empty one is not sent. The old
+  // version of this test asserted the field was absent, encoding the
+  // over-broad "hidden for every built-in endpoint" rule that D7 replaces.
+  it('sends no base_url for a provider whose field was left empty', async () => {
     fetchMock.mockResolvedValue(jsonResponse(201, { name: 'anthropic' }))
     render(<ProviderStep step={step()} providers={[card()]} onDone={() => {}} />)
-    expect(screen.queryByLabelText(/api endpoint/i)).toBeNull()
+    expect(screen.getByLabelText(/api endpoint/i)).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText(/api key/i), { target: { value: 'sk-ant' } })
     fireEvent.click(screen.getByRole('button', { name: /^save$/i }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalled())

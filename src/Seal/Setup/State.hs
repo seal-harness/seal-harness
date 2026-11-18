@@ -45,6 +45,7 @@ import Seal.Core.Types (ModelId (..))
 import Seal.Providers.OllamaReadiness (OllamaReadiness (..))
 import Seal.Providers.Registry
   ( KnownProvider (..), knownProviders, providerLabel
+  , providerRequiresBaseUrl, providerRequiresName
   , configuredCustomProviderNames, resolveDefaultModelForName )
 import Seal.Security.Vault (VaultHandle (vhStatus), VaultStatus (..))
 
@@ -283,8 +284,8 @@ classifyProvider inputs configured readiness =
       -- P4
       | otherwise ->
           pendingProvider
-            "Add an LLM provider: anthropic, openrouter, ollama, or an \
-            \OpenAI-compatible endpoint."
+            "Add an LLM provider: Anthropic, OpenAI, Ollama (local), \
+            \Ollama Cloud, OpenRouter, or a self-hosted OpenAI-compatible endpoint."
             ["configure"]
   where
     -- Design D8: the "not ready yet" sentence is appended to the existing
@@ -334,12 +335,8 @@ providerCards inputs configured readiness =
       , pcIsDefault = rcDefaultProvider (siRuntime inputs) == Just (providerLabel known)
       , pcDefaultModel = providerDefaultModel (siRuntime inputs) (providerLabel known)
       , pcModels = providerModels (siRuntime inputs) (providerLabel known)
-      , pcRequiresBaseUrl = case known of
-          OpenAICompatibleProvider -> True
-          _ -> False
-      , pcRequiresName = case known of
-          OpenAICompatibleProvider -> True
-          _ -> False
+      , pcRequiresBaseUrl = providerRequiresBaseUrl known
+      , pcRequiresName = providerRequiresName known
       , pcReadiness = case known of
           OllamaProvider -> Just readiness
           _ -> Nothing
@@ -353,7 +350,9 @@ providerDisplayName :: KnownProvider -> Text
 providerDisplayName known = case known of
   AnthropicProvider  -> "Anthropic"
   OllamaProvider     -> "Ollama"
+  OllamaCloudProvider -> "Ollama Cloud"
   OpenRouterProvider -> "OpenRouter"
+  OpenAIProvider     -> "OpenAI"
   OpenAICompatibleProvider -> "OpenAI-compatible"
 
 isYubiKeyVault :: SetupInputs -> Bool

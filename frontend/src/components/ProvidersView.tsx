@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ProviderInput, ProviderAuthStatus, ProviderReadiness } from '../types'
 import { readinessLabel, readinessTone, type ReadinessTone } from '../lib/readiness'
+import { OPENAI_COMPATIBLE_OPTION } from '../lib/providerLabels'
 import {
   ProviderFormFields,
   emptyProviderFormValues,
@@ -97,9 +98,13 @@ function readinessColor(tone: ReadinessTone): string {
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
   ollama: 'Ollama',
+  'ollama-cloud': 'Ollama Cloud',
   openrouter: 'OpenRouter',
-  openai: 'OpenAI-compatible',
+  openai: 'OpenAI',
+  'openai-compatible': 'OpenAI-compatible',
 }
+
+
 
 const labelStyle: React.CSSProperties = {
   fontSize: 12,
@@ -135,11 +140,14 @@ function Row({
   )
 }
 
-/** Provider ids that already mean a built-in type (and are therefore not
- *  available as a *new* custom instance name). `openai` is allowed: it is the
- *  built-in OpenAI-compatible instance, and reconfiguring it keeps the same
- *  name. */
-const RESERVED_PROVIDER_NAMES = new Set(['all', 'default', 'anthropic', 'ollama', 'openrouter'])
+/** Provider ids that cannot be used as a *new* custom instance name: the two
+ *  route words plus every built-in type id (D9). This mirrors
+ *  `validateProviderName` in Seal.Providers.Registry, which derives the same
+ *  set from `knownProviders`. */
+const RESERVED_PROVIDER_NAMES = new Set([
+  'all', 'default',
+  'anthropic', 'ollama', 'ollama-cloud', 'openrouter', 'openai', 'openai-compatible',
+])
 
 const PROVIDER_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/
 
@@ -241,32 +249,66 @@ export function ProvidersView() {
   )
 
   // Names already used by custom OpenAI-compatible instances. The built-in
-  // `openai` row is intentionally excluded: it is the same instance the user
-  // may reconfigure by entering "openai".
+  // rows are intentionally excluded: they are the same instances the operator
+  // may reconfigure by selecting their id ("openai-compatible" for the
+  // generic type).
   const existingCustomNames = useMemo(
     () => new Set(providers.filter((p) => PROVIDER_LABELS[p.name] === undefined).map((p) => p.name)),
     [providers],
   )
 
-  const isOpenAIType = creating && formName === 'openai'
-    || (!creating && (selected?.type ?? selected?.name) === 'openai')
-  const uniqueNameError = creating && formName === 'openai'
+  // The dropdown's own ProviderDetail row. While `creating` is true, `selected`
+  // is null, so per-provider values must come from the list the dropdown was
+  // built from - never from `selected`.
+  const formRow = useMemo(
+    () => providers.find((p) => p.name === formName),
+    [providers, formName],
+  )
+
+  // D7: `requiresBaseUrl` means REQUIRED, not VISIBLE. Visibility has its own
+  // predicate and the two must never be conflated: Ollama's base URL is
+  // optional yet essential (the only GUI path to a remote daemon), so driving
+  // visibility off `requiresBaseUrl` would delete that affordance.
+  //
+  // When the row is unresolved, treat the field as hidden for the PAYLOAD (an
+  // unloaded list must not re-send a stale value) but keep today's render
+  // default. `openai`, `ollama-cloud` and `openrouter` each supply a specific
+  // endpoint, so the form never asks for one. `anthropic` and `ollama` keep a
+  // visible field: anthropic's is inert (its endpoint is fixed inside the
+  // provider) and ollama's is the only GUI path to a remote daemon.
+  const hiddenBaseUrlIds = ['openai', 'ollama-cloud', 'openrouter']
+  const isHiddenBaseUrl =
+    formRow === undefined
+      ? hiddenBaseUrlIds.includes(formName)
+      : hiddenBaseUrlIds.includes(formRow.name)
+  const showBaseUrl = !isHiddenBaseUrl
+  const showUniqueName = formRow === undefined
+    ? formName === 'openai-compatible'
+    : formRow.requiresName
+  const requiresBaseUrl = formRow?.requiresBaseUrl === true
+
+  const uniqueNameError = showUniqueName
     ? providerNameError(uniqueName, existingCustomNames)
     : null
-  const openAIBaseUrlOk =
-    !isOpenAIType || /^https?:\/\/\S+$/.test(form.baseUrl.trim())
+  const baseUrlOk =
+    !requiresBaseUrl || /^https?:\/\/\S+$/.test(form.baseUrl.trim())
 
   const handleSubmit = async () => {
     setSubmitting(true)
     setFormError(null)
     const trimmedName = formName.trim()
     if (creating) {
-      const customOpenAI = formName === 'openai'
+      const customOpenAI = showUniqueName
       const payload: ProviderInput = {
         name: customOpenAI ? uniqueName.trim() : trimmedName,
-        ...(customOpenAI ? { type: 'openai' } : {}),
+        ...(customOpenAI ? { type: 'openai-compatible' } : {}),
         api_key: form.apiKey && form.apiKey.trim().length > 0 ? form.apiKey.trim() : undefined,
-        base_url: form.baseUrl && form.baseUrl.trim().length > 0 ? form.baseUrl.trim() : undefined,
+        // Gated on VISIBILITY, not on requiresBaseUrl. Keying this on the
+        // latter would silently drop a typed remote-Ollama URL, because that
+        // flag is false for Ollama (D7).
+        base_url: showBaseUrl && form.baseUrl && form.baseUrl.trim().length > 0
+          ? form.baseUrl.trim()
+          : undefined,
         default_model: form.defaultModel && form.defaultModel.trim().length > 0 ? form.defaultModel.trim() : undefined,
         models: modelsFromText(form.modelsText),
       }
@@ -283,7 +325,13 @@ export function ProvidersView() {
     } else if (editing) {
       const payload: ProviderInput = {
         api_key: form.apiKey && form.apiKey.trim().length > 0 ? form.apiKey.trim() : undefined,
-        base_url: form.baseUrl && form.baseUrl.trim().length > 0 ? form.baseUrl.trim() : undefined,
+        // Same visibility gate as the create path. `providerFormValuesFrom`
+        // pre-fills baseUrl from the stored detail, so without this an edit of
+        // an OpenAI provider would re-send a value the operator cannot see -
+        // contradicting "hidden entirely" (D7).
+        base_url: showBaseUrl && form.baseUrl && form.baseUrl.trim().length > 0
+          ? form.baseUrl.trim()
+          : undefined,
         default_model: form.defaultModel && form.defaultModel.trim().length > 0 ? form.defaultModel.trim() : undefined,
         models: modelsFromText(form.modelsText),
       }
@@ -493,14 +541,20 @@ export function ProvidersView() {
                 <select
                   id="provider-name"
                   value={formName}
-                  onChange={(e) => setFormName(e.target.value)}
+                  onChange={(e) => {
+                    setFormName(e.target.value)
+                    setUniqueName('')
+                    setForm((f) => ({ ...f, baseUrl: '' }))
+                  }}
                   className="composer-select"
                   style={inputStyle}
                 >
                   <option value="">(select)</option>
                   {unconfigured.filter((p) => PROVIDER_LABELS[p.name] !== undefined).map((p) => (
                     <option key={p.name} value={p.name}>
-                      {PROVIDER_LABELS[p.name] ?? p.name}
+                      {p.name === 'openai-compatible'
+                        ? OPENAI_COMPATIBLE_OPTION
+                        : (PROVIDER_LABELS[p.name] ?? p.name)}
                     </option>
                   ))}
                   {/* Allow already-configured providers too (upsert) */}
@@ -513,7 +567,7 @@ export function ProvidersView() {
               </Row>
             )}
 
-            {creating && formName === 'openai' && (
+            {creating && showUniqueName && (
               <Row
                 label="Unique Name"
                 htmlFor="provider-instance-name"
@@ -549,8 +603,9 @@ export function ProvidersView() {
               isKeyless={isKeyless}
               isVaultLocked={isVaultLocked}
               isOllama={isOllama}
-              isOpenAIType={isOpenAIType}
-              baseUrlError={isOpenAIType && !openAIBaseUrlOk ? 'Enter an http:// or https:// URL.' : null}
+              isOpenAIType={formName === 'openai-compatible'}
+              showBaseUrl={showBaseUrl}
+              baseUrlError={requiresBaseUrl && !baseUrlOk ? 'Enter an http:// or https:// URL.' : null}
             />
 
             {formError && (
@@ -574,8 +629,8 @@ export function ProvidersView() {
                   disabled={
                     submitting
                     || (creating && !formName.trim())
-                    || (creating && formName === 'openai' && uniqueNameError !== null)
-                    || (isOpenAIType && !openAIBaseUrlOk)
+                    || (creating && showUniqueName && uniqueNameError !== null)
+                    || (requiresBaseUrl && !baseUrlOk)
                   }
                   aria-label={creating ? 'Create provider' : 'Save provider'}
                   data-testid="provider-save"
