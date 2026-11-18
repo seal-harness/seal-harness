@@ -9,11 +9,11 @@ Gate history:
 | 1 | 4/5 NEEDS_REVISION (Security APPROVED) |
 | 2 | 3/5 NEEDS_REVISION, 2 APPROVED |
 | 3 | 2 APPROVED, 3 NEEDS_REVISION (all blockers fixed) |
-| 4 | Security, Architect, Designer, Product Manager **APPROVED**; CTO outstanding |
+| 4 | **5/5 APPROVED** — gate passed (`0ba0bc5` + the §7 invariant-list fix) |
 
-All blockers from rounds 1-3 are addressed and each is pinned by a numbered
-test. Round 4 re-review is running against this text; the design is not approved
-until 5/5 return APPROVED.
+**APPROVED — implementation may proceed.** All blockers from rounds 1-3 are
+addressed and each is pinned by a numbered test. Round 4 returned 5/5 APPROVED
+on this text.
 **Date:** 2026-11-18
 **Branch:** `providers/openai-and-ollama-cloud`
 
@@ -958,7 +958,7 @@ suite, per the Makefile, and `.coverage-thresholds.json`'s enforcement command.
 
 | Risk | Mitigation |
 |---|---|
-| A missed site in a **total function over `KnownProvider`** | `-Werror` + `-Wincomplete-patterns`: the compiler names every such site. This holds **only while those functions have no `_ ->` fallback** — adding one silently opts every future constructor out of the compiler's help. `vaultKeyName`, `providerLabel`, `defaultModelFor`, `providerBaseUrlFor`, `providerAuthStatus`, `staticModelsFor` must stay wildcard-free. |
+| A missed site in a **total function over `KnownProvider`** | `-Werror` + `-Wincomplete-patterns`: the compiler names every such site. This holds **only while those functions have no `_ ->` fallback** — adding one silently opts every future constructor out of the compiler's help. All **nine** sites enumerated in §5.6 must stay wildcard-free — `providerLabel`, `vaultKeyName`, `defaultModelFor`, `builtInBaseUrl`, `resolveProvider`, `isConfigured`, `providerAuthStatus`, `staticModelsFor`, `providerDisplayName`. The two lists must not drift: §5.6 is the authority, and a tenth site added later belongs in both. |
 | Conflating a provider's id with its display name when parameterising the fail-closed error (emitting `[providers.Ollama Cloud]`) | The helper takes the section key and the display noun as separate parameters; item 20b pins it on `ollama-cloud`, where the two differ. |
 | A missed **label string comparison** — the compiler is blind to these | Enumerated exhaustively and each given a test: `Registry.hs:242` (the fail-closed section name, item 20), `API.hs:715` (custom `type`), `API.hs:3246` (readiness guard), `Registry.hs:118` (reserved names, item 13), `ProvidersView.tsx:247` (custom-ness, item 36). The `"ollama"` comparisons at `State.hs:294`, `Provider.hs:175/256/279`, `API.hs:3182` are **correct as-is** (Ollama-only semantics) and are pinned by guard items. |
 | Frontend and backend disagree on which types hide the fields | Server-driven flags (D7) plus item 36 pinning the creating-state helper. |
