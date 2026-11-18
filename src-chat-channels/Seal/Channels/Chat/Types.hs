@@ -187,6 +187,13 @@ data StreamingState = StreamingState
     -- the recorded entry, because the server's streaming path and the
     -- post-turn broadcast are unsynchronized — are ignored while set.
     -- Cleared when a new turn starts (harness-status: thinking).
+  , ssLastBubbleEdit :: IORef (Maybe UTCTime)
+    -- ^ When the last successful single-bubble EDIT landed. Both edit sources
+    -- (streaming frames and tool calls) share this ONE field, so a turn cannot
+    -- exceed one edit per interval by alternating between them. A create does
+    -- not set it (a create is not an edit) and a failed edit does not set it,
+    -- so the next event retries instead of waiting out another interval.
+    -- Unused by the default ('PsSeparateMessages') style.
   }
 
 -- | Create fresh streaming state for one conversation.
@@ -199,6 +206,7 @@ newStreamingState = do
   lastEntry <- newIORef ""
   splices <- newIORef []
   finalized <- newIORef False
+  lastBubbleEdit <- newIORef Nothing
   pure StreamingState
     { ssMsgId = msgId
     , ssAccumulated = accum
@@ -207,6 +215,7 @@ newStreamingState = do
     , ssLastEntry = lastEntry
     , ssSplices = splices
     , ssFinalized = finalized
+    , ssLastBubbleEdit = lastBubbleEdit
     }
 
 -- | Reset the streaming state for a new segment/turn: the bubble id is
@@ -223,3 +232,4 @@ resetStreamingState ss = do
   writeIORef (ssLastLen ss) 0
   writeIORef (ssLastEntry ss) ""
   writeIORef (ssSplices ss) []
+  writeIORef (ssLastBubbleEdit ss) Nothing

@@ -75,7 +75,9 @@ data SignalConfig = SignalConfig
 
 -- | The byte budget for one Signal message body. Replies longer than this are
 -- chunked via 'Seal.Channels.Chat.Signal.chunkMessage', which measures UTF-8
--- bytes (not characters) so a multi-byte body cannot overrun the limit.
+-- bytes (not characters) so a multi-byte body cannot overrun the limit, and
+-- which breaks at the most natural boundary that fits (paragraph, line,
+-- sentence, clause, word) rather than at an arbitrary character.
 --
 -- Signal inlines the first ~2048 bytes of a message and moves the remainder to
 -- an attachment, so a body over that size is not fully shown inline;
