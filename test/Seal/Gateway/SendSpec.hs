@@ -69,6 +69,7 @@ import Seal.Command.Spec (CommandSpec (..), mkRegistry)
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Security.Vault (VaultHandle)
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
+import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Session.Lock (newReplyRegistry, newSessionLocks, sessionTurnInFlight)
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry, lookupOrCreateAbortFlag, isAborted, setSessionAbort)
@@ -281,7 +282,7 @@ mkSendDepsWith paths resolveStub = do
   execCache <- newSessionExecCache
   agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
   let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-      pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+      pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prOllamaReadiness = noOllamaReadiness }
       sendDeps = SendDeps
         { sdPaths      = paths
         , sdVault      = rt

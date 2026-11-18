@@ -104,14 +104,36 @@
   build back does not move the table back: copy `[gateway]` from
   `security.toml` into `config.toml` by hand.
 
-* **A fourth provider: any OpenAI-compatible endpoint.** `openai` (label
-  "OpenAI-compatible") reuses the OpenRouter client — both speak
+* **A fourth provider: any OpenAI-compatible endpoint.** `openai-compatible`
+  (label "OpenAI-compatible", shown as "OpenAI-compatible (custom /
+  self-hosted)" in dropdowns) reuses the OpenRouter client — both speak
   `/v1/chat/completions` — and differs in exactly one way: it has **no**
-  built-in base URL. The endpoint is required input (`[providers.openai]
-  base_url`, or the setup wizard's "API endpoint" field), and resolution fails
-  with an actionable message rather than defaulting to `api.openai.com`, so a
-  key meant for a self-hosted server is never sent to a third party. Its vault
-  credential is `OPENAI_API_KEY`; `/api/providers` now lists four providers.
+  built-in base URL. The endpoint is required input
+  (`[providers.openai-compatible] base_url`, or the setup wizard's "API
+  endpoint" field), and resolution fails with an actionable message rather
+  than defaulting to `api.openai.com`, so a key meant for a self-hosted server
+  is never sent to a third party. Its vault credential is
+  `OPENAI_COMPATIBLE_API_KEY`.
+
+  **Renamed in this release.** This type used to be `openai` with vault key
+  `OPENAI_API_KEY`. Those now belong to **real OpenAI** (see below); the
+  generic type is `openai-compatible` with `OPENAI_COMPATIBLE_API_KEY`. There
+  are no users of the old ids, so there is no migration — but a config written
+  before this change has to be re-keyed by hand.
+
+* **Two built-in providers: OpenAI and Ollama Cloud.** `openai`
+  (`https://api.openai.com/v1`, vault key `OPENAI_API_KEY`) and
+  `ollama-cloud` (`https://ollama.com/v1`, vault key
+  `OLLAMA_CLOUD_API_KEY`) both reuse the OpenAI-compatible client and carry
+  their endpoint, so the setup wizard and the Providers page neither ask for a
+  Base URL nor for a unique name — one paste of an API key is the whole
+  configuration. Both still honour an explicit
+  `[providers.<id>] base_url` for a corporate proxy or local mirror. `/api/providers`
+  now lists six providers.
+
+  Vault keys are injective per type: deleting one provider never deprovisions
+  a sibling. `ollama-cloud` deliberately has its own key rather than sharing
+  `OLLAMA_API_KEY` with local Ollama, so removing one cannot remove the other.
 
   Because "Test connection" is only useful if it actually reaches the endpoint,
   the OpenAI-compatible client's `listModels` now asks the endpoint's

@@ -162,12 +162,12 @@ export function ProviderFormFields({
   const baseUrlPlaceholder = isOllama
     ? 'http://localhost:11434'
     : isOpenAIType
-      ? 'https://api.openai.com/v1'
+      ? 'http://localhost:8000/v1'
       : '(optional)'
   const baseUrlHint = isOllama
     ? 'Ollama server URL. Leave blank for default (http://localhost:11434).'
     : isOpenAIType
-      ? 'Required for OpenAI-compatible providers, e.g. https://api.openai.com/v1 or http://localhost:8000/v1.'
+      ? 'Required for a self-hosted OpenAI-compatible endpoint, e.g. http://localhost:8000/v1.'
       : 'Custom API endpoint URL (optional).'
 
   return (

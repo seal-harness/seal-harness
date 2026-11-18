@@ -10,6 +10,7 @@
 --   that would mean a physical touch just to render the wizard (test 14).
 module Seal.Setup.StateSpec (spec) where
 
+import Control.Monad (forM_)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -18,6 +19,7 @@ import Test.Hspec
 import Test.Hspec.QuickCheck (prop)
 import Test.QuickCheck (Gen, elements, forAll, ioProperty, oneof)
 
+import Seal.Providers.OllamaReadiness (OllamaReadiness (..))
 import Seal.Config.File
   ( ProviderConfig (..), RuntimeConfig (..), defaultRuntimeConfig )
 import Seal.Config.Paths (SealPaths (..))
@@ -113,17 +115,21 @@ spec = describe "Seal.Setup.State" $ do
       -- provider cards must still be emitted.
       state <- deriveSetupState (emptySetupInputs fakePaths)
       map pcId (ssProviders state)
-        `shouldBe` ["anthropic", "ollama", "openrouter", "openai"]
-      map pcConfigured (ssProviders state) `shouldBe` [False, False, False, False]
+        `shouldBe` [ "anthropic", "ollama", "ollama-cloud"
+                   , "openrouter", "openai", "openai-compatible" ]
+      map pcConfigured (ssProviders state)
+        `shouldBe` [False, False, False, False, False, False]
       -- Branding is a display name, not a mechanical capitalise.
       map pcLabel (ssProviders state)
-        `shouldBe` ["Anthropic", "Ollama", "OpenRouter", "OpenAI-compatible"]
-      -- Only the generic endpoint needs a URL from the operator.
+        `shouldBe` [ "Anthropic", "Ollama", "Ollama Cloud"
+                   , "OpenRouter", "OpenAI", "OpenAI-compatible" ]
+      -- Only the generic endpoint needs a URL from the operator: OpenAI and
+      -- Ollama Cloud have built-in endpoints, and Ollama's is optional.
       map pcRequiresBaseUrl (ssProviders state)
-        `shouldBe` [False, False, False, True]
+        `shouldBe` [False, False, False, False, False, True]
       -- ...and only it needs an operator-chosen unique name.
       map pcRequiresName (ssProviders state)
-        `shouldBe` [False, False, False, True]
+        `shouldBe` [False, False, False, False, False, True]
 
   describe "provider step" $ do
 
@@ -142,6 +148,44 @@ spec = describe "Seal.Setup.State" $ do
           , siConfiguredProviders = pure [OllamaProvider] }
       stStatus (providerStep state) `shouldBe` StepReady
       fromMaybe "" (stDetail (providerStep state)) `shouldSatisfy` T.isInfixOf "llama3.2"
+
+    -- DoD 13 / design test 33 + D8. The "not ready yet" sentence is appended
+    -- to the existing detail for exactly three states, and for NO other.
+    it "33: appends the not-ready sentence only for {not-installed, not-running, no-models}" $ do
+      let detailFor readiness = do
+            state <- deriveSetupState
+              (emptySetupInputs fakePaths)
+                { siRuntime = defaultRuntimeConfig { rcDefaultProvider = Just "ollama" }
+                , siConfiguredProviders = pure [OllamaProvider]
+                , siOllamaReadiness = readiness }
+            pure (fromMaybe "" (stDetail (providerStep state)))
+      forM_ [RdNotInstalled, RdNotRunning, RdNoModels] $ \r -> do
+        d <- detailFor r
+        d `shouldSatisfy` T.isInfixOf "Ollama is not ready yet"
+        -- It is APPENDED, not substituted: the existing detail survives.
+        d `shouldSatisfy` T.isInfixOf "ollama · "
+      forM_ [RdPending, RdUnknown, RdCloud, RdNoFittingModel, RdReady 1] $ \r -> do
+        d <- detailFor r
+        d `shouldSatisfy` (not . T.isInfixOf "Ollama is not ready yet")
+        d `shouldSatisfy` T.isInfixOf "ollama · "
+
+    it "33b: the not-ready sentence is Ollama-only (never on anthropic)" $ do
+      state <- deriveSetupState
+        (emptySetupInputs fakePaths)
+          { siRuntime = defaultRuntimeConfig { rcDefaultProvider = Just "anthropic" }
+          , siConfiguredProviders = pure [AnthropicProvider]
+          , siOllamaReadiness = RdNotRunning }
+      fromMaybe "" (stDetail (providerStep state))
+        `shouldSatisfy` (not . T.isInfixOf "Ollama is not ready yet")
+
+    it "providerCards carries readiness for Ollama and nothing for other providers" $ do
+      state <- deriveSetupState
+        (emptySetupInputs fakePaths)
+          { siConfiguredProviders = pure []
+          , siOllamaReadiness = RdNotRunning }
+      let byId = Map.fromList [(pcId c, c) | c <- ssProviders state]
+      (pcReadiness =<< Map.lookup "ollama" byId) `shouldBe` Just RdNotRunning
+      (pcReadiness =<< Map.lookup "anthropic" byId) `shouldBe` Nothing
 
     it "provider: default without credential is pending, naming the provider" $ do
       state <- deriveSetupState
@@ -165,6 +209,40 @@ spec = describe "Seal.Setup.State" $ do
       stStatus (providerStep state) `shouldBe` StepPending
       fromMaybe "" (stDetail (providerStep state))
         `shouldSatisfy` T.isInfixOf "Add an LLM provider"
+
+    -- Design 3.2: the P4 detail must name the new options. Asserted on the
+    -- WORDS, not a prefix: the old text listed four providers and would still
+    -- satisfy "Add an LLM provider", so a prefix check cannot see this.
+    it "item 22/24: the P4 copy names OpenAI and Ollama Cloud" $ do
+      state <- deriveSetupState (emptySetupInputs fakePaths)
+      let detail = fromMaybe "" (stDetail (providerStep state))
+      detail `shouldSatisfy` T.isInfixOf "OpenAI"
+      detail `shouldSatisfy` T.isInfixOf "Ollama Cloud"
+      -- It must stay readable rather than becoming a raw six-id inventory. The
+      -- ids are hyphenated-lowercase; display names are capitalised. Assert on
+      -- the IDS (case-sensitive, so "OpenAI-compatible" as a display name is
+      -- allowed), because the earlier lowercased comparison both passed
+      -- vacuously AND wrongly fired on the legitimate capitalised form.
+      forM_ ["ollama-cloud", "openai-compatible", "anthropic", "openrouter"] $ \i ->
+        detail `shouldSatisfy` (not . T.isInfixOf i)
+
+    -- Items 22/23, asserted per card rather than as a whole-list vector: the
+    -- vector is already pinned above, but these two are the ones whose failure
+    -- would ship a broken form.
+    it "item 23: both new cards hide Base URL and Unique name" $ do
+      state <- deriveSetupState (emptySetupInputs fakePaths)
+      let card n = [ c | c <- ssProviders state, pcId c == n ]
+      forM_ ["openai", "ollama-cloud"] $ \n -> do
+        case card n of
+          [c] -> do
+            pcRequiresBaseUrl c `shouldBe` False
+            pcRequiresName c `shouldBe` False
+          other -> expectationFailure
+            ("expected exactly one card for " <> T.unpack n <> ", got "
+               <> show (length other))
+      -- ...and the generic type is the only one that requires both.
+      let requiring = [ pcId c | c <- ssProviders state, pcRequiresBaseUrl c ]
+      requiring `shouldBe` ["openai-compatible"]
 
     it "a yubikey vault never probes the vault for providers" $ do
       let yubiSecurity = defaultSecurityConfig
@@ -265,6 +343,9 @@ data Scenario = Scenario
   , scHandle      :: Maybe Bool   -- ^ 'Nothing' = no handle; @Just locked?@
   , scIdentity    :: Maybe Bool
   , scDefaultProv :: Maybe Bool   -- ^ @Just True@ = default set and configured
+  , scReadiness   :: OllamaReadiness
+    -- ^ The observed Ollama readiness. Defaults to 'RdPending' so the generated
+    -- cases stay offline and unchanged (design test 34).
   } deriving stock (Show)
 
 genScenario :: Gen Scenario
@@ -274,6 +355,7 @@ genScenario = Scenario
   <*> oneof [pure Nothing, Just <$> elements [True, False]]
   <*> elements [Nothing, Just True, Just False]
   <*> elements [Nothing, Just True, Just False]
+  <*> pure RdPending
 
 inputsFor :: Scenario -> IO SetupInputs
 inputsFor scenario = do
@@ -309,5 +391,6 @@ inputsFor scenario = do
     , siVaultFileExists = scVaultFile scenario
     , siIdentityReadable = scIdentity scenario
     , siConfiguredProviders = configured
+    , siOllamaReadiness = scReadiness scenario
     , siHome = "/home/alice"
     }

@@ -72,6 +72,7 @@ import Seal.Config.Security
   ( SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig )
 import Seal.Core.Types (ModelId (..))
 import Seal.Providers.Class (SomeProvider)
+import Seal.Providers.OllamaReadiness (OllamaReadiness (..), readinessWire)
 import Seal.Providers.Registry
   ( KnownProvider, customProviderNames, listSome, parseProvider
   , resolveDefaultModelForName )
@@ -113,6 +114,10 @@ data SetupEnv = SetupEnv
   , seConfigPath   :: FilePath
   , seSecurityPath :: FilePath
   , seProviders    :: IO [KnownProvider]
+  , seOllamaReadiness :: IO OllamaReadiness
+    -- ^ The observed Ollama readiness. Read once per @GET \/api\/setup@ so the
+    -- card and the provider step's detail agree, and so the handler never
+    -- probes inline (design D2.4). @pure RdPending@ in tests.
   , seDeps         :: SetupDeps
   }
 
@@ -151,6 +156,7 @@ handleSetupState env = do
   security <- loadSecurityConfig (seSecurityPath env)
   runtime <- loadRuntimeConfig (seConfigPath env)
   mhandle <- readIORef (seHandleRef env)
+  readiness <- seOllamaReadiness env
   let sec = fromRight defaultSecurityConfig security
       rt = fromRight defaultRuntimeConfig runtime
       vaultPath = maybe (vaultFilePath (sePaths env)) T.unpack (scVaultPath sec)
@@ -167,6 +173,7 @@ handleSetupState env = do
     , siVaultFileExists = vaultExists
     , siIdentityReadable = identityReadable
     , siConfiguredProviders = seProviders env
+    , siOllamaReadiness = readiness
     -- The seal home's parent is the user's home for the default ~/.seal
     -- layout, which is what the tilde form in a detail is measured from.
     , siHome = takeDirectory (spHome (sePaths env))
@@ -187,7 +194,7 @@ setupStateJson state = object
       , "detail" .= stDetail step
       , "actions" .= stActions step
       ]
-    cardJson card = object
+    cardJson card = object $
       [ "id" .= pcId card
       , "label" .= pcLabel card
       , "configured" .= pcConfigured card
@@ -197,6 +204,20 @@ setupStateJson state = object
       , "default_model" .= pcDefaultModel card
       , "models" .= pcModels card
       ]
+      -- These two keys are OMITTED, not nulled, for a card with no readiness
+      -- (every non-Ollama provider). `(.=)` on a `Maybe` emits an explicit
+      -- `null`, which would break the contract the frontend's absent-field
+      -- fallback depends on: `readiness === undefined` must mean "no
+      -- readiness", and `null` is a third state no consumer handles.
+      <> readinessKeys card
+
+    readinessKeys card = case pcReadiness card of
+      Nothing -> []
+      Just st ->
+        [ "readiness" .= readinessWire st ]
+        <> case st of
+             RdReady n -> [ "readiness_models" .= n ]
+             _         -> []
 
 statusText :: StepStatus -> Text
 statusText status = case status of
@@ -350,7 +371,7 @@ handleProviderTest env rawName req = do
   if not known
     then pure (setupErr status400
       ("unknown provider: " <> rawName)
-      (Just "known providers: anthropic, openrouter, ollama, or a configured OpenAI-compatible instance"))
+      (Just "known providers: anthropic, ollama, ollama-cloud, openrouter, openai, or a configured OpenAI-compatible instance"))
     else do
       mhandle <- readIORef (seHandleRef env)
       case mhandle of

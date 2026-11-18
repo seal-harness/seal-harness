@@ -1,12 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import type { ProviderInfo } from '../types'
+import type { ProviderInfo, ProviderReadiness } from '../types'
+import { readinessLabel } from '../lib/readiness'
 
 /** Human labels for provider ids. An id this build does not know still renders
  *  as itself, never as an empty string and never as an error. */
 export const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
-  openai: 'OpenAI-compatible',
+  'ollama-cloud': 'Ollama Cloud',
+  openai: 'OpenAI',
+  'openai-compatible': 'OpenAI-compatible',
   openrouter: 'OpenRouter',
   ollama: 'Ollama',
 }
@@ -37,6 +40,13 @@ export interface ProviderOption {
   isDefault?: boolean
   configured?: boolean
   missing?: boolean
+  /** Ollama's observed readiness. Absent for every other provider, and for a
+   *  backend that does not send it yet. */
+  readiness?: ProviderReadiness
+  /** The usable-model count for `readiness: 'ready'`. Snake_case because this
+   *  interface is satisfied structurally by `ProviderInfo`, which mirrors
+   *  `GET /api/providers` — the endpoint that keeps its own lowercase casing. */
+  readiness_models?: number
 }
 
 interface ProviderSelectProps {
@@ -83,11 +93,24 @@ export function ProviderSelect({
         <option key={p.name} value={p.name}>
           {PROVIDER_LABELS[p.name] ?? p.name}
           {p.isDefault ? ' (default)' : ''}
-          {p.missing ? ' (missing)' : ''}
+          {/* `missing` wins over readiness when both apply: it is the stronger
+              statement (the stored id does not resolve at all), and readiness
+              is an annotation, never a gate — the option stays selectable. */}
+          {p.missing ? ' (missing)' : optionReadinessAnnotation(p)}
         </option>
       ))}
     </select>
   )
+}
+
+/** The parenthesised readiness annotation for an Ollama option, or the empty
+ *  string. Parenthesised to match the existing ` (default)` / ` (missing)`
+ *  annotations rather than inventing a dash. `pending` renders nothing: it is
+ *  "we have not looked yet", not a state worth annotating. */
+function optionReadinessAnnotation(p: ProviderOption): string {
+  if (p.name !== 'ollama' || p.readiness === undefined) return ''
+  const label = readinessLabel(p.readiness, p.readiness_models)
+  return label === '' ? '' : ` (${label})`
 }
 
 /** A self-contained combobox: a text input (free entry) plus a left-aligned

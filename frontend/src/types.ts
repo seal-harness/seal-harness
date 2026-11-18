@@ -250,6 +250,12 @@ export interface AgentInfo {
 
 export interface ProviderInfo {
   name: string
+  /** Ollama's observed readiness. **Absent** (not null) for every other
+   *  provider and for custom OpenAI-compatible instances. */
+  readiness?: ProviderReadiness
+  /** The usable-model count that accompanies `readiness: 'ready'`. Absent
+   *  otherwise. Lowercase snake_case: this endpoint keeps its own casing. */
+  readiness_models?: number
   /** True for the provider Seal is configured to use (from CLI flag or
    *  config file). At most one entry has it set to true. */
   isDefault?: boolean
@@ -266,6 +272,18 @@ export interface ProviderInfo {
 
 // ── Provider CRUD (detailed) ───────────────────────────────────────────
 
+/** Ollama's observed readiness (design §D3). One enum, no free text: the
+ *  backend never sends RAM bytes, model names or sizes. */
+export type ProviderReadiness =
+  | 'pending'
+  | 'unknown'
+  | 'not-installed'
+  | 'not-running'
+  | 'no-models'
+  | 'no-fitting-model'
+  | 'ready'
+  | 'cloud'
+
 /** The auth status of a provider, as reported by GET /api/providers/all.
  *  Mirrors the backend's authStatus field. */
 export type ProviderAuthStatus = 'api-key' | 'oauth' | 'keyless' | 'none' | 'vault-locked'
@@ -275,9 +293,15 @@ export type ProviderAuthStatus = 'api-key' | 'oauth' | 'keyless' | 'none' | 'vau
  *  config fields, and whether the provider is the default. */
 export interface ProviderDetail {
   name: string
-  /** The provider implementation ("anthropic", "ollama", "openrouter",
-   *  "openai"). For a custom OpenAI-compatible instance `name` is the
-   *  operator-chosen unique name and `type` is "openai". */
+  /** Ollama's observed readiness. Absent for every other provider. */
+  readiness?: ProviderReadiness
+  /** The usable-model count for `readiness: 'ready'`. camelCase here: this
+   *  endpoint is a 1:1 wire mapping like `authStatus`/`isDefault`. */
+  readinessModels?: number
+  /** The provider implementation ("anthropic", "ollama", "ollama-cloud",
+   *  "openrouter", "openai", "openai-compatible"). For a custom
+   *  OpenAI-compatible instance `name` is the operator-chosen unique name and
+   *  `type` is "openai-compatible". */
   type?: string
   isDefault: boolean
   defaultModel: string | null
@@ -285,6 +309,12 @@ export interface ProviderDetail {
   models: string[]
   baseUrl: string | null
   authStatus: ProviderAuthStatus
+  /** Whether the operator must SUPPLY a base URL / unique name. This is a
+   *  validation question, NOT a visibility one: Ollama's base URL is optional
+   *  yet must still be shown, because it is the only GUI path to a remote
+   *  daemon (design D7). */
+  requiresBaseUrl: boolean
+  requiresName: boolean
 }
 
 /** The body for POST /api/providers and PUT /api/providers/:name. The

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { ProviderSelect } from '../ProviderModelFields'
 import { CronView } from '../CronView'
 import type {
   AgentDefInfo,
@@ -322,6 +323,64 @@ describe('CronView provider + model', () => {
     // Only Seal's configured default carries the marker.
     expect(opts.find((o) => o.value === 'anthropic')!.textContent).toBe('Anthropic (default)')
     expect(opts.find((o) => o.value === 'ollama')!.textContent).toBe('Ollama')
+  })
+
+  // Test 42, the ProviderSelect half. CronView renders the SHARED component, so
+  // this is the live render that proves the annotation reaches it. AgentsView
+  // hand-rolls its own <select> and never touches ProviderSelect, which is why
+  // that file needs its own assertion.
+  it('42: annotates Ollama with its readiness and keeps it selectable', () => {
+    providersState = [
+      { name: 'anthropic', isDefault: true, configured: true },
+      { name: 'ollama', configured: true, readiness: 'not-running' },
+    ]
+    render(<CronView />)
+    fireEvent.click(screen.getByLabelText('New cron job'))
+    const sel = providerSelect()
+    const opts = Array.from(sel.options)
+    expect(opts.find((o) => o.value === 'ollama')!.textContent).toBe('Ollama (Not Running)')
+    // Annotation, not gating: the option is still selectable.
+    expect(opts.find((o) => o.value === 'ollama')!.disabled).toBe(false)
+    sel.value = 'ollama'
+    fireEvent.change(sel, { target: { value: 'ollama' } })
+    expect(sel.value).toBe('ollama')
+  })
+
+  it('42b: a ready Ollama carries its model count', () => {
+    providersState = [
+      { name: 'ollama', configured: true, readiness: 'ready', readiness_models: 3 },
+    ]
+    render(<CronView />)
+    fireEvent.click(screen.getByLabelText('New cron job'))
+    const opts = Array.from(providerSelect().options)
+    expect(opts.find((o) => o.value === 'ollama')!.textContent).toBe('Ollama (Ready · 3 Models)')
+  })
+
+  it('42c: a pending Ollama carries no annotation', () => {
+    providersState = [
+      { name: 'ollama', configured: true, readiness: 'pending' },
+    ]
+    render(<CronView />)
+    fireEvent.click(screen.getByLabelText('New cron job'))
+    const opts = Array.from(providerSelect().options)
+    expect(opts.find((o) => o.value === 'ollama')!.textContent).toBe('Ollama')
+  })
+
+  it('42d: missing wins over readiness when both apply', () => {
+    // `missing` lives on ProviderOption (the shared select's input), not on
+    // ProviderInfo, so this case is asserted on the component directly rather
+    // than through CronView's wiring.
+    render(
+      <ProviderSelect
+        id="missing-wins"
+        value=""
+        onChange={() => {}}
+        providers={[{ name: 'ollama', configured: true, missing: true, readiness: 'not-running' }]}
+        loading={false}
+      />,
+    )
+    const opts = Array.from((document.getElementById('missing-wins') as HTMLSelectElement).options)
+    expect(opts.find((o) => o.value === 'ollama')!.textContent).toBe('Ollama (missing)')
   })
 
   it('shows a loading entry until the provider list arrives', () => {

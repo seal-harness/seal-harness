@@ -34,6 +34,7 @@ import Seal.Providers.Class (Provider (..), SomeProvider (..))
 import Seal.Security.Vault (VaultHandle)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.TestHelpers.FakeCaps (makeFakeCaps)
+import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.Vault.Commands (VaultRuntime (..))
 
 -- | A shared test abort flag (top-level, created once via unsafePerformIO).
@@ -120,7 +121,8 @@ spec = do
                      { vrPaths = SealPaths "/x" "/x" "/x" "/x" "/x"
                      , vrConfigPath = "/x/config.toml", vrHandleRef = ref }
                  , prManager = mgr
-                 , prCallCounter = cntRef }
+                 , prCallCounter = cntRef
+                 , prOllamaReadiness = noOllamaReadiness }
       r <- resolveSessionProvider pr (metaWith "anthropic" "claude-opus-4-8")
       case r of
         Left e  -> e `shouldSatisfy` ("vault not configured" `T.isInfixOf`)
@@ -136,7 +138,8 @@ spec = do
                      { vrPaths = SealPaths "/x" "/x" "/x" "/x" "/x"
                      , vrConfigPath = "/x/config.toml", vrHandleRef = ref }
                  , prManager = mgr
-                 , prCallCounter = cntRef }
+                 , prCallCounter = cntRef
+                 , prOllamaReadiness = noOllamaReadiness }
       r <- resolveSessionProvider pr (metaWith "bogus" "m")
       case r of
         Left e  -> e `shouldSatisfy` ("unknown provider" `T.isInfixOf`)

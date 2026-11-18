@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { AgentDefInfo, AgentDefInput, ToolsAllowList } from '../types'
+import type { AgentDefInfo, AgentDefInput, ProviderReadiness, ToolsAllowList } from '../types'
+import { readinessLabel } from '../lib/readiness'
 import {
   createAgentDef,
   deleteAgentDef,
@@ -15,7 +16,9 @@ import { type AgentGroup, groupAgents } from '../lib/agentGroups'
 
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
-  openai: 'OpenAI-compatible',
+  'ollama-cloud': 'Ollama Cloud',
+  openai: 'OpenAI',
+  'openai-compatible': 'OpenAI-compatible',
   openrouter: 'OpenRouter',
   ollama: 'Ollama',
 }
@@ -194,6 +197,17 @@ function AgentGroupSection({
  *  The id is the canonical AgentDefId — [A-Za-z0-9_-]+, non-empty, no
  *  leading dot. The form validates this client-side so the user gets
  *  immediate feedback before the round-trip. */
+/** The parenthesised readiness annotation for a provider option. Empty for
+ *  `pending` (nothing has been observed yet) and for any provider with no
+ *  readiness at all. */
+function optionReadinessSuffix(
+  readiness: ProviderReadiness,
+  usableModels: number | undefined,
+): string {
+  const label = readinessLabel(readiness, usableModels)
+  return label === '' ? '' : ` (${label})`
+}
+
 export function AgentsView() {
   const { agents, loaded, error, refresh } = useAgentDefs()
   const { providers, loaded: providersLoaded } = useConfiguredProviders()
@@ -486,6 +500,13 @@ export function AgentsView() {
                 {providersLoaded && providers.map((p) => (
                   <option key={p.name} value={p.name}>
                     {PROVIDER_LABELS[p.name] ?? p.name}
+                    {/* Test 42: this list is hand-rolled (it never renders
+                        ProviderSelect), so it needs the annotation itself.
+                        Parenthesised to match ` (default)`/` (missing)`, and
+                        the option stays selectable — annotation, not gating. */}
+                    {p.name === 'ollama' && p.readiness !== undefined
+                      ? optionReadinessSuffix(p.readiness, p.readiness_models)
+                      : ''}
                   </option>
                 ))}
                 {/* Allow providers not in the configured list too — the

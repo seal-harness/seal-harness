@@ -17,7 +17,7 @@ import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromJust, isJust, mapMaybe)
+import Data.Maybe (fromJust, fromMaybe, isJust, listToMaybe, mapMaybe)
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -71,6 +71,8 @@ import Seal.Ingest (emptyChain)
 import Seal.Providers.Class
   ( ContentBlock (..), Message, pattern Message, Role (..), ToolResultPart (..)
   , SomeProvider (..), Provider (..), CompletionResponse (..), StopReason (..), Usage (..) )
+import Seal.Providers.ContextWindow (modelContextWindow)
+import Seal.Providers.OllamaReadiness (OllamaReadiness (..))
 import Seal.Providers.Registry (KnownProvider (..), knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
@@ -88,7 +90,7 @@ import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( SessionRuntime (..), listSessions, newSession, saveSessionMeta )
 import Seal.TestHelpers.ApiTestHarness
-  ( ApiTestEnv (..), defaultApiTestOptions, runApiTestLocal )
+  ( ApiTestEnv (..), defaultApiTestOptions, noOllamaReadiness, runApiTestLocal )
 import Options.Applicative (info)
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry, replySubscribe)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
@@ -325,6 +327,7 @@ mkDepsFor paths = do
     , adAgentDefs       = adb
     , adSkills          = skills
     , adProviders       = pure knownProviders
+    , adOllamaReadiness = noOllamaReadiness
     , adUiState         = uiState
     , adSend            = Nothing
     , adDefaultAgent    = pure Nothing
@@ -503,6 +506,7 @@ mkProviderTestDeps tmp cfgRoot vr = do
     , adAgentDefs       = adb
     , adSkills          = skills
     , adProviders       = pure knownProviders
+    , adOllamaReadiness = noOllamaReadiness
     , adUiState         = uiState
     , adSend            = Nothing
     , adDefaultAgent    = pure Nothing
@@ -593,6 +597,11 @@ spec = describe "Seal.Gateway.API" $ do
   let mkPaths = fakePaths { spState = sharedStateDir }
       mkApp = apiApp <$> mkDepsFor mkPaths
       mkAppWithHealth health = apiApp <$> mkDepsWithHealth mkPaths health
+      -- An app whose Ollama readiness seam reports a chosen state, so the
+      -- wire shape can be asserted (tests 9/10/11/31/32).
+      mkAppWithReadiness r = do
+        d <- mkDepsFor mkPaths
+        pure (apiApp d { adOllamaReadiness = pure r })
 
   it "GET /api/health returns 200" $ do
     app <- mkApp
@@ -2507,6 +2516,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adAgentDefs       = adb
                 , adSkills          = skills
                 , adProviders       = pure knownProviders
+                , adOllamaReadiness = noOllamaReadiness
                 , adUiState         = uiState
                 , adSend            = Nothing
                  , adDefaultAgent    = pure (Just "zoe")
@@ -2591,6 +2601,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = adb
             , adSkills          = bSkills backends
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Nothing
              , adDefaultAgent    = do
@@ -2667,6 +2678,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = adb
             , adSkills          = bSkills backends
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = do
@@ -2746,6 +2758,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2848,6 +2861,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2915,6 +2929,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2981,6 +2996,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -3028,6 +3044,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -3127,6 +3144,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -3192,6 +3210,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -3256,6 +3275,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -3314,6 +3334,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -3381,6 +3402,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = adb
             , adSkills          = skills
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = pure Nothing
@@ -3650,6 +3672,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adAgentDefs       = adb
                 , adSkills          = skills
                 , adProviders       = pure knownProviders
+                , adOllamaReadiness = noOllamaReadiness
                 , adUiState         = uiState
                 , adSend            = Nothing
                 , adDefaultAgent    = pure Nothing
@@ -3848,6 +3871,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adAgentDefs       = adb
                 , adSkills          = skills
                 , adProviders       = pure knownProviders
+                , adOllamaReadiness = noOllamaReadiness
                 , adUiState         = uiState
                 , adSend            = Nothing
                 , adDefaultAgent    = pure Nothing
@@ -3931,6 +3955,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = adb
             , adSkills          = skills
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = pure Nothing
@@ -3983,6 +4008,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = adb
             , adSkills          = skills
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = pure Nothing
@@ -4176,6 +4202,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = adb
             , adSkills          = skills
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = pure Nothing
@@ -4515,6 +4542,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adAgentDefs       = adb
                 , adSkills          = skills
                 , adProviders       = pure [OllamaProvider]
+                , adOllamaReadiness = noOllamaReadiness
                 , adUiState         = uiState
                 , adSend            = Nothing
                 , adDefaultAgent    = pure Nothing
@@ -4542,7 +4570,7 @@ spec = describe "Seal.Gateway.API" $ do
     let arr = case A.decode body :: Maybe [A.Value] of
           Just xs -> xs
           Nothing -> error ("could not decode providers body: " ++ show body)
-    -- Every known provider is present (anthropic, ollama, openrouter, openai).
+    -- Every known provider is present (all six, in D2 order).
     length arr `shouldBe` length knownProviders
     -- Each entry has a name; build a name -> configured map.
     let entries = [ (n, c) | e <- arr, A.Object o <- [e]
@@ -4556,8 +4584,10 @@ spec = describe "Seal.Gateway.API" $ do
     byName `shouldBe` Map.fromList
               [ ("anthropic", False)
               , ("ollama", True)
+              , ("ollama-cloud", False)
               , ("openrouter", False)
               , ("openai", False)
+              , ("openai-compatible", False)
               ]
 
   it "GET /api/providers/anthropic/models returns 200" $ do
@@ -4570,6 +4600,131 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app (testRequest methodGet
       ["api", "providers", "anthropic", "models", "claude-sonnet-4-20250514", "context"])
     status `shouldBe` 200
+
+  -- Design item 21: the OpenAI static list is non-empty, and EVERY id in it is
+  -- sized by ContextWindow.hs (modelContextWindow returns Int, not Maybe, so
+  -- an unknown id scores 0 and the UI would render no percentage). Also pins
+  -- that Ollama Cloud's list stays empty - its catalogue is the operator's own.
+  it "item 21: the OpenAI static model list is non-empty and every id is sized" $ do
+    app <- mkApp
+    (status, body) <- runAppBody app
+      (testRequest methodGet ["api", "providers", "openai", "models"])
+    status `shouldBe` 200
+    let entries = case A.decode body :: Maybe [A.Value] of
+          Just xs -> xs
+          Nothing -> error ("could not decode models body: " ++ show body)
+        ids = [ i | A.Object o <- entries, Just (A.String i) <- [lookupK "name" o] ]
+    ids `shouldSatisfy` (not . null)
+    -- Every published id must resolve to a positive context window, or the UI
+    -- shows a model it cannot size.
+    forM_ ids $ \i ->
+      modelContextWindow i `shouldSatisfy` (> 0)
+    -- The contextWindow field the wire carries agrees with the lookup.
+    forM_ entries $ \case
+      A.Object o -> case (lookupK "name" o, lookupK "contextWindow" o) of
+        (Just (A.String i), Just (A.Number w)) ->
+          w `shouldBe` fromIntegral (modelContextWindow i)
+        _ -> expectationFailure "expected name + contextWindow"
+      _ -> expectationFailure "expected object"
+    -- gpt-4o is deliberately absent: ContextWindow's clause is "gpt-4o-" with a
+    -- trailing dash, so the bare id scores 0.
+    ids `shouldSatisfy` notElem "gpt-4o"
+
+  it "item 21: the Ollama Cloud static model list is empty" $ do
+    app <- mkApp
+    (status, body) <- runAppBody app
+      (testRequest methodGet ["api", "providers", "ollama-cloud", "models"])
+    status `shouldBe` 200
+    (A.decode body :: Maybe [A.Value]) `shouldBe` Just []
+
+  -- Items 26-27: /api/providers/all carries the two 1:1 booleans, and a custom
+  -- instance is typed openai-compatible. Uses the real temp-config harness so
+  -- the routes see a genuine install.
+  it "items 26-27: /api/providers/all carries requiresBaseUrl/requiresName" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      (status, body) <- runAppBody (apiApp deps)
+        (testRequest methodGet ["api", "providers", "all"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode providers/all: " ++ show body)
+          row n = [ o | A.Object o <- arr, lookupK "name" o == Just (A.String n) ]
+          boolAt n k = case row n of
+            (o:_) -> case lookupK k o of
+              Just (A.Bool b) -> Just b
+              _ -> Nothing
+            [] -> Nothing
+      -- Only the generic type requires an operator-supplied endpoint and name.
+      boolAt "openai-compatible" "requiresBaseUrl" `shouldBe` Just True
+      boolAt "openai-compatible" "requiresName" `shouldBe` Just True
+      boolAt "openai" "requiresBaseUrl" `shouldBe` Just False
+      boolAt "openai" "requiresName" `shouldBe` Just False
+      boolAt "ollama-cloud" "requiresBaseUrl" `shouldBe` Just False
+      boolAt "ollama-cloud" "requiresName" `shouldBe` Just False
+      -- Ollama's base URL is optional but STILL SHOWN, so the flag is False
+      -- while the field renders (D7: required is not visible).
+      boolAt "ollama" "requiresBaseUrl" `shouldBe` Just False
+
+  -- Item 27b: the PUT path's typeId (resolveExistingTarget) is a SECOND
+  -- literal from the create path's; a create-only test cannot see it.
+  it "item 27b: a PUT on a custom instance echoes type openai-compatible" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("local-vllm" :: T.Text)
+          , "type" .= ("openai-compatible" :: T.Text)
+          , "api_key" .= ("sk-local" :: T.Text)
+          , "base_url" .= ("http://localhost:8000/v1" :: T.Text)
+          ]))
+      (createStatus, _) <- runAppBody app req
+      createStatus `shouldBe` 201
+      putReq <- testPut ["api", "providers", "local-vllm"]
+        (A.encode (A.object [ "default_model" .= ("my-model" :: T.Text) ]))
+      (status, body) <- runAppBody app putReq
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) ->
+          lookupK "type" o `shouldBe` Just (A.String "openai-compatible")
+        _ -> expectationFailure "expected a JSON object"
+
+  -- Item 33: a custom instance must NOT inherit Ollama readiness. The typeId
+  -- guard at API.hs:3246 becomes a tautology if it still says "openai".
+  it "item 33: a custom instance carries no readiness keys" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("local-vllm" :: T.Text)
+          , "type" .= ("openai-compatible" :: T.Text)
+          , "api_key" .= ("sk-local" :: T.Text)
+          , "base_url" .= ("http://localhost:8000/v1" :: T.Text)
+          ]))
+      (createStatus, _) <- runAppBody app req
+      createStatus `shouldBe` 201
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "providers", "all"])
+      let arr = fromMaybe [] (A.decode body :: Maybe [A.Value])
+          row = [ o | A.Object o <- arr, lookupK "name" o == Just (A.String "local-vllm") ]
+      case row of
+        (o:_) -> do
+          lookupK "readiness" o `shouldBe` Nothing
+          lookupK "readinessModels" o `shouldBe` Nothing
+        [] -> expectationFailure "custom instance missing from providers/all"
 
   it "GET /api/providers/unknown/models returns 200 with []" $ do
     app <- mkApp
@@ -4590,6 +4745,168 @@ spec = describe "Seal.Gateway.API" $ do
         lookupK "isDefault" o `shouldSatisfy` isJust
         lookupK "authStatus" o `shouldSatisfy` isJust
       _ -> expectationFailure "expected object"
+
+  describe "readiness on the wire (tests 9-11, 30-33b)" $ do
+
+    it "31: GET /api/providers emits readiness + readiness_models for Ollama only" $ do
+      app <- mkAppWithReadiness (RdReady 3)
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe [A.Value] of
+        Nothing -> expectationFailure "could not decode /api/providers"
+        Just arr -> forM_ arr $ \case
+          A.Object o -> case lookupK "name" o of
+            Just (A.String "ollama") -> do
+              lookupK "readiness" o `shouldBe` Just (A.String "ready")
+              -- snake_case on this endpoint.
+              lookupK "readiness_models" o `shouldBe` Just (A.Number 3)
+            Just (A.String _) -> do
+              -- ABSENT, not null, for every other provider.
+              lookupK "readiness" o `shouldBe` Nothing
+              lookupK "readiness_models" o `shouldBe` Nothing
+            _ -> pure ()
+          _ -> expectationFailure "expected object"
+
+    it "31b: for a non-Ollama provider the keys are ABSENT, not null" $ do
+      -- `(.=)` on a Maybe emits an explicit null, which is a THIRD state no
+      -- frontend consumer handles (`readiness === undefined` is the
+      -- absent-field fallback). This asserts key absence, not null-ness.
+      app <- mkAppWithReadiness (RdReady 2)
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
+      case A.decode body :: Maybe [A.Value] of
+        Nothing -> expectationFailure "could not decode /api/providers"
+        Just arr -> forM_ arr $ \case
+          A.Object o -> case lookupK "name" o of
+            Just (A.String "ollama") -> pure ()
+            Just (A.String _) -> do
+              KeyMap.member (Key.fromText "readiness") o `shouldBe` False
+              KeyMap.member (Key.fromText "readiness_models") o `shouldBe` False
+            _ -> pure ()
+          _ -> expectationFailure "expected object"
+
+    it "9: a not-running Ollama carries readiness and NO count" $ do
+      app <- mkAppWithReadiness RdNotRunning
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
+      case A.decode body :: Maybe [A.Value] of
+        Nothing -> expectationFailure "could not decode /api/providers"
+        Just arr -> forM_ arr $ \case
+          A.Object o -> case lookupK "name" o of
+            Just (A.String "ollama") -> do
+              lookupK "readiness" o `shouldBe` Just (A.String "not-running")
+              lookupK "readiness_models" o `shouldBe` Nothing
+            _ -> pure ()
+          _ -> pure ()
+
+    it "10: GET /api/providers/all emits readiness + readinessModels (camelCase)" $ do
+      app <- mkAppWithReadiness (RdReady 2)
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "providers", "all"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe [A.Value] of
+        Nothing -> expectationFailure "could not decode providers/all"
+        Just arr -> forM_ arr $ \case
+          A.Object o -> case lookupK "name" o of
+            Just (A.String "ollama") -> do
+              lookupK "readiness" o `shouldBe` Just (A.String "ready")
+              -- camelCase on this endpoint (1:1 wire mapping).
+              lookupK "readinessModels" o `shouldBe` Just (A.Number 2)
+              lookupK "readiness_models" o `shouldBe` Nothing
+            Just (A.String _) -> do
+              lookupK "readiness" o `shouldBe` Nothing
+              lookupK "readinessModels" o `shouldBe` Nothing
+            _ -> pure ()
+          _ -> expectationFailure "expected object"
+
+    it "30: configured is unchanged for every readiness value (the no-gate-flap invariant)" $ do
+      let configuredFor r = do
+            app <- mkAppWithReadiness r
+            (_, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
+            pure $ case A.decode body :: Maybe [A.Value] of
+              Nothing -> Nothing
+              Just arr -> listToMaybe
+                [ c | A.Object o <- arr
+                    , lookupK "name" o == Just (A.String "ollama")
+                    , Just (A.Bool c) <- [lookupK "configured" o] ]
+      results <- mapM configuredFor
+        [RdPending, RdUnknown, RdNotInstalled, RdNotRunning, RdNoModels
+        , RdNoFittingModel, RdReady 2, RdCloud]
+      -- Every value agrees: readiness never touches `configured`, so a daemon
+      -- going down cannot re-open the blocking gate or eject Ollama from the
+      -- dropdowns.
+      results `shouldBe` replicate 8 (Just True)
+
+    it "WU-B DoD 10: RdNoFittingModel is advisory — configured and required_complete unchanged" $ do
+      -- The advisory state must never gate the wizard or flip `configured`.
+      app <- mkAppWithReadiness RdNoFittingModel
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
+      case A.decode body :: Maybe [A.Value] of
+        Nothing -> expectationFailure "could not decode /api/providers"
+        Just arr -> do
+          let ollamaCfg = listToMaybe
+                [ c | A.Object o <- arr
+                    , lookupK "name" o == Just (A.String "ollama")
+                    , Just (A.Bool c) <- [lookupK "configured" o] ]
+          ollamaCfg `shouldBe` Just True
+          let ollamaRd = listToMaybe
+                [ r | A.Object o <- arr
+                    , lookupK "name" o == Just (A.String "ollama")
+                    , Just (A.String r) <- [lookupK "readiness" o] ]
+          ollamaRd `shouldBe` Just "no-fitting-model"
+      -- And the setup gate is unaffected.
+      (setupStatus, setupBody) <- runAppBody app (testRequest methodGet ["api", "setup"])
+      setupStatus `shouldBe` 200
+      case A.decode setupBody :: Maybe A.Value of
+        Just (A.Object o) -> do
+          lookupK "required_complete" o `shouldSatisfy` isJust
+          -- The Ollama CARD carries the readiness; a non-Ollama card OMITS
+          -- both keys (absent, never null). Asserting on a card, not on the
+          -- top-level object, which has no such key either way.
+          let cards = case lookupK "providers" o of
+                Just (A.Array xs) -> [c | A.Object c <- V.toList xs]
+                _                 -> []
+              ollamaCard = [c | c <- cards, lookupK "id" c == Just (A.String "ollama")]
+              otherCard  = [c | c <- cards, lookupK "id" c /= Just (A.String "ollama")]
+          ollamaCard `shouldSatisfy` (not . null)
+          forM_ ollamaCard $ \c ->
+            lookupK "readiness" c `shouldBe` Just (A.String "no-fitting-model")
+          forM_ otherCard $ \c -> do
+            lookupK "readiness" c `shouldBe` Nothing
+            lookupK "readiness_models" c `shouldBe` Nothing
+        _ -> expectationFailure "could not decode /api/setup"
+
+    it "10b: a PUT mutation response carries the same readiness (test 33b)" $
+      -- providerDetailJsonFor is shared by /all and both mutations, so this
+      -- pins that a saved Ollama cannot flip back to Keyless.
+      withSystemTempDirectory "seal-prov-readiness" $ \tmp -> do
+        let cfgRoot = tmp </> "config"
+        createDirectoryIfMissing True cfgRoot
+        ensureConfigRepo cfgRoot
+        vault <- makeFakeVaultRuntime []
+        deps <- mkProviderTestDeps tmp cfgRoot vault
+        let app = apiApp deps { adOllamaReadiness = pure RdNoModels }
+        req <- testWithBody methodPut ["api", "providers", "ollama"]
+          (A.encode (A.object ["default_model" .= ("llama3.2" :: T.Text)]))
+        (status, body) <- runAppBody app req
+        status `shouldBe` 200
+        case A.decode body :: Maybe A.Value of
+          Nothing -> expectationFailure "could not decode PUT response"
+          Just (A.Object o) -> do
+            lookupK "readiness" o `shouldBe` Just (A.String "no-models")
+            lookupK "readinessModels" o `shouldBe` Nothing
+          _ -> expectationFailure "expected object"
+
+    it "10c: DELETE is unchanged — 204 with an empty body" $
+      withSystemTempDirectory "seal-prov-del" $ \tmp -> do
+        let cfgRoot = tmp </> "config"
+        createDirectoryIfMissing True cfgRoot
+        ensureConfigRepo cfgRoot
+        vault <- makeFakeVaultRuntime []
+        deps <- mkProviderTestDeps tmp cfgRoot vault
+        let app = apiApp deps { adOllamaReadiness = pure RdNotRunning }
+        (status, body) <- runAppBody app (testRequest methodDelete ["api", "providers", "anthropic"])
+        status `shouldBe` 204
+        -- The bodiless 204 is asserted explicitly: DELETE returns noContent,
+        -- and adding a readiness body here would be a wire change.
+        BL.toStrict body `shouldBe` ""
 
   it "GET /api/providers/all returns authStatus for locked vault" $ do
     app <- mkApp
@@ -4768,7 +5085,7 @@ spec = describe "Seal.Gateway.API" $ do
       req <- testPost ["api", "providers"]
         (A.encode (A.object
           [ "name" .= ("local-vllm" :: T.Text)
-          , "type" .= ("openai" :: T.Text)
+          , "type" .= ("openai-compatible" :: T.Text)
           , "api_key" .= ("sk-local" :: T.Text)
           , "base_url" .= ("http://localhost:8000/v1" :: T.Text)
           ]))
@@ -4777,7 +5094,7 @@ spec = describe "Seal.Gateway.API" $ do
       case A.decode body :: Maybe A.Value of
         Just (A.Object o) -> do
           lookupK "name" o `shouldBe` Just (A.String "local-vllm")
-          lookupK "type" o `shouldBe` Just (A.String "openai")
+          lookupK "type" o `shouldBe` Just (A.String "openai-compatible")
           lookupK "authStatus" o `shouldBe` Just (A.String "api-key")
         _ -> expectationFailure "expected JSON object"
       eCfg <- loadRuntimeConfig (cfgRoot </> "config.toml")
@@ -4816,7 +5133,7 @@ spec = describe "Seal.Gateway.API" $ do
       req <- testPost ["api", "providers"]
         (A.encode (A.object
           [ "name" .= ("local-vllm" :: T.Text)
-          , "type" .= ("openai" :: T.Text)
+          , "type" .= ("openai-compatible" :: T.Text)
           , "api_key" .= ("sk-local" :: T.Text)
           , "base_url" .= ("http://localhost:9000/v1" :: T.Text)
           ]))
@@ -4830,7 +5147,7 @@ spec = describe "Seal.Gateway.API" $ do
     req <- testPost ["api", "providers"]
       (A.encode (A.object
         [ "name" .= ("Bad Name" :: T.Text)
-        , "type" .= ("openai" :: T.Text)
+        , "type" .= ("openai-compatible" :: T.Text)
         , "api_key" .= ("k" :: T.Text)
         , "base_url" .= ("http://localhost:8000/v1" :: T.Text)
         ]))
@@ -5714,6 +6031,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adHarnessRegistry = reg, adAdoptConsent = Just CcWeb
                 , adAgentDefs = userAdb, adSkills = skillsBackend
                 , adProviders = pure knownProviders, adUiState = uiState
+                , adOllamaReadiness = noOllamaReadiness
                 , adSend = Nothing, adDefaultAgent = pure mDefault
                 , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
                 , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
@@ -5855,6 +6173,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adHarnessRegistry = reg, adAdoptConsent = Just CcWeb
             , adAgentDefs = userAdb, adSkills = skillsBackend
             , adProviders = pure knownProviders, adUiState = uiState
+            , adOllamaReadiness = noOllamaReadiness
             , adSend = Nothing, adDefaultAgent = pure Nothing
             , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
             , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
@@ -5951,6 +6270,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = adb
             , adSkills          = skills
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -6014,7 +6334,7 @@ spec = describe "Seal.Gateway.API" $ do
       cntRef <- newIORef 0
       execCache <- newSessionExecCache
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prOllamaReadiness = noOllamaReadiness }
           paths = SealPaths
             { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" , spCache = ""}
           meta0 = fakeMeta { smId = case mkSessionId "e2e" of Right s -> s; Left _ -> error "sid" }
@@ -6068,6 +6388,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = adb
             , adSkills          = bSkills backends
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -6201,7 +6522,7 @@ spec = describe "Seal.Gateway.API" $ do
       activeRef' <- newIORef meta0
       uiState <- newUiStateHandle paths
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prOllamaReadiness = noOllamaReadiness }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef' }
           resolveStub :: SessionMeta -> IO (Either T.Text (SomeProvider, ModelId))
           resolveStub _ = pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2"))
@@ -6248,6 +6569,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = bAgentDefs backends
             , adSkills          = bSkills backends
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -6336,7 +6658,7 @@ spec = describe "Seal.Gateway.API" $ do
       cntRef <- newIORef 0
       execCache <- newSessionExecCache
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prOllamaReadiness = noOllamaReadiness }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
           registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps (mkWebTurnDeps sendDeps) requestSid) ]
           sendDeps = SendDeps
@@ -6382,6 +6704,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = bAgentDefs backends
             , adSkills          = bSkills backends
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = error "adUiState: unused on the slash path"
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -6473,7 +6796,7 @@ spec = describe "Seal.Gateway.API" $ do
       cntRef <- newIORef 0
       execCache <- newSessionExecCache
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prOllamaReadiness = noOllamaReadiness }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
           registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps (mkWebTurnDeps sendDeps) requestSid) ]
           sendDeps = SendDeps
@@ -6519,6 +6842,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = bAgentDefs backends
             , adSkills          = bSkills backends
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = error "adUiState: unused on the slash path"
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing

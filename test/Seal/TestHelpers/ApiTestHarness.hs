@@ -27,6 +27,8 @@ module Seal.TestHelpers.ApiTestHarness
   , waitForTranscript
   , assertTranscriptContains
   , setScript
+    -- * Offline stubs
+  , noOllamaReadiness
   , uemLabel
   , ghEnvMarkerName
   , readGhEnvMarker
@@ -101,6 +103,7 @@ import Seal.Ingest (emptyChain)
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Providers.Class
   ( CompletionResponse (..), SomeProvider (..) )
+import Seal.Providers.OllamaReadiness (OllamaReadiness (..))
 import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
@@ -126,6 +129,18 @@ import Seal.Tabs (newTabsHandle)
 import Seal.Web.UiState (newUiStateHandle)
 import Seal.Memory.Embedding (nullEmbeddingBackend)
 import Seal.Cron.Store (CronStore (..))
+
+-- | The shared Ollama readiness stub (design D6.2). Every @ApiDeps@ and
+-- 'ProviderRuntime' literal in the test suite references this ONE constant, so
+-- adding the readiness seam is a mechanical, one-field churn and no test ever
+-- touches the network or the real PATH.
+--
+-- 'RdPending' rather than 'RdUnknown' is deliberate: @pending@ is the honest
+-- "no probe result yet" value and is the one state the frontend renders as an
+-- empty readiness slot, so existing assertions about the auth badge keep
+-- passing unchanged (design test 34).
+noOllamaReadiness :: IO OllamaReadiness
+noOllamaReadiness = pure RdPending
 
 -- | A pure 'CronStore' stub for ApiDeps literals that don't exercise cron.
 stubCronStore :: CronStore
@@ -460,7 +475,8 @@ buildTestEnv tmp mode mRepo opts = do
   let rt = vaultRt
       pr = ProviderRuntime
         { prConfigPath = configRoot </> "config.toml", prVault = rt
-        , prManager = mgr, prCallCounter = cntRef }
+        , prManager = mgr, prCallCounter = cntRef
+        , prOllamaReadiness = noOllamaReadiness }
 
   -- Provider resolve stub.
   let resolveStub :: SessionMeta -> IO (Either Text (SomeProvider, ModelId))
@@ -544,6 +560,7 @@ buildTestEnv tmp mode mRepo opts = do
         , adAgentDefs = bAgentDefs backends
         , adSkills = bSkills backends
         , adProviders = pure knownProviders
+        , adOllamaReadiness = noOllamaReadiness
         , adUiState = uiState
         , adSend = Just sendDeps
         , adDefaultAgent = pure Nothing

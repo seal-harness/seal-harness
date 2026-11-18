@@ -97,6 +97,8 @@ import Seal.Gateway.Config
 import Seal.Tools.Exec.FileExplorer (mkLocalFileExplorer, mkRemoteFileExplorer, mkFailClosedFileExplorer)
 import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Gateway.Server (runGateway)
+import Seal.Providers.OllamaReadinessProbe
+  ( mkOllamaProbes, defaultProbesConfig, oprReadiness, oprRefresh )
 import Seal.Gateway.Setup (SetupDeps (..))
 
 import Seal.Gateway.Stream (StreamGuard (..), StreamHealth (..))
@@ -315,11 +317,35 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
             }
   mgr <- newTlsManager
   callCounter <- newIORef 0
+  -- The Ollama readiness cache (design D2.4/D2.5), created before the
+  -- 'ProviderRuntime' that carries its read side and long before
+  -- @let deps = ApiDeps@ / 'runGateway' (DoD 23).
+  --
+  -- The manager is @mgr@, the PROVIDER manager — never 'gatewayManager', which
+  -- installs a @managerModifyRequest@ stamping @Authorization: Bearer
+  -- <gateway service token>@ onto every request. Building the probe on that
+  -- manager would ship the gateway's service token to an operator-set
+  -- @base_url@ (design D2.9).
+  --
+  -- 'pcReadConfig' re-reads config.toml per refresh (design D2.10), mirroring
+  -- the @adProviders@ seam, so an edited @base_url@ takes effect without a
+  -- restart.
+  let loadProbeCfg = fromRight defaultRuntimeConfig <$> loadRuntimeConfig cfgPath
+  probes <- mkOllamaProbes (defaultProbesConfig mgr loadProbeCfg)
+  -- Warm the cache at startup, non-blocking: 'oprRefresh' forks and returns, so
+  -- the first @\/api\/providers@ is not blank and the HTTP bind is never
+  -- delayed.
+  oprRefresh probes
   let pr = ProviderRuntime
             { prConfigPath  = cfgPath
             , prVault       = rt
             , prManager     = mgr
             , prCallCounter = callCounter
+            -- Created earlier and shared with the gateway's ApiDeps. The TUI
+            -- builds its own inline probes; this ProcessRuntime is the
+            -- gateway's, and @\/provider list@ run inside a gateway-hosted CLI
+            -- session can share the cache.
+            , prOllamaReadiness = oprReadiness probes
             }
       cfgRoot = spConfig paths
   ensureConfigRepo cfgRoot
@@ -665,8 +691,8 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
             -- inputs are re-read: the vault handle from the same ref the
             -- commands use, and config.toml from disk — a provider whose
             -- *credential* arrives through the vault, but whose *endpoint*
-            -- (`[providers.openai] base_url`) arrives through the config, is
-            -- only "configured" once both are visible.
+            -- (`[providers.openai-compatible] base_url`) arrives through the
+            -- config, is only "configured" once both are visible.
             mh <- readIORef (vrHandleRef rt)
             cfg' <- loadCfg
             configuredProviders mh cfg'
@@ -706,6 +732,7 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
         , adDownloadAllowBlocked = downloadAllowBlocked
         , adHttpManager = Just mgr
         , adIconCache = Just iconCache
+        , adOllamaReadiness = oprReadiness probes
         }
   -- The WS stream server is MOUNTED in the HTTP application (same port),
   -- so there is no second listener and no second port to collide with.

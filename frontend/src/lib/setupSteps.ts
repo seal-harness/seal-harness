@@ -12,6 +12,8 @@
  *    registered in the wizard's step switch. Nothing else in the gate changes.
  */
 
+import type { ProviderReadiness } from '../types'
+
 export type SetupStatus = 'ready' | 'pending' | 'blocked'
 
 export interface SetupStep {
@@ -26,6 +28,10 @@ export interface ProviderCard {
   id: string
   label: string
   configured: boolean
+  /** Ollama's observed readiness. Absent for every other provider. */
+  readiness?: ProviderReadiness
+  /** The usable-model count for `readiness: 'ready'`. Absent otherwise. */
+  readiness_models?: number
   isDefault: boolean
   default_model: string | null
   /** Operator-configured frequently-used models for this provider. */
@@ -189,11 +195,35 @@ function parseStep(raw: unknown): { step: SetupStep; unknownStatus?: string } | 
     : { step, unknownStatus: status }
 }
 
+/** The eight readiness wire values. An unrecognised one is dropped rather than
+ *  passed through: a stale client must not render a state it has no label for,
+ *  and the absent-field fallback is exactly the current behaviour. */
+const KNOWN_READINESS: ProviderReadiness[] = [
+  'pending',
+  'unknown',
+  'not-installed',
+  'not-running',
+  'no-models',
+  'no-fitting-model',
+  'ready',
+  'cloud',
+]
+
+/** Preserve `readiness` and `readiness_models` through the whitelist. Without
+ *  this they are silently dropped and every card renders as if the server had
+ *  never sent them (test 41). */
 function parseProvider(raw: unknown): ProviderCard | null {
   if (!isRecord(raw)) return null
-  const { id, label, configured, isDefault, default_model, requires_base_url, requires_name } = raw
+  const {
+    id, label, configured, isDefault, default_model, requires_base_url, requires_name,
+    readiness, readiness_models,
+  } = raw
   if (typeof id !== 'string' || typeof label !== 'string') return null
   if (typeof configured !== 'boolean' || typeof isDefault !== 'boolean') return null
+  const parsedReadiness =
+    typeof readiness === 'string' && (KNOWN_READINESS as string[]).includes(readiness)
+      ? (readiness as ProviderReadiness)
+      : undefined
   return {
     id,
     label,
@@ -202,6 +232,8 @@ function parseProvider(raw: unknown): ProviderCard | null {
     default_model: typeof default_model === 'string' ? default_model : null,
     requires_base_url: requires_base_url === true,
     requires_name: requires_name === true,
+    ...(parsedReadiness === undefined ? {} : { readiness: parsedReadiness }),
+    ...(typeof readiness_models === 'number' ? { readiness_models } : {}),
   }
 }
 

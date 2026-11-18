@@ -31,6 +31,7 @@ import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
 import Seal.TestHelpers.FakeCaps (getSent, makeFakeCaps)
+import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.TestHelpers.FakeVault (makeFakeVault)
 import Seal.Transcript.Conv (readConversation)
 import Seal.Vault.Commands (VaultRuntime (..))
@@ -53,7 +54,7 @@ mkPR cfgPath mvh = do
   cntRef <- newIORef 0
   let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath cfgPath
       vrt = VaultRuntime { vrPaths = sp, vrConfigPath = cfgPath, vrHandleRef = ref }
-  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef }
+  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef, prOllamaReadiness = noOllamaReadiness }
 
 runModel :: ProviderRuntime -> SessionRuntime -> [String] -> ChannelCaps -> IO ()
 runModel pr sr argv caps =
@@ -96,6 +97,7 @@ mkPRWithOllama cfgPath vh port = do
     , prVault       = vrt
     , prManager     = mgr
     , prCallCounter = cntRef
+    , prOllamaReadiness = noOllamaReadiness
     }
 
 spec :: Spec
