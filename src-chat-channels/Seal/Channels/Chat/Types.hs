@@ -170,12 +170,30 @@ data StreamingState = StreamingState
   , ssLastLen     :: IORef Int
     -- ^ Codepoints in the accumulated text at the last platform edit.
     -- The edit gate measures NEW text since the last edit, not the total.
+  , ssLastEntry   :: IORef Text
+    -- ^ The text of the most recently recorded response entry. The gateway's
+    -- streaming accumulator is turn-scoped, so a later response's text can
+    -- already INCLUDE an earlier one; this is what lets the loop tell "the
+    -- same text arriving again" from "a genuinely new segment".
+  , ssSplices     :: IORef [(Int, Text)]
+    -- ^ Tool-progress lines for the single-edited-bubble style, each paired
+    -- with the length of the turn's cumulative streamed text when it fired.
+    -- The offset lets the renderer splice the line into the text where it
+    -- actually happened instead of appending every tool line at the end.
+    -- Unused by the default ('PsSeparateMessages') style.
   , ssFinalized   :: IORef Bool
     -- ^ 'True' once the turn's final entry has been delivered (the
     -- bubble was finalized). Late entry-updates — which can arrive after
     -- the recorded entry, because the server's streaming path and the
     -- post-turn broadcast are unsynchronized — are ignored while set.
     -- Cleared when a new turn starts (harness-status: thinking).
+  , ssLastBubbleEdit :: IORef (Maybe UTCTime)
+    -- ^ When the last successful single-bubble EDIT landed. Both edit sources
+    -- (streaming frames and tool calls) share this ONE field, so a turn cannot
+    -- exceed one edit per interval by alternating between them. A create does
+    -- not set it (a create is not an edit) and a failed edit does not set it,
+    -- so the next event retries instead of waiting out another interval.
+    -- Unused by the default ('PsSeparateMessages') style.
   }
 
 -- | Create fresh streaming state for one conversation.
@@ -185,13 +203,19 @@ newStreamingState = do
   accum <- newIORef ""
   lastEdit <- newIORef Nothing
   lastLen <- newIORef 0
+  lastEntry <- newIORef ""
+  splices <- newIORef []
   finalized <- newIORef False
+  lastBubbleEdit <- newIORef Nothing
   pure StreamingState
     { ssMsgId = msgId
     , ssAccumulated = accum
     , ssLastEdit = lastEdit
     , ssLastLen = lastLen
+    , ssLastEntry = lastEntry
+    , ssSplices = splices
     , ssFinalized = finalized
+    , ssLastBubbleEdit = lastBubbleEdit
     }
 
 -- | Reset the streaming state for a new segment/turn: the bubble id is
@@ -206,3 +230,6 @@ resetStreamingState ss = do
   writeIORef (ssAccumulated ss) ""
   writeIORef (ssLastEdit ss) Nothing
   writeIORef (ssLastLen ss) 0
+  writeIORef (ssLastEntry ss) ""
+  writeIORef (ssSplices ss) []
+  writeIORef (ssLastBubbleEdit ss) Nothing

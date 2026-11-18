@@ -13,12 +13,47 @@
 -- mock) fall back to the text-based question rendering.
 module Seal.Channels.Chat.Class
   ( ChatChannel (..)
+  , ChunkUnit (..)
   , QuestionOption (..)
+  , ProgressStyle (..)
   ) where
 
 import Data.Text (Text)
 
 import Seal.Channels.Chat.Types (InboundMessage, ChatMessageId)
+
+-- | How the loop renders a turn's progress on the platform.
+--
+-- 'PsSeparateMessages' (the default) is the long-standing behaviour: each
+-- text segment and each tool call becomes its own message. 'PsSingleBubble'
+-- creates one message per turn and edits it in place, so a turn produces a
+-- single notification instead of one per tool call.
+--
+-- Deliberately opt-in per channel: it depends on the platform's edit support
+-- being reliable in practice. Signal and Telegram both opt in; every other
+-- channel keeps the default.
+data ProgressStyle
+  = PsSeparateMessages
+  | PsSingleBubble
+  deriving stock (Eq, Show)
+
+-- | The unit a platform expresses its maximum message length in.
+--
+-- This is not cosmetic. Signal's limit is a byte budget (it inlines the first
+-- ~2048 /utf-8 bytes/ and moves the rest to an attachment), while Telegram's
+-- 4096 is measured in /utf-16 code units/. Counting code points — 'T.length' —
+-- is correct for neither: an emoji is 4 bytes and 2 UTF-16 units but a single
+-- code point. Chunking a multi-byte message by code-point count silently
+-- overruns the platform's real limit and the tail gets truncated or demoted to
+-- an attachment.
+--
+-- Lives here rather than in "Seal.Channels.Chat.Bubble" so the 'ChatChannel'
+-- class can name it without an import cycle ('Bubble' already imports this
+-- module).
+data ChunkUnit
+  = ChunkUtf8Bytes
+  | ChunkUtf16Units
+  deriving stock (Eq, Show)
 
 -- | One discrete choice offered alongside an ASK_HUMAN question. Mirrors
 -- 'Seal.Handles.AskReply.QuestionOption' but lives in the chat-channel
@@ -48,16 +83,71 @@ class ChatChannel c where
   -- 'True' on success, 'False' on failure (or unsupported).
   ccEditMessage :: c -> ChatMessageId -> Text -> IO Bool
 
+  -- | Send a message that must NOT raise a platform notification, returning
+  -- its id so it can be edited later. Used for a turn's progress bubble: the
+  -- progress should be visible without pinging the human.
+  --
+  -- 'Nothing' means the platform cannot send silently, or the send failed; the
+  -- loop then falls back to 'ccSendWithId' (which notifies) so progress is
+  -- never lost. Default: 'ccSendWithId' — i.e. a channel that cannot send
+  -- silently keeps today's behaviour exactly.
+  --
+  -- Deliberately NOT used for @ASK_HUMAN@ (or any message that must reach the
+  -- human): those always use the notifying path.
+  ccSendWithIdSilently :: c -> Text -> IO (Maybe ChatMessageId)
+  ccSendWithIdSilently c t = ccSendWithId c t
+
   -- | The channel's label (e.g. @"signal"@, @"telegram"@).
   ccLabel :: c -> Text
 
   -- | Whether the channel supports progressive message editing (streaming
-  -- text bubbles). When 'False', the loop sends the final text as a single
-  -- message after the turn completes instead of creating/editing a
-  -- streaming bubble per delta. Default: 'True' (most channels support
-  -- editing). Signal sets this to 'False' to match the old behavior.
+  -- text bubbles). Only consulted by the @PsSeparateMessages@ style - a
+  -- @PsSingleBubble@ channel always edits, so this is inert for Signal and
+  -- Telegram. Default: 'True' (most channels support editing).
   ccSupportsStreaming :: c -> Bool
   ccSupportsStreaming _ = True
+
+  -- | How to render a turn's progress. Default 'PsSeparateMessages' — the
+  -- long-standing one-message-per-segment/tool behaviour — so a channel is
+  -- unaffected unless it explicitly opts in.
+  ccProgressStyle :: c -> ProgressStyle
+  ccProgressStyle _ = PsSeparateMessages
+
+  -- | The platform's maximum message length in codepoints, when it has one.
+  -- Used by 'PsSingleBubble' to stop live-editing a bubble that has outgrown
+  -- a single message and fall back to chunked sends. 'Nothing' (the default)
+  -- means no known limit. The loop is polymorphic in the channel, so the
+  -- limit has to be reachable through the class rather than from a
+  -- channel-specific record field.
+  ccChunkLimit :: c -> Maybe Int
+  ccChunkLimit _ = Nothing
+
+  -- | The unit 'ccChunkLimit' is expressed in. Only consulted by the chunked
+  -- send path ('Seal.Channels.Chat.Bubble.chunkMessage').
+  --
+  -- Defaults to 'ChunkUtf8Bytes', the stricter of the two: a byte budget
+  -- never overruns a platform that actually counts UTF-16 units only for
+  -- characters outside the BMP, whereas counting code points overruns both.
+  -- A channel whose documented limit is in code units should say so, because
+  -- a byte budget then splits earlier than it needs to.
+  ccChunkUnit :: c -> ChunkUnit
+  ccChunkUnit _ = ChunkUtf8Bytes
+
+  -- | Minimum milliseconds between live edits of a turn's single progress
+  -- bubble. Both edit sources (streaming frames and tool calls) share one
+  -- bucket, so a turn cannot exceed one edit per interval.
+  --
+  -- Defaults to 'spcEditIntervalMs' of the streaming config (1500 ms), i.e.
+  -- the same cadence the separate-messages style already uses - so this is
+  -- not a second, drift-prone constant. It exists because that style's
+  -- 'shouldEdit' is an @||@: its 80-codepoint branch forces an edit on every
+  -- frame once the accumulator passes the threshold, which is unbounded. The
+  -- single-bubble path needs an interval-only gate.
+  --
+  -- Only consulted by 'PsSingleBubble'. The @idle@ closing edit is never
+  -- gated, so a turn always ends on its final content.
+  ccEditIntervalMs :: c -> Int
+  ccEditIntervalMs _ = 1500
 
   -- | Send a question with multiple-choice options as an inline keyboard
   -- (one button per option). The @askIdPrefix@ is the 8-hex prefix of the

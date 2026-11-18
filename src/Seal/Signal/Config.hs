@@ -73,10 +73,19 @@ data SignalConfig = SignalConfig
   , scAllowFrom      :: AllowList Text   -- ^ sender allow-list (phone or UUID)
   } deriving stock (Eq, Show)
 
--- | Signal's text-message character limit. Replies longer than this are
--- chunked via 'Seal.Channels.Chat.Signal.chunkMessage'.
+-- | The byte budget for one Signal message body. Replies longer than this are
+-- chunked via 'Seal.Channels.Chat.Signal.chunkMessage', which measures UTF-8
+-- bytes (not characters) so a multi-byte body cannot overrun the limit, and
+-- which breaks at the most natural boundary that fits (paragraph, line,
+-- sentence, clause, word) rather than at an arbitrary character.
+--
+-- Signal inlines the first ~2048 bytes of a message and moves the remainder to
+-- an attachment, so a body over that size is not fully shown inline;
+-- Signal-Android additionally splits at 2000 UTF-16 code units. 4000 leaves
+-- room for a single edited progress bubble to stay a plausible message while
+-- still being split well before any client-side truncation of the whole body.
 defaultSignalChunkLimit :: Int
-defaultSignalChunkLimit = 1998
+defaultSignalChunkLimit = 4000
 
 defaultSignalConfig :: SignalConfig
 defaultSignalConfig = SignalConfig
