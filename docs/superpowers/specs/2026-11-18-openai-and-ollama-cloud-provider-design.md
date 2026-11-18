@@ -179,6 +179,31 @@ Consequence: the wizard needs **no** change to its field-visibility logic
 input). The Providers page replaces its hardcoded `formName === 'openai'`
 special-cases with these two flags.
 
+**`requiresBaseUrl` means REQUIRED, not VISIBLE — they are different questions.**
+`pcRequiresBaseUrl` is true only for `OpenAICompatibleProvider` (`State.hs:337-342`);
+it is `False` for **Ollama**, whose base URL is *optional* but *essential*: it is
+the only GUI affordance for pointing at a remote Ollama daemon
+(`ProviderFormFields.tsx:162-168` gives it the `http://localhost:11434`
+placeholder and the "Leave blank for default" hint), and `resolveProvider` reads
+it to decide keyless-vs-keyed (`Registry.hs:213-216`). Driving visibility off
+`requiresBaseUrl` would **delete remote-Ollama configuration from the GUI** and
+break the existing test at `ProvidersView.test.tsx:142-164`, which finds that
+field by its placeholder.
+
+So visibility needs its **own** predicate, and the two must never be conflated:
+
+| Type | `requiresBaseUrl` (validation) | visible (UI) |
+|---|---|---|
+| `openai`, `ollama-cloud` | `false` | **`false`** — hidden entirely |
+| `openai-compatible` | `true` | `true` — required, so shown |
+| `ollama` | `false` | **`true`** — optional, still shown |
+| `anthropic`, `openrouter` | `false` | `true` (today's behaviour) |
+
+Concretely `showBaseUrl = not isHiddenBaseUrl`, where `isHiddenBaseUrl` is true
+for exactly `openai` and `ollama-cloud`. `requiresBaseUrl` keeps its existing job
+— deciding whether a non-empty URL is **required** before Save is enabled (the
+item 42 guard) — and is never used to decide whether the field renders.
+
 **Both surfaces, both modes.** "Hidden entirely" applies to the Providers page
 in **create and edit** alike. Verified gap: `ProvidersView.tsx:544` invokes
 `ProviderFormFields` **without** `showBaseUrl`, which defaults to `true`
@@ -214,17 +239,19 @@ sourced from the Unique Name input when there is one and from the selected
 built-in id otherwise.
 
 One implementation detail the design must not gloss. While `creating ===
-true`, `selected` is `null` (`ProvidersView.tsx:220-223`), so the flags cannot
-come from `selected`. The correct source is the dropdown's own `ProviderDetail`
-row: both option lists already iterate the provider list from
+true`, `selected` is `null` (`ProvidersView.tsx:220-223`), so the per-provider
+values cannot come from `selected`. The correct source is the dropdown's own
+`ProviderDetail` row: both option lists already iterate the provider list from
 `GET /api/providers/all`, so
 
 ```ts
-providers.find(p => p.name === formName)?.requiresBaseUrl
+const row = providers.find(p => p.name === formName)
+const isHiddenBaseUrl = row?.name === 'openai' || row?.name === 'ollama-cloud'
 ```
 
-is available for every selectable type, including `openai-compatible`
-(true/true) and custom rows. D7 means exactly that source - not `selected`.
+is available for every selectable type. D7 reads `requiresBaseUrl` (validation)
+and `requiresName` from that row, and derives `isHiddenBaseUrl` from the row's
+**identity**, never from `requiresBaseUrl` — per the table above.
 
 `ProvidersView.tsx:247` currently derives "is custom" from
 `PROVIDER_LABELS[p.name] === undefined`, which is secretly a
@@ -408,7 +435,21 @@ Before this change, `[providers.openai]` meant a *generic* endpoint. After,
      misdirection bug: an operator on case 1 (`base_url = localhost`) who edits
      any other field would have their stored key silently redirected to
      `api.openai.com` — precisely the failure this design exists to prevent.
-     Item 35j pins both halves.
+
+     **The repair also requires the request to carry a new `api_key`.** A Save
+     that only changes the default model is not a statement that "this key
+     belongs to OpenAI"; clearing the guard on it would authorise the very
+     transmission the guard exists to require confirmation for, and would make
+     the UI path weaker than `/provider add openai` (which prompts for the key).
+
+     | `PUT` carries | section state | result |
+     |---|---|---|
+     | non-empty `api_key` | no `base_url` | repair: write the built-in, resolve |
+     | non-empty `api_key` | has `base_url` | keep the operator's URL |
+     | no `api_key` | no `base_url` | stay fail-closed, surface the `/provider add openai` hint |
+     | no `api_key` | has `base_url` | keep everything (pure field edit) |
+
+     Item 35j pins all four.
 
    `OllamaCloudProvider` needs no guard: it is a brand-new id, so no legacy
    section can exist. It still gets the same explicit `base_url` write, for
@@ -489,7 +530,7 @@ the new types), `Seal.Providers.ContextWindow` (D10), the ISA, any opcode.
 |---|---|
 | `frontend/src/types.ts` | `ProviderDetail` +`requiresBaseUrl` / `requiresName`; comment updates on `type`. |
 | `frontend/src/lib/providerLabels.ts` | labels for `openai` / `ollama-cloud` / `openai-compatible`. The generic row renders **"OpenAI-compatible (custom / self-hosted)"** in dropdowns, since the id no longer disambiguates it from real OpenAI. |
-| `frontend/src/components/ProvidersView.tsx` | label map; drive Base URL + Unique name visibility from the detail flags (when creating: the dropdown's own `ProviderDetail` row — D7) instead of `formName === 'openai'`; **pass `showBaseUrl`/`showModels`/`showDefaultModel` explicitly at the `ProviderFormFields` call site** (it currently omits `showBaseUrl`, which defaults to `true`, so edit renders Base URL for every provider); **gate the submitted payload on those flags too, and clear `baseUrl`/`uniqueName` when `formName` changes** (RG-2); custom-instance `type: 'openai-compatible'`; reserved-name set. |
+| `frontend/src/components/ProvidersView.tsx` | label map; drive Base URL + Unique name visibility from the detail flags (when creating: the dropdown's own `ProviderDetail` row — D7) instead of `formName === 'openai'`; **pass `showBaseUrl` explicitly at the `ProviderFormFields` call site** (and `showModels`/`showDefaultModel` as `true` — no flag drives them and no behavioural change is intended) (it currently omits `showBaseUrl`, which defaults to `true`, so edit renders Base URL for every provider); **gate the submitted payload on those flags too, and clear `baseUrl`/`uniqueName` when `formName` changes** (RG-2); custom-instance `type: 'openai-compatible'`; reserved-name set. |
 | `frontend/src/components/ProviderFormFields.tsx` | `isOpenAIType` → `isOpenAICompatible` (the generic type's placeholder/hint); no visibility logic change — `showBaseUrl` already exists. |
 | `frontend/src/components/setup/ProviderStep.tsx` | reserved-name array **and the `saveKey` POST body (~`:147`)**, which sends `type: 'openai'` for a custom instance and becomes a 400 after D8. Field visibility already correct via `requires_base_url` / `requires_name`. |
 | `frontend/src/components/ProviderModelFields.tsx`, `frontend/src/components/AgentsView.tsx` | label maps. |
@@ -658,7 +699,8 @@ able to **finish**. These are the acceptance criteria for §1's benefit claim.
      `provider-instance-name-input`, even though the stored detail carries a
      `baseUrl` (pre-filled by `providerFormValuesFrom`). This is the case the
      first draft missed — `showBaseUrl` defaults to `true` and the Providers
-     page never passed it.
+     page never passed it. Repeat for **Ollama Cloud** (the edit×Ollama Cloud
+     combination is otherwise unasserted).
 34b. **RED** Providers page: for **OpenAI**, entering only an API key leaves
      Save **enabled**, and submitting succeeds.
 34c. **RED** Providers page: for **Ollama Cloud**, likewise.
@@ -687,11 +729,14 @@ able to **finish**. These are the acceptance criteria for §1's benefit claim.
      `providerBaseUrl` — a `providerBaseUrl`-only check fails this item because
      it returns `Nothing` for both the absent-section and section-without-field
      states (`Config/File.hs:742`).
-35j. **RED** `PUT /api/providers/openai` repairs a case-3 section: after `PUT`
-     with no `base_url`, `resolveProviderByName "openai"` returns `Right`. **And**
-     `PUT` on a **case-1** section (`base_url = http://localhost:8000/v1`) leaves
-     that value untouched — the repair must never overwrite an existing endpoint,
-     or it would redirect a self-hosted key to `api.openai.com`.
+35j. **RED** `PUT /api/providers/openai` repair matrix (all four rows):
+     (i) non-empty `api_key` + no `base_url` ⇒ the built-in is written and
+     `resolveProviderByName "openai"` returns `Right`;
+     (ii) non-empty `api_key` + an existing `base_url` ⇒ that value is **kept**
+     (never redirected to `api.openai.com`);
+     (iii) **no** `api_key` + no `base_url` ⇒ still fail-closed (a model-only
+     Save must not authorise transmission);
+     (iv) no `api_key` + existing `base_url` ⇒ unchanged.
 35i. **RED** **Case 1 through the guard**: with a `[providers.openai]` section
      that HAS a `base_url` (e.g. `http://localhost:8000/v1`), `resolveProvider
      OpenAIProvider` returns `Right` and uses **that** URL, not the built-in.
@@ -708,6 +753,18 @@ able to **finish**. These are the acceptance criteria for §1's benefit claim.
 40. **GUARD** `providerBaseUrlFor defaultRuntimeConfig OpenAICompatibleProvider == ""`
     (the generic type still has no default — the whole point of D2).
 41. **GUARD** `validateProviderName "local-vllm" == Right ()`.
+41b. **GUARD** **Ollama keeps an editable Base URL** on the Providers page, in
+     **both** create and edit modes: `provider-base-url-input` renders with the
+     `http://localhost:11434` placeholder. This is the regression guard for
+     `requiresBaseUrl` meaning *required* rather than *visible* — conflating
+     them silently removes the only GUI path to a remote Ollama daemon, and
+     breaks the existing test at `ProvidersView.test.tsx:142-164`.
+41c. **GUARD** A custom `openai-compatible` instance still renders an editable
+     Base URL in **edit** mode, pre-filled with its stored URL, and the
+     submitted payload carries it. Absence-only coverage (item 34a) would pass an
+     implementation that hides the field unconditionally in edit mode — making a
+     custom instance's endpoint uneditable *and*, with the payload gated on
+     `requiresBaseUrl`, unsendable.
 42. **GUARD** Providers page: selecting **OpenAI-compatible** still renders both
     fields and Save stays disabled until both are valid.
 43. **GUARD** Wizard: an `openai-compatible` card still renders both fields.
