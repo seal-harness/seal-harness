@@ -68,6 +68,18 @@ streamAppWithFallback guard broker =
   streamMiddleware guard broker (\_req respond -> respond (responseLBS status404 [] "not found"))
 
 -- | Extract a field from a JSON object (for assertions).
+-- | Poll 'subscriberCount' until it equals the target, up to ~2 s (20 x
+-- 100 ms). Returns whether the target was reached. Bounded so a regression
+-- fails the test instead of hanging the suite.
+waitForSubscribers :: StreamBroker -> Int -> Int -> IO Bool
+waitForSubscribers broker target attemptsLeft = do
+  n <- subscriberCount broker
+  if n == target
+    then pure True
+    else if attemptsLeft <= 0
+      then pure False
+      else threadDelay 100000 >> waitForSubscribers broker target (attemptsLeft - 1)
+
 jsonField :: T.Text -> A.Value -> Maybe A.Value
 jsonField key (A.Object o) = KeyMap.lookup (Key.fromText key) o
 jsonField _ _ = Nothing
@@ -106,6 +118,33 @@ spec = describe "Seal.Gateway.Stream" $ do
             Just (A.String _) -> pure ()
             other -> expectationFailure ("expected serverStartedAt string, got " <> show other)
         Nothing -> error "expected hello JSON"
+
+  -- Regression: nothing ever removed a subscriber when its peer went away.
+  -- 'acceptConn' subscribed and, on disconnect, simply returned; dead entries
+  -- were only reaped opportunistically by a later broadcast that tried to
+  -- send to them. A process up ~22h showed 15 connect events and zero
+  -- teardowns. Past 'sbCap' the silent no-op in 'subscribe' then leaves NEW
+  -- connections added to nothing at all — the tab renders connected and
+  -- never receives a frame.
+  --
+  -- The assertion runs AFTER 'withStreamServer' returns, deliberately: that
+  -- helper converts ConnectionException/IOException into 'pendingWith', so a
+  -- disconnect asserted inside it could pass as "pending" instead of failing.
+  it "unsubscribes the connection when the client disconnects" $ do
+    broker <- newStreamBroker 10
+    tabsH <- newTabsHandle
+    let guard = StreamGuard { sgAllowedOrigins = ["http://localhost:8080"], sgGlobalCap = 10, sgTabsHandle = tabsH, sgPaths = fakePaths, sgHeartbeatSeconds = 3600, sgAccessControl = Nothing }
+    withStreamServer guard broker $ \_port conn -> do
+      _hello <- receiveData conn :: IO BL.ByteString
+      _lists <- receiveData conn :: IO BL.ByteString
+      -- Connected and subscribed.
+      n <- subscriberCount broker
+      n `shouldBe` 1
+    -- The client is gone; 'finally' in 'acceptConn' must have removed it.
+    -- Poll briefly: teardown is server-side and therefore asynchronous to the
+    -- client's close.
+    gone <- waitForSubscribers broker 0 100
+    gone `shouldBe` True
 
   it "broadcastLists delivers to a connected client" $ do
     broker <- newStreamBroker 10
