@@ -839,6 +839,14 @@ The rename is not a forced big-bang, but WU3 is irreducible.
   `staticModelsFor`, `providerDisplayName`) — none of which touches a route, a
   JSON shape, or an HTTP path.
 
+  **`State.hs` appears in both WU1 and WU2, by design and by line.** WU1 owns
+  exactly one function in it — `providerDisplayName` (`:352`), the two new
+  `Text` equations. WU2 owns everything else in that file (P4 copy, the card
+  flags, `StateSpec`). No other file is split: `Registry.hs` is wholly WU1,
+  `ProvidersView.tsx`/`ProviderStep.tsx` wholly WU3, and `API.hs` is split by
+  **function** (WU1: `providerAuthStatus`, `staticModelsFor`; WU3: the rest),
+  which is stated above.
+
   Sites that are **not** in this set because they use a `_ ->` wildcard and so
   compile fine: `providerCards` (`State.hs:337-346` — its wildcards already
   yield the correct defaults for the new types, `requiresBaseUrl = False`,
