@@ -66,13 +66,17 @@ Files:
 - `test/Seal/Providers/RegistrySpec.hs` — new items + the four updates.
 
 TDD order (RED then GREEN, per item):
-1. Write the failing assertions for design items **1-21, 20b, 20c** and the
-   `RegistrySpec` updates (`:88-93`, `:118-124`, `:297`, `:410`, `:422`).
+1. Write the failing assertions for design items **1-21, 20b, 20c**, the
+   GUARD items **40** (the generic type keeps `providerBaseUrlFor == ""`, i.e.
+   no default — the whole point of D2) and **41** (`validateProviderName
+   "local-vllm"` still accepted), and the `RegistrySpec` updates (`:88-93`,
+   `:118-124`, `:297`, `:410`, `:422`).
 2. Add the constructors and make each site total until the suite is green.
 3. `make build && make test && make lint`.
 
 **DoD:** `make build` clean under `-Werror`; `make test` green; `make lint`
-reports "No hints"; design items 1-21, 20b and 20c all pass.
+reports "No hints"; design items 1-21, 20b, 20c and the GUARD items 40, 41 all
+pass.
 
 **Explicitly NOT in WU1:** `resolveCreateTarget`, `resolveExistingTarget`,
 `customProviderDetailJson`, the `:715` literal, the `:3246` readiness guard, the
@@ -125,7 +129,10 @@ Files:
 - `CHANGELOG.md`, `config/templates/config.toml`, `scripts/setup-walkthrough.sh`.
 
 TDD order: write design items **25-39, 34a-34d, 35b-35k, 41b, 41c, 45, 45b**
-failing, then implement.
+failing, then implement. GUARD item **42** (the Providers page still renders
+both fields for `openai-compatible`, and Save stays disabled until both are
+valid) must stay green throughout — it is the regression guard for D7 in create
+mode, and it is the item that fails if the visibility work over-reaches.
 
 **DoD:** all of those pass; `make check` green end to end (build + test + lint +
 frontend-test).
