@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import logoImg from '../../assets/SealLogo.png'
+import { SealMark } from './SealMark'
 import { SignOutButton } from './SignOutButton'
 
 /** The top-level navigation sections. The existing sessions/tabs/chat UI
@@ -42,11 +42,9 @@ export function TopBar({
       style={{ height: 'var(--topbar-height)', borderBottom: '1px solid var(--border)' }}
     >
       <div className="flex items-center gap-2.5">
-        <img
-          src={logoImg}
-          alt="Seal Harness"
-          style={{ width: 'var(--logo-size)', height: 'var(--logo-size)', borderRadius: 'var(--radius-md)', objectFit: 'cover' }}
-        />
+        {/* Decorative: the wordmark beside it already names the product, so
+            the mark itself carries no accessible name. */}
+        <SealMark size={28} title={null} />
         <span
           className="font-semibold text-sm"
           style={{ color: 'var(--text-primary)', letterSpacing: 'var(--tracking-tighter)' }}

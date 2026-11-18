@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import logoImg from '../../../assets/SealLogo.png'
+import { SealMark } from '../SealMark'
 import { useSetupState } from '../../hooks/useSetup'
 import { SetupWizard } from './SetupWizard'
 import * as s from './styles'
@@ -51,7 +51,9 @@ export function SetupGate({ children }: { children: React.ReactNode }) {
     <div style={s.pageStyle}>
       <div style={s.shellStyle}>
         <header style={s.headerStyle}>
-          <img src={logoImg} alt="" style={s.logoStyle} />
+          {/* Decorative: the heading beside it names the product, so the mark
+              is hidden from assistive tech rather than repeated. */}
+          <SealMark size={32} title={null} />
           <div>
             <h1 style={s.titleStyle}>Seal Harness Setup Wizard</h1>
             <p style={s.subtitleStyle}>

@@ -36,13 +36,6 @@ export const headerStyle: React.CSSProperties = {
   marginBottom: 8,
 }
 
-export const logoStyle: React.CSSProperties = {
-  width: 32,
-  height: 32,
-  borderRadius: 'var(--radius-md)',
-  objectFit: 'cover',
-}
-
 export const titleStyle: React.CSSProperties = {
   fontSize: 20,
   fontWeight: 600,

@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="assets/SealLogo.png" alt="Seal Harness logo — baby seal" width="200">
+  <!-- The mark, not the lockup: the name is live text immediately below, so
+       baking a wordmark into the image would repeat it and break at small
+       widths. `assets/SealLogo.png` is still the source the mark was drawn
+       from; `scripts/logo/generate.py` regenerates this SVG. -->
+  <img src="assets/seal-mark.svg" alt="Seal Harness — a baby seal" width="112" height="112">
 </p>
 
 <p align="center">
