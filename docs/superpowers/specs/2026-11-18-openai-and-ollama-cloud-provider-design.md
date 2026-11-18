@@ -197,9 +197,21 @@ hazard: `ProvidersView.tsx:496` sets `formName` without resetting `form`, and
 select OpenAI-compatible, type `http://localhost:8000/v1`, switch to OpenAI, and
 Save writes that stale URL into `[providers.openai]` — contradicting D4 and
 item 28. The same applies to `uniqueName`. Therefore: send `base_url` **only
-when `requiresBaseUrl`**, send `type`/`name` **only when `requiresName`**, and
-clear `baseUrl`/`uniqueName` when `formName` changes. This is the exact class of
-defect D7 exists to prevent.
+when `requiresBaseUrl`**, and clear `baseUrl`/`uniqueName` when `formName`
+changes. This is the exact class of defect D7 exists to prevent.
+
+**`name` is always sent — only its *source* is conditional.** `name` is a
+required field (`API.hs:3306` answers 400 `name must not be empty`), so the rule
+is the existing ternary, not an omission:
+
+```ts
+name: requiresName ? uniqueName.trim() : formName
+...(requiresName ? { type: 'openai-compatible' } : {})
+```
+
+i.e. `type` is present **only** for a custom instance; `name` is always present,
+sourced from the Unique Name input when there is one and from the selected
+built-in id otherwise.
 
 One implementation detail the design must not gloss. While `creating ===
 true`, `selected` is `null` (`ProvidersView.tsx:220-223`), so the flags cannot
@@ -345,7 +357,10 @@ Before this change, `[providers.openai]` meant a *generic* endpoint. After,
    ever trips on a genuinely pre-existing config:
    - Providers page / wizard → `handleProviderCreate` injects the built-in
      `base_url` **server-side** (§4), never from client input (the field is
-     hidden, so the client sends nothing).
+     hidden, so the client sends nothing). Precedence is explicitly
+     `base_url = supplied <|> providerBaseUrlFor cfg kp`, so a scripted POST that
+     *does* supply a URL (e.g. an Ollama Cloud proxy) still wins over the
+     built-in default, and only an omitted value falls back to it.
    - `/provider add openai` → `addCmd`'s non-Ollama branch now writes the
      built-in `base_url` too. Without it the fail-closed message's named remedy
      is a **no-op**: `seedProviderDefaults` (`Command/Provider.hs:163-169`) sets
@@ -568,7 +583,11 @@ covered without editing the test. Enumerating six values is not a property.
     `type: "openai-compatible"`.
 38. **RED** Wizard: saving a custom instance POSTs `type: "openai-compatible"`
     (the `ProviderStep.tsx:147` fix — the bug that would otherwise ship green).
-39. **RED** Label maps render "OpenAI", "Ollama Cloud", "OpenAI-compatible".
+39. **RED** Label maps render the short forms "OpenAI", "Ollama Cloud",
+     "OpenAI-compatible" (`providerLabel`). The dropdown **option text** is a
+     separate surface and uses the disambiguating form "OpenAI-compatible
+     (custom / self-hosted)" — asserted separately, so the two strings cannot be
+     confused for one another.
 
 ### 5.3b RED — user outcomes (the design's actual promise)
 
@@ -592,7 +611,8 @@ able to **finish**. These are the acceptance criteria for §1's benefit claim.
 35c. **RED** Same for `ollama-cloud`.
 35d. **RED** Submit-gating: with OpenAI-compatible selected and a base URL typed,
      then switching to OpenAI, the submitted payload carries **no** `base_url`
-     and **no** `type` (RG-2).
+     and **no** `type` (RG-2) — **and** `name: "openai"` is present, since `name`
+     is mandatory. An absence-only assertion would pass on a payload that 400s.
 35e. **RED** `resolveProvider OpenAIProvider` when a `[providers.openai]` section
      exists **without** `base_url` returns `Left` naming `/provider add openai`
      (§3.1 case 3), and makes no network call.
