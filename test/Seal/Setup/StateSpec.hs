@@ -210,6 +210,40 @@ spec = describe "Seal.Setup.State" $ do
       fromMaybe "" (stDetail (providerStep state))
         `shouldSatisfy` T.isInfixOf "Add an LLM provider"
 
+    -- Design 3.2: the P4 detail must name the new options. Asserted on the
+    -- WORDS, not a prefix: the old text listed four providers and would still
+    -- satisfy "Add an LLM provider", so a prefix check cannot see this.
+    it "item 22/24: the P4 copy names OpenAI and Ollama Cloud" $ do
+      state <- deriveSetupState (emptySetupInputs fakePaths)
+      let detail = fromMaybe "" (stDetail (providerStep state))
+      detail `shouldSatisfy` T.isInfixOf "OpenAI"
+      detail `shouldSatisfy` T.isInfixOf "Ollama Cloud"
+      -- It must stay readable rather than becoming a raw six-id inventory. The
+      -- ids are hyphenated-lowercase; display names are capitalised. Assert on
+      -- the IDS (case-sensitive, so "OpenAI-compatible" as a display name is
+      -- allowed), because the earlier lowercased comparison both passed
+      -- vacuously AND wrongly fired on the legitimate capitalised form.
+      forM_ ["ollama-cloud", "openai-compatible", "anthropic", "openrouter"] $ \i ->
+        detail `shouldSatisfy` (not . T.isInfixOf i)
+
+    -- Items 22/23, asserted per card rather than as a whole-list vector: the
+    -- vector is already pinned above, but these two are the ones whose failure
+    -- would ship a broken form.
+    it "item 23: both new cards hide Base URL and Unique name" $ do
+      state <- deriveSetupState (emptySetupInputs fakePaths)
+      let card n = [ c | c <- ssProviders state, pcId c == n ]
+      forM_ ["openai", "ollama-cloud"] $ \n -> do
+        case card n of
+          [c] -> do
+            pcRequiresBaseUrl c `shouldBe` False
+            pcRequiresName c `shouldBe` False
+          other -> expectationFailure
+            ("expected exactly one card for " <> T.unpack n <> ", got "
+               <> show (length other))
+      -- ...and the generic type is the only one that requires both.
+      let requiring = [ pcId c | c <- ssProviders state, pcRequiresBaseUrl c ]
+      requiring `shouldBe` ["openai-compatible"]
+
     it "a yubikey vault never probes the vault for providers" $ do
       let yubiSecurity = defaultSecurityConfig
             { scVaultRecipient = Just testRecipient

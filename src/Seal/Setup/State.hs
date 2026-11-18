@@ -283,8 +283,8 @@ classifyProvider inputs configured readiness =
       -- P4
       | otherwise ->
           pendingProvider
-            "Add an LLM provider: anthropic, openrouter, ollama, or an \
-            \OpenAI-compatible endpoint."
+            "Add an LLM provider: Anthropic, OpenAI, Ollama (local), \
+            \Ollama Cloud, OpenRouter, or a self-hosted OpenAI-compatible endpoint."
             ["configure"]
   where
     -- Design D8: the "not ready yet" sentence is appended to the existing
