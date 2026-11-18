@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ProviderInput, ProviderAuthStatus, ProviderReadiness } from '../types'
 import { readinessLabel, readinessTone, type ReadinessTone } from '../lib/readiness'
+import { OPENAI_COMPATIBLE_OPTION } from '../lib/providerLabels'
 import {
   ProviderFormFields,
   emptyProviderFormValues,
@@ -103,9 +104,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   'openai-compatible': 'OpenAI-compatible',
 }
 
-/** The generic type's dropdown option text. Longer than the short label
- *  because its id no longer implies "not real OpenAI" (design item 39). */
-const OPENAI_COMPATIBLE_OPTION = 'OpenAI-compatible (custom / self-hosted)'
+
 
 const labelStyle: React.CSSProperties = {
   fontSize: 12,
@@ -141,14 +140,12 @@ function Row({
   )
 }
 
-/** Provider ids that already mean a built-in type (and are therefore not
- *  available as a *new* custom instance name). `openai` is allowed: it is the
- *  built-in OpenAI-compatible instance, and reconfiguring it keeps the same
- *  name. */
+/** Provider ids that cannot be used as a *new* custom instance name: the two
+ *  route words plus every built-in type id (D9). This mirrors
+ *  `validateProviderName` in Seal.Providers.Registry, which derives the same
+ *  set from `knownProviders`. */
 const RESERVED_PROVIDER_NAMES = new Set([
   'all', 'default',
-  // Every built-in type id is reserved (D9): a custom instance can no longer
-  // be named after one.
   'anthropic', 'ollama', 'ollama-cloud', 'openrouter', 'openai', 'openai-compatible',
 ])
 

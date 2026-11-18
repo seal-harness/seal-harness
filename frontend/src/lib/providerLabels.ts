@@ -14,7 +14,7 @@ const LABELS: Record<string, string> = {
   'ollama-cloud': 'Ollama Cloud',
   openai: 'OpenAI',
   // The generic type. Its id no longer disambiguates it from real OpenAI, so
-  // dropdowns use the longer form (see DISAMBIGUATED below).
+  // dropdowns use OPENAI_COMPATIBLE_OPTION below instead of this short label.
   'openai-compatible': 'OpenAI-compatible',
 }
 
