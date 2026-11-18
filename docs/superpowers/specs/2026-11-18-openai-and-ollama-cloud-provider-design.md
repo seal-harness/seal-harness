@@ -413,7 +413,7 @@ endpoint still requires an explicit base URL and still fails closed without one
 |---|---|
 | `src/Seal/Providers/Registry.hs` | +2 constructors; every total function updated: `providerLabel`, `vaultKeyName`, `defaultModelFor`, `providerBaseUrlFor`, `resolveProvider`, `configuredProviders`, `validateProviderName`. Also `resolveProvider OpenAICompatibleProvider`'s hardcoded `"openai"` argument → `providerLabel OpenAICompatibleProvider` (that string names the config section in its fail-closed error). And the **§3.1 case-3 guard** in `resolveProvider OpenAIProvider`: fail closed when a `[providers.openai]` section exists without `base_url`. The guard uses `Map.member` on `rcProviders`, **not** `providerBaseUrl` alone (which returns `Nothing` for both an absent section and a section without the field). And `resolveOpenAICompatible`'s fixed error nouns ("the OpenAI-compatible provider … the setup wizard asks for it", `:269-270`) are parameterised by display label and by whether the type has a built-in endpoint, so the message is not false for the new types. `providerTypeForName` needs **no** change (already `fromMaybe OpenAICompatibleProvider`). `knownProviders` order (D2). |
 | `src/Seal/Setup/State.hs` | `providerDisplayName` +2; `providerCards` raises no flags for the new types (already constructor-keyed); P4 copy. |
-| `src/Seal/Gateway/API.hs` | `providerAuthStatus` +2; `staticModelsFor` +2; `providerDetailJsonFor` gains `requiresBaseUrl`/`requiresName`; `customProviderDetailJson` type id → `openai-compatible`; **`:715`** the `customInfos` `"type"` literal → `openai-compatible`; **`:3246`** the readiness guard `typeId /= "openai"` → `typeId /= "openai-compatible"` (otherwise it becomes a tautology and custom instances inherit Ollama readiness); `resolveCreateTarget` / `resolveExistingTarget` type ids and the required-type check; `handleProvidersAll` unchanged (mapM over `knownProviders` picks up the new rows). |
+| `src/Seal/Gateway/API.hs` | `providerAuthStatus` +2 and `staticModelsFor` +2 (**these two are WU1 work** — wildcard-free exhaustive cases, so the library will not compile without them; see §5.6); `providerDetailJsonFor` gains `requiresBaseUrl`/`requiresName`; `customProviderDetailJson` type id → `openai-compatible`; **`:715`** the `customInfos` `"type"` literal → `openai-compatible`; **`:3246`** the readiness guard `typeId /= "openai"` → `typeId /= "openai-compatible"` (otherwise it becomes a tautology and custom instances inherit Ollama readiness); `resolveCreateTarget` / `resolveExistingTarget` type ids and the required-type check; `handleProvidersAll` unchanged (mapM over `knownProviders` picks up the new rows). |
 | `src/Seal/Gateway/Setup.hs` | `handleProviderTest`'s "known providers" hint text. Card JSON already emits both booleans — no change. |
 | `src/Seal/Gateway/API.hs` (create path) | `handleProviderCreate` injects `providerBaseUrlFor cfg OpenAIProvider` as `base_url` **server-side** when creating an OpenAI or Ollama Cloud provider, so `upsertProvider` (`Config/File.hs:828-830`) never materialises a section without one. Without this the §3.1 guard would immediately dead-end a provider created through the UI. Pinned by item 35f. |
 | `src/Seal/Command/Provider.hs` | `addCmd`'s generic path already prompts for a key for any non-`ollama` type, so both new types work — **but it must also write the built-in `base_url`** for `openai`/`ollama-cloud` (via `providerBaseUrlFor`), or the §3.1 guard's named remedy is a no-op (`seedProviderDefaults` sets only `rcDefaultProvider`/`pcDefaultModel`). Pinned by item 35h. `providerReadinessSegment` already returns "" for non-`ollama`. The help text listing known ids is generated from `knownProviders`, so it needs no edit. **Not fixed here:** `authLabel` (`:255-266`) probes `anthropicOAuthKey` in its `otherwise` branch, so it reports `auth: oauth` for any non-Ollama provider when Anthropic OAuth exists — pre-existing, already wrong for OpenRouter, and made more visible by two more rows. Separate PR (§6). |
@@ -495,7 +495,10 @@ covered without editing the test. Enumerating six values is not a property.
 9. **RED** `defaultModelFor` per D10, exactly.
 10. **RED** `providerBaseUrlFor defaultRuntimeConfig OpenAIProvider == "https://api.openai.com/v1"`.
 11. **RED** `providerBaseUrlFor defaultRuntimeConfig OllamaCloudProvider == "https://ollama.com/v1"`.
-12. **RED** A configured `base_url` overrides each new built-in default.
+12. **RED** A configured `base_url` overrides each new built-in default. (The
+    override *mechanism* already works today - `fromMaybe builtIn (providerBaseUrl
+    cfg …)`; this fails only because the built-in does not exist yet. It becomes
+    a true guard once the built-ins land.)
 13. **RED** `validateProviderName` rejects every built-in label — *property* over
     `map providerLabel knownProviders` (D9). This item auto-covers a future
     constructor.
@@ -620,7 +623,7 @@ able to **finish**. These are the acceptance criteria for §1's benefit claim.
     no unique-name field (D7 says this already holds because the wizard gates on
     the server flags — a guard, not new behaviour).
 
-### 5.4b GUARD — vault retention and injectivity (security)
+### 5.4b RED — vault retention and injectivity (security)
 
 45. **RED** Delete `ollama` ⇒ `providerAuthStatus ollama-cloud` is still
     `api-key` (D3 injectivity, through DELETE).
@@ -655,7 +658,18 @@ as work, not discover them mid-implementation.
 The rename is not a forced big-bang, but WU3 is irreducible.
 
 - **WU1** `Registry.hs` + `RegistrySpec` (items 1-21 plus the four
-  `RegistrySpec` updates). Independently green; pure; no HTTP.
+  `RegistrySpec` updates) **plus the two exhaustive `KnownProvider` cases that
+  live in `API.hs`**: `providerAuthStatus` (`API.hs:3259`) and
+  `staticModelsFor` (`API.hs:3828`).
+
+  Those two must be in WU1, not WU3. Both are wildcard-free `case` expressions
+  over `KnownProvider`, so `+2` constructors makes the **library fail to
+  compile** under `-Werror`/`-Wincomplete-patterns` before any test can run.
+  Adding the constructors without them is not a green commit at all.
+
+  So WU1's independence is "green modulo two *pure, additive* exhaustive cases
+  in `API.hs`" - they touch no route, no JSON shape, and no HTTP path, which is
+  why they belong with the vocabulary rather than with the wire work.
 - **WU2** `Setup/State.hs` + `StateSpec` + `SetupApiSpec` (items 22-24). Green
   alone — the new cards render as raw ids until WU3 lands the frontend labels,
   which is degraded, not broken.
