@@ -2,8 +2,8 @@
 <!-- updated: 2026-11-18 -->
 
 ## Current Position
-- Active work unit: final review
-- Current phase: FINAL REVIEW (cross-unit)
+- Active work unit: (none — complete)
+- Current phase: COMPLETE
 - Retry count: 0 (WU1 closed on retry 1)
 
 ## Work Unit Status
@@ -21,6 +21,10 @@
 ## Completed
 All three units committed. make check green: 4693 backend / 0 failures,
 1135 frontend tests, hlint "No hints".
+
+## Final
+Final cross-unit review PASSED (retry 2). PR 341 updated. Session review
+filed at docs/context/session-reviews/2026-11-18-openai-ollama-cloud.md.
 
 ## Blocked / Escalated
 none
