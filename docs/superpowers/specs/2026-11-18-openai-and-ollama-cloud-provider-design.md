@@ -1,0 +1,555 @@
+# Design — OpenAI and Ollama Cloud provider types
+
+**Status:** draft — revision 2 (design review gate round 1 returned
+NEEDS_REVISION; revisions applied per
+`2026-11-18-openai-and-ollama-cloud-revision-2.md`)
+**Date:** 2026-11-18
+**Branch:** `providers/openai-and-ollama-cloud`
+
+## 1. Problem
+
+The setup wizard's *Choose an LLM provider* step and the Providers page's
+*New provider* form both offer four choices: Anthropic, Ollama, OpenRouter,
+and OpenAI-compatible. Two obvious destinations are missing:
+
+- **OpenAI** (`https://api.openai.com/v1`) — the single most requested
+  provider (original issue #14). Today an operator must select the generic
+  "OpenAI-compatible" row, then type `https://api.openai.com/v1` into a Base
+  URL field and `openai` into a Unique name field — two pieces of information
+  the product already knows.
+- **Ollama Cloud** (`https://ollama.com/v1`) — Ollama's hosted inference,
+  reachable directly over an OpenAI-compatible API with no local install
+  (`docs.ollama.com/api/openai-compatibility`: `base_url="https://ollama.com/v1"`,
+  key from `https://ollama.com/settings/keys`). Today this is reachable only by
+  selecting *Ollama* and typing `https://ollama.com` as the base URL, which
+  routes through the **native Ollama protocol**, not the OpenAI-compatible one.
+
+Both new types reuse the existing OpenAI-compatible infrastructure
+(`Seal.Providers.OpenRouter.mkOpenAICompatible`). No new HTTP client, no new
+request/response mapping, no new protocol.
+
+## 2. Decisions
+
+### D1 — Operator decisions (recorded verbatim from the request)
+
+> "Let's add two more provider types to our list of available providers (shown
+> in the setup wizard's `Choose an LLM provider` form and in the new provider
+> form on the providers page): Ollama Cloud, and OpenAI. These two models will
+> both use the OpenAI-compatible API infrastructure and hard code the Base URL
+> and Unique name fields appropriately for those providers."
+
+Asked how "hard code the Base URL and Unique name fields" should render, the
+operator chose: **"Hidden entirely."**
+
+Asked how to resolve the `openai` id collision (see D2), the operator chose:
+**"Rename generic to openai-compatible."**
+
+### D2 — The `openai` id collision, and its resolution
+
+`openai` is **already taken**. It is the id of `OpenAICompatibleProvider` — the
+*generic* OpenAI-compatible type, the only one with `pcRequiresBaseUrl = True`
+and `pcRequiresName = True`, and the only one with **no** built-in base URL
+(`providerBaseUrlFor` returns `""` for it deliberately; `resolveProvider`
+fails closed rather than reaching out to `api.openai.com` on the operator's
+behalf, "which would send a key meant for a self-hosted server to a third
+party").
+
+Real OpenAI needs that id — a provider type named `openai` that is *not*
+OpenAI would be a permanent trap. Resolution:
+
+| Type | id (= config key = vault-name stem) | display name |
+|---|---|---|
+| `AnthropicProvider` | `anthropic` | Anthropic |
+| `OllamaProvider` | `ollama` | Ollama |
+| **`OllamaCloudProvider`** (new) | **`ollama-cloud`** | **Ollama Cloud** |
+| `OpenRouterProvider` | `openrouter` | OpenRouter |
+| **`OpenAIProvider`** (new) | **`openai`** | **OpenAI** |
+| `OpenAICompatibleProvider` (renamed) | `openai-compatible` | OpenAI-compatible |
+
+`knownProviders` order (from `[minBound .. maxBound]`) becomes the wizard's and
+the dropdown's order: anthropic, ollama, ollama-cloud, openrouter, openai,
+openai-compatible. Grouping each vendor's types adjacently reads better in a
+six-item list than appending the new rows at the end.
+
+Because `Enum`/`Bounded` are derived, that order **is** the constructors'
+declaration order in the `data` block — the intended order is expressed
+structurally, not by a comment. `KnownProvider` is never serialized and
+`[minBound .. maxBound]` is its only ordinal use, so inserting constructors in
+the middle is safe; nothing persists an ordinal.
+
+### D3 — Distinct vault keys per type
+
+| Type | vault key |
+|---|---|
+| `AnthropicProvider` | `ANTHROPIC_API_KEY` |
+| `OllamaProvider` | `OLLAMA_API_KEY` |
+| `OllamaCloudProvider` | `OLLAMA_CLOUD_API_KEY` |
+| `OpenRouterProvider` | `OPENROUTER_API_KEY` |
+| `OpenAIProvider` | `OPENAI_API_KEY` |
+| `OpenAICompatibleProvider` | `OPENAI_COMPATIBLE_API_KEY` |
+
+`vaultKeyName :: KnownProvider -> Text` stays total and **injective**.
+
+The alternative — sharing `OLLAMA_API_KEY` between `ollama` and `ollama-cloud`,
+since both are the same ollama.com account credential — was rejected. Concrete
+reason, not taste: `handleProviderDelete` calls
+`vhDelete vh (vaultKeyName <provider>)`. With a shared key, deleting the *Ollama*
+provider would silently deprovision *Ollama Cloud*, and `providerAuthStatus`
+for one type would depend on another type's provisioning. Injectivity is worth
+one extra paste, and only for an operator who uses both.
+
+`OPENAI_API_KEY` moves from the generic type to real OpenAI, which is what the
+name always meant. The generic type takes `OPENAI_COMPATIBLE_API_KEY`.
+
+### D4 — Base URLs are built-in defaults, still overridable in config
+
+`providerBaseUrlFor` gains two `builtInBaseUrl` cases:
+
+```haskell
+builtInBaseUrl OllamaCloudProvider = "https://ollama.com/v1"
+builtInBaseUrl OpenAIProvider = "https://api.openai.com/v1"
+```
+
+Precedence is unchanged: `fromMaybe builtIn (providerBaseUrl cfg label)`. A
+`[providers.openai] base_url = …` in config.toml still wins.
+
+Keeping the override is deliberate — it is the established behaviour for every
+other built-in provider, and it is what lets an operator route through a
+corporate proxy or a local caching mirror. "Hard code" in the request is about
+the **form**: the operator is not asked for a value the product already knows.
+It is not a claim that the value must be unchangeable on disk.
+
+### D5 — Both new types reuse `mkOpenAICompatible`
+
+`resolveProvider` delegates both new constructors to the existing
+`resolveOpenAICompatible` helper (the same one `OpenRouterProvider` and custom
+instances use), which already: requires a base URL fail-closed, requires a
+vault key fail-closed, and builds `mkOpenAICompatible`. Both types need a key —
+neither has a keyless mode, unlike local Ollama.
+
+No change to `Seal.Providers.OpenRouter` at all.
+
+### D6 — Neither new type carries readiness
+
+`pcReadiness` / the `readiness` wire field stay **Ollama-only**. Ollama Cloud is
+a remote HTTPS endpoint like OpenRouter; `readinessFields` already gates on
+`n == "ollama"`, so `ollama-cloud` emits neither key. This is the existing
+design-D1 rule ("the remote HTTPS providers' config plus credential genuinely
+is their whole story") and no local probe exists to run.
+
+### D7 — The forms hide Base URL and Unique name; the server says so
+
+"Hidden entirely" is implemented by **not rendering the fields**, driven by the
+same server booleans the wizard already consumes — not by a second hardcoded
+provider list in TypeScript.
+
+- `ProviderCard` already carries `pcRequiresBaseUrl` / `pcRequiresName`, emitted
+  as `requires_base_url` / `requires_name` on `GET /api/setup`. Both are
+  `False` for `openai` and `ollama-cloud` (unchanged code path — `providerCards`
+  already keys these off the constructor).
+- `ProviderDetail` (`GET /api/providers/all`) **gains** `requiresBaseUrl` and
+  `requiresName` (camelCase, 1:1 like `authStatus`/`isDefault`). The Providers
+  page is driven by that endpoint, so it currently has no such signal and would
+  otherwise need its own hardcoded `type` map — a second source of truth that
+  can drift from the registry. For custom instances both are `True`.
+
+Consequence: the wizard needs **no** change to its field-visibility logic
+(`needsBaseUrl` / `needsName` already gate `showBaseUrl` and the Unique name
+input). The Providers page replaces its hardcoded `formName === 'openai'`
+special-cases with these two flags.
+
+One implementation detail the design must not gloss: in
+`ProvidersView`, a **new** provider has no `selected` detail (`creating ===
+true`), so there is no server object to read the flags from. For that state the
+page must derive them from the chosen `formName` through a small helper that
+maps a built-in id to its flags — with the list of *custom-capable* types
+(`requiresBaseUrl`/`requiresName` both true) being exactly
+`{openai-compatible}`. To avoid a fourth parallel list, that helper lives beside
+the label map and is asserted by item 36. `ProvidersView.tsx:247` currently
+derives "is custom" from `PROVIDER_LABELS[p.name] === undefined`, which is
+secretly a registry-membership test; where the detail object is available, the
+flags are preferred.
+
+### D8 — Wire `type` values
+
+`type` means "which implementation", consistently:
+
+| `type` | meaning |
+|---|---|
+| `anthropic` | Anthropic |
+| `ollama` | native Ollama protocol |
+| `ollama-cloud` | Ollama Cloud over OpenAI-compatible |
+| `openrouter` | OpenRouter |
+| `openai` | real OpenAI |
+| `openai-compatible` | generic / custom instance |
+
+`customProviderDetailJson` emits `type: "openai-compatible"`, and
+`resolveCreateTarget` requires `type: "openai-compatible"` for a custom name.
+
+**No legacy aliasing.** The frontend is embedded in the binary via `file-embed`,
+so client and server are always the same build. A stale browser tab that POSTs
+`type: "openai"` with a non-`openai` name gets the existing 400
+(`unknown provider: …`) and a reload fixes it. Silently reinterpreting the
+string would be worse: after the rename, `type: "openai"` legitimately means
+real OpenAI, and aliasing it back to the generic type would recreate exactly
+the ambiguity D2 removes.
+
+### D9 — Reserved instance names
+
+`validateProviderName` currently reserves `["anthropic", "ollama",
+"openrouter"]` — deliberately **not** `openai`, because `openai` was the generic
+built-in's own section and must stay nameable.
+
+After the rename every built-in label is reserved:
+`anthropic`, `ollama`, `ollama-cloud`, `openrouter`, `openai`,
+`openai-compatible`. A custom instance can no longer be named `openai`; it must
+be e.g. `local-vllm`.
+
+Frontend mirrors are updated to match: `RESERVED_PROVIDER_NAMES` in
+`ProvidersView.tsx` and the literal array inside `ProviderStep.tsx`. The two
+lists are duplicated in the frontend today; a follow-up should share them, but
+that is out of scope here.
+
+### D10 — Default models and static model lists
+
+| Type | `defaultModelFor` | `staticModelsFor` |
+|---|---|---|
+| `OpenAIProvider` | `gpt-4o-mini` | `gpt-4o-mini`, `gpt-4-turbo` |
+| `OllamaCloudProvider` | `gemma4:31b` | `[]` |
+| `OpenAICompatibleProvider` | `gpt-4o-mini` (unchanged) | `[]` (unchanged) |
+
+`gpt-4o-mini` was the generic type's default; it becomes real OpenAI's, which
+is what it always described. The generic type keeps it as "a starting point
+only: a generic endpoint's real model ids are its own".
+
+OpenAI's two ids are stable public ids already sized by
+`Seal.Providers.ContextWindow` (`gpt-4o-` and `gpt-4-turbo` prefixes).
+`gpt-4o` is deliberately **excluded**: the table's clause is `"gpt-4o-"`
+(trailing dash), so the bare id scores 0. `modelContextWindow` returns `Int`,
+not `Maybe`, and a 0 is rendered as *no percentage* (`BottomBar.tsx:37` guards
+the block with `contextWindow > 0`), so a 0 degrades honestly — but there is no
+reason to publish a model the table cannot size. `ContextWindow.hs` is
+therefore not touched.
+
+`gemma4:31b` is the identifier form Ollama documents for **direct** cloud
+requests ("Direct cloud requests use the identifiers from
+`https://ollama.com/api/tags`", e.g. `gemma4:31b`; the `:cloud` suffix is the
+*signed-in-local-server* form). Ollama Cloud's static list is empty for the same
+reason the generic type's is: its live catalogue is the operator's own, and
+inventing ids here would be a guess the UI presents as fact. `listModels`
+already calls the real `/v1/models`.
+
+`gemma4:31b` has no `ContextWindow` clause and so scores 0. That is the same
+state as any custom endpoint's models today and renders no percentage; a default
+model need not appear in the static *list*, which is only the new-tab
+suggestion set.
+
+## 3. Consequences
+
+### 3.1 The `openai` id changes meaning — one documented migration wart
+
+Before this change, `[providers.openai]` meant a *generic* endpoint. After,
+`openai` means real OpenAI. Three cases:
+
+1. **`[providers.openai] base_url = "http://localhost:8000/v1"` + key.**
+   Works unchanged: the configured `base_url` still overrides the new built-in
+   default, so calls still go to the operator's server. Only the *label* in the
+   UI now reads "OpenAI". Acceptable and self-correcting once the operator
+   renames the section to a custom instance.
+2. **No `[providers.openai]` section at all.** No behaviour change; `openai`
+   simply gains a working default endpoint.
+3. **`[providers.openai]` with a key but no `base_url`.** ⚠️ *This is the one
+   real change.* Before: `resolveOpenAICompatible` failed closed with "needs a
+   base URL — set [providers.openai] base_url". Nothing was ever transmitted.
+   After: that stored key is sent to `https://api.openai.com/v1`.
+
+   Case 3 was already a non-functional configuration (the provider could not
+   answer), so no working setup regresses. But a key the operator stored for a
+   *self-hosted* endpoint is now transmitted to OpenAI. It will be rejected
+   (401) and is the wrong key for that host, so the practical impact is a
+   failed request — but bytes do leave the machine that previously never left.
+
+   **Accepted**, because the alternative (leaving `openai` generic and giving
+   real OpenAI an awkward id) was explicitly rejected by the operator, and
+   because a key with no endpoint was never usable. **Mitigated** by calling
+   this out in the CHANGELOG and in the `config/templates/config.toml` comment
+   block, so an operator upgrading with a stale section is told to migrate it to
+   a named instance.
+
+No automatic config migration. Rewriting a user's config.toml section key on
+load is more surprising than the wart it fixes, and it would have to guess
+whether a `base_url` that *is* `api.openai.com` was meant as OpenAI or as a
+generic instance. `Seal.Config.Migrate` has no provider-section machinery today,
+so adding one would be new, untested surface for a one-time wart.
+
+### 3.2 The setup step's P4 copy
+
+`classifyProvider`'s P4 detail currently reads "Add an LLM provider: anthropic,
+openrouter, ollama, or an OpenAI-compatible endpoint." Updated to name the new
+options without becoming an unreadable inventory — the operator sees the radio
+list directly beneath it, so the sentence stays short.
+
+### 3.3 `scripts/setup-walkthrough.sh` reproduces the case-3 egress
+
+Steps 8b–8f POST `{"name":"openai", …}` to exercise the generic type's
+fail-closed behaviour:
+
+```sh
+8b. POST /api/providers {name:openai, api_key} with NO base_url
+8c. POST /api/providers/openai/test (fails closed: the endpoint is required)
+```
+
+After the rename, `name: "openai"` **is real OpenAI** and has a built-in
+endpoint, so 8b succeeds instead of failing closed and 8c performs a **real
+request to `https://api.openai.com/v1`** carrying `sk-local`. That is exactly the
+§3.1 case-3 transmission, reproduced by a script developers run locally.
+
+The whole block is re-keyed to a custom name (`local-vllm` with
+`type: "openai-compatible"`), which preserves the original intent — a generic
+endpoint still requires an explicit base URL and still fails closed without one
+— and removes the egress.
+
+## 4. Files touched
+
+### Backend
+
+| File | Change |
+|---|---|
+| `src/Seal/Providers/Registry.hs` | +2 constructors; every total function updated: `providerLabel`, `vaultKeyName`, `defaultModelFor`, `providerBaseUrlFor`, `resolveProvider`, `configuredProviders`, `validateProviderName`. Also `resolveProvider OpenAICompatibleProvider`'s hardcoded `"openai"` argument → `providerLabel OpenAICompatibleProvider` (that string names the config section in its fail-closed error). `providerTypeForName` needs **no** change (already `fromMaybe OpenAICompatibleProvider`). `knownProviders` order (D2). |
+| `src/Seal/Setup/State.hs` | `providerDisplayName` +2; `providerCards` raises no flags for the new types (already constructor-keyed); P4 copy. |
+| `src/Seal/Gateway/API.hs` | `providerAuthStatus` +2; `staticModelsFor` +2; `providerDetailJsonFor` gains `requiresBaseUrl`/`requiresName`; `customProviderDetailJson` type id → `openai-compatible`; **`:715`** the `customInfos` `"type"` literal → `openai-compatible`; **`:3246`** the readiness guard `typeId /= "openai"` → `typeId /= "openai-compatible"` (otherwise it becomes a tautology and custom instances inherit Ollama readiness); `resolveCreateTarget` / `resolveExistingTarget` type ids and the required-type check; `handleProvidersAll` unchanged (mapM over `knownProviders` picks up the new rows). |
+| `src/Seal/Gateway/Setup.hs` | `handleProviderTest`'s "known providers" hint text. Card JSON already emits both booleans — no change. |
+| `src/Seal/Command/Provider.hs` | `addCmd`'s generic path already prompts for a key for any non-`ollama` type, so both new types work; `authLabel` falls into the `otherwise` branch correctly; `providerReadinessSegment` already returns "" for non-`ollama`. The help text listing known ids is generated from `knownProviders`, so it needs no edit. |
+| `CHANGELOG.md` | A `0.1.0.0` bullet documenting **both** migrations: `[providers.openai]` now means real OpenAI (move a self-hosted section to a named `openai-compatible` instance), and `[providers.ollama] base_url = "https://ollama.com"` gains the OpenAI-compatible path as `ollama-cloud`. |
+| `scripts/setup-walkthrough.sh` | Steps 8b–8f re-keyed from `name: "openai"` to a custom name with `type: "openai-compatible"`. See §3.3 — leaving it as-is turns the script into the case-3 egress. |
+| `config/templates/config.toml` | Comment block gains the new ids; the generic example is re-keyed to `openai-compatible` with the D2 migration note. |
+
+**Not touched:** `src/Seal/Providers/OpenRouter.hs` (reused as-is),
+`Seal.Providers.Ollama`, `Seal.Providers.OllamaReadiness*` (no readiness for
+the new types), `Seal.Providers.ContextWindow` (D10), the ISA, any opcode.
+
+### Frontend
+
+| File | Change |
+|---|---|
+| `frontend/src/types.ts` | `ProviderDetail` +`requiresBaseUrl` / `requiresName`; comment updates on `type`. |
+| `frontend/src/lib/providerLabels.ts` | labels for `openai` / `ollama-cloud` / `openai-compatible`. |
+| `frontend/src/components/ProvidersView.tsx` | label map; drive Base URL + Unique name visibility from the new detail flags (and, when creating, from the id→flags helper of D7) instead of `formName === 'openai'`; custom-instance `type: 'openai-compatible'`; reserved-name set. |
+| `frontend/src/components/ProviderFormFields.tsx` | `isOpenAIType` → `isOpenAICompatible` (the generic type's placeholder/hint); no visibility logic change — `showBaseUrl` already exists. |
+| `frontend/src/components/setup/ProviderStep.tsx` | reserved-name array **and the `saveKey` POST body (~`:147`)**, which sends `type: 'openai'` for a custom instance and becomes a 400 after D8. Field visibility already correct via `requires_base_url` / `requires_name`. |
+| `frontend/src/components/ProviderModelFields.tsx`, `frontend/src/components/AgentsView.tsx` | label maps. |
+| `frontend/src/components/ActiveTabs.tsx` | badge specs for `openai` and `ollama-cloud`. `ollama-cloud` reuses the bundled Ollama mark (same brand). `openai` needs a bundled mark; if none is available, a lettered chip (`char: 'O'`) is the established pattern (Anthropic uses `char: 'A'`). This is **load-bearing, not cosmetic**: `handleProviderIconWith` reads the config-only `providerBaseUrl`, so a provider with only a built-in default 404s on icon fetch (pre-existing — Anthropic behaves this way today). |
+| `frontend/src/lib/setupSteps.ts` | comment only (`requires_*` parsing unchanged). |
+
+### Tests
+
+- `test/Seal/Providers/RegistrySpec.hs` — `knownProviders` membership + order;
+  labels, vault keys, default models, base URLs for the two new types; the
+  generic type's renamed label/key; `validateProviderName` reserving all six;
+  `configuredProviders` for each new type (key present ⇒ configured; key absent
+  ⇒ not); `providerBaseUrlFor` override still wins.
+- `test/Seal/Setup/StateSpec.hs` — card list, labels, and both `requires*`
+  flag vectors for six cards.
+- `test/Seal/Gateway/SetupApiSpec.hs` — `requires_base_url` /
+  `requires_name` are `False` for `openai` and `ollama-cloud`; the `openai`
+  card is present.
+- `test/Seal/Gateway/ApiSpec.hs` — `/api/providers` includes six built-ins with
+  the new names; `/api/providers/all` carries `requiresBaseUrl` /
+  `requiresName`; a custom instance reports `type: "openai-compatible"`; POST
+  with `type: "openai-compatible"` creates a custom instance; POST
+  `name: "openai"` with no base URL succeeds and does **not** 400 (it has a
+  built-in endpoint now).
+- `frontend/src/components/__tests__/ProvidersView.test.tsx` — selecting
+  OpenAI renders **no** Base URL and **no** Unique name input; selecting
+  OpenAI-compatible renders both and still requires them.
+- `frontend/src/components/__tests__/providerStep.test.tsx` — an `openai` card
+  renders no base-URL field; an `openai-compatible` card does; and the custom
+  instance's POST body carries `type: "openai-compatible"`.
+
+## 5. Test plan
+
+Every item is labelled:
+
+- **RED** — fails before the implementation that satisfies it, by construction.
+- **GUARD** — passes today and must **stay** green. These are real regression
+  guards, not RED tests; labelling them RED would misrepresent the TDD cycle.
+
+Security-critical pure functions get QuickCheck properties over
+`knownProviders` (`= [minBound .. maxBound]`), so a **future** constructor is
+covered without editing the test. Enumerating six values is not a property.
+
+### 5.1 RED — registry and pure vocabulary
+
+1. **RED** `knownProviders` equals
+   `[Anthropic, Ollama, OllamaCloud, OpenRouter, OpenAI, OpenAICompatible]`.
+2. **RED** *Property:* `providerLabel` is injective over `knownProviders` —
+   pairwise-distinct over the list, written over the list, not six literals.
+3. **RED** *Property:* `vaultKeyName` is injective over `knownProviders` — same
+   shape. This is the invariant D3 rests on.
+4. **RED** *Property:* every label round-trips —
+   `∀ p ∈ knownProviders, parseProvider (providerLabel p) == Just p`.
+5. **RED** `providerLabel OpenAIProvider == "openai"`; `parseProvider "openai" == Just OpenAIProvider`.
+6. **RED** `providerLabel OpenAICompatibleProvider == "openai-compatible"`; `parseProvider "openai-compatible" == Just OpenAICompatibleProvider`.
+7. **RED** `providerLabel OllamaCloudProvider == "ollama-cloud"`; `parseProvider "ollama-cloud" == Just OllamaCloudProvider`.
+8. **RED** `vaultKeyName` values per D3, exactly (six cases).
+9. **RED** `defaultModelFor` per D10, exactly.
+10. **RED** `providerBaseUrlFor defaultRuntimeConfig OpenAIProvider == "https://api.openai.com/v1"`.
+11. **RED** `providerBaseUrlFor defaultRuntimeConfig OllamaCloudProvider == "https://ollama.com/v1"`.
+12. **RED** A configured `base_url` overrides each new built-in default.
+13. **RED** `validateProviderName` rejects every built-in label — *property* over
+    `map providerLabel knownProviders` (D9). This item auto-covers a future
+    constructor.
+14. **RED** `configuredProviders` with `OPENAI_API_KEY` stored ⇒ includes `OpenAIProvider`.
+15. **RED** `configuredProviders` with `OLLAMA_CLOUD_API_KEY` stored ⇒ includes `OllamaCloudProvider`.
+16. **RED** `configuredProviders` with no keys ⇒ neither new type (no keyless mode).
+17. **RED** `configuredProviders` with `OLLAMA_API_KEY` only ⇒ includes
+    `OllamaProvider` **and not** `OllamaCloudProvider` (D3 injectivity, observable
+    through the public filter).
+18. **RED** `resolveProvider OpenAIProvider` with no key ⇒ `Left` whose text
+    names **OpenAI** (not "OpenAI-compatible").
+19. **RED** `resolveProvider OllamaCloudProvider` with no key ⇒ `Left` naming
+    **Ollama Cloud**.
+20. **RED** `resolveProvider OpenAICompatibleProvider` with no vault ⇒ `Left`
+    naming the config section **`openai-compatible`**, asserted as
+    `"[providers.openai-compatible]" isInfixOf e` **and**
+    `"[providers.openai]" notInfixOf e`. A bare `openai` substring check passes
+    when it should fail, because `"openai-compatible"` contains `"openai"`.
+21. **RED** `staticModelsFor OpenAIProvider` is non-empty and every id satisfies
+    `modelContextWindow id > 0` (`Int`, so "non-zero" — the function returns
+    `Int`, not `Maybe`). `staticModelsFor OllamaCloudProvider == []`.
+
+### 5.2 RED — setup state and HTTP surfaces
+
+22. **RED** Setup state emits six cards in D2 order with the D2 display names.
+23. **RED** `pcRequiresBaseUrl` / `pcRequiresName` are `False`/`False` for
+    `openai` and `ollama-cloud`, `True`/`True` for `openai-compatible`, and
+    `False`/`False` for the other three.
+24. **RED** `GET /api/setup`: the `openai` card has `requires_base_url: false`
+    and `requires_name: false`; the `openai-compatible` card has `true`/`true`
+    — asserted **per card by id**, not by whole-body substring. (The existing
+    `hasBoolField` helper is a `contains` on the whole body, so a paired
+    `True`/`False` pair both passes while the per-provider semantics invert.)
+25. **RED** `GET /api/providers` lists six built-ins with the D2 names **and**
+    the correct per-name `configured` flags.
+26. **RED** `GET /api/providers/all`: `requiresBaseUrl`/`requiresName` are
+    `false`/`false` for `openai` and `ollama-cloud`; `true`/`true` for
+    `openai-compatible`.
+27. **RED** `GET /api/providers/all` for a custom instance reports
+    `type: "openai-compatible"`, `requiresBaseUrl: true`, `requiresName: true`.
+28. **RED** `POST {"name":"openai","api_key":"sk-…"}` ⇒ 201, and no `base_url`
+    is stored for it (the default is implicit).
+29. **RED** `POST {"name":"ollama-cloud","api_key":"…"}` ⇒ 201.
+30. **RED** `POST {"name":"local-vllm","type":"openai-compatible","base_url":…}`
+    ⇒ 201 with `type: "openai-compatible"` echoed.
+31. **RED** `POST {"name":"local-vllm","type":"openai"}` ⇒ 400 (no legacy
+    aliasing, D8).
+32. **RED** `POST {"name":"openai","type":"openai-compatible"}` ⇒ 400
+    (type/name mismatch).
+33. **RED** `GET /api/providers/all` for a custom instance emits **no**
+    readiness keys (the `:3246` guard fix).
+
+### 5.3 RED — frontend
+
+34. **RED** Providers page: selecting **OpenAI** renders neither
+    `provider-base-url-input` nor `provider-instance-name-input`; Save is
+    enabled with only an API key.
+35. **RED** Providers page: selecting **Ollama Cloud** likewise renders neither.
+36. **RED** Providers page: the id→flags helper classifies exactly
+    `openai-compatible` as custom-capable (`requiresBaseUrl`/`requiresName`
+    true) and every other built-in as not — the anti-drift guard for D7's
+    creating-state helper.
+37. **RED** Providers page: submitting a custom instance POSTs
+    `type: "openai-compatible"`.
+38. **RED** Wizard: saving a custom instance POSTs `type: "openai-compatible"`
+    (the `ProviderStep.tsx:147` fix — the bug that would otherwise ship green).
+39. **RED** Label maps render "OpenAI", "Ollama Cloud", "OpenAI-compatible".
+
+### 5.4 GUARD — passing today, must stay green
+
+40. **GUARD** `providerBaseUrlFor defaultRuntimeConfig OpenAICompatibleProvider == ""`
+    (the generic type still has no default — the whole point of D2).
+41. **GUARD** `validateProviderName "local-vllm" == Right ()`.
+42. **GUARD** Providers page: selecting **OpenAI-compatible** still renders both
+    fields and Save stays disabled until both are valid.
+43. **GUARD** Wizard: an `openai-compatible` card still renders both fields.
+44. **GUARD** Wizard: an `openai` / `ollama-cloud` card renders no base-URL and
+    no unique-name field (D7 says this already holds because the wizard gates on
+    the server flags — a guard, not new behaviour).
+
+### 5.5 Existing tests to UPDATE (not merely add to)
+
+These assert the old names and **will go red**. The plan phase must budget them
+as work, not discover them mid-implementation.
+
+| File | Assertion |
+|---|---|
+| `RegistrySpec.hs:118-124` | 4-element `knownProviders` vector; `providerLabel OpenAICompatibleProvider == "openai"`; `vaultKeyName … == "OPENAI_API_KEY"`; `parseProvider "openai"`. |
+| `RegistrySpec.hs:88-93` | `openAICfg` keys `[providers.openai]`; must key `openai-compatible` or the four `resolveProvider`/`configuredProviders` tests (`:288-320`) go red. |
+| `RegistrySpec.hs:410` | `validateProviderName "openai" == Right ()` → `isLeft` (D9). |
+| `RegistrySpec.hs:422` | `vaultKeyNameForName "openai" == "OPENAI_API_KEY"` — `openai` is now a built-in, so the name-derived path no longer applies; assert with a custom name. |
+| `RegistrySpec.hs:297` | `"base URL" isInfixOf` → also assert the section name (item 20). |
+| `StateSpec.hs:118-129` | 4-card vector, names, `requires*` vectors → 6 cards. |
+| `ApiSpec.hs:4465` | 4-entry `byName` Map incl. `("openai", False)` → 6 entries. |
+| `ApiSpec.hs:4838-4847, 4886, 4900` | Custom-instance POST bodies and the `type` echo → `openai-compatible`. |
+| `SetupApiSpec.hs:127-138` | `hasBoolField` is a whole-body `contains` helper (`:626-628`); replace with per-card assertions (item 24). |
+| `ProvidersView.test.tsx:379-420` | Selects `value: 'openai'` expecting the generic flow → `openai-compatible`. |
+| `providerStep.test.tsx:280-305` | Card `id: 'openai'` with `requires_base_url: true` → `openai-compatible`. |
+| `scripts/setup-walkthrough.sh:79-92` | Re-key steps 8b–8f (§3.3). |
+
+`ProviderBadge.test.tsx` is unaffected (it uses `ollama`).
+
+### 5.6 Work units
+
+The rename is not a forced big-bang, but WU3 is irreducible.
+
+- **WU1** `Registry.hs` + `RegistrySpec` (items 1-21 plus the four
+  `RegistrySpec` updates). Independently green; pure; no HTTP.
+- **WU2** `Setup/State.hs` + `StateSpec` + `SetupApiSpec` (items 22-24). Green
+  alone — the new cards render as raw ids until WU3 lands the frontend labels,
+  which is degraded, not broken.
+- **WU3** The atomic unit: `resolveCreateTarget` / `resolveExistingTarget` /
+  `customProviderDetailJson` / `providerAuthStatus` / `staticModelsFor` /
+  `providerDetailJsonFor` (`API.hs`) + `types.ts` + `ProvidersView.tsx` +
+  `ProviderStep.tsx` + `ProviderFormFields.tsx` + label maps + `ActiveTabs.tsx`
+  + items 25-39 and their test updates.
+
+  WU3 **cannot** be split: the frontend is embedded via `file-embed`, so client
+  and server ship together, and `type: "openai"` for a custom name must start
+  and stop being valid in the same commit.
+
+Completion gate: `make check` (build + test + lint) plus the frontend test
+suite, per the Makefile, and `.coverage-thresholds.json`'s enforcement command.
+
+## 6. Non-goals
+
+- Renaming the existing custom-instance concept, or changing
+  `vaultKeyNameForName` / `customProviderNames`.
+- Consolidating the four duplicated `PROVIDER_LABELS` maps into one (an
+  existing, documented follow-up). This change adds entries to each; it does not
+  merge them.
+- Adding readiness probing for Ollama Cloud.
+- Automatic config migration for `[providers.openai]` (§3.1).
+- Touching `Seal.Providers.ContextWindow` (D10).
+- Changing `Seal.Providers.OpenRouter`, the ISA, or any opcode.
+- Streaming: both new types inherit the existing non-streaming
+  `sendChatCompletion`, exactly like OpenRouter and custom instances today.
+- Extending `inferProviderId` (`Seal.Session.Kind`) with an `ollama-cloud` rule.
+  `gemma` does **not** disambiguate — `gemma3:4b` is a perfectly good *local*
+  Ollama model. Its existing `gpt` → `openai` rule becomes consistent with real
+  OpenAI as a side effect of D2; it has no callers today, so it is noted, not
+  changed.
+- Fixing `handleProviderDelete`'s unconditional deletion of
+  `anthropicOAuthKey` (a pre-existing, separate bug). D3's injectivity is what
+  prevents *new* instances of that bug class; the old one is its own PR.
+
+## 7. Risks
+
+| Risk | Mitigation |
+|---|---|
+| A missed site in a **total function over `KnownProvider`** | `-Werror` + totality: the compiler names every such site. This holds only for pattern-matching/total functions. |
+| A missed **label string comparison** — the compiler is blind to these | Enumerated exhaustively and each given a test: `Registry.hs:242` (the fail-closed section name, item 20), `API.hs:715` (custom `type`), `API.hs:3246` (readiness guard), `Registry.hs:118` (reserved names, item 13), `ProvidersView.tsx:247` (custom-ness, item 36). The `"ollama"` comparisons at `State.hs:294`, `Provider.hs:175/256/279`, `API.hs:3182` are **correct as-is** (Ollama-only semantics) and are pinned by guard items. |
+| Frontend and backend disagree on which types hide the fields | Server-driven flags (D7) plus item 36 pinning the creating-state helper. |
+| The §3.1 case-3 key transmission | Documented in CHANGELOG + config template; §3.3 removes the one place a developer would reproduce it. Accepted explicitly (see §3.1). |
+| A stale tab POSTs the old `type: "openai"` | 400 with a clear message; reload fixes it (D8). |
+| Six rows make the wizard list long | Acceptable at this count; vendor-adjacent grouping (D2) keeps it readable. |
+| A 0 context window looking like a bug | It renders as *no percentage* (`BottomBar.tsx:37`), which is honest (D10). |
