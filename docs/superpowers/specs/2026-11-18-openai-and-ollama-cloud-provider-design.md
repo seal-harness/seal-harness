@@ -1,9 +1,9 @@
 # Design — OpenAI and Ollama Cloud provider types
 
-**Status:** draft - revision 4. Round 1 verdicts: CTO, Product, Designer and
-Architect NEEDS_REVISION; Security APPROVED (4/5, so the gate is not passed).
-Every blocker is addressed in `…-revision-2.md`, `…-revision-3.md`, and
-`…-revision-4.md`. Round 2 re-review is required.
+**Status:** draft - revision 5. Gate history: round 1 (4/5 NEEDS_REVISION),
+round 2 (3/5 NEEDS_REVISION), round 3 (in progress; all blockers from every
+round addressed in `…-revision-{2,3,4}.md` and the round-3 commits). Not
+approved until 5/5 reviewers return APPROVED on this text.
 **Date:** 2026-11-18
 **Branch:** `providers/openai-and-ollama-cloud`
 
@@ -221,9 +221,17 @@ hazard: `ProvidersView.tsx:496` sets `formName` without resetting `form`, and
 `:269` sends `base_url` whenever it is non-empty *regardless of visibility*. So
 select OpenAI-compatible, type `http://localhost:8000/v1`, switch to OpenAI, and
 Save writes that stale URL into `[providers.openai]` — contradicting D4 and
-item 28. The same applies to `uniqueName`. Therefore: send `base_url` **only
-when `requiresBaseUrl`**, and clear `baseUrl`/`uniqueName` when `formName`
-changes. This is the exact class of defect D7 exists to prevent.
+item 28. The same applies to `uniqueName`.
+
+Therefore: send `base_url` when **`!isHiddenBaseUrl`** — i.e. `openai` and
+`ollama-cloud` send nothing; `ollama`, `openai-compatible`, `anthropic`,
+`openrouter` and custom instances send their non-empty value. Keying the gate on
+`requiresBaseUrl` instead would be the same required-vs-visible conflation this
+section exists to prevent: `ollama` has `requiresBaseUrl = false` but a visible,
+essential field, so an operator could type a remote daemon URL and have it
+**silently dropped on submit**, breaking the only GUI path to a remote Ollama.
+`uniqueName` and `type` stay gated on `requiresName`. Clear `baseUrl`/`uniqueName`
+when `formName` changes.
 
 **`name` is always sent — only its *source* is conditional.** `name` is a
 required field (`API.hs:3306` answers 400 `name must not be empty`), so the rule
@@ -530,7 +538,7 @@ the new types), `Seal.Providers.ContextWindow` (D10), the ISA, any opcode.
 |---|---|
 | `frontend/src/types.ts` | `ProviderDetail` +`requiresBaseUrl` / `requiresName`; comment updates on `type`. |
 | `frontend/src/lib/providerLabels.ts` | labels for `openai` / `ollama-cloud` / `openai-compatible`. The generic row renders **"OpenAI-compatible (custom / self-hosted)"** in dropdowns, since the id no longer disambiguates it from real OpenAI. |
-| `frontend/src/components/ProvidersView.tsx` | label map; drive Base URL + Unique name visibility from the detail flags (when creating: the dropdown's own `ProviderDetail` row — D7) instead of `formName === 'openai'`; **pass `showBaseUrl` explicitly at the `ProviderFormFields` call site** (and `showModels`/`showDefaultModel` as `true` — no flag drives them and no behavioural change is intended) (it currently omits `showBaseUrl`, which defaults to `true`, so edit renders Base URL for every provider); **gate the submitted payload on those flags too, and clear `baseUrl`/`uniqueName` when `formName` changes** (RG-2); custom-instance `type: 'openai-compatible'`; reserved-name set. |
+| `frontend/src/components/ProvidersView.tsx` | label map; drive Base URL + Unique name visibility from the detail flags (when creating: the dropdown's own `ProviderDetail` row — D7) instead of `formName === 'openai'`; **pass `showBaseUrl` explicitly at the `ProviderFormFields` call site** (and `showModels`/`showDefaultModel` as `true` — no flag drives them and no behavioural change is intended) (it currently omits `showBaseUrl`, which defaults to `true`, so edit renders Base URL for every provider); **gate the submitted payload on `!isHiddenBaseUrl` (not `requiresBaseUrl`), and clear `baseUrl`/`uniqueName` when `formName` changes** (RG-2); custom-instance `type: 'openai-compatible'`; reserved-name set. |
 | `frontend/src/components/ProviderFormFields.tsx` | `isOpenAIType` → `isOpenAICompatible` (the generic type's placeholder/hint); no visibility logic change — `showBaseUrl` already exists. |
 | `frontend/src/components/setup/ProviderStep.tsx` | reserved-name array **and the `saveKey` POST body (~`:147`)**, which sends `type: 'openai'` for a custom instance and becomes a 400 after D8. Field visibility already correct via `requires_base_url` / `requires_name`. |
 | `frontend/src/components/ProviderModelFields.tsx`, `frontend/src/components/AgentsView.tsx` | label maps. |
@@ -618,7 +626,11 @@ covered without editing the test. Enumerating six values is not a property.
     when it should fail, because `"openai-compatible"` contains `"openai"`.
 20c. **RED** An **empty-string** `base_url` also fails closed:
      `resolveProvider OpenAIProvider` with `providerBaseUrl = Just ""` returns
-     `Left`. This must fail **at the guard's own value test**, not downstream:
+     `Left`, **with a `[providers.openai]` section present**. That premise is
+     what makes the item sound: `Just ""` only arises when a section exists, so
+     without it the case-2 branch would legitimately return `Right` and a future
+     editor could "fix" the guard to fail closed on fresh installs. This must
+     fail **at the guard's own value test**, not downstream:
      `providerBaseUrl` yields `Just ""`, so a naive `Just u -> use u` routes it
      to case 1 and only `resolveOpenAICompatible`'s null check rejects it. Same
      outcome, wrong path — and a refactor of either site would split them. The
@@ -755,10 +767,12 @@ able to **finish**. These are the acceptance criteria for §1's benefit claim.
 41. **GUARD** `validateProviderName "local-vllm" == Right ()`.
 41b. **GUARD** **Ollama keeps an editable Base URL** on the Providers page, in
      **both** create and edit modes: `provider-base-url-input` renders with the
-     `http://localhost:11434` placeholder. This is the regression guard for
-     `requiresBaseUrl` meaning *required* rather than *visible* — conflating
-     them silently removes the only GUI path to a remote Ollama daemon, and
-     breaks the existing test at `ProvidersView.test.tsx:142-164`.
+     `http://localhost:11434` placeholder, **and the submitted payload carries
+     the typed remote URL**. Asserting rendering alone is not enough: keying the
+     payload on `requiresBaseUrl` (false for Ollama) would render the field and
+     then silently drop the value — the regression would pass the whole suite.
+     This is the guard for `requiresBaseUrl` meaning *required*, not *visible*,
+     and it also protects the existing test at `ProvidersView.test.tsx:142-164`.
 41c. **GUARD** A custom `openai-compatible` instance still renders an editable
      Base URL in **edit** mode, pre-filled with its stored URL, and the
      submitted payload carries it. Absence-only coverage (item 34a) would pass an
@@ -932,7 +946,7 @@ suite, per the Makefile, and `.coverage-thresholds.json`'s enforcement command.
 | The §3.1 guard dead-ending a provider created through the UI (because `upsertProvider` always writes a section) | Both write paths (create + `/provider add`) inject the built-in `base_url` server-side; items 35f/35h round-trip and fail if they do not. |
 | The §3.1 guard failing closed on a **fresh install** (the case-2 regression) | The guard tests `Map.member (rcProviders cfg)`, not `providerBaseUrl`, which cannot distinguish the two states. Item 35g pins case 2. |
 | A hidden field still being *shown* in edit mode (`showBaseUrl` defaults to `true`; only the wizard passes it) | Both call sites pass `showBaseUrl`/`showModels`/`showDefaultModel` from the flags; item 34a asserts the edit path specifically. |
-| A hidden field still leaking a value into the payload (stale `base_url`) | The payload is gated on `requiresBaseUrl`/`requiresName`, and `formName` changes clear the fields (D7, RG-2). Item 35d pins it. |
+| A hidden field still leaking a value into the payload (stale `base_url`) | The payload is gated on `!isHiddenBaseUrl` (visibility) and `requiresName`, and `formName` changes clear the fields (D7, RG-2). Items 35d and 41b pin it. |
 | A legacy `OPENAI_API_KEY` outliving deletion of `openai-compatible` | Deliberate retention, documented in the CHANGELOG and pinned by item 45b; §3.1's guard is what stops it being transmitted unconfirmed. |
 | A stale tab POSTs the old `type: "openai"` | 400 with a clear message; reload fixes it (D8). |
 | Six rows make the wizard list long | Acceptable at this count; vendor-adjacent grouping (D2) keeps it readable. |
