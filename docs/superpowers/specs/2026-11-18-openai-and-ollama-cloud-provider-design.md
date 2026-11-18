@@ -643,6 +643,12 @@ able to **finish**. These are the acceptance criteria for §1's benefit claim.
      `providerBaseUrl` — a `providerBaseUrl`-only check fails this item because
      it returns `Nothing` for both the absent-section and section-without-field
      states (`Config/File.hs:742`).
+35i. **RED** **Case 1 through the guard**: with a `[providers.openai]` section
+     that HAS a `base_url` (e.g. `http://localhost:8000/v1`), `resolveProvider
+     OpenAIProvider` returns `Right` and uses **that** URL, not the built-in.
+     Item 12 pins the accessor (`providerBaseUrlFor`); this pins the guard's
+     `Just u` branch, which is the one that must never fail closed. Together
+     35e/35g/35i cover all three branches.
 35h. **RED** `/provider add openai` **clears** the case-3 guard: after the
      fail-closed state, the command writes `base_url` and
      `resolveProviderByName "openai"` returns `Right`. Fails today, because
