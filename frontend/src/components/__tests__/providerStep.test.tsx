@@ -122,11 +122,134 @@ describe('ProviderStep', () => {
     }))
   })
 
-  // ── Design D8: the CTA must agree with the pill (test 44) ────────────
+  // ── The provider list carries no status pills ────────────────────────
+  //
+  // The operator is choosing between names here. "configured" / "no
+  // credential" / "Ready · 10 Models" are not decision inputs: readiness is
+  // acted on at the point it matters — the CTA for the chosen provider — not
+  // as decoration beside every name.
 
-  it('44: the pill renders from readiness and the CTA stays enabled', () => {
+  it('renders no status pill beside any provider name', () => {
+    render(
+      <ProviderStep
+        step={step({ detail: 'ollama · llama3.2' })}
+        providers={[
+          card({ id: 'ollama', label: 'Ollama', configured: true, readiness: 'ready', readiness_models: 10 }),
+          card({ id: 'anthropic', configured: true }),
+          card({ id: 'openrouter', configured: false }),
+        ]}
+        onDone={() => {}}
+      />,
+    )
+    for (const id of ['ollama', 'anthropic', 'openrouter']) {
+      expect(screen.queryByTestId(`setup-provider-pill-${id}`)).toBeNull()
+      expect(screen.queryByTestId(`setup-provider-hint-${id}`)).toBeNull()
+    }
+    // The stale strings must not appear anywhere in the list either.
+    expect(screen.queryByText('no credential')).toBeNull()
+    expect(screen.queryByText('configured')).toBeNull()
+    expect(screen.queryByText(/Ready · 10 Models/)).toBeNull()
+  })
+
+  it('still shows each provider name and the default marker', () => {
+    render(
+      <ProviderStep
+        step={step()}
+        providers={[
+          card({ id: 'anthropic', configured: true, isDefault: true }),
+          card({ id: 'ollama', label: 'Ollama', configured: true, readiness: 'ready', readiness_models: 10 }),
+        ]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.getByText('Anthropic')).toBeDefined()
+    expect(screen.getByText('Ollama')).toBeDefined()
+    // `default` is the one badge that IS a decision input, so it stays.
+    expect(screen.getByText('default')).toBeDefined()
+  })
+
+  // ── Unusable provider: disable the CTA, explain, and stay escapable ──
+
+  it('disables `Use Ollama` when Ollama is not running', () => {
+    render(
+      <ProviderStep
+        step={step({ detail: 'ollama · llama3.2' })}
+        providers={[card({ id: 'ollama', label: 'Ollama', configured: true, readiness: 'not-running' })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.getByRole('button', { name: /use ollama/i })).toBeDisabled()
+  })
+
+  it('explains why, and names the remedy', () => {
+    render(
+      <ProviderStep
+        step={step({ detail: 'ollama · llama3.2' })}
+        providers={[card({ id: 'ollama', label: 'Ollama', configured: true, readiness: 'not-running' })]}
+        onDone={() => {}}
+      />,
+    )
+    const note = screen.getByTestId('setup-provider-blocked')
+    expect(note.textContent).toContain('ollama serve')
+  })
+
+  it.each(['not-installed', 'not-running', 'no-models'] as const)(
+    'blocks selection for %s',
+    (readiness) => {
+      render(
+        <ProviderStep
+          step={step({ detail: 'ollama · llama3.2' })}
+          providers={[card({ id: 'ollama', label: 'Ollama', configured: true, readiness })]}
+          onDone={() => {}}
+        />,
+      )
+      expect(screen.getByRole('button', { name: /use ollama/i })).toBeDisabled()
+      expect(screen.getByTestId('setup-provider-blocked')).toBeDefined()
+    },
+  )
+
+  it.each(['pending', 'unknown', 'cloud', 'no-fitting-model'] as const)(
+    'does NOT block selection for %s (not a claim of absence, or advisory)',
+    (readiness) => {
+      render(
+        <ProviderStep
+          step={step({ detail: 'ollama · llama3.2' })}
+          providers={[card({ id: 'ollama', label: 'Ollama', configured: true, readiness })]}
+          onDone={() => {}}
+        />,
+      )
+      expect(screen.getByRole('button', { name: /use ollama/i })).toBeEnabled()
+      expect(screen.queryByTestId('setup-provider-blocked')).toBeNull()
+    },
+  )
+
+  it('a ready Ollama is selectable', () => {
+    render(
+      <ProviderStep
+        step={step({ detail: 'ollama · llama3.2' })}
+        providers={[card({
+          id: 'ollama', label: 'Ollama', configured: true,
+          readiness: 'ready', readiness_models: 10,
+        })]}
+        onDone={() => {}}
+      />,
+    )
+    expect(screen.getByRole('button', { name: /use ollama/i })).toBeEnabled()
+  })
+
+  it('a card with no readiness at all stays selectable (non-Ollama)', () => {
+    render(
+      <ProviderStep step={step()} providers={[card({ id: 'anthropic', configured: true })]} onDone={() => {}} />,
+    )
+    expect(screen.getByRole('button', { name: /use anthropic/i })).toBeEnabled()
+  })
+
+  it('offers a two-step escape hatch so an unusable Ollama cannot hard-block setup', async () => {
+    // Ollama's `configured` is true from config alone, so on a machine that
+    // never installed it `required_complete` is already true and this wizard is
+    // the only screen the operator sees. A disabled button with no way forward
+    // would lock them out of the product.
     const onDone = vi.fn()
-    fetchMock.mockResolvedValue(jsonResponse(200, { default_provider: 'ollama' }))
     render(
       <ProviderStep
         step={step({ detail: 'ollama · llama3.2' })}
@@ -134,43 +257,16 @@ describe('ProviderStep', () => {
         onDone={onDone}
       />,
     )
-    // Honest pill, not "configured".
-    expect(screen.getByTestId('setup-provider-pill-ollama').textContent).toBe('Not Running')
-    // ... and the CTA still says "Use Ollama" and is still enabled: the
-    // wizard's job is credential sufficiency, and a keyless Ollama has nothing
-    // missing.
-    const useBtn = screen.getByRole('button', { name: /use ollama/i })
-    expect(useBtn).toBeEnabled()
+    fireEvent.click(screen.getByTestId('setup-provider-skip'))
+    // Asks once, and says what the consequence is.
+    expect(screen.getByTestId('setup-provider-skip-confirm')).toBeDefined()
+    expect(screen.getByText(/messages will fail until/i)).toBeDefined()
+    expect(onDone).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByTestId('setup-provider-skip-confirm'))
+    expect(onDone).toHaveBeenCalled()
   })
 
-  it('44b: the hint slot renders below the pill for an actionable state', () => {
-    render(
-      <ProviderStep
-        step={step({ detail: 'ollama · llama3.2' })}
-        providers={[card({ id: 'ollama', label: 'Ollama', configured: true, readiness: 'not-running' })]}
-        onDone={() => {}}
-      />,
-    )
-    const hint = screen.getByTestId('setup-provider-hint-ollama')
-    expect(hint.textContent).toContain('ollama serve')
-  })
-
-  it('44c: a ready Ollama renders Ready · n Models and no hint', () => {
-    render(
-      <ProviderStep
-        step={step({ detail: 'ollama · llama3.2' })}
-        providers={[card({
-          id: 'ollama', label: 'Ollama', configured: true,
-          readiness: 'ready', readiness_models: 2,
-        })]}
-        onDone={() => {}}
-      />,
-    )
-    expect(screen.getByTestId('setup-provider-pill-ollama').textContent).toBe('Ready · 2 Models')
-    expect(screen.queryByTestId('setup-provider-hint-ollama')).toBeNull()
-  })
-
-  it('44d: a card with no readiness keeps the existing pill text (the fallback)', () => {
+  it('the escape hatch is absent when the provider is usable', () => {
     render(
       <ProviderStep
         step={step()}
@@ -178,19 +274,7 @@ describe('ProviderStep', () => {
         onDone={() => {}}
       />,
     )
-    expect(screen.getByTestId('setup-provider-pill-anthropic').textContent).toBe('configured')
-  })
-
-  it('44e: a pending Ollama falls back rather than rendering an empty pill', () => {
-    render(
-      <ProviderStep
-        step={step({ detail: 'ollama · llama3.2' })}
-        providers={[card({ id: 'ollama', label: 'Ollama', configured: true, readiness: 'pending' })]}
-        onDone={() => {}}
-      />,
-    )
-    expect(screen.getByTestId('setup-provider-pill-ollama').textContent).toBe('configured')
-    expect(screen.queryByTestId('setup-provider-hint-ollama')).toBeNull()
+    expect(screen.queryByTestId('setup-provider-skip')).toBeNull()
   })
 
   it('requires a base URL and a unique name for the generic OpenAI-compatible provider', async () => {

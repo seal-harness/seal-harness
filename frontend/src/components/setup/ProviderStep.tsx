@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { setDefaultProvider, testProvider, type SetupResult } from '../../hooks/useSetup'
 import { providerLabel } from '../../lib/providerLabels'
-import { readinessHint, readinessLabel, readinessTone } from '../../lib/readiness'
+import { readinessHint } from '../../lib/readiness'
 import type { ProviderCard, SetupStep } from '../../lib/setupSteps'
+import type { ProviderReadiness } from '../../types'
 import * as s from './styles'
 import {
   ProviderFormFields,
@@ -37,27 +38,24 @@ type SaveState =
  *   /api/providers/default`. Without this the step offered a disabled Save
  *   button and no way forward — no amount of typing would enable it.
  */
-/** The pill's text. `readiness` wins when present; otherwise the pre-existing
- *  `configured` / `no credential` wording. */
-function pillText(card: ProviderCard): string {
-  if (card.readiness === undefined) {
-    return card.configured ? 'configured' : 'no credential'
-  }
-  const label = readinessLabel(card.readiness, card.readiness_models)
-  // A `pending` card has no label; fall back rather than render an empty pill.
-  return label === '' ? (card.configured ? 'configured' : 'no credential') : label
-}
-
-function pillColor(card: ProviderCard): string {
-  if (card.readiness !== undefined) {
-    switch (readinessTone(card.readiness)) {
-      case 'ok': return 'var(--success)'
-      case 'warn': return 'var(--needs-input)'
-      case 'muted': return 'var(--text-muted)'
-      case 'faint': return 'var(--text-faint)'
-    }
-  }
-  return card.configured ? 'var(--text-muted)' : 'var(--text-faint)'
+/**
+ * Does this readiness state mean "cannot be used right now"?
+ *
+ * Deliberately narrow. Only the three states that positively mean *the thing is
+ * absent* block selection:
+ *
+ * - `pending` — nothing has been observed yet. Blocking here would disable the
+ *   button on first paint for every provider, before any probe finished.
+ * - `unknown` — the probe ran and failed unexplainably. We do not know, so we
+ *   do not block (and we certainly do not claim).
+ * - `cloud` — an `ollama.com` endpoint is not probed; it is not a local
+ *   absence.
+ * - `no-fitting-model` — advisory only (design D5.4). Turning it into a
+ *   verdict is exactly the error the design forbids.
+ * - `ready`, and absent readiness (a non-Ollama card) — usable.
+ */
+function readinessBlocksSelection(readiness: ProviderReadiness | undefined): boolean {
+  return readiness === 'not-installed' || readiness === 'not-running' || readiness === 'no-models'
 }
 
 export function ProviderStep({
@@ -84,10 +82,25 @@ export function ProviderStep({
   const [save, setSave] = useState<SaveState>({ status: 'idle' })
   const [ping, setPing] = useState<SetupResult | null>(null)
   const [pinging, setPinging] = useState(false)
+  // Confirm-before-skip: the escape hatch asks once rather than silently
+  // letting the operator through to a product that cannot answer.
+  const [finishingAnyway, setFinishingAnyway] = useState(false)
 
   const fallback = defaultCard ?? providers.find((p) => p.configured) ?? firstProvider
   const effectiveId = providers.some((p) => p.id === selected) ? selected : (fallback?.id ?? '')
   const card = providers.find((p) => p.id === effectiveId)
+
+  // The selected provider cannot be used right now. Only meaningful for a card
+  // the wizard would otherwise let through via `Use <provider>` — i.e. one the
+  // server already counts as configured.
+  const blocked = card !== undefined
+    && card.configured
+    && !card.isDefault
+    && readinessBlocksSelection(card.readiness)
+  const blockedReason =
+    card !== undefined && card.readiness !== undefined && readinessBlocksSelection(card.readiness)
+      ? readinessHint(card.readiness, card.default_model ?? undefined)
+      : null
 
   // Seed the shared fields from the selected card. In particular, an existing
   // frequent-model list must be shown (and round-tripped) instead of being
@@ -208,29 +221,8 @@ export function ProviderStep({
                 {providerLabel(provider.id)}
               </span>
               {provider.isDefault ? <span className="pill" style={{ color: 'var(--success)' }}>default</span> : null}
-              {/* Design D8: the pill renders from `readiness` when the server
-                  sent one, and falls back to today's text when it did not (a
-                  non-Ollama card). The fallback is a fallback, not a
-                  replacement. */}
-              <span
-                className="pill"
-                data-testid={`setup-provider-pill-${provider.id}`}
-                style={{ color: pillColor(provider) }}
-              >
-                {pillText(provider)}
-              </span>
               {provider.default_model !== null ? (
                 <span style={{ fontSize: 12, color: 'var(--text-faint)' }}>{provider.default_model}</span>
-              ) : null}
-              {/* D8's hint slot: below the pill, and only when the state has
-                  something actionable to say. */}
-              {provider.readiness !== undefined && readinessHint(provider.readiness, provider.default_model ?? undefined) !== null ? (
-                <span
-                  data-testid={`setup-provider-hint-${provider.id}`}
-                  style={{ display: 'block', fontSize: 12, color: 'var(--text-faint)', marginTop: 2 }}
-                >
-                  {readinessHint(provider.readiness, provider.default_model ?? undefined)}
-                </span>
               ) : null}
             </label>
           </li>
@@ -271,7 +263,7 @@ export function ProviderStep({
         {card !== undefined && card.configured ? (
           <button
             type="button"
-            disabled={save.status === 'saving' || card.isDefault}
+            disabled={save.status === 'saving' || card.isDefault || blocked}
             onClick={() => { void useAsDefault() }}
             className={s.primaryButtonClass}
           >
@@ -300,6 +292,49 @@ export function ProviderStep({
           Test connection
         </button>
       </div>
+
+      {/* Why the CTA above is disabled, and how to get unstuck.
+          The escape hatch is not decoration: Ollama's `configured` is true from
+          config alone (Registry.hs), so on a machine that has never installed
+          it `required_complete` is already true and the wizard is the ONLY
+          screen the operator sees. A disabled button with no way forward would
+          hard-block them out of the product. `onDone` refreshes the setup
+          state, and the gate then renders the app. */}
+      {blocked ? (
+        <div style={{ marginTop: 12 }} data-testid="setup-provider-blocked">
+          <p role="alert" style={{ ...s.warningStyle }}>
+            {blockedReason ?? `${providerLabel(card?.id ?? '')} is not ready.`}
+          </p>
+          {/* The secondary finish path. Kept separate from the primary CTA so
+              the explanation stays adjacent to the disabled button. */}
+          {!finishingAnyway ? (
+            <button
+              type="button"
+              onClick={() => setFinishingAnyway(true)}
+              className={s.ghostButtonClass}
+              style={{ marginTop: 8 }}
+              data-testid="setup-provider-skip"
+            >
+              Continue without a working provider
+            </button>
+          ) : (
+            <div style={{ marginTop: 8 }}>
+              <p style={{ ...s.mutedStyle }}>
+                Finish setup now? Messages will fail until{' '}
+                {providerLabel(card?.id ?? '')} is available.
+              </p>
+              <button
+                type="button"
+                onClick={onDone}
+                className={s.ghostButtonClass}
+                data-testid="setup-provider-skip-confirm"
+              >
+                Finish setup
+              </button>
+            </div>
+          )}
+        </div>
+      ) : null}
 
       {save.status === 'failed' ? (
         <p role="alert" style={{ ...s.errorStyle, marginTop: 12 }}>
