@@ -115,6 +115,56 @@ from any point and you branch from the real record.
 audit trail and rest easy knowing that you have full visibily into the workings
 of your agent organization.
 
+### One Gateway API for Every Surface You Automate
+
+The web UI is one client of Seal Harness, not the only one.
+
+`seal serve` exposes the entire agent surface over a single HTTP + WebSocket
+listener — loopback `:8080` by default. Sessions, transcripts, sends, slash
+commands, agents, skills, repos, providers, channels, cron jobs and the file
+explorer are all JSON routes; the browser frontend, the Signal and Telegram
+channels and anything you write yourself are peers on that API, and they see
+the same transcript because they drive the same turns.
+
+That is what makes an agent programmable rather than merely clickable:
+
+- **Automation from outside a browser.** Create a session, bind an agent, point
+  it at a repo, send it a message, read the result back — JSON in, JSON out:
+
+  ```bash
+  SID=$(curl -s localhost:8080/api/sessions/new -d '{"agent":"coder"}' | jq -r .session_id)
+  curl -s localhost:8080/api/sessions/$SID/setup-repo -d '{"url":"git@github.com:acme/api.git"}'
+  curl -s localhost:8080/api/sessions/$SID/send -d '{"message":"fix the failing test"}'
+  curl -s "localhost:8080/api/sessions/$SID/transcript?limit=50" | jq length
+  ```
+
+  (Send returns as soon as the turn starts; the reply lands in the transcript
+  and on the stream. A `passkey` install answers `401` until you authenticate,
+  so sign in first and reuse the `seal_session` cookie.)
+
+- **Live state instead of polling.** One WebSocket on the same port streams
+  entries as they are recorded, coalesced `entry-update` frames while a reply is
+  still being written, `ask` frames the moment the agent needs a human, and
+  `lists` snapshots as tabs open and close. A `since` cursor replays what a
+  dropped connection missed, so a phone that slept through a turn catches up
+  without re-reading the session.
+
+- **The opcode surface, over HTTP.** A message of `/call OPNAME {"json":"args"}`
+  is routed like any other slash command, so an automation reaches the same
+  opcodes an in-session turn does — same authorization, same ACK-before-execute
+  durability, same transcript entry.
+
+Every mutating request is origin-guarded before it reaches a handler, and the
+WebSocket handshake is authorized by the same single decision function as the
+HTTP routes, so the two surfaces cannot disagree about who you are. Passkeys,
+enrollment and TLS are covered in
+[`docs/web-access-control.md`](docs/web-access-control.md).
+
+Machine-readable clients: `GET /api/openapi.json` serves the OpenAPI 3.1
+document, `GET /api/openapi` renders it as Swagger UI, and `seal gen-openapi`
+prints it for a pipeline. `GET /api/health` is reachable without a session and
+reports the stream's real status, not its configured one.
+
 ## The SealOp ISA
 
 Every other agent framework has ad-hoc tool calls: `shell`, `read_file`,
