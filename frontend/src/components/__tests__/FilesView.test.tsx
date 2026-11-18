@@ -3,6 +3,9 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/re
 import { FilesView } from '../FilesView'
 import type { FileListing, FileContent } from '../../types'
 
+const origClipboard = navigator.clipboard
+const origExecCommand = document.execCommand
+
 // ── Fetch-layer stubs ────────────────────────────────────────────────────
 //
 // These tests stub `global.fetch` (the suite's established idiom) and drive
@@ -194,6 +197,10 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  Object.defineProperty(navigator, 'clipboard', {
+    value: origClipboard, configurable: true, writable: true,
+  })
+  document.execCommand = origExecCommand
   window.history.replaceState(null, '', '/')
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
@@ -692,5 +699,125 @@ describe('FilesView', () => {
     fireEvent.click(screen.getByTestId('breadcrumb-/'))
     expect(pushSpy).toHaveBeenCalled()
     expect(pushSpy.mock.calls[0]![2] as string).toContain('path=' + encodeURIComponent('/'))
+  })
+
+  // ── Copy-path button (top of the page, right of the path) ──────────────
+
+  describe('copy-path button', () => {
+    /** Stub the Clipboard API; returns the array the writes land in. */
+    function stubClipboard(): string[] {
+      const written: string[] = []
+      Object.defineProperty(navigator, 'clipboard', {
+        value: { writeText: (t: string) => { written.push(t); return Promise.resolve() } },
+        configurable: true,
+        writable: true,
+      })
+      return written
+    }
+
+    it('sits to the right of the path at the top of the page', async () => {
+      setLocation('/home/user')
+      registerParent('/home/user', 'user')
+      routes.set('/home/user', { body: makeListing() })
+      render(<FilesView />)
+      await waitFor(() => expect(screen.getByTestId('breadcrumb-/home/user')).toBeTruthy())
+
+      const header = screen.getByTestId('breadcrumbs')
+      const copyBtn = screen.getByTestId('copy-path')
+      expect(header.contains(copyBtn)).toBe(true)
+      // DOM order: the last breadcrumb precedes the copy button.
+      const lastCrumb = screen.getByTestId('breadcrumb-/home/user')
+      expect(lastCrumb.compareDocumentPosition(copyBtn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    })
+
+    it('copies the full directory path', async () => {
+      setLocation('/home/user')
+      registerParent('/home/user', 'user')
+      routes.set('/home/user', { body: makeListing() })
+      const written = stubClipboard()
+      render(<FilesView />)
+      await waitFor(() => expect(screen.getByTestId('copy-path')).toBeTruthy())
+
+      fireEvent.click(screen.getByTestId('copy-path'))
+      await waitFor(() => expect(written).toEqual(['/home/user']))
+    })
+
+    it('copies the full file path from the viewer', async () => {
+      setLocation('/home/user/readme.txt')
+      routes.set('/home/user', { body: makeListing() })
+      routes.set('/home', { body: makeListing({ path: '/home', entries: [{ name: 'user', isDir: true, isSymlink: false, size: null, mtime: null }] }) })
+      routes.set('/home/user/readme.txt', { body: makeContent() })
+      const written = stubClipboard()
+      render(<FilesView />)
+      await waitFor(() => expect(screen.getByTestId('file-content-pre')).toBeTruthy())
+
+      fireEvent.click(screen.getByTestId('copy-path'))
+      await waitFor(() => expect(written).toEqual(['/home/user/readme.txt']))
+    })
+
+    it('copies the full path even when the breadcrumb trail is collapsed', async () => {
+      // A deep path renders as `/ … / f`, so the visible crumbs no longer
+      // spell the path out. Copy must still yield the whole thing.
+      setLocation('/a/b/c/d/e/f')
+      routes.set('/a/b/c/d/e/f', { body: makeListing({ path: '/a/b/c/d/e/f', entries: [] }) })
+      routes.set('/a/b/c/d/e', { body: makeListing({ path: '/a/b/c/d/e', entries: [] }) })
+      const written = stubClipboard()
+      render(<FilesView />)
+      await waitFor(() => expect(screen.getByTestId('breadcrumb-ellipsis')).toBeTruthy())
+
+      fireEvent.click(screen.getByTestId('copy-path'))
+      await waitFor(() => expect(written).toEqual(['/a/b/c/d/e/f']))
+    })
+
+    it('copies the resolved home path when the URL carries no path', async () => {
+      setLocation()
+      routes.set('', { body: makeListing({ path: '/home/user' }) })
+      routes.set('/', { body: makeListing({ path: '/', entries: [] }) })
+      const written = stubClipboard()
+      render(<FilesView />)
+      await waitFor(() => expect(screen.getByTestId('file-entry-readme.txt')).toBeTruthy())
+
+      fireEvent.click(screen.getByTestId('copy-path'))
+      // The full path of what is on screen, not the literal '/'.
+      await waitFor(() => expect(written).toEqual(['/home/user']))
+    })
+
+    it('reports success in its accessible name, then does not navigate', async () => {
+      setLocation('/home/user')
+      registerParent('/home/user', 'user')
+      routes.set('/home/user', { body: makeListing() })
+      stubClipboard()
+      render(<FilesView />)
+      await waitFor(() => expect(screen.getByTestId('copy-path')).toBeTruthy())
+
+      const pushSpy = vi.spyOn(window.history, 'pushState')
+      const btn = screen.getByTestId('copy-path')
+      expect(btn.getAttribute('aria-label')).toMatch(/copy/i)
+      fireEvent.click(btn)
+      await waitFor(() =>
+        expect(screen.getByTestId('copy-path').getAttribute('aria-label')).toMatch(/copied/i),
+      )
+      expect(pushSpy).not.toHaveBeenCalled()
+    })
+
+    it('falls back to execCommand in a non-secure context', async () => {
+      setLocation('/home/user')
+      registerParent('/home/user', 'user')
+      routes.set('/home/user', { body: makeListing() })
+      Object.defineProperty(navigator, 'clipboard', { value: undefined, configurable: true, writable: true })
+      const execSpy = vi.fn(() => true)
+      document.execCommand = execSpy as unknown as typeof document.execCommand
+      try {
+        render(<FilesView />)
+        await waitFor(() => expect(screen.getByTestId('copy-path')).toBeTruthy())
+        fireEvent.click(screen.getByTestId('copy-path'))
+        await waitFor(() => expect(execSpy).toHaveBeenCalledWith('copy'))
+        await waitFor(() =>
+          expect(screen.getByTestId('copy-path').getAttribute('aria-label')).toMatch(/copied/i),
+        )
+      } finally {
+        document.execCommand = origExecCommand
+      }
+    })
   })
 })
