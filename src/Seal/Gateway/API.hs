@@ -45,7 +45,7 @@ import Network.HTTP.Client (Manager)
 import Network.HTTP.Types
   ( Header, HeaderName, Status, methodDelete, methodGet, methodOptions
   , methodPost, methodPut
-  , status200, status201, status204, status400, status403, status404, status409, status416, status500, status501 )
+  , status200, status201, status204, status400, status403, status404, status409, status413, status416, status500, status501 )
 import Network.Socket (SockAddr (..), hostAddressToTuple)
 import Network.Wai
   ( Application, Request, Response, getRequestBodyChunk, pathInfo
@@ -110,6 +110,7 @@ import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastAgentDefsChanged
 import Seal.Gateway.ProviderIcon
   ( IconCache, IconResult (..), resolveProviderIconBytes, newIconCache )
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
+import Seal.Gateway.MediaType (InlineMediaType (..), inlineMediaTypeFor)
 import Seal.Gateway.SessionJson
   ( sessionInfoJsonWithSnippet, tabToJson )
 import Seal.Gateway.Stream (StreamHealth (..), streamHealthMessage, streamHealthStatus)
@@ -233,6 +234,12 @@ data ApiDeps = ApiDeps
   , adFileExplorerEnabled :: Bool  -- ^ 'False' when the operator has disabled it via [gateway] file_explorer_enabled = false. Routes return 403.
   , adDownloadPromptBytes :: Int    -- ^ the size threshold (bytes) above which the frontend prompts the user before downloading (default 256 MiB).
   , adDownloadChunkBytes  :: Int    -- ^ the chunk size for chunked downloads (default 4 MiB). Also the second Int passed to 'mkLocalFileExplorer'/'mkRemoteFileExplorer'.
+  , adMediaPreviewBytes   :: Int
+    -- ^ The byte ceiling for an inline image preview (@inline=1@ on
+    -- @\/api\/files\/download@). A file over this size is refused with 413
+    -- rather than truncated, because a truncated image cannot be decoded.
+    -- Bounds both gateway memory and the per-file remote transport.
+    -- Default 32 MiB.
   , adDownloadAllowBlocked :: Bool  -- ^ when 'True', the chunked download routes skip 'blockedSegment' enforcement (SEC-B3 override; default 'False').
   , adHttpManager :: Maybe Manager
     -- ^ The shared TLS HTTP manager (for the provider favicon proxy
@@ -2609,6 +2616,48 @@ parsePathsQuery req =
   , k == "paths"
   ]
 
+-- | Read a whole file for inline preview, up to @maxBytes@.
+--
+-- Two details make this correct:
+--
+-- 1. **Chunk alignment is mandatory.** 'feReadRange' derives the remote
+--    @dd skip=@ index as @offset `div` chunkSize@, so a non-aligned offset
+--    silently reads from the wrong place. Every call here therefore passes a
+--    FULL @chunkSize@ as the length, including the final chunk — which
+--    short-reads at EOF and is returned as-is. Passing @min chunkSize
+--    remaining@ instead would shrink @chunkSize@ on the last chunk and
+--    misalign the remote arm for every file whose size is not a multiple of
+--    the chunk size.
+--
+-- 2. **The ceiling is enforced before reading, not after.** A file larger
+--    than @maxBytes@ is refused outright rather than truncated: a truncated
+--    image is an undecodable fragment, so serving it would be a silent lie.
+--    The caller turns 'FeTooLarge' into a 413 with the real size.
+readFileForPreview
+  :: FileExplorerHandle -> Int -> FilePath
+  -> IO (Either FileExplorerErr ByteString)
+readFileForPreview fe maxBytes path = do
+  eStat <- feStatFile fe path
+  case eStat of
+    Left err -> pure (Left err)
+    Right stat
+      | fsSize stat > fromIntegral maxBytes -> pure (Left FeTooLarge)
+      | fsSize stat <= 0 -> pure (Right BS.empty)
+      | otherwise -> go (fsSize stat) 0 []
+  where
+    chunkSize = if maxBytes <= 0 then 1 else maxBytes
+    go total !off !acc
+      | off >= total = pure (Right (BS.concat (reverse acc)))
+      | otherwise = do
+          eChunk <- feReadRange fe path off chunkSize
+          case eChunk of
+            Left err -> pure (Left err)
+            Right bs
+              -- A zero-byte chunk before EOF would loop forever; treat it as
+              -- a transport failure rather than hang the request thread.
+              | BS.null bs -> pure (Left (FeIo "unexpected EOF during preview read"))
+              | otherwise -> go total (off + fromIntegral (BS.length bs)) (bs : acc)
+
 parsePathQuery :: Request -> Maybe Text
 parsePathQuery req =
   case lookup "path" (queryString req) of
@@ -2692,11 +2741,28 @@ handleFileContent deps req = do
                   Left err -> pure (fileExplorerErrResponse err)
                   Right content -> pure (jsonLBS status200 (A.encode (fileContentJson content)))
 
--- | Handle GET /api/files/download — raw file download as
--- application/octet-stream. Parses the @path@ query parameter, calls
--- 'feReadFileBytes', returns the raw bytes with Content-Disposition,
--- X-Content-Type-Options: nosniff, and X-Truncated headers. Audit-logs
--- the access.
+-- | Handle GET /api/files/download — raw file bytes.
+--
+-- Two modes, selected by the @inline@ query parameter:
+--
+-- * **Attachment (default, no @inline@)** — @application\/octet-stream@,
+--   @Content-Disposition: attachment@, @X-Content-Type-Options: nosniff@,
+--   read through 'feReadFileBytes' at the viewer ceiling with @X-Truncated@.
+--   This contract is unchanged; the chunked downloader depends on it.
+--
+-- * **Inline (@inline=1@)** — for the file explorer's image preview only.
+--   Serves a real @Content-Type@ so the browser decodes the bytes, at
+--   @inline@ disposition, and still @nosniff@. Two independent gates keep
+--   this from becoming a general render-anything endpoint:
+--
+--   1. 'inlineMediaTypeFor' allowlists only raster image extensions. SVG and
+--      HTML are refused, so they can never be rendered in this origin.
+--   2. The read goes through 'readFileForPreview', which honours a size
+--      ceiling and returns 'FeTooLarge' (→ 413) instead of a truncated file.
+--
+--   A path failing the allowlist falls back to the attachment behaviour
+--   rather than erroring: the caller asked for bytes, and attachment bytes
+--   are always safe.
 handleFileDownload :: ApiDeps -> Request -> IO Response
 handleFileDownload deps req = do
   if not (adFileExplorerEnabled deps)
@@ -2707,19 +2773,63 @@ handleFileDownload deps req = do
           | T.null pathTxt -> pure (errJson status400 "path is required")
           | otherwise -> case validateFilePath pathTxt of
               Left e -> pure (errJson status400 e)
-              Right path -> do
-                eBytes <- feReadFileBytes (adFileExplorer deps) path
-                case eBytes of
-                  Left err -> pure (fileExplorerErrResponse err)
-                  Right (bs, truncated) -> do
-                    let basename = takeFileName path
-                        disposition = "attachment; filename=\"" <> basename <> "\""
-                        truncatedHdr = (mkHN "X-Truncated", if truncated then "true" else "false")
-                        nosniffHdr = (mkHN "X-Content-Type-Options", "nosniff")
-                        dispHdr = (mkHN "Content-Disposition", BC.pack disposition)
-                        octetHdr = (mkHN "Content-Type", "application/octet-stream")
-                    pure (responseLBS status200 [octetHdr, dispHdr, nosniffHdr, truncatedHdr]
-                           (BL.fromStrict bs))
+              Right path ->
+                case (wantsInline req, inlineMediaTypeFor path) of
+                  (True, Just mt) -> serveInline deps path mt
+                  _ -> serveAttachment deps path
+
+-- | Whether the caller asked for the inline (renderable) response.
+wantsInline :: Request -> Bool
+wantsInline req =
+  case lookup "inline" (queryString req) of
+    Just (Just v) -> v `elem` ["1", "true", "yes"]
+    _ -> False
+
+-- | The hardened download response: octet-stream, attachment, nosniff,
+-- read through the viewer ceiling with an explicit @X-Truncated@ marker.
+serveAttachment :: ApiDeps -> FilePath -> IO Response
+serveAttachment deps path = do
+  eBytes <- feReadFileBytes (adFileExplorer deps) path
+  case eBytes of
+    Left err -> pure (fileExplorerErrResponse err)
+    Right (bs, truncated) -> do
+      let basename = takeFileName path
+          disposition = "attachment; filename=\"" <> basename <> "\""
+          truncatedHdr = (mkHN "X-Truncated", if truncated then "true" else "false")
+          nosniffHdr = (mkHN "X-Content-Type-Options", "nosniff")
+          dispHdr = (mkHN "Content-Disposition", BC.pack disposition)
+          octetHdr = (mkHN "Content-Type", "application/octet-stream")
+      pure (responseLBS status200 [octetHdr, dispHdr, nosniffHdr, truncatedHdr]
+             (BL.fromStrict bs))
+
+-- | The inline image response: real @Content-Type@, @inline@ disposition,
+-- still @nosniff@ so the browser trusts our declared type over the bytes.
+-- Honors the SEC-B3 blocked-path check, which the attachment arm deliberately
+-- skips: an attachment never renders, so a path resolving into a blocked
+-- location is only a confidentiality problem once the browser draws it.
+serveInline :: ApiDeps -> FilePath -> InlineMediaType -> IO Response
+serveInline deps path mt = do
+  mBlocked <- checkBlockedPath deps path
+  case mBlocked of
+    Just resp -> pure resp
+    Nothing -> do
+      eBytes <- readFileForPreview (adFileExplorer deps) (adMediaPreviewBytes deps) path
+      case eBytes of
+        Left FeTooLarge ->
+          -- 413 carries the real size so the UI can explain the refusal
+          -- instead of showing a broken image.
+          pure (errJson status413 "image exceeds the preview size limit")
+        Left err -> pure (fileExplorerErrResponse err)
+        Right bs -> do
+          let basename = takeFileName path
+              hdrs =
+                [ (mkHN "Content-Type", TE.encodeUtf8 (imtContentType mt))
+                , (mkHN "Content-Disposition", BC.pack ("inline; filename=\"" <> basename <> "\""))
+                , (mkHN "X-Content-Type-Options", "nosniff")
+                , (mkHN "Cache-Control", "no-store")
+                , (mkHN "Content-Length", BC.pack (show (BS.length bs)))
+                ]
+          pure (responseLBS status200 hdrs (BL.fromStrict bs))
 
 -- | Handle GET /api/files/stat — file metadata (size + mtime) for the
 -- chunked download path. Returns JSON @{path, size, mtimeEpoch}@ where
@@ -2944,6 +3054,7 @@ fileExplorerErrResponse = \case
   FeIo msg -> errJson status500 ("I/O error: " <> msg)
   FeExec msg -> errJson status500 ("exec error: " <> msg)
   FeTruncated -> errJson status500 "output truncated"
+  FeTooLarge -> errJson status413 "file exceeds the preview size limit"
   FeDisabled -> errJson status403 "file explorer disabled (gateway is not loopback)"
 
 -- | Encode a 'FileListing' as a JSON 'Value' (for the API response).

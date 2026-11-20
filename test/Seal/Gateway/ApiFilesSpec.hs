@@ -16,7 +16,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Time (UTCTime (..), fromGregorian)
-import Network.HTTP.Types (status200, status400, status403, status404, status500)
+import Network.HTTP.Types (status200, status400, status403, status404, status413, status500)
 import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, queryString
   , requestMethod, requestHeaders, responseHeaders, responseStatus )
@@ -185,6 +185,98 @@ spec = describe "Seal.Gateway.ApiFilesSpec" $ do
       resp <- runAppResp (apiApp deps) (mkGetReq ["api", "files", "download"] [("path", Just "/nonexistent/file.bin")])
       responseStatus resp `shouldBe` status404
 
+  -- Inline image preview: `inline=1` on the download route swaps the
+  -- hardened octet-stream contract for a renderable Content-Type, gated by
+  -- the MediaType allowlist and a size ceiling.
+  describe "GET /api/files/download?inline=1" $ do
+    it "serves a PNG with a real Content-Type and inline disposition" $
+      withSystemTempDirectory "seal-inline" $ \tmp -> do
+        let p = tmp </> "photo.png"
+            payload = BC.pack "\137PNG\r\n\26\n-fake-png-body"
+        BC.writeFile p payload
+        deps <- mkDeps (mkLocalFileExplorer 131072 4194304) True
+        resp <- runAppResp (apiApp deps)
+                  (mkGetReq ["api", "files", "download"]
+                    [("path", Just (T.pack p)), ("inline", Just "1")])
+        responseStatus resp `shouldBe` status200
+        let hdrs = responseHeaders resp
+        -- The whole point: a type the browser will decode as an image.
+        lookup "Content-Type" hdrs `shouldBe` Just "image/png"
+        -- Still nosniff: our declared type wins over content sniffing.
+        lookup "X-Content-Type-Options" hdrs `shouldBe` Just "nosniff"
+        -- inline, not attachment, so <img> renders rather than downloads.
+        lookup "Content-Disposition" hdrs `shouldBe` Just "inline; filename=\"photo.png\""
+        body <- responseBodyStrict resp
+        body `shouldBe` payload
+
+    it "serves the FULL file, past the 128 KiB viewer ceiling" $
+      withSystemTempDirectory "seal-inline-big" $ \tmp -> do
+        -- A real photo is far larger than the viewer ceiling; the inline
+        -- path must not truncate it into an undecodable fragment.
+        let p = tmp </> "big.png"
+            payload = BC.replicate 400000 'x'
+        BC.writeFile p payload
+        deps <- mkDeps (mkLocalFileExplorer 131072 4194304) True
+        resp <- runAppResp (apiApp deps)
+                  (mkGetReq ["api", "files", "download"]
+                    [("path", Just (T.pack p)), ("inline", Just "1")])
+        responseStatus resp `shouldBe` status200
+        lookup "X-Truncated" (responseHeaders resp) `shouldBe` Nothing
+        body <- responseBodyStrict resp
+        BC.length body `shouldBe` 400000
+
+    it "refuses a file over the preview ceiling with 413, not a truncated image" $
+      withSystemTempDirectory "seal-inline-huge" $ \tmp -> do
+        let p = tmp </> "huge.png"
+        BC.writeFile p (BC.replicate 200 'y')
+        -- Explorer + deps wired with a tiny ceiling via a local override.
+        deps0 <- mkDeps (mkLocalFileExplorer 131072 4194304) True
+        let deps = deps0 { adMediaPreviewBytes = 100 }
+        resp <- runAppResp (apiApp deps)
+                  (mkGetReq ["api", "files", "download"]
+                    [("path", Just (T.pack p)), ("inline", Just "1")])
+        responseStatus resp `shouldBe` status413
+
+    it "falls back to attachment for a non-allowlisted extension (SVG)" $
+      withSystemTempDirectory "seal-inline-svg" $ \tmp -> do
+        -- SVG is scriptable; it must never be served renderable here.
+        let p = tmp </> "logo.svg"
+        BC.writeFile p "<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>"
+        deps <- mkDeps (mkLocalFileExplorer 131072 4194304) True
+        resp <- runAppResp (apiApp deps)
+                  (mkGetReq ["api", "files", "download"]
+                    [("path", Just (T.pack p)), ("inline", Just "1")])
+        responseStatus resp `shouldBe` status200
+        let hdrs = responseHeaders resp
+        lookup "Content-Type" hdrs `shouldBe` Just "application/octet-stream"
+        lookup "Content-Disposition" hdrs `shouldBe` Just "attachment; filename=\"logo.svg\""
+
+    it "leaves the default (no inline) contract untouched" $
+      withSystemTempDirectory "seal-inline-default" $ \tmp -> do
+        let p = tmp </> "photo.png"
+        BC.writeFile p "pngbytes"
+        deps <- mkDeps (mkLocalFileExplorer 131072 4194304) True
+        resp <- runAppResp (apiApp deps)
+                  (mkGetReq ["api", "files", "download"] [("path", Just (T.pack p))])
+        responseStatus resp `shouldBe` status200
+        let hdrs = responseHeaders resp
+        lookup "Content-Type" hdrs `shouldBe` Just "application/octet-stream"
+        lookup "Content-Disposition" hdrs `shouldBe` Just "attachment; filename=\"photo.png\""
+
+    it "returns 403 when file explorer is disabled" $ do
+      deps <- mkDeps mkFailClosedFileExplorer False
+      resp <- runAppResp (apiApp deps)
+                (mkGetReq ["api", "files", "download"]
+                  [("path", Just "/tmp/x.png"), ("inline", Just "1")])
+      responseStatus resp `shouldBe` status403
+
+    it "returns 404 for a missing image" $ do
+      deps <- mkDeps (mkLocalFileExplorer 131072 4194304) True
+      resp <- runAppResp (apiApp deps)
+                (mkGetReq ["api", "files", "download"]
+                  [("path", Just "/nonexistent/x.png"), ("inline", Just "1")])
+      responseStatus resp `shouldBe` status404
+
   -- The harness's per-session workdirs live under ~/.seal/cache/workdirs, so
   -- the SEC-B3 blocklist would otherwise make the operator's own agent output
   -- undownloadable. Downloads must be allowed there, while a symlink that
@@ -316,6 +408,7 @@ mkDepsWithCache cacheRoot fe enabled = do
     , adFileExplorerEnabled = enabled
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
+, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -345,6 +438,16 @@ responseBodyText (ResponseBuilder _ _ builderBody) =
 responseBodyText (ResponseRaw _ _) = pure ""
 responseBodyText ResponseFile {} = pure ""
 responseBodyText ResponseStream {} = pure ""
+
+-- | Read a 'Response' body as strict 'ByteString' — needed by the image
+-- preview tests, whose payloads are arbitrary bytes and must not be
+-- round-tripped through 'Text'.
+responseBodyStrict :: Response -> IO BC.ByteString
+responseBodyStrict (ResponseBuilder _ _ builderBody) =
+  BL.toStrict <$> runBuilder builderBody
+responseBodyStrict (ResponseRaw _ _) = pure BC.empty
+responseBodyStrict ResponseFile {} = pure BC.empty
+responseBodyStrict ResponseStream {} = pure BC.empty
 
 -- | Run a Builder into a lazy ByteString.
 runBuilder :: Builder -> IO BL.ByteString

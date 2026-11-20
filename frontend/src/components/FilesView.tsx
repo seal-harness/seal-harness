@@ -1,11 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import type { FileEntry, FileListing, FileContent } from '../types'
+import { isPreviewableImage, type FileEntry, type FileListing, type FileContent } from '../types'
 import { fetchFileListing, fetchFileListingWithRail, fetchFileContent, fetchFileStat } from '../hooks/useApi'
 import { useFileDownload } from '../hooks/useFileDownload'
 import { copyTextToClipboard } from '../lib/clipboard'
 import { DownloadProgressUI } from './DownloadProgress'
 import { FileTree, type FileTreeNode } from './FileTree'
 import { DownloadConfirmDialog } from './DownloadConfirmDialog'
+import { MediaView } from './MediaView'
 
 // ── URL helpers ─────────────────────────────────────────────────────────
 
@@ -737,6 +738,13 @@ export function FilesView() {
           const dirRes = await loadListing(target)
           if (cancelled) return
           if (!dirRes.listing) setError(dirRes.status ?? 404)
+        } else if (isPreviewableImage(target)) {
+          // An image is rendered by the browser from the inline endpoint, so
+          // there is no JSON content to fetch. Skipping it matters: the
+          // content route is capped at 128 KiB and would return a truncated
+          // fragment, and the extra round trip would be pure waste.
+          if (!cancelled) setLoading(false)
+          return
         } else {
           setContentLoading(true)
           const res = await fetchFileContent(target)
@@ -886,6 +894,13 @@ export function FilesView() {
 
   const isDirectoryTarget =
     path === null || path === '/' || listings.has(path)
+  /** A path that names a file rather than a directory. `path` is non-null,
+   *  not the root, and the pane is not showing a listing for it. */
+  const isFileTarget =
+    path !== null && path !== '/' && !isDirectoryTarget
+  /** True when the selected file is an image the backend will serve inline,
+   *  so the viewer previews it instead of fetching text content. */
+  const isImageTarget = isFileTarget && isPreviewableImage(path ?? '')
   const listingForPane: FileListing | undefined =
     path === null ? listings.get(null) : listings.get(path)
 
@@ -961,6 +976,17 @@ export function FilesView() {
             onBack={() => onNavigate(parentDir(content.path))}
             onDownload={handleViewerDownload}
             downloadTruncated={viewerDownloadTruncated}
+          />
+        ) : isImageTarget ? (
+          /* An allowlisted image is previewed by the browser itself, which
+             fetches the bytes directly (with Range support) from the inline
+             endpoint. It must NOT go through `fetchFileContent`: that JSON
+             call is capped at 128 KiB and would hand back a truncated,
+             undecodable fragment for any real photo. */
+          <MediaView
+            path={path ?? ''}
+            onBack={() => onNavigate(parentDir(path ?? '/'))}
+            onDownload={handleViewerDownload}
           />
         ) : listingForPane && isDirectoryTarget ? (
           <DirectoryListing

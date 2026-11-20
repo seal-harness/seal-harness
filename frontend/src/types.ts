@@ -609,6 +609,25 @@ export interface FileContent {
   isBinary: boolean
 }
 
+/** Raster image extensions the file explorer previews inline. Mirrors the
+ *  backend allowlist in `Seal.Gateway.MediaType` — SVG is deliberately
+ *  absent there (it is scriptable when navigated to directly), so it must
+ *  stay absent here or the viewer would show a broken image instead of the
+ *  binary-file message. */
+const INLINE_IMAGE_EXTENSIONS = [
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.bmp', '.ico',
+] as const
+
+/** True when `path` names a file the backend will serve as an inline image.
+ *  Judged on the final extension, case-insensitively, and never when the
+ *  whole filename is the suffix (a `.png` dotfile is not an image). */
+export function isPreviewableImage(path: string): boolean {
+  const base = path.slice(path.lastIndexOf('/') + 1)
+  const dot = base.lastIndexOf('.')
+  if (dot <= 0) return false
+  return (INLINE_IMAGE_EXTENSIONS as readonly string[]).includes(base.slice(dot).toLowerCase())
+}
+
 /** The result of `GET /api/files/stat?path=<file>`. Mirrors the backend's
  *  `FileStat` JSON. `mtimeEpoch` is null when mtime is unavailable. */
 export interface FileStat {

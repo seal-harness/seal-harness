@@ -70,6 +70,7 @@ data FileExplorerErr
   | FeIo !Text          -- ^ I/O error (message)
   | FeExec !Text        -- ^ remote SSH exec failure (message)
   | FeTruncated         -- ^ output exceeded the byte ceiling
+  | FeTooLarge          -- ^ file exceeds a caller-supplied byte ceiling (inline preview)
   | FeDisabled          -- ^ file explorer disabled (non-loopback)
   deriving stock (Eq, Show)
 
