@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# Package the built `seal` executable as a release tarball plus SHA256 sidecar.
+# Package the portable `seal` distribution as a release tarball plus a SHA256
+# sidecar.
 #
 # Usage: package-release.sh <system> <version> <basename>
 #
-#   system    Nix system string, e.g. x86_64-linux (recorded in the tarball name
-#             for the versioned release; the CI per-run artifact passes its own
-#             basename instead)
+#   system    Nix system string, e.g. x86_64-linux
 #   version   Release version without a leading `v` (e.g. 0.1.0). Pass "" for
 #             CI-only artifacts that are not tied to a release.
 #   basename  Output name without the .tar.gz suffix.
 #
-# Both ci.yml and release.yml call this, so the asset naming cannot drift
-# between the rolling `latest` release and a versioned release.
+# Both ci.yml and release.yml call this, so asset naming cannot drift between
+# the rolling `latest` release and a versioned release.
+#
+# The input is the `dist` output of the flake (a bin/ tree holding `seal` and,
+# on macOS, the shared libraries it needs beside it). The whole tree is
+# archived so the binary keeps working on a machine with no Nix.
 set -euo pipefail
 
 if [ "$#" -ne 3 ]; then
@@ -23,40 +26,38 @@ SYSTEM="$1"
 VERSION="$2"
 BASENAME="$3"
 
-# nix build leaves ./result/bin/seal
-BIN="${SEAL_BIN:-./result/bin/seal}"
-if [ ! -x "$BIN" ]; then
-  echo "error: no executable at $BIN — run 'nix build' first" >&2
+# `nix build .#dist` leaves ./result/bin
+DIST="${SEAL_DIST:-./result}"
+if [ ! -d "$DIST/bin" ]; then
+  echo "error: no bin/ at $DIST — run 'nix build .#dist' first" >&2
   exit 1
 fi
 
 STAGING="$(mktemp -d)"
 trap 'rm -rf "$STAGING"' EXIT
 
-cp "$BIN" "$STAGING/seal"
-chmod +x "$STAGING/seal"
+# Copy the tree, resolving the ./result symlink. Timestamps are pinned so the
+# archive is reproducible.
+cp -rL "$DIST"/. "$STAGING"/
+chmod -R u+w "$STAGING"
+find "$STAGING" -exec touch -t 198001010000 {} +
 
-# --owner/--group 0 --numeric-owner so the archive does not encode the
-# building user, and the mtime is pinned to the commit-independent epoch: the
-# tarball is a published artifact and should be reproducible.
-#
-# BSD tar (macOS runners) rejects GNU's --owner/--mtime spellings, so branch on
-# which tar is present rather than assuming GNU.
+# Strip macOS extended attributes: bsdtar would otherwise add AppleDouble ._
+# entries, which are useless in a Linux-consumed archive and break reproducible
+# hashing.
+if command -v xattr >/dev/null 2>&1; then
+  find "$STAGING" -exec xattr -c {} + 2>/dev/null || true
+fi
+
+# Reproducible archiving. GNU tar can pin ownership and mtime directly; bsdtar
+# (macOS) cannot, so the mtimes are pinned above instead. Either way the gzip
+# stream must be `-n` — without it gzip records its own creation time in header
+# bytes 4-7 and the archive differs run to run even for identical payloads.
 if tar --version 2>/dev/null | grep -q 'GNU tar'; then
   tar --numeric-owner --owner=0 --group=0 --mtime='@0' \
-      -czf "${BASENAME}.tar.gz" -C "$STAGING" seal
+      -czf "${BASENAME}.tar.gz" -C "$STAGING" .
 else
-  # bsdtar (macOS) has no --mtime/--owner, and stamps each file's real mtime,
-  # so the same binary produces a different archive every run. Pin the mtime
-  # on the file itself instead; SOURCE_DATE_EPOCH is the conventional epoch and
-  # COPYFILE_DISABLE stops bsdtar adding AppleDouble ._ entries.
-  #
-  # `gzip -n` is what actually makes the output stable: without -n, gzip
-  # records its own creation timestamp in the header (bytes 4-7), so the
-  # archive differs run to run even when the tar payload is byte-identical.
-  touch -t 198001010000 "$STAGING/seal"
-  chmod 0755 "$STAGING/seal"
-  ( cd "$STAGING" && COPYFILE_DISABLE=1 tar -cf - seal | gzip -n ) > "${BASENAME}.tar.gz"
+  ( cd "$STAGING" && COPYFILE_DISABLE=1 tar -cf - . | gzip -n ) > "${BASENAME}.tar.gz"
 fi
 
 sha256sum "${BASENAME}.tar.gz" > "${BASENAME}.tar.gz.sha256" 2>/dev/null \

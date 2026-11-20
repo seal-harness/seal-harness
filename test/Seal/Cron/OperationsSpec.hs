@@ -1,8 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Cron.OperationsSpec (spec) where
 
+import Control.Exception (bracket)
 import Data.Text qualified as T
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
+import System.Environment (lookupEnv, setEnv, unsetEnv)
 import Test.Hspec
 
 import Seal.Cron.Types
@@ -19,6 +21,15 @@ spec = do
       let tz = case mkCronTimeZone "America/New_York" of Right t -> t; Left _ -> error "unreachable"
       r <- validateCronTimeZone tz
       r `shouldBe` Right ()
+
+    it "falls back to the embedded tz database when TZDIR is missing" $ do
+      let tz = case mkCronTimeZone "America/New_York" of Right t -> t; Left _ -> error "unreachable"
+      bracket
+        (do prev <- lookupEnv "TZDIR"
+            setEnv "TZDIR" "/nonexistent/seal-test-tzdir"
+            pure prev)
+        (maybe (unsetEnv "TZDIR") (setEnv "TZDIR"))
+        (\_ -> validateCronTimeZone tz `shouldReturn` Right ())
 
     it "rejects a format-valid-but-nonexistent timezone" $ do
       let tz = case mkCronTimeZone "Not/AZone" of Right t -> t; Left _ -> error "unreachable"
