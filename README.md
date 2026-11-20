@@ -229,8 +229,7 @@ Pre-built binaries are available on the
 ```bash
 # Linux (x86_64)
 curl -L https://github.com/seal-harness/seal-harness/releases/download/v0.1.0/seal-0.1.0-x86_64-linux.tar.gz | tar xz
-chmod +x seal
-./seal --help
+./bin/seal --help
 ```
 
 Pre-releases (tags like `beta-0`, `alpha-1`, `rc-0.1.0`) are published on the
@@ -242,15 +241,32 @@ without the leading keyword, e.g. `seal-0-x86_64-linux.tar.gz` for `beta-0`.
 ```bash
 # Linux (x86_64)
 curl -L https://github.com/seal-harness/seal-harness/releases/download/latest/seal-x86_64-linux.tar.gz | tar xz
-chmod +x seal
-./seal --help
+./bin/seal --help
 ```
 
 Verify download integrity with the SHA256 checksums provided alongside
 each release asset.
 
-The tarball contains a single self-contained `seal` binary: the web UI is
-compiled in, so `seal serve` needs no static files and no config.
+The tarball is self-contained — no Nix and no other installs required. It
+extracts to `bin/seal`. On macOS it is accompanied by the `bin/dylibs/` shared
+libraries it loads from beside itself; keep the `bin/` tree together — if you
+move the binary, move the whole tree. The web UI is compiled into the binary,
+so `seal serve` needs no static files and no configuration.
+
+**Linux is not yet store-free.** The Linux artifact is a normal dynamically
+linked build and still expects to run on a machine with Nix; a static musl
+build is a known gap. Only the macOS artifact is verified portable — that is
+what `scripts/check-portability.sh` enforces in CI, and it is enforced on
+macOS alone.
+
+**macOS Gatekeeper.** Release binaries are not yet signed with an Apple
+Developer ID, so a freshly downloaded `seal` is quarantined and macOS reports
+"Apple could not verify…". Clear the flag once:
+
+```bash
+xattr -dr com.apple.quarantine bin/
+./bin/seal --help
+```
 
 #### Build from source
 

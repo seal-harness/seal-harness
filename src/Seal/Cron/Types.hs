@@ -21,6 +21,7 @@ module Seal.Cron.Types
 
 import Data.Aeson
   ( FromJSON (..), ToJSON (..), object, withObject, (.:), (.:?), (.=) )
+import qualified Data.ByteString.Char8 as BS
 import Data.Char (isAlphaNum, isAscii, isAsciiLower, isDigit, toLower)
 import Data.List.NonEmpty (NonEmpty, toList)
 import Data.Maybe (fromMaybe)
@@ -35,7 +36,8 @@ import GHC.Generics (Generic)
 import System.Cron.Parser (parseCronSchedule)
 import System.Cron.Types (CronSchedule)
 import System.Cron.Internal.Check (Expanded (..), expand)
-import Data.Time.Zones (loadTZFromDB, utcToLocalTimeTZ, localTimeToUTCTZ)
+import Data.Time.Zones (TZ, loadSystemTZ, utcToLocalTimeTZ, localTimeToUTCTZ)
+import qualified Data.Time.Zones.All as ZonesAll
 
 -- ---------------------------------------------------------------------------
 -- CronJobId
@@ -128,7 +130,7 @@ mkCronTimeZone t
 -- can never enter the store and kill the scheduler thread.
 validateCronTimeZone :: CronTimeZone -> IO (Either Text ())
 validateCronTimeZone tz = do
-  eEx <- try (loadTZFromDB (T.unpack (cronTimeZoneText tz)))
+  eEx <- loadCronTZ tz
   pure $ case eEx of
     Left (_ :: SomeException) -> Left ("timezone not found in tz database: " <> cronTimeZoneText tz)
     Right _ -> Right ()
@@ -143,6 +145,20 @@ isValidTzComponent = T.all (\c -> isAscii c && (isAlphaNum c || c == '_' || c ==
 
 cronTimeZoneText :: CronTimeZone -> Text
 cronTimeZoneText = unCronTimeZone
+
+-- | Load a zone from the host tz database, falling back to the database
+-- embedded in @tzdata@. The fallback keeps static release binaries portable:
+-- 'loadTZFromDB' resolves to a build-time Nix store data path that does not
+-- exist on a machine without Nix.
+loadCronTZ :: CronTimeZone -> IO (Either SomeException TZ)
+loadCronTZ zone = do
+  let name = T.unpack (cronTimeZoneText zone)
+  eSystem <- try (loadSystemTZ name)
+  pure $ case eSystem of
+    Right loaded -> Right loaded
+    Left err -> case ZonesAll.tzByName (BS.pack name) of
+      Just loaded -> Right loaded
+      Nothing -> Left err
 
 instance FromJSON CronTimeZone where
   parseJSON v = do
@@ -342,7 +358,7 @@ nextFireUTC sched refTime =
 -- | Compute next fire with timezone awareness.
 nextFireTZ :: CronSchedule -> CronTimeZone -> UTCTime -> IO (Maybe UTCTime)
 nextFireTZ sched tz refTime = do
-  eLoaded <- try (loadTZFromDB (T.unpack (cronTimeZoneText tz)))
+  eLoaded <- loadCronTZ tz
   case eLoaded of
     Left (_ :: SomeException) -> pure Nothing
     Right loadedTz -> do
