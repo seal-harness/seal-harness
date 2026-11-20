@@ -687,6 +687,23 @@ spec = describe "Seal.Tools.Exec.FileExplorer" $ do
       recorded <- readIORef calls
       length recorded `shouldBe` 1
 
+    it "emits a portable BSD stat fallback (single -f format)" $ do
+      calls <- newIORef []
+      runner <- scriptedRunner calls [Right "12345 1700000000"]
+      fe <- mkRemoteFileExplorer sshCfg runner 1048576 1048576
+      _ <- feStatFile fe "/test/file.bin"
+      recorded <- readIORef calls
+      case recorded of
+        (cmd : _) -> do
+          -- GNU coreutils form first.
+          "stat -c '%s %Y' -- \"$p\"" `T.isInfixOf` cmd `shouldBe` True
+          -- BSD/macOS form: ONE -f format. `stat -f%z -f%m` is invalid on
+          -- BSD ("can't use format 'f' with 'f'") and exits 1, which broke
+          -- every remote inline image preview (it stats before reading).
+          "stat -f '%z %m' -- \"$p\"" `T.isInfixOf` cmd `shouldBe` True
+          "-f%z -f%m" `T.isInfixOf` cmd `shouldBe` False
+        [] -> expectationFailure "expected a recorded command"
+
   describe "feReadRange (remote)" $ do
     it "reads a chunk via dd through runRemoteStream" $ do
       calls <- newIORef []

@@ -777,15 +777,17 @@ remoteReadCmd path ceilingBytes =
 -- | Build the remote stat command. The path is 'shellQuote'-d and
 -- assigned to a shell variable, then @stat -c '%s %Y' -- "$p"@ emits
 -- size and mtime (epoch seconds) on one line. Error sentinels
--- distinguish missing paths from directories. The @stat -f%z -f%m@
--- fallback covers BSD/macOS.
+-- distinguish missing paths from directories. The @stat -f '%z %m'@
+-- fallback covers BSD/macOS, whose @stat@ rejects @-c@ and whose format
+-- language uses @%z@ (size) and @%m@ (mtime). One @-f@ format string
+-- only: @stat -f%z -f%m@ fails with "can't use format 'f' with 'f'".
 remoteStatCmd :: FilePath -> Text
 remoteStatCmd path =
   T.pack $ unwords
     [ "p=" <> shellQuote path <> ";"
     , "if [ ! -e \"$p\" ]; then echo \"" <> T.unpack notFoundMarker <> "\";"
     , "elif [ -d \"$p\" ]; then echo \"" <> T.unpack isDirMarker <> "\";"
-    , "else stat -c '%s %Y' -- \"$p\" 2>/dev/null || stat -f%z -f%m -- \"$p\" 2>/dev/null;"
+    , "else stat -c '%s %Y' -- \"$p\" 2>/dev/null || stat -f '%z %m' -- \"$p\" 2>/dev/null;"
     , "fi"
     ]
 
