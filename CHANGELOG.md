@@ -38,6 +38,13 @@
   their conversation line whenever reconstruction started mid-transcript, which
   full reads (always starting at 0) never exposed.
 
+* **Linux x86_64 release binaries are fully static.** The `x86_64-linux`
+  artifact is now a static musl ELF with no dynamic loader and no embedded
+  `/nix/store` paths, so it runs on a machine without Nix. The portability check
+  now fails on a dynamically linked Linux artifact instead of warning, and
+  `make static` builds and verifies it directly. macOS continues to ship the
+  bundled-dylib tree.
+
 * **The enrollment link now works, and `enroll` prints it.** Two changes to the
   first-run enrollment journey, both reported from real use.
 
