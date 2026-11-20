@@ -117,6 +117,7 @@ function processEntry(e: TranscriptEntry, ctx: ProcessContext): Message[] {
         messages.push({
           id: e.id + '-skillload',
           entryId: e.id,
+          convLen: e.convLen ?? undefined,
           agentName: channel ? `Skill · ${channel}` : 'Skill',
           agentStatus: 'completed',
           timestamp: ts,
@@ -155,6 +156,7 @@ function processEntry(e: TranscriptEntry, ctx: ProcessContext): Message[] {
         messages.push({
           id: e.id + '-setuprepo',
           entryId: e.id,
+          convLen: e.convLen ?? undefined,
           agentName: channel ? `Repo · ${channel}` : 'Repo',
           agentStatus: status === 'failed' ? 'idle' : 'completed',
           timestamp: ts,
@@ -225,6 +227,7 @@ function processEntry(e: TranscriptEntry, ctx: ProcessContext): Message[] {
             messages.push({
               id: e.id + '-user',
               entryId: e.id,
+              convLen: e.convLen ?? undefined,
               agentName: e.channel
                 ? (e.userId ? `You · ${e.channel}:${e.userId}` : `You · ${e.channel}`)
                 : 'You',
@@ -245,6 +248,7 @@ function processEntry(e: TranscriptEntry, ctx: ProcessContext): Message[] {
             messages.push({
               id: e.id + '-asst',
               entryId: e.id,
+              convLen: e.convLen ?? undefined,
               agentName: e.model ?? 'Assistant',
               agentStatus: 'completed',
               timestamp: ts,
@@ -294,6 +298,7 @@ function processEntry(e: TranscriptEntry, ctx: ProcessContext): Message[] {
       messages.push({
         id: e.id,
         entryId: e.id,
+        convLen: e.convLen ?? undefined,
         agentName: e.model ?? e.harness ?? 'Assistant',
         agentStatus: 'completed',
         timestamp: ts,

@@ -74,6 +74,7 @@ mkHarnessTe payload = TranscriptEntry
   , tePayload = payload
   , teDurationMs = Nothing
   , teCorrelation = Nothing
+  , teConvLen = Nothing
   , teMeta = Map.empty
   }
 
@@ -158,6 +159,32 @@ getTopField _ _ = Nothing
 
 spec :: Spec
 spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
+  -- The branch anchor must reach the WIRE. These three render paths each
+  -- hand-build the frontend JSON object field-by-field (they do not
+  -- serialize TranscriptEntry), so adding the field to the record alone
+  -- leaves it off the wire: the branch button then renders nowhere, and
+  -- the failure is invisible to tests that only inspect TranscriptEntry.
+  describe "branch anchor (convLen) on the wire" $ do
+    it "reconEntryToFrontend emits convLen from teConvLen" $ do
+      let te = (mkHarnessTe skillLoadPayload) { teConvLen = Just 7 }
+      case reconEntryToFrontend 0 te of
+        Nothing -> expectationFailure "expected Just"
+        Just v  -> getTopField "convLen" v `shouldBe` Just (Number 7)
+
+    it "reconEntryToFrontend emits null convLen when the entry has no anchor" $ do
+      let te = (mkHarnessTe skillLoadPayload) { teConvLen = Nothing }
+      case reconEntryToFrontend 0 te of
+        Nothing -> expectationFailure "expected Just"
+        Just v  -> getTopField "convLen" v `shouldBe` Just Null
+
+    it "convLineToFrontend emits convLen = lineIndex + 1" $ do
+      let rawLine = A.object
+            [ "role"    .= ("user" :: String)
+            , "content" .= ([] :: [A.Value])
+            ]
+      getTopField "convLen" (convLineToFrontend "llama3" [] "ts" 4 rawLine)
+        `shouldBe` Just (Number 5)
+
   describe "userId in frontend entries" $ do
     it "reconEntryToFrontend emits teMeta.userId and teMeta.channel" $ do
       let te = (mkHarnessTe skillLoadPayload)
@@ -270,6 +297,7 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
               ]
           , teDurationMs = Nothing
           , teCorrelation = Nothing
+          , teConvLen = Nothing
           , teMeta = Map.empty
           }
         frontendField k val = case val of
@@ -360,6 +388,7 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
               ]
           , teDurationMs = Nothing
           , teCorrelation = Nothing
+          , teConvLen = Nothing
           , teMeta = Map.empty
           }
         -- Look up the "tools" array inside a frontend payload object.
