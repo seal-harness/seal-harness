@@ -25,15 +25,22 @@ interface NewTabComposerProps {
    *  createTab response). */
   onSubmit: (res: NewTabResponse | null) => void
   onCancel: () => void
-  /** When branching, pre-fills the `branch_from` field and locks the kind to
-   *  provider (branching creates a provider session seeded from an existing
-   *  transcript entry). Undefined for the plain new-tab flow. */
-  branchFrom?: string
+  /** The PARENT SESSION id when branching. Undefined for the plain
+   *  new-tab flow. This must be a session id, never a transcript row id:
+   *  the backend copies `branch_conv_len` conversation lines out of this
+   *  session, and a row index is not a session. */
+  branchParentSid?: string
+  /** The conversation length to inherit from `branchParentSid` — the
+   *  number of `conversation.jsonl` lines the child starts with. */
+  branchConvLen?: number
 }
 
 // ── Component ─────────────────────────────────────────────────────────
 
-export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabComposerProps) {
+export function NewTabComposer({
+  spec, onSubmit, onCancel, branchParentSid, branchConvLen,
+}: NewTabComposerProps) {
+  const branchFrom = branchParentSid !== undefined
   // Only configured providers are selectable. Unconfigured types stay hidden:
   // they belong in the Providers screen, not in a "start a new tab" picker.
   // `configured` absent => configured (back-compat with older test mocks).
@@ -66,7 +73,10 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
       return
     }
     const body = spec.buildBody()
-    if (branchFrom) body.branch_from = branchFrom
+    if (branchParentSid !== undefined && branchConvLen !== undefined) {
+      body.branch_from = branchParentSid
+      body.branch_conv_len = branchConvLen
+    }
     const res = await createTab(body)
     if (res) {
       // If the user entered a repo URL and the new tab has a session id
@@ -216,11 +226,23 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
               <input
                 id="provider-branch-from"
                 type="text"
-                value={branchFrom}
+                value={branchParentSid}
                 readOnly
                 style={{ ...inputStyle, opacity: 0.6, cursor: 'not-allowed' }}
               />
             </Row>
+          )}
+
+          {branchFrom && (
+            <div
+              data-testid="branch-mode-note"
+              style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.4 }}
+            >
+              Inherits {branchConvLen ?? 0} message{branchConvLen === 1 ? '' : 's'} of
+              history, up to the row you picked. The new session starts with an
+              <strong> empty workdir</strong> — files are not carried over. Paste a
+              repo URL above if you want to clone one before the first turn.
+            </div>
           )}
         </div>
       )}

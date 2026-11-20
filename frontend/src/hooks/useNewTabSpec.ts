@@ -93,7 +93,20 @@ export interface NewTabSpec {
   persistOnSubmit: () => void
 }
 
-export function useNewTabSpec(): NewTabSpec {
+export function useNewTabSpec(
+  /** Branch mode — a LIVE flag, not a mount-time option. A branched session
+   *  must start with an EMPTY workdir, so a branch submit must never record
+   *  the repo; otherwise the next ordinary "new tab" would restore it and
+   *  auto-clone into an unrelated session (NewTabComposer dispatches
+   *  SETUP_REPO for any non-empty repo).
+   *
+   *  This is read through a ref because the hook instance is created once at
+   *  App mount and shared by every composer opening: a mount-time argument
+   *  could never change when the user clicks "branch from here". */
+  opts?: { branchModeRef?: { readonly current: boolean } },
+): NewTabSpec {
+  const branchModeRef = opts?.branchModeRef
+  const inBranchMode = (): boolean => branchModeRef?.current === true
   // Kind
   const [kind, setKind] = useState<NewTabKind>('provider')
 
@@ -174,7 +187,9 @@ export function useNewTabSpec(): NewTabSpec {
       if (opts.attachSession) setAttachSession(opts.attachSession)
       if (opts.attachWindow) setAttachWindow(opts.attachWindow)
       if (opts.attachManual) setAttachManual(true)
-      if (opts.repo) setRepo(opts.repo)
+      // Branch mode: never restore a last-used repo. The branch's workdir
+      // must start empty, and this box is what triggers SETUP_REPO.
+      if (opts.repo && !inBranchMode()) setRepo(opts.repo)
       // Provider + model: stage the model so the model-fetch effect (which
       // fires when the restored provider lands) honors it instead of the
       // configured default. The fetch effect clears the ref once consumed.
@@ -321,7 +336,9 @@ export function useNewTabSpec(): NewTabSpec {
       attachSession,
       attachWindow,
       attachManual,
-      repo: repo.trim(),
+      // Branch mode must not rewrite the remembered repo, or the parent's
+      // URL would leak into the next ordinary new-tab form.
+      repo: inBranchMode() ? '' : repo.trim(),
     }
     void putUiState(opts)
     if (isCustomModel) {

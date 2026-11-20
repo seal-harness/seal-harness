@@ -34,6 +34,7 @@ mkEntry = do
     , tePayload = object ["x" .= (1 :: Int)]
     , teDurationMs = Nothing
     , teCorrelation = Nothing
+    , teConvLen = Nothing
     , teMeta = Map.empty
     }
 

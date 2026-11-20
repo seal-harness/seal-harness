@@ -75,7 +75,11 @@ Seal Harness treats every agent session as a first-class, persistent object
 - **Session transcript is the source of truth.** Web frontend renders the
   transcript directly with full fidelity — every message, tool call, skill
   load, and permission prompt, with channel attribution, timestamps, raw JSON
-  inspection, and branching from any point. This is where you do deep work.
+  inspection, and branching from any point. A branch inherits the transcript
+  up to the row you pick and starts with an **empty workdir** — files are not
+  carried over, because a past workdir state cannot be reconstructed. Paste a
+  repo URL in the composer if you want to clone one before the first turn.
+  This is where you do deep work.
 - **Manage multiple in-flight tasks.** Easily juggle multiple tasks even with
   append-only chat interfaces. Get notified when tasks are waiting on you, and
   direct them from your phone wherever you are.
@@ -109,7 +113,8 @@ decisions.
 directly — every message, tool call, skill load, and permission prompt with
 full fidelity: channel attribution, timestamps, raw JSON inspection,
 collapsible structured views. Nothing is summarized behind the scenes. Branch
-from any point and you branch from the real record.
+from any point and you branch from the real record: the new session inherits
+the transcript up to that row, and nothing else (its workdir starts empty).
 
 **Agents can't tamper with the logs.** Prevent agents from tampering with your
 audit trail and rest easy knowing that you have full visibily into the workings
@@ -248,11 +253,10 @@ libraries it loads from beside itself; keep the `bin/` tree together — if you
 move the binary, move the whole tree. The web UI is compiled into the binary,
 so `seal serve` needs no static files and no configuration.
 
-**Linux is not yet store-free.** The Linux artifact is a normal dynamically
-linked build and still expects to run on a machine with Nix; a static musl
-build is a known gap. Only the macOS artifact is verified portable — that is
-what `scripts/check-portability.sh` enforces in CI, and it is enforced on
-macOS alone.
+**Linux (x86_64) is a fully static musl binary.** It has no dynamic loader and
+embeds no `/nix/store` paths, so it runs on any recent x86_64 Linux without Nix.
+`scripts/check-portability.sh` enforces this in CI: a dynamically linked Linux
+artifact, or one carrying an embedded store path, fails the build.
 
 **macOS Gatekeeper.** Release binaries are not yet signed with an Apple
 Developer ID, so a freshly downloaded `seal` is quarantined and macOS reports

@@ -834,6 +834,10 @@ body {
   background: transparent;
   border: 1px solid transparent;
   color: var(--text-muted);
+  /* The workdir control is an <a> (so its URL is visible in the status bar and
+     it can open in a new tab) while its neighbours are <button>s. Both must
+     look identical, so the anchor never picks up an underline. */
+  text-decoration: none;
   cursor: pointer;
   transition: background var(--duration-fast) ease,
               color var(--duration-fast) ease,
@@ -850,7 +854,8 @@ body {
   box-shadow: 0 0 0 2px var(--bg-base), 0 0 0 4px rgba(124, 108, 246, 0.4);
 }
 .header-scroll-btn svg { display: block; }
-.header-scroll-btn:disabled { opacity: 0.5; cursor: default; }
+.header-scroll-btn:disabled,
+.header-scroll-btn[aria-disabled='true'] { opacity: 0.5; cursor: default; }
 .header-scroll-btn svg.spin {
   animation: btn-spin 0.8s linear infinite;
 }

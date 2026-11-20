@@ -954,6 +954,7 @@ describe('ChatArea', () => {
       {
         id: 'm1',
         entryId: 'e1',
+        convLen: 5,
         agentName: 'You',
         agentStatus: 'completed',
         timestamp: '2024-06-01 12:00:00',
@@ -970,7 +971,35 @@ describe('ChatArea', () => {
     )
     const branchBtn = screen.getByLabelText('branch session from here')
     fireEvent.click(branchBtn)
-    expect(onBranch).toHaveBeenCalledWith('e1')
+    // The callback carries the CONVERSATION ANCHOR, never the row's entryId:
+    // the entry id is a render index, and the backend needs a position in
+    // conversation.jsonl.
+    expect(onBranch).toHaveBeenCalledWith(5)
+  })
+
+  it('renders NO branch button on a row without convLen (no anchor)', () => {
+    const onBranch = vi.fn()
+    const messages: Message[] = [
+      {
+        id: 'm1',
+        entryId: 'e1',
+        // convLen deliberately absent: legacy transcript rows, or
+        // synthesized rows with no conversation position.
+        agentName: 'You',
+        agentStatus: 'completed',
+        timestamp: '2024-06-01 12:00:00',
+        blocks: [{ id: 'b1', text: 'cannot branch here' }],
+        rawJson: '{}',
+      },
+    ]
+    render(
+      <ChatArea
+        selectedAgent={makeAgent()}
+        messages={messages}
+        onBranch={onBranch}
+      />,
+    )
+    expect(screen.queryByLabelText('branch session from here')).toBeNull()
   })
 
   it('raw JSON modal toggles open/closed', () => {
@@ -1137,45 +1166,104 @@ describe('ChatArea', () => {
     expect(dots.length).toBe(3)
   })
 
-  it('OpenWorkdirButton: clicking fetches the workdir path and navigates to /files', async () => {
-    // Stub fetch so /api/sessions/:id/workdir returns a fake path.
-    const origFetch = global.fetch
-    const fetchMock = vi.fn(async (url: string) => {
-      if (typeof url === 'string' && url.includes('/workdir')) {
-        return { ok: true, json: async () => ({ path: '/home/user/.seal/cache/workdirs/s1' }) } as Response
-      }
- return { ok: true, json: async () => null } as Response
-    })
-    global.fetch = fetchMock as unknown as typeof global.fetch
+  describe('OpenWorkdirLink', () => {
+    const WORKDIR = '/home/user/.seal/cache/workdirs/s1'
 
-    // Stub history.pushState + popstate dispatch so the navigation is observable.
-    const origPushState = window.history.pushState
-    let pushedUrl = ''
-    window.history.pushState = vi.fn((..._args: unknown[]) => { pushedUrl = '/files?path=%2Fhome%2Fuser%2F.seal%2Fcache%2Fworkdirs%2Fs1' }) as unknown as typeof window.history.pushState
-    const dispatchSpy = vi.spyOn(window, 'dispatchEvent')
+    /** Stub /api/sessions/:id/workdir to answer with `path` (or 404 when
+     *  `path` is null), and restore on the way out. */
+    function stubWorkdirFetch(path: string | null) {
+      const origFetch = global.fetch
+      global.fetch = vi.fn(async (url: string) => (
+        typeof url === 'string' && url.includes('/workdir')
+          ? { ok: path !== null, json: async () => (path === null ? null : { path }) } as Response
+          : { ok: true, json: async () => null } as Response
+      )) as unknown as typeof global.fetch
+      return () => { global.fetch = origFetch }
+    }
 
-    try {
-      const session = makeSession({ id: 's1' })
+    /** Render a ChatArea with one user message so the transcript header (which
+     *  carries the workdir control) is present. */
+    function renderWithSession() {
       const messages: Message[] = [
         { id: 'm1', agentName: 'You', agentStatus: 'completed', timestamp: '2024-06-01 12:00:00', blocks: [{ id: 'b1', text: 'hi' }] },
       ]
-      render(
+      return render(
         <ChatArea
           selectedAgent={makeAgent()}
-          selectedSession={session}
+          selectedSession={makeSession({ id: 's1' })}
           messages={messages}
         />,
       )
-      const btn = screen.getByLabelText('Open session workdir in Files')
-      await act(async () => { fireEvent.click(btn) })
-      expect(pushedUrl).toContain('/files')
-      expect(pushedUrl).toContain('path=')
-      expect(dispatchSpy).toHaveBeenCalled()
-    } finally {
-      global.fetch = origFetch
-      window.history.pushState = origPushState
-      dispatchSpy.mockRestore()
     }
+
+    it('renders an <a> whose href targets the workdir in Files, opened in a new tab', async () => {
+      const restore = stubWorkdirFetch(WORKDIR)
+      // A real anchor with target=_blank is what gives the browser a URL to
+      // show; the SPA must NOT navigate the current tab.
+      const pushSpy = vi.spyOn(window.history, 'pushState')
+      try {
+        renderWithSession()
+        const link = await screen.findByLabelText('Open session workdir in Files')
+        expect(link.tagName).toBe('A')
+        const href = link.getAttribute('href') ?? ''
+        expect(href.startsWith('/files?path=')).toBe(true)
+        expect(href).toContain(encodeURIComponent(WORKDIR))
+        expect(link.getAttribute('target')).toBe('_blank')
+        expect(link.getAttribute('rel')).toContain('noopener')
+        expect(link.getAttribute('rel')).toContain('noreferrer')
+        // The current tab keeps its URL: the new tab does the navigating.
+        expect(pushSpy).not.toHaveBeenCalled()
+      } finally {
+        pushSpy.mockRestore()
+        restore()
+      }
+    })
+
+    it('has no href when the workdir cannot be resolved', async () => {
+      const restore = stubWorkdirFetch(null)
+      try {
+        renderWithSession()
+        // An unresolvable workdir leaves the control href-less, so there is no
+        // stale/blank URL to preview and nothing to open.
+        const link = await screen.findByLabelText('Could not resolve workdir')
+        expect(link.tagName).toBe('A')
+        expect(link.getAttribute('href')).toBeNull()
+      } finally {
+        restore()
+      }
+    })
+
+    it('resolves the workdir for the selected session only', async () => {
+      const restore = stubWorkdirFetch(WORKDIR)
+      try {
+        const { rerender } = renderWithSession()
+        const link = await screen.findByLabelText('Open session workdir in Files')
+        expect(link.getAttribute('href')).toContain(encodeURIComponent(WORKDIR))
+
+        // Switching sessions must not leave the previous session's href in
+        // place: the link would open the wrong directory.
+        global.fetch = vi.fn(async (url: string) => (
+          typeof url === 'string' && url.includes('/workdir')
+            ? { ok: true, json: async () => ({ path: '/home/user/.seal/cache/workdirs/s2' }) } as Response
+            : { ok: true, json: async () => null } as Response
+        )) as unknown as typeof global.fetch
+        rerender(
+          <ChatArea
+            selectedAgent={makeAgent()}
+            selectedSession={makeSession({ id: 's2' })}
+            messages={[
+              { id: 'm1', agentName: 'You', agentStatus: 'completed', timestamp: '2024-06-01 12:00:00', blocks: [{ id: 'b1', text: 'hi' }] },
+            ]}
+          />,
+        )
+        await waitFor(() => {
+          const href = screen.getByLabelText('Open session workdir in Files').getAttribute('href') ?? ''
+          expect(href).toContain(encodeURIComponent('/home/user/.seal/cache/workdirs/s2'))
+        })
+      } finally {
+        restore()
+      }
+    })
   })
 
   it('renders the BottomBar with the supplied token stats', () => {

@@ -543,6 +543,10 @@ export interface TranscriptEntry {
   payload: Record<string, unknown> | string
   harness: string | null
   model: string | null
+  /** The conversation length AFTER this entry's messages — the branch
+   *  anchor, rendered onto the derived `Message`. Null on legacy
+   *  `transcript.jsonl` rows, which carry no trustworthy position. */
+  convLen?: number | null
   /** The originating communications-channel label of this entry (e.g.
    *  "telegram", "web", "cli"), or null when the entry carries no channel
    *  (response entries, CLI TUI turns with no MessageSource, the
@@ -700,6 +704,14 @@ export interface Message {
    *  on branchable rows (user + assistant); absent on synthesized rows
    *  (e.g. the System prompt row). Used as the branch boundary key. */
   entryId?: string
+  /** The conversation length AFTER this row — the branch anchor. The
+   *  backend copies this many `conversation.jsonl` lines into a branched
+   *  session. Undefined means "no anchor": the row cannot be branched from
+   *  (legacy `transcript.jsonl` rows, and synthesized rows that have no
+   *  conversation position). The branch button is gated on this field
+   *  rather than `entryId`, because `entryId` is a render index while this
+   *  is a real position in the conversation file. */
+  convLen?: number
   agentName: string
   agentStatus: AgentStatus
   timestamp: string

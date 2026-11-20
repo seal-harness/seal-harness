@@ -102,6 +102,9 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
 function makeEntry(overrides: Partial<TranscriptEntry> = {}): TranscriptEntry {
   return {
     id: 'e1',
+    // The branch anchor: a real position in conversation.jsonl. Without it
+    // the row offers no branch button (entryId is only a render index).
+    convLen: 1,
     timestamp: '2024-06-01T12:00:00Z',
     direction: 'request',
     payload: JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }),

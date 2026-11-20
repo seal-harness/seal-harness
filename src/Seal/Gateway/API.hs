@@ -150,6 +150,7 @@ import Seal.Security.Vault (VaultHandle (vhDelete, vhGet, vhList, vhPut))
 import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound, VaultLocked))
 import Seal.Security.Crypto (sha256Hash)
 import Seal.Vault.Commands (VaultRuntime (vrHandleRef))
+import Seal.Session.Branch (branchSession)
 import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection, listArchivedSessions
   , listSessions, newSession, newSessionMeta, resolveDefaultAgent
@@ -1290,18 +1291,42 @@ handleTabNew deps v =
       -- on disk — otherwise the orphaned session would surface in Recent
       -- Sessions with no tab to back it. newSessionMeta mints the id
       -- without touching disk; saveSessionMeta writes the atomically.
+      --
+      -- Branching (see Seal.Session.Branch) rides on THIS arm: three
+      -- cases, distinguished by the two optional branch fields.
       let paths = srPaths (adSessionRuntime deps)
           (provider, model) = parseProviderModel v
           mAgent = parseAgentField v
-      meta <- newSessionMeta paths provider model "web" mAgent
-      let sid = smId meta
-      res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
-      case res of
-        Left e   -> pure (errJson status400 e)
-        Right _  -> do
-          saveSessionMeta paths meta
-          triggerBroadcast deps
-          pure (tabInsertResponse res (Just sid) "session:provider")
+          mBranchFrom = parseBranchFrom v
+          mBranchLen  = parseBranchConvLen v
+      case (mBranchFrom, mBranchLen) of
+        -- A client that sends branch_from IS branching. Silently handing
+        -- it an empty session is the exact bug this feature fixes, so a
+        -- missing anchor is a loud error — reachable from a stale cached
+        -- bundle, since a render index like "12" is a valid SessionId.
+        (Just _, Nothing) ->
+          pure (errJson status400
+                 "branch_from requires branch_conv_len (the conversation \
+                 \length to inherit from the parent session)")
+        (Nothing, _) -> plainProviderSession deps paths provider model mAgent
+        (Just parentSid, Just n) -> do
+          parentExists <- doesFileExist (sessionMetaPath paths parentSid)
+          if not parentExists
+            then pure (errJson status404 "session not found")
+            else do
+              meta <- newSessionMeta paths provider model "web" mAgent
+              let sid = smId meta
+              eSeed <- branchSession paths parentSid sid n
+              case eSeed of
+                Left err -> pure (errJson status400 err)
+                Right () -> do
+                  res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
+                  case res of
+                    Left e -> pure (errJson status400 e)
+                    Right _ -> do
+                      saveSessionMeta paths meta
+                      triggerBroadcast deps
+                      pure (tabInsertResponse res (Just sid) "session:provider")
     Just "harness" -> do
       hid <- newHarnessId
       let label = parseHarnessLabel v
@@ -1327,6 +1352,41 @@ handleTabNew deps v =
                 pure (tabInsertResponse res (Just sid) "session:provider")
 
     Just _ -> pure (errJson status400 "unknown 'kind' field")
+
+-- | The non-branching provider path, extracted so the branch cases above
+-- stay readable. Mints, inserts the tab, then persists — the original
+-- ordering, unchanged.
+plainProviderSession
+  :: ApiDeps -> SealPaths -> Text -> Text -> Maybe AgentDefId -> IO Response
+plainProviderSession deps paths provider model mAgent = do
+  meta <- newSessionMeta paths provider model "web" mAgent
+  let sid = smId meta
+  res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
+  case res of
+    Left e   -> pure (errJson status400 e)
+    Right _  -> do
+      saveSessionMeta paths meta
+      triggerBroadcast deps
+      pure (tabInsertResponse res (Just sid) "session:provider")
+
+-- | Parse the optional @branch_from@ field (a PARENT SESSION id).
+parseBranchFrom :: A.Value -> Maybe SessionId
+parseBranchFrom v = case v of
+  A.Object o -> case KeyMap.lookup (Key.fromText "branch_from") o of
+    Just (A.String t) -> either (const Nothing) Just (mkSessionId (T.strip t))
+    _                 -> Nothing
+  _ -> Nothing
+
+-- | Parse the optional @branch_conv_len@ field: a non-negative
+-- conversation length. Absent, non-numeric, or negative ⇒ 'Nothing'.
+parseBranchConvLen :: A.Value -> Maybe Int
+parseBranchConvLen v = case v of
+  A.Object o -> case KeyMap.lookup (Key.fromText "branch_conv_len") o of
+    Just (A.Number n) ->
+      let i = round n :: Int
+      in if i >= 0 then Just i else Nothing
+    _ -> Nothing
+  _ -> Nothing
 
 -- | Parse the @session_id@ field of a @POST /api/tabs/new {kind:"resume"}@ body.
 parseResumeSessionId :: A.Value -> Maybe SessionId
