@@ -110,7 +110,7 @@ import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastAgentDefsChanged
 import Seal.Gateway.ProviderIcon
   ( IconCache, IconResult (..), resolveProviderIconBytes, newIconCache )
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
-import Seal.Gateway.MediaType (InlineMediaType (..), inlineMediaTypeFor)
+import Seal.Gateway.MediaType (InlineMediaType (..), inlineMediaTypeFor, svgHardeningCsp)
 import Seal.Gateway.SessionJson
   ( sessionInfoJsonWithSnippet, tabToJson )
 import Seal.Gateway.Stream (StreamHealth (..), streamHealthMessage, streamHealthStatus)
@@ -2822,13 +2822,23 @@ serveInline deps path mt = do
         Left err -> pure (fileExplorerErrResponse err)
         Right bs -> do
           let basename = takeFileName path
-              hdrs =
+              baseHdrs =
                 [ (mkHN "Content-Type", TE.encodeUtf8 (imtContentType mt))
                 , (mkHN "Content-Disposition", BC.pack ("inline; filename=\"" <> basename <> "\""))
                 , (mkHN "X-Content-Type-Options", "nosniff")
                 , (mkHN "Cache-Control", "no-store")
                 , (mkHN "Content-Length", BC.pack (show (BS.length bs)))
                 ]
+              -- SVG is a scriptable DOCUMENT, and this URL is fetchable
+              -- directly as well as via <img>. Navigating to it loads the
+              -- file as a document in this passkey-authenticated origin,
+              -- where its script would run. The CSP neutralises that path
+              -- without affecting <img> rendering. Omitting it for SVG
+              -- would be a stored-XSS vector.
+              hdrs
+                | imtNeedsSvgCsp mt =
+                    (mkHN "Content-Security-Policy", TE.encodeUtf8 svgHardeningCsp) : baseHdrs
+                | otherwise = baseHdrs
           pure (responseLBS status200 hdrs (BL.fromStrict bs))
 
 -- | Handle GET /api/files/stat — file metadata (size + mtime) for the

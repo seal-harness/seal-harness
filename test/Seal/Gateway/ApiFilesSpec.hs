@@ -15,6 +15,7 @@ import Data.IORef (newIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Data.Maybe (fromMaybe)
 import Data.Time (UTCTime (..), fromGregorian)
 import Network.HTTP.Types (status200, status400, status403, status404, status413, status500)
 import Network.Wai
@@ -237,11 +238,10 @@ spec = describe "Seal.Gateway.ApiFilesSpec" $ do
                     [("path", Just (T.pack p)), ("inline", Just "1")])
         responseStatus resp `shouldBe` status413
 
-    it "falls back to attachment for a non-allowlisted extension (SVG)" $
+    it "falls back to attachment for a non-allowlisted extension (HTML)" $
       withSystemTempDirectory "seal-inline-svg" $ \tmp -> do
-        -- SVG is scriptable; it must never be served renderable here.
-        let p = tmp </> "logo.svg"
-        BC.writeFile p "<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>"
+        let p = tmp </> "page.html"
+        BC.writeFile p "<html><script>alert(1)</script></html>"
         deps <- mkDeps (mkLocalFileExplorer 131072 4194304) True
         resp <- runAppResp (apiApp deps)
                   (mkGetReq ["api", "files", "download"]
@@ -249,7 +249,57 @@ spec = describe "Seal.Gateway.ApiFilesSpec" $ do
         responseStatus resp `shouldBe` status200
         let hdrs = responseHeaders resp
         lookup "Content-Type" hdrs `shouldBe` Just "application/octet-stream"
-        lookup "Content-Disposition" hdrs `shouldBe` Just "attachment; filename=\"logo.svg\""
+        lookup "Content-Disposition" hdrs `shouldBe` Just "attachment; filename=\"page.html\""
+
+    -- SVG is served inline (users want to see the drawing, not the markup),
+    -- but ONLY with the hardening CSP. The file stays reachable as a
+    -- document at this same URL; without the CSP, navigating there runs its
+    -- script in the gateway's authenticated origin.
+    it "serves an SVG inline as image/svg+xml" $
+      withSystemTempDirectory "seal-inline-svg2" $ \tmp -> do
+        let p = tmp </> "drawing.svg"
+        BC.writeFile p "<svg xmlns='http://www.w3.org/2000/svg'/>"
+        deps <- mkDeps (mkLocalFileExplorer 131072 4194304) True
+        resp <- runAppResp (apiApp deps)
+                  (mkGetReq ["api", "files", "download"]
+                    [("path", Just (T.pack p)), ("inline", Just "1")])
+        responseStatus resp `shouldBe` status200
+        let hdrs = responseHeaders resp
+        lookup "Content-Type" hdrs `shouldBe` Just "image/svg+xml"
+        lookup "Content-Disposition" hdrs `shouldBe` Just "inline; filename=\"drawing.svg\""
+
+    it "attaches the hardening CSP to an inline SVG" $
+      withSystemTempDirectory "seal-inline-svg3" $ \tmp -> do
+        let p = tmp </> "drawing.svg"
+        BC.writeFile p "<svg xmlns='http://www.w3.org/2000/svg'/>"
+        deps <- mkDeps (mkLocalFileExplorer 131072 4194304) True
+        resp <- runAppResp (apiApp deps)
+                  (mkGetReq ["api", "files", "download"]
+                    [("path", Just (T.pack p)), ("inline", Just "1")])
+        responseStatus resp `shouldBe` status200
+        let csp = lookup "Content-Security-Policy" (responseHeaders resp)
+        csp `shouldSatisfy` isJust
+        let policy = fromMaybe "" csp
+        -- The directives that stop document-mode script execution.
+        policy `shouldSatisfy` BC.isInfixOf "sandbox"
+        policy `shouldSatisfy` BC.isInfixOf "script-src 'none'"
+        policy `shouldSatisfy` BC.isInfixOf "object-src 'none'"
+        -- `allow-scripts` would defeat the sandbox entirely.
+        policy `shouldNotSatisfy` BC.isInfixOf "allow-scripts"
+
+    -- Raster images must NOT carry the SVG sandbox policy: it is
+    -- unnecessary for a bitmap, and `sandbox` on an image response has no
+    -- meaningful effect while widening the diff surface.
+    it "does not attach the SVG CSP to a raster image" $
+      withSystemTempDirectory "seal-inline-png-csp" $ \tmp -> do
+        let p = tmp </> "photo.png"
+        BC.writeFile p "pngbytes"
+        deps <- mkDeps (mkLocalFileExplorer 131072 4194304) True
+        resp <- runAppResp (apiApp deps)
+                  (mkGetReq ["api", "files", "download"]
+                    [("path", Just (T.pack p)), ("inline", Just "1")])
+        responseStatus resp `shouldBe` status200
+        lookup "Content-Security-Policy" (responseHeaders resp) `shouldBe` Nothing
 
     it "leaves the default (no inline) contract untouched" $
       withSystemTempDirectory "seal-inline-default" $ \tmp -> do

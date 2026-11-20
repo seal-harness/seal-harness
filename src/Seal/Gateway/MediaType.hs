@@ -17,14 +17,24 @@
 -- A denylist of dangerous types is unbounded; a browser's renderer set is
 -- not. Only the handful of raster image formats below may be inlined.
 --
--- = Why SVG is excluded
+-- = SVG: allowed, but only with a hardening CSP
 --
--- @image\/svg+xml@ is a scriptable document format. Navigated to directly it
--- executes script in the serving origin — precisely the class of risk the
--- @nosniff@ + @attachment@ default exists to prevent. It can be previewed
--- safely only inside a sandbox, which is a separate design decision; until
--- then an @.svg@ falls through to the normal download path (a broken image
--- in the viewer, never a script execution).
+-- @image\/svg+xml@ is a scriptable document format, so its inclusion is
+-- conditional. Two facts decide the design, both verified in a real browser
+-- (see 'svgHardeningCsp'):
+--
+-- * Inside an @<img>@ the browser decodes the file in a restricted mode —
+--   scripts never run and subresources never load. So rendering an SVG
+--   preview is safe *as a preview*.
+-- * The file stays fetchable at its own URL, and navigating there loads it
+--   as a DOCUMENT with scripting enabled, in this gateway's
+--   passkey-authenticated origin. A malicious @.svg@ fetched that way runs
+--   its script and can act as the operator.
+--
+-- The second fact is why 'inlineMediaTypeFor' returning an SVG is not
+-- enough on its own: the response also carries 'svgHardeningCsp', which
+-- neutralises the document-navigation path. A caller that serves SVG
+-- without that header has reintroduced the vulnerability.
 --
 -- = Why the extension, not the file's magic bytes
 --
@@ -37,6 +47,7 @@
 module Seal.Gateway.MediaType
   ( InlineMediaType (..)
   , inlineMediaTypeFor
+  , svgHardeningCsp
   ) where
 
 import Data.Text (Text)
@@ -44,11 +55,22 @@ import Data.Text qualified as T
 import System.FilePath (takeExtension, takeFileName)
 
 -- | An image type cleared for inline rendering, and the @Content-Type@
--- header value it must be served with. The constructor is exported so the
--- spec can assert the exact header text.
-newtype InlineMediaType = InlineMediaType
+-- header value it must be served with.
+--
+-- 'imtNeedsSvgCsp' distinguishes SVG, which is a *document* rather than a
+-- bitmap. Only SVG sets it, and the serving code must then attach
+-- 'svgHardeningCsp' — that header is what makes the document-navigation
+-- path safe. Splitting this out as a field (rather than string-matching
+-- @image\/svg+xml@ at the call site) keeps the requirement visible in the
+-- type instead of in a comment.
+data InlineMediaType = InlineMediaType
   { imtContentType :: Text
+  , imtNeedsSvgCsp :: Bool
   } deriving stock (Eq, Show)
+
+-- | A raster image type: rendered as pixels, no document semantics.
+rasterType :: Text -> InlineMediaType
+rasterType ct = InlineMediaType { imtContentType = ct, imtNeedsSvgCsp = False }
 
 -- | The @Content-Type@ to serve @path@ with inline, or 'Nothing' when the
 -- extension is not on the allowlist (the caller then keeps the hardened
@@ -65,16 +87,61 @@ inlineMediaTypeFor path
   -- image purely because of its name.
   | T.null stem = Nothing
   | otherwise = case T.toLower ext of
-      ".png"  -> Just (InlineMediaType "image/png")
-      ".jpg"  -> Just (InlineMediaType "image/jpeg")
-      ".jpeg" -> Just (InlineMediaType "image/jpeg")
-      ".gif"  -> Just (InlineMediaType "image/gif")
-      ".webp" -> Just (InlineMediaType "image/webp")
-      ".avif" -> Just (InlineMediaType "image/avif")
-      ".bmp"  -> Just (InlineMediaType "image/bmp")
-      ".ico"  -> Just (InlineMediaType "image/x-icon")
+      ".png"  -> Just (rasterType "image/png")
+      ".jpg"  -> Just (rasterType "image/jpeg")
+      ".jpeg" -> Just (rasterType "image/jpeg")
+      ".gif"  -> Just (rasterType "image/gif")
+      ".webp" -> Just (rasterType "image/webp")
+      ".avif" -> Just (rasterType "image/avif")
+      ".bmp"  -> Just (rasterType "image/bmp")
+      ".ico"  -> Just (rasterType "image/x-icon")
+      -- SVG is a document, not a bitmap. Allowed here because the response
+      -- also carries 'svgHardeningCsp'; the '<img>' render context alone is
+      -- not sufficient (the file is reachable as a document too).
+      ".svg"  -> Just InlineMediaType
+        { imtContentType = "image/svg+xml"
+        , imtNeedsSvgCsp = True
+        }
       _       -> Nothing
   where
     name = T.pack (takeFileName path)
     ext  = T.pack (takeExtension path)
     stem = T.take (T.length name - T.length ext) name
+
+-- | The @Content-Security-Policy@ that makes serving an SVG inline safe.
+--
+-- Every directive is load-bearing, and the combination was chosen by
+-- measurement rather than by copying a snippet:
+--
+-- * @sandbox@ — no tokens. Strips scripting and gives the document an
+--   opaque origin, so even if a payload slipped through it cannot read
+--   cookies, storage, or make same-origin requests.
+-- * @default-src 'none'@ / @script-src 'none'@ / @object-src 'none'@ —
+--   defence in depth against script, @javascript:@ URLs, and
+--   @<object>@/@<embed>@ re-embedding.
+-- * @style-src 'unsafe-inline'@ — REQUIRED for fidelity, not a concession.
+--   @default-src 'none'@ alone drops an SVG's own @<style>@ block, and
+--   design tools routinely style by class rather than by presentation
+--   attribute. Measured: without this, a styled SVG renders with default
+--   BLACK fills (47k pixels changed). With it, byte-identical to no-CSP.
+--   Inline *styles* are not a script vector; @style-src@ is unrelated to
+--   execution.
+-- * @img-src data:@ — permits only inline (data-URI) images inside the
+--   SVG, so a drawing can embed a raster without phoning home.
+-- * @base-uri@ / @form-action 'none'@ — close the remaining document
+--   behaviours (link rewriting, form submission).
+--
+-- 'sandbox' cannot be delivered via @<meta http-equiv>@, so this must be a
+-- real response header.
+svgHardeningCsp :: Text
+svgHardeningCsp = T.intercalate "; "
+  [ "sandbox"
+  , "default-src 'none'"
+  , "script-src 'none'"
+  , "object-src 'none'"
+  , "base-uri 'none'"
+  , "form-action 'none'"
+  , "style-src 'unsafe-inline'"
+  , "img-src data:"
+  ]
+

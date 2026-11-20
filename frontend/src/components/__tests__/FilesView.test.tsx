@@ -397,7 +397,7 @@ describe('FilesView', () => {
     })
 
     it('previews every allowlisted extension', async () => {
-      for (const ext of ['jpg', 'jpeg', 'gif', 'webp', 'avif', 'bmp', 'ico']) {
+      for (const ext of ['jpg', 'jpeg', 'gif', 'webp', 'avif', 'bmp', 'ico', 'svg']) {
         const target = `/home/user/pic.${ext}`
         setLocation(target)
         registerImageTarget(target)
@@ -407,14 +407,39 @@ describe('FilesView', () => {
       }
     })
 
-    it('does NOT preview .svg (scriptable; backend refuses to serve it inline)', async () => {
+    it('previews .svg in an <img> (script never runs in that context)', async () => {
       const target = '/home/user/logo.svg'
       setLocation(target)
       registerImageTarget(target)
-      routes.set(target, { body: makeContent({ path: target, isBinary: true, content: '' }) })
       render(<FilesView />)
-      await waitFor(() => expect(screen.getByTestId('binary-file-message')).toBeTruthy())
-      expect(screen.queryByTestId('media-image')).toBeNull()
+      await waitFor(() => expect(screen.getByTestId('media-image')).toBeTruthy())
+      const img = screen.getByTestId('media-image') as HTMLImageElement
+      // Still the inline endpoint, which serves the SVG with its hardening CSP.
+      expect(img.getAttribute('src')).toBe(
+        `/api/files/download?path=${encodeURIComponent(target)}&inline=1`,
+      )
+      // Crucially an <img>, never inline SVG markup or an <object>/<iframe>:
+      // those would run the file's script in this origin.
+      expect(document.querySelector('object')).toBeNull()
+      expect(document.querySelector('iframe')).toBeNull()
+    })
+
+    // The preview must never put SVG *markup* into the page. Inlining it, or
+    // using <object>/<embed>/<iframe>, would run the file's script in this
+    // origin — only <img> is a safe render context.
+    it('never inlines SVG markup into the document (XSS)', async () => {
+      const target = '/home/user/evil.svg'
+      setLocation(target)
+      registerImageTarget(target)
+      const { container } = render(<FilesView />)
+      await waitFor(() => expect(screen.getByTestId('media-image')).toBeTruthy())
+
+      expect(container.querySelector('object')).toBeNull()
+      expect(container.querySelector('embed')).toBeNull()
+      expect(container.querySelector('iframe')).toBeNull()
+      // The preview element is an IMG: the browser applies its restricted
+      // image decode path, so the file gets no document and no script engine.
+      expect(screen.getByTestId('media-image').tagName).toBe('IMG')
     })
 
     it('shows an error state when the image fails to load', async () => {

@@ -9,7 +9,10 @@ module Seal.Gateway.MediaTypeSpec (spec) where
 
 import Test.Hspec
 
-import Seal.Gateway.MediaType (InlineMediaType (..), inlineMediaTypeFor)
+import Data.Text qualified as T
+
+import Seal.Gateway.MediaType
+  ( InlineMediaType (..), inlineMediaTypeFor, svgHardeningCsp )
 
 spec :: Spec
 spec = describe "Seal.Gateway.MediaType" $ do
@@ -38,14 +41,23 @@ spec = describe "Seal.Gateway.MediaType" $ do
       fmap imtContentType (inlineMediaTypeFor "/home/u/Photo.PnG")
         `shouldBe` Just "image/png"
 
-  describe "inlineMediaTypeFor — SVG is refused" $ do
-    -- SVG is a scriptable document format: served inline and navigated to
-    -- directly, it executes script in the gateway's authenticated origin.
-    -- It must fall through to the hardened download path.
-    it "refuses .svg" $
-      inlineMediaTypeFor "/home/u/logo.svg" `shouldBe` Nothing
+  describe "inlineMediaTypeFor — SVG is allowed, typed as a document" $ do
+    -- SVG is scriptable, but it is allowed precisely because the response
+    -- also carries 'svgHardeningCsp'. The type must be the SVG MIME type,
+    -- not a raster one: the browser needs to know it is a document to
+    -- render it at all.
+    it "types .svg as image/svg+xml" $
+      fmap imtContentType (inlineMediaTypeFor "/home/u/logo.svg")
+        `shouldBe` Just "image/svg+xml"
 
-    it "refuses .svgz" $
+    it "matches an upper-case .SVG" $
+      fmap imtContentType (inlineMediaTypeFor "/home/u/LOGO.SVG")
+        `shouldBe` Just "image/svg+xml"
+
+    -- .svgz is gzip-compressed SVG. It cannot be served uncompressed under
+    -- image/svg+xml, and adding Content-Encoding negotiation is out of
+    -- scope, so it stays on the attachment path.
+    it "refuses .svgz (compressed; needs Content-Encoding)" $
       inlineMediaTypeFor "/home/u/logo.svgz" `shouldBe` Nothing
 
   describe "inlineMediaTypeFor — non-image and executable formats are refused" $ do
@@ -80,3 +92,43 @@ spec = describe "Seal.Gateway.MediaType" $ do
 
   describe "inlineMediaTypeFor — directory-ish input" $ do
     it "refuses an empty path" $ inlineMediaTypeFor "" `shouldBe` Nothing
+
+  -- The CSP is what makes serving an SVG safe: the file remains reachable as
+  -- a document at its own URL, where scripts WOULD run without it. These
+  -- assertions pin the directives that carry that weight.
+  describe "svgHardeningCsp" $ do
+    let csp = svgHardeningCsp
+        directives = T.splitOn "; " csp
+
+    it "sandboxes the document with no allow-* tokens" $ do
+      -- `sandbox` with no tokens is the maximal restriction. `allow-scripts`
+      -- here would hand back the key and is the one token that must never
+      -- appear.
+      directives `shouldSatisfy` elem "sandbox"
+      csp `shouldNotSatisfy` T.isInfixOf "allow-scripts"
+      csp `shouldNotSatisfy` T.isInfixOf "allow-same-origin"
+
+    it "denies script execution" $
+      directives `shouldSatisfy` elem "script-src 'none'"
+
+    it "denies plugin re-embedding" $
+      directives `shouldSatisfy` elem "object-src 'none'"
+
+    it "denies all unlisted fetches by default" $
+      directives `shouldSatisfy` elem "default-src 'none'"
+
+    it "denies form submission and base-uri rewriting" $ do
+      directives `shouldSatisfy` elem "form-action 'none'"
+      directives `shouldSatisfy` elem "base-uri 'none'"
+
+    -- This one is required for correct RENDERING, not security: without it
+    -- `default-src 'none'` drops the SVG's own <style> block and a
+    -- class-styled drawing renders with default black fills.
+    it "permits inline styles so styled SVGs render faithfully" $
+      directives `shouldSatisfy` elem "style-src 'unsafe-inline'"
+
+    it "permits only inline data-URI images" $
+      directives `shouldSatisfy` elem "img-src data:"
+
+    it "is a single header value (newlines would be stripped or split)" $
+      csp `shouldNotSatisfy` T.isInfixOf "\n"
