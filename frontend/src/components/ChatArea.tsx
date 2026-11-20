@@ -352,41 +352,78 @@ function CopySessionIdButton({ sessionId }: { sessionId: string }) {
   )
 }
 
-/** Open-workdir button for the chat header. Renders a small folder icon;
- *  clicking fetches the session's workdir path from the backend and
- *  navigates the SPA to the Files page opened to that path. Uses the same
- *  `header-scroll-btn` styling as the adjacent copy-session-id and
- *  scroll buttons. */
-function OpenWorkdirButton({ sessionId }: { sessionId: string }) {
-  const [loading, setLoading] = useState(false)
+/** The Files-page URL for a session workdir. The `path` parameter is what
+ *  FilesView reads on mount, so this is the whole address contract — kept in
+ *  one place so the link's href and any other caller agree on the encoding. */
+function workdirFilesUrl(path: string): string {
+  const params = new URLSearchParams()
+  params.set('path', path)
+  return `/files?${params.toString()}`
+}
+
+/** Open-workdir link for the chat header.
+ *
+ *  A real `<a target="_blank">` rather than a button that navigates the SPA:
+ *  the href is what makes the destination *visible* (hover shows the URL in
+ *  the browser's status bar, right-click offers "copy link address", and it
+ *  can be opened in a new tab). Keeping the transcript tab where it is also
+ *  means the user does not lose their place to go look at a directory.
+ *
+ *  Because the href has to exist before the user hovers, the workdir is
+ *  resolved eagerly on mount (and again whenever the selection changes) —
+ *  `<cache>/workdirs/<sid>` is fixed per session, so one resolve is enough.
+ *  Until it resolves, the anchor has no href: there is nothing truthful to
+ *  preview yet, and a click retries instead of opening a blank path. */
+function OpenWorkdirLink({ sessionId }: { sessionId: string }) {
+  const [path, setPath] = useState<string | null>(null)
   const [error, setError] = useState(false)
 
-  const onClick = async () => {
-    if (loading) return
-    setLoading(true)
+  useEffect(() => {
+    let cancelled = false
+    setPath(null)
     setError(false)
-    const path = await fetchSessionWorkdir(sessionId)
-    setLoading(false)
-    if (!path) {
+    void fetchSessionWorkdir(sessionId).then((resolved) => {
+      if (cancelled) return
+      if (resolved) setPath(resolved)
+      else setError(true)
+    })
+    return () => { cancelled = true }
+  }, [sessionId])
+
+  const onClick = async (ev: React.MouseEvent<HTMLAnchorElement>) => {
+    // With an href the browser's own link behaviour is exactly what we want
+    // (new tab, honouring the user's cmd/ctrl/middle-click preferences).
+    if (path) return
+    // Unresolved (still loading, or the fetch failed): retry rather than
+    // opening a link with no destination.
+    ev.preventDefault()
+    const resolved = await fetchSessionWorkdir(sessionId)
+    if (resolved) {
+      setPath(resolved)
+      setError(false)
+    } else {
       setError(true)
-      // Clear the error indicator after 1.5s (matches the copy feedback).
-      setTimeout(() => setError(false), 1500)
-      return
     }
-    // In-app navigation to the Files page with the workdir path as a
-    // query parameter. The FilesView reads `path` from the URL on mount
-    // and after popstate, so a pushState + popstate dispatch is enough.
-    const params = new URLSearchParams()
-    params.set('path', path)
-    window.history.pushState(null, '', `/files?${params.toString()}`)
-    window.dispatchEvent(new PopStateEvent('popstate'))
   }
 
+  const label = error
+    ? 'Could not resolve workdir'
+    : path
+      ? 'Open session workdir in Files'
+      : 'Resolving workdir'
   return (
-    <button
+    <a
       className="header-scroll-btn"
-      title={error ? 'Could not resolve workdir' : loading ? 'Resolving…' : 'Open session workdir in Files'}
-      aria-label={error ? 'Could not resolve workdir' : loading ? 'Resolving workdir' : 'Open session workdir in Files'}
+      href={path ? workdirFilesUrl(path) : undefined}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={error ? 'Could not resolve workdir' : path ? `Open ${path} in Files` : 'Resolving…'}
+      aria-label={label}
+      // No href ⇒ not a link and not focusable, so a keyboard user could not
+      // retry a failed resolve. Focusable + aria-disabled keeps the retry (and
+      // its Enter key) reachable while making the inert state explicit.
+      tabIndex={path ? undefined : 0}
+      aria-disabled={path ? undefined : true}
       onClick={onClick}
     >
       <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
@@ -394,7 +431,7 @@ function OpenWorkdirButton({ sessionId }: { sessionId: string }) {
         aria-hidden="true">
         <path d="M2 4.5 A1.5 1.5 0 0 1 3.5 3 H6 L7.5 4.5 H12.5 A1.5 1.5 0 0 1 14 6 V11.5 A1.5 1.5 0 0 1 12.5 13 H3.5 A1.5 1.5 0 0 1 2 11.5 Z" />
       </svg>
-    </button>
+    </a>
   )
 }
 
@@ -2967,7 +3004,7 @@ export function ChatArea({
            {isThinking && onStop && <StopButton onStop={onStop} />}
             <TranscriptViewToggle mode={markdownMode} onChange={changeMarkdownMode} />
            {selectedSession && <CopySessionIdButton sessionId={selectedSession.id} />}
-           {selectedSession && <OpenWorkdirButton sessionId={selectedSession.id} />}
+           {selectedSession && <OpenWorkdirLink sessionId={selectedSession.id} />}
             <button
               className="header-scroll-btn"
               title={loadingMore ? "Loading…" : "Scroll to top of transcript"}
@@ -3015,7 +3052,7 @@ export function ChatArea({
         {selectedSession && messages.length === 0 && (
           <div className="ml-auto flex items-center gap-1 shrink-0">
             <CopySessionIdButton sessionId={selectedSession.id} />
-            <OpenWorkdirButton sessionId={selectedSession.id} />
+            <OpenWorkdirLink sessionId={selectedSession.id} />
           </div>
         )}
       </div>
