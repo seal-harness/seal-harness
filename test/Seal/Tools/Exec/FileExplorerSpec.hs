@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE RankNTypes #-}
 module Seal.Tools.Exec.FileExplorerSpec (spec) where
 
 import Data.ByteString (ByteString)
@@ -16,6 +17,9 @@ import System.Directory
 import System.FilePath ((</>))
 import System.IO (hClose, IOMode (..), openBinaryFile)
 import System.IO.Temp (withSystemTempDirectory)
+import System.Exit (ExitCode (..))
+import System.Process
+  ( CreateProcess (..), StdStream (..), createProcess, proc, waitForProcess )
 import Test.Hspec
 
 import Seal.Tools.Exec.FileExplorer
@@ -725,6 +729,19 @@ spec = describe "Seal.Tools.Exec.FileExplorer" $ do
         Right bs -> BS.length bs `shouldBe` 100000
         Left e -> expectationFailure ("expected Right, got " <> show e)
 
+    it "drains the whole chunk when stdout arrives through a pipe" $ do
+      -- A pipe delivers at most one buffer's worth per read (~64 KiB), so a
+      -- single hGetSome returns a fraction of a 4 MiB dd block. The caller
+      -- must drain until the full block is in, or the image/download bytes
+      -- are silently corrupted.
+      let n = 4194304
+      runner <- streamingPipeRunner n
+      fe <- mkRemoteFileExplorer sshCfg runner 1048576 n
+      r <- feReadRange fe "/test/big.bin" 0 n
+      case r of
+        Right bs -> BS.length bs `shouldBe` n
+        Left e -> expectationFailure ("expected Right, got " <> show e)
+
 -- ---------------------------------------------------------------------------
 -- Test helpers
 -- ---------------------------------------------------------------------------
@@ -868,3 +885,30 @@ scriptedRunnerStream recRef canned0 = do
               pure (Right r)
     , runRemoteBytes = \_argv -> pure (Right (BS.empty, False))
     }
+
+-- | A 'RemoteRunner' whose stream arm spawns a real local process that
+-- writes @n@ bytes through a PIPE. Unlike 'scriptedRunnerStream' (a temp
+-- file, whose reads always fill the buffer), a pipe short-reads at its
+-- buffer size — this is what actually exercises the drain loop.
+streamingPipeRunner :: Int -> IO RemoteRunner
+streamingPipeRunner n = pure RemoteRunner
+  { runRemote = \_argv -> pure (Right "")
+  , runRemoteStdin = \_argv _stdin -> pure (Right "")
+  , runRemoteEnv = \_env _argv -> pure (Right "")
+  , runRemoteStream = \_argv action -> do
+      (_, mOut, _, ph) <-
+        createProcess (proc "sh" ["-c", "head -c " <> show n <> " /dev/zero"])
+          { std_in = NoStream, std_out = CreatePipe, std_err = NoStream }
+      case mOut of
+        Nothing -> pure (Left ExecRemoteUnreachable)
+        Just h -> do
+          r <- action h
+          -- Close first: an unread pipe would otherwise block the child
+          -- forever when the caller asks for fewer bytes than it writes.
+          hClose h
+          ec <- waitForProcess ph
+          pure $ case ec of
+            ExitSuccess -> Right r
+            ExitFailure _ -> Left ExecRemoteUnreachable
+  , runRemoteBytes = \_argv -> pure (Right (BS.empty, False))
+  }
