@@ -18,6 +18,7 @@ import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString (ByteString)
+import Data.ByteString.Builder qualified as BB
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString qualified as BS
 import Data.ByteString.Base64 qualified as B64
@@ -48,8 +49,9 @@ import Network.HTTP.Types
   , status200, status201, status204, status400, status403, status404, status409, status413, status416, status500, status501 )
 import Network.Socket (SockAddr (..), hostAddressToTuple)
 import Network.Wai
-  ( Application, Request, Response, getRequestBodyChunk, pathInfo
-  , queryString, requestMethod, responseLBS, remoteHost, requestHeaders )
+  ( Application, Request, Response, StreamingBody, getRequestBodyChunk, pathInfo
+  , queryString, requestMethod, responseLBS, responseStream, remoteHost
+  , requestHeaders )
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
 import System.Exit (ExitCode (..))
 import System.FilePath (joinPath, splitDirectories, takeDirectory, takeFileName, (</>))
@@ -2616,48 +2618,6 @@ parsePathsQuery req =
   , k == "paths"
   ]
 
--- | Read a whole file for inline preview, up to @maxBytes@.
---
--- Two details make this correct:
---
--- 1. **Chunk alignment is mandatory.** 'feReadRange' derives the remote
---    @dd skip=@ index as @offset `div` chunkSize@, so a non-aligned offset
---    silently reads from the wrong place. Every call here therefore passes a
---    FULL @chunkSize@ as the length, including the final chunk — which
---    short-reads at EOF and is returned as-is. Passing @min chunkSize
---    remaining@ instead would shrink @chunkSize@ on the last chunk and
---    misalign the remote arm for every file whose size is not a multiple of
---    the chunk size.
---
--- 2. **The ceiling is enforced before reading, not after.** A file larger
---    than @maxBytes@ is refused outright rather than truncated: a truncated
---    image is an undecodable fragment, so serving it would be a silent lie.
---    The caller turns 'FeTooLarge' into a 413 with the real size.
-readFileForPreview
-  :: FileExplorerHandle -> Int -> FilePath
-  -> IO (Either FileExplorerErr ByteString)
-readFileForPreview fe maxBytes path = do
-  eStat <- feStatFile fe path
-  case eStat of
-    Left err -> pure (Left err)
-    Right stat
-      | fsSize stat > fromIntegral maxBytes -> pure (Left FeTooLarge)
-      | fsSize stat <= 0 -> pure (Right BS.empty)
-      | otherwise -> go (fsSize stat) 0 []
-  where
-    chunkSize = if maxBytes <= 0 then 1 else maxBytes
-    go total !off !acc
-      | off >= total = pure (Right (BS.concat (reverse acc)))
-      | otherwise = do
-          eChunk <- feReadRange fe path off chunkSize
-          case eChunk of
-            Left err -> pure (Left err)
-            Right bs
-              -- A zero-byte chunk before EOF would loop forever; treat it as
-              -- a transport failure rather than hang the request thread.
-              | BS.null bs -> pure (Left (FeIo "unexpected EOF during preview read"))
-              | otherwise -> go total (off + fromIntegral (BS.length bs)) (bs : acc)
-
 parsePathQuery :: Request -> Maybe Text
 parsePathQuery req =
   case lookup "path" (queryString req) of
@@ -2757,8 +2717,9 @@ handleFileContent deps req = do
 --
 --   1. 'inlineMediaTypeFor' allowlists only raster image extensions. SVG and
 --      HTML are refused, so they can never be rendered in this origin.
---   2. The read goes through 'readFileForPreview', which honours a size
---      ceiling and returns 'FeTooLarge' (→ 413) instead of a truncated file.
+--   2. The body is streamed in bounded chunks and the size ceiling is
+--      checked from the file's stat before the first byte is sent: a file
+--      over the ceiling is refused with 413 instead of a truncated image.
 --
 --   A path failing the allowlist falls back to the attachment behaviour
 --   rather than erroring: the caller asked for bytes, and attachment bytes
@@ -2807,39 +2768,69 @@ serveAttachment deps path = do
 -- Honors the SEC-B3 blocked-path check, which the attachment arm deliberately
 -- skips: an attachment never renders, so a path resolving into a blocked
 -- location is only a confidentiality problem once the browser draws it.
+--
+-- The body is streamed ('responseStream') one bounded chunk at a time instead
+-- of being read whole and concatenated. Reading the whole file would hold
+-- every chunk plus a copy for 'BS.concat' at peak, per concurrent request;
+-- streaming keeps the per-request working set at one chunk regardless of the
+-- preview ceiling.
 serveInline :: ApiDeps -> FilePath -> InlineMediaType -> IO Response
 serveInline deps path mt = do
   mBlocked <- checkBlockedPath deps path
   case mBlocked of
     Just resp -> pure resp
     Nothing -> do
-      eBytes <- readFileForPreview (adFileExplorer deps) (adMediaPreviewBytes deps) path
-      case eBytes of
-        Left FeTooLarge ->
+      eStat <- feStatFile (adFileExplorer deps) path
+      case eStat of
+        Left err -> pure (fileExplorerErrResponse err)
+        Right stat
           -- 413 carries the real size so the UI can explain the refusal
           -- instead of showing a broken image.
-          pure (errJson status413 "image exceeds the preview size limit")
-        Left err -> pure (fileExplorerErrResponse err)
-        Right bs -> do
-          let basename = takeFileName path
-              baseHdrs =
-                [ (mkHN "Content-Type", TE.encodeUtf8 (imtContentType mt))
-                , (mkHN "Content-Disposition", BC.pack ("inline; filename=\"" <> basename <> "\""))
-                , (mkHN "X-Content-Type-Options", "nosniff")
-                , (mkHN "Cache-Control", "no-store")
-                , (mkHN "Content-Length", BC.pack (show (BS.length bs)))
-                ]
-              -- SVG is a scriptable DOCUMENT, and this URL is fetchable
-              -- directly as well as via <img>. Navigating to it loads the
-              -- file as a document in this passkey-authenticated origin,
-              -- where its script would run. The CSP neutralises that path
-              -- without affecting <img> rendering. Omitting it for SVG
-              -- would be a stored-XSS vector.
-              hdrs
-                | imtNeedsSvgCsp mt =
-                    (mkHN "Content-Security-Policy", TE.encodeUtf8 svgHardeningCsp) : baseHdrs
-                | otherwise = baseHdrs
-          pure (responseLBS status200 hdrs (BL.fromStrict bs))
+          | fsSize stat > fromIntegral (adMediaPreviewBytes deps) ->
+              pure (errJson status413 "image exceeds the preview size limit")
+          | otherwise -> do
+              let basename = takeFileName path
+                  size = fsSize stat
+                  baseHdrs =
+                    [ (mkHN "Content-Type", TE.encodeUtf8 (imtContentType mt))
+                    , (mkHN "Content-Disposition", BC.pack ("inline; filename=\"" <> basename <> "\""))
+                    , (mkHN "X-Content-Type-Options", "nosniff")
+                    , (mkHN "Cache-Control", "no-store")
+                    , (mkHN "Content-Length", BC.pack (show size))
+                    ]
+                  -- SVG is a scriptable DOCUMENT, and this URL is fetchable
+                  -- directly as well as via <img>. Navigating to it loads the
+                  -- file as a document in this passkey-authenticated origin,
+                  -- where its script would run. The CSP neutralises that path
+                  -- without affecting <img> rendering. Omitting it for SVG
+                  -- would be a stored-XSS vector.
+                  hdrs
+                    | imtNeedsSvgCsp mt =
+                        (mkHN "Content-Security-Policy", TE.encodeUtf8 svgHardeningCsp) : baseHdrs
+                    | otherwise = baseHdrs
+              pure (responseStream status200 hdrs (streamPreview deps path size))
+
+-- | Stream exactly @total@ bytes from @path@. Each read is bounded by the
+-- download chunk size, so memory is O(chunk), not O(file). A read failure
+-- after the headers are sent can only end the body early; the declared
+-- 'Content-Length' makes that a client-visible truncation.
+streamPreview :: ApiDeps -> FilePath -> Integer -> StreamingBody
+streamPreview deps path total write flush = go 0
+  where
+    chunkSize = max 1 (adDownloadChunkBytes deps)
+    go !off
+      | off >= total = pure ()
+      | otherwise = do
+          eChunk <- feReadRange (adFileExplorer deps) path off chunkSize
+          case eChunk of
+            Left _ -> pure ()
+            Right bs
+              -- A zero-byte chunk before EOF would loop forever.
+              | BS.null bs -> pure ()
+              | otherwise -> do
+                  write (BB.byteString bs)
+                  flush
+                  go (off + fromIntegral (BS.length bs))
 
 -- | Handle GET /api/files/stat — file metadata (size + mtime) for the
 -- chunked download path. Returns JSON @{path, size, mtimeEpoch}@ where

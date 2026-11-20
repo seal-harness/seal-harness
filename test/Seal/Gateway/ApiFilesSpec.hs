@@ -11,7 +11,7 @@ import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Builder (Builder, toLazyByteString)
 import Data.Text.Encoding (decodeUtf8)
-import Data.IORef (newIORef)
+import Data.IORef (newIORef, modifyIORef', readIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -20,7 +20,8 @@ import Data.Time (UTCTime (..), fromGregorian)
 import Network.HTTP.Types (status200, status400, status403, status404, status413, status500)
 import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, queryString
-  , requestMethod, requestHeaders, responseHeaders, responseStatus )
+  , requestMethod, requestHeaders, responseHeaders, responseStatus
+  , responseToStream )
 import Network.Wai.Internal (Response (..), ResponseReceived (..))
 import System.Directory (createDirectoryIfMissing, createFileLink)
 import System.FilePath ((</>))
@@ -225,6 +226,26 @@ spec = describe "Seal.Gateway.ApiFilesSpec" $ do
         lookup "X-Truncated" (responseHeaders resp) `shouldBe` Nothing
         body <- responseBodyStrict resp
         BC.length body `shouldBe` 400000
+
+    it "streams a preview across many bounded chunks with exact bytes" $
+      withSystemTempDirectory "seal-inline-stream" $ \tmp -> do
+        -- Force many chunks so the streaming loop's offset arithmetic is
+        -- exercised. The bytes vary, so an overlap/duplication bug shows up
+        -- as a content mismatch rather than merely a length mismatch.
+        let p = tmp </> "big.png"
+            payload = BC.pack
+              [ toEnum (i `mod` 251) | i <- [0 .. 399999 :: Int] ]
+        BC.writeFile p payload
+        deps0 <- mkDeps (mkLocalFileExplorer 131072 4194304) True
+        let deps = deps0 { adDownloadChunkBytes = 1000 }
+        resp <- runAppResp (apiApp deps)
+                  (mkGetReq ["api", "files", "download"]
+                    [("path", Just (T.pack p)), ("inline", Just "1")])
+        responseStatus resp `shouldBe` status200
+        lookup "Content-Length" (responseHeaders resp)
+          `shouldBe` Just (BC.pack (show (BC.length payload)))
+        body <- responseBodyStrict resp
+        body `shouldBe` payload
 
     it "refuses a file over the preview ceiling with 413, not a truncated image" $
       withSystemTempDirectory "seal-inline-huge" $ \tmp -> do
@@ -491,13 +512,17 @@ responseBodyText ResponseStream {} = pure ""
 
 -- | Read a 'Response' body as strict 'ByteString' — needed by the image
 -- preview tests, whose payloads are arbitrary bytes and must not be
--- round-tripped through 'Text'.
+-- round-tripped through 'Text'. Handles both builder responses and the
+-- streamed inline-preview body.
 responseBodyStrict :: Response -> IO BC.ByteString
-responseBodyStrict (ResponseBuilder _ _ builderBody) =
-  BL.toStrict <$> runBuilder builderBody
-responseBodyStrict (ResponseRaw _ _) = pure BC.empty
-responseBodyStrict ResponseFile {} = pure BC.empty
-responseBodyStrict ResponseStream {} = pure BC.empty
+responseBodyStrict resp = do
+  let (_, _, withBody) = responseToStream resp
+  withBody $ \body -> do
+    chunks <- newIORef []
+    body
+      (\b -> modifyIORef' chunks (BL.toStrict (toLazyByteString b) :))
+      (pure ())
+    BC.concat . reverse <$> readIORef chunks
 
 -- | Run a Builder into a lazy ByteString.
 runBuilder :: Builder -> IO BL.ByteString
