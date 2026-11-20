@@ -14,8 +14,8 @@
 #            sibling @executable_path libraries (bundled next to it), and that
 #            no /nix/store string is embedded (Cabal's Paths_<pkg> modules bake
 #            the install prefix in unless the package is built relocatable).
-#   Linux  — not enforced yet; a static musl artifact is a deferred follow-up.
-#            Reported as warnings so the Linux leg stays green.
+#   Linux  — a fully static ELF is required: no dynamic loader and no
+#            /nix/store paths (including embedded data directories).
 set -euo pipefail
 
 if [ "$#" -ne 1 ]; then
@@ -93,24 +93,50 @@ if [ "$(uname -s)" = "Darwin" ]; then
     fi
   done
 else
-  # Linux is not portable yet: a static musl artifact is a deferred follow-up
-  # (see the README), so the shipped build is the ordinary dynamically linked
-  # one. Report the state but do not fail — otherwise every Linux leg would be
-  # red for a known gap. Flip this to `fail=1` once the static build lands.
-  if ! command -v ldd >/dev/null 2>&1; then
-    echo "::warning::ldd not available; cannot assess static linkage"
-  elif ldd "$DIST/bin/seal" 2>&1 | grep -q 'not a dynamic executable'; then
-    echo "OK: static ELF"
-  else
-    echo "::warning file=$DIST/bin/seal::not statically linked (known gap; Linux static is a deferred follow-up)"
+  # Linux release artifacts are fully static musl ELFs: the dynamic loader must
+  # not be involved at all. `ldd` exits non-zero for a static binary, so capture
+  # its output rather than piping it under `set -o pipefail`.
+  _ldd_out=""
+  if command -v ldd >/dev/null 2>&1; then
+    _ldd_out=$(ldd "$DIST/bin/seal" 2>&1 || true)
   fi
 
-  # Capture before matching: a plain `strings | grep -q` under pipefail lets
-  # strings die of SIGPIPE (141) on the first match, which would hide findings.
+  if printf '%s' "$_ldd_out" | grep -qE 'not a dynamic executable|statically linked'; then
+    echo "OK: static ELF"
+  else
+    # Same SIGPIPE concern as above: readelf emits more than a pipe buffer, so
+    # capture its output before matching. Otherwise a matching grep makes
+    # readelf exit 141 and `!` would invert that into a false pass.
+    _elf_headers=""
+    if command -v readelf >/dev/null 2>&1; then
+      _elf_headers=$(readelf -l "$DIST/bin/seal" 2>/dev/null || true)
+    fi
+
+    if printf '%s' "$_elf_headers" | grep -q 'INTERP'; then
+      echo "::error file=$DIST/bin/seal::has a dynamic loader (PT_INTERP)"
+      fail=1
+    elif command -v file >/dev/null 2>&1 \
+         && file -L "$DIST/bin/seal" | grep -q 'statically linked'; then
+      echo "OK: static ELF (file)"
+    elif [ -n "$_elf_headers" ]; then
+      echo "OK: static ELF (no PT_INTERP)"
+    else
+      echo "::error file=$DIST/bin/seal::not statically linked"
+      if [ -n "$_ldd_out" ]; then
+        printf '%s\n' "$_ldd_out" | sed 's/^/    /' | sed -n '1,20p'
+      fi
+      fail=1
+    fi
+  fi
+
+  # Static linkage is not enough: a portable artifact must not embed /nix/store
+  # data paths either (tzdata, terminfo). The static build rewrites both to
+  # system locations, so any remaining store path is a release blocker.
   _nix_paths=$(nix_store_paths "$DIST/bin/seal")
   if [ -n "$_nix_paths" ]; then
-    echo "::warning file=$DIST/bin/seal::contains /nix/store paths (known gap on Linux)"
+    echo "::error file=$DIST/bin/seal::contains embedded /nix/store paths"
     printf '%s\n' "$_nix_paths" | sort -u | sed -n '1,5p' | sed 's/^/    /'
+    fail=1
   fi
 fi
 
@@ -122,5 +148,5 @@ fi
 if [ "$(uname -s)" = "Darwin" ]; then
   echo "Portability check passed: macOS artifact has no Nix store dependencies."
 else
-  echo "Portability check: Linux portability is a known, deferred gap (see the README); not enforced."
+  echo "Portability check passed: Linux artifact is statically linked and has no Nix store dependencies."
 fi
