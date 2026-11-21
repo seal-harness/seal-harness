@@ -8,10 +8,22 @@ import { JsonTree } from './JsonTree'
 import { sessionDisplayTitle, sessionSubtitle, shortenModel } from '../types'
 import { StatusDot } from './StatusDot'
 import { BottomBar } from './BottomBar'
-import { fetchModelContext, type PendingQuestion } from '../hooks/useApi'
+import { MarkdownView } from './MarkdownView'
+import {
+  DEFAULT_TRANSCRIPT_VIEW_MODE,
+  loadTranscriptViewMode,
+  saveTranscriptViewMode,
+  type TranscriptViewMode,
+} from '../lib/transcriptViewMode'
+import { fetchModelContext, fetchSessionWorkdir, type PendingQuestion } from '../hooks/useApi'
 import * as perf from '../lib/perf'
 import { useVirtualWindow } from '../hooks/useVirtualWindow'
 import { rateLimitedLog, detectLoop, logMemoryNow } from '../lib/diag'
+import { nextScrollIntent, type ScrollIntent } from '../lib/scrollIntent'
+import { isAtBottom, isNearTop, isSyntheticScroll } from '../lib/transcriptScroll'
+import { openModalStack } from '../lib/modalStack'
+import type { LoadResult } from '../types/stream'
+import { copyTextToClipboard } from '../lib/clipboard'
 
 /** The connection-state banner shown above the transcript when the
  *  WebSocket stream is not live.
@@ -261,6 +273,41 @@ function StopButton({ onStop }: { onStop: () => void }) {
   )
 }
 
+/** Segmented control in the chat header that switches the transcript between
+ *  the raw markdown source and the rendered version.
+ *
+ *  Two visible buttons rather than a single cycling toggle: the current mode
+ *  is readable at a glance (which is the whole point of a view option), and
+ *  either mode is one click away instead of two. */
+function TranscriptViewToggle({
+  mode,
+  onChange,
+}: {
+  mode: TranscriptViewMode
+  onChange: (mode: TranscriptViewMode) => void
+}) {
+  return (
+    <div className="view-mode-toggle" role="group" aria-label="Message rendering">
+      <button
+        type="button"
+        aria-pressed={mode === 'raw'}
+        title="Show the raw markdown source, exactly as the model wrote it"
+        onClick={() => onChange('raw')}
+      >
+        Raw
+      </button>
+      <button
+        type="button"
+        aria-pressed={mode === 'rendered'}
+        title="Render the markdown (tables, lists, code, headings)"
+        onClick={() => onChange('rendered')}
+      >
+        Rendered
+      </button>
+    </div>
+  )
+}
+
 /** Copy-session-id button for the chat header. Renders a small ID-style
  *  icon; clicking copies the session id to the clipboard with a brief
  *  "Copied!" tooltip as feedback. Uses the same copyTextToClipboard helper
@@ -305,42 +352,87 @@ function CopySessionIdButton({ sessionId }: { sessionId: string }) {
   )
 }
 
-/** Best-effort clipboard copy that survives non-secure contexts. Returns a
- *  Promise<boolean> that resolves true if either the modern Clipboard API
- *  or the legacy execCommand path succeeded. */
-async function copyTextToClipboard(text: string): Promise<boolean> {
-  if (navigator.clipboard?.writeText) {
-    try {
-      await navigator.clipboard.writeText(text)
-      return true
-    } catch {
-      // Fall through to the execCommand fallback (permissions / non-secure
-      // context / Firefox-on-some-pages all reject the same way).
-    }
-  }
-  return execCommandCopy(text)
+/** The Files-page URL for a session workdir. The `path` parameter is what
+ *  FilesView reads on mount, so this is the whole address contract — kept in
+ *  one place so the link's href and any other caller agree on the encoding. */
+function workdirFilesUrl(path: string): string {
+  const params = new URLSearchParams()
+  params.set('path', path)
+  return `/files?${params.toString()}`
 }
 
-function execCommandCopy(text: string): boolean {
-  const ta = document.createElement('textarea')
-  ta.value = text
-  // Off-screen but still focusable.
-  ta.style.position = 'fixed'
-  ta.style.top = '0'
-  ta.style.left = '0'
-  ta.style.opacity = '0'
-  ta.style.pointerEvents = 'none'
-  ta.setAttribute('readonly', '')
-  document.body.appendChild(ta)
-  ta.select()
-  let ok = false
-  try {
-    ok = document.execCommand('copy')
-  } catch {
-    ok = false
+/** Open-workdir link for the chat header.
+ *
+ *  A real `<a target="_blank">` rather than a button that navigates the SPA:
+ *  the href is what makes the destination *visible* (hover shows the URL in
+ *  the browser's status bar, right-click offers "copy link address", and it
+ *  can be opened in a new tab). Keeping the transcript tab where it is also
+ *  means the user does not lose their place to go look at a directory.
+ *
+ *  Because the href has to exist before the user hovers, the workdir is
+ *  resolved eagerly on mount (and again whenever the selection changes) —
+ *  `<cache>/workdirs/<sid>` is fixed per session, so one resolve is enough.
+ *  Until it resolves, the anchor has no href: there is nothing truthful to
+ *  preview yet, and a click retries instead of opening a blank path. */
+function OpenWorkdirLink({ sessionId }: { sessionId: string }) {
+  const [path, setPath] = useState<string | null>(null)
+  const [error, setError] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    setPath(null)
+    setError(false)
+    void fetchSessionWorkdir(sessionId).then((resolved) => {
+      if (cancelled) return
+      if (resolved) setPath(resolved)
+      else setError(true)
+    })
+    return () => { cancelled = true }
+  }, [sessionId])
+
+  const onClick = async (ev: React.MouseEvent<HTMLAnchorElement>) => {
+    // With an href the browser's own link behaviour is exactly what we want
+    // (new tab, honouring the user's cmd/ctrl/middle-click preferences).
+    if (path) return
+    // Unresolved (still loading, or the fetch failed): retry rather than
+    // opening a link with no destination.
+    ev.preventDefault()
+    const resolved = await fetchSessionWorkdir(sessionId)
+    if (resolved) {
+      setPath(resolved)
+      setError(false)
+    } else {
+      setError(true)
+    }
   }
-  document.body.removeChild(ta)
-  return ok
+
+  const label = error
+    ? 'Could not resolve workdir'
+    : path
+      ? 'Open session workdir in Files'
+      : 'Resolving workdir'
+  return (
+    <a
+      className="header-scroll-btn"
+      href={path ? workdirFilesUrl(path) : undefined}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={error ? 'Could not resolve workdir' : path ? `Open ${path} in Files` : 'Resolving…'}
+      aria-label={label}
+      // No href ⇒ not a link and not focusable, so a keyboard user could not
+      // retry a failed resolve. Focusable + aria-disabled keeps the retry (and
+      // its Enter key) reachable while making the inert state explicit.
+      tabIndex={path ? undefined : 0}
+      aria-disabled={path ? undefined : true}
+      onClick={onClick}
+    >
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
+        stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
+        aria-hidden="true">
+        <path d="M2 4.5 A1.5 1.5 0 0 1 3.5 3 H6 L7.5 4.5 H12.5 A1.5 1.5 0 0 1 14 6 V11.5 A1.5 1.5 0 0 1 12.5 13 H3.5 A1.5 1.5 0 0 1 2 11.5 Z" />
+      </svg>
+    </a>
+  )
 }
 
 function copyAnchorLink(anchorId: string) {
@@ -523,9 +615,6 @@ function prettyJsonOrRaw(payload: string): string {
 }
 
 // Stack of currently-open modals. Only the top entry consumes Escape so
-// that closing the topmost doesn't also collapse the one underneath.
-const openModalStack: symbol[] = []
-
 type JsonTab = 'formatted' | 'raw'
 
 function CopyJsonButton({ text }: { text: string }) {
@@ -766,191 +855,23 @@ function toolCallSummary(input: unknown): string {
   const preferredKeys = ['command', 'cmd', 'shell_command', 'script', 'code', 'file_path', 'path', 'pattern', 'query', 'url', 'question']
   for (const k of preferredKeys) {
     const v = obj[k]
-    if (typeof v === 'string' && v.length > 0) return v
+    // The branch is a qualifier on the primary arg (SETUP_REPO's url), so
+    // surface it inline instead of hiding it in the expanded JSON.
+    const br = typeof obj.branch === 'string' ? obj.branch.trim() : ''
+    if (typeof v === 'string' && v.length > 0) {
+      return br ? `${v} (branch: ${br})` : v
+    }
   }
   // Fall back to a JSON one-liner so we never silently hide structure.
   return JSON.stringify(obj)
 }
 
-/** A lightweight markdown renderer for SHOW_HUMAN messages. Handles the
- *  most common markdown features: headers (h1-h3), bold, italic, inline
- *  code, code blocks (fenced), unordered lists, ordered lists, blockquotes,
- *  and horizontal rules. Falls back gracefully — any unrecognized line is
- *  rendered as a paragraph with whitespace preserved. No HTML is produced
- *  directly; everything is React elements (XSS-safe by construction). */
+/** The SHOW_HUMAN body, rendered as formatted markdown (headings, lists,
+ *  code, tables, links). Shares the transcript markdown renderer, so there
+ *  is exactly one markdown implementation and one XSS surface to audit:
+ *  every node is a React element, never `dangerouslySetInnerHTML`. */
 function ShowHumanMessage({ text }: { text: string }) {
-  const blocks = parseMarkdown(text)
-  return (
-    <div className="show-human-message" style={{ color: 'var(--text-primary)', lineHeight: 'var(--leading-relaxed)' }}>
-      {blocks.map((b, i) => renderBlock(b, i))}
-    </div>
-  )
-}
-
-type MdBlock =
-  | { kind: 'heading'; level: number; inline: MdInline[] }
-  | { kind: 'code'; lang: string; code: string }
-  | { kind: 'para'; inline: MdInline[] }
-  | { kind: 'ul'; items: MdInline[][] }
-  | { kind: 'ol'; items: MdInline[][] }
-  | { kind: 'quote'; inline: MdInline[] }
-  | { kind: 'hr' }
-
-type MdInline =
-  | { kind: 'text'; text: string }
-  | { kind: 'bold'; inline: MdInline[] }
-  | { kind: 'italic'; inline: MdInline[] }
-  | { kind: 'code'; code: string }
-
-function parseMarkdown(text: string): MdBlock[] {
-  const lines = text.split('\n')
-  const blocks: MdBlock[] = []
-  let i = 0
-  while (i < lines.length) {
-    const line = lines[i]!
-    // Skip blank lines
-    if (line.trim() === '') { i++; continue }
-    // Fenced code block
-    const fence = line.match(/^```(\w*)/)
-    if (fence) {
-      const lang = fence[1] ?? ''
-      const codeLines: string[] = []
-      i++
-      while (i < lines.length && !lines[i]!.trim().startsWith('```')) {
-        codeLines.push(lines[i]!)
-        i++
-      }
-      i++ // skip closing ```
-      blocks.push({ kind: 'code', lang, code: codeLines.join('\n') })
-      continue
-    }
-    // Heading
-    const heading = line.match(/^(#{1,3})\s+(.*)/)
-    if (heading) {
-      blocks.push({ kind: 'heading', level: heading[1]!.length, inline: parseInline(heading[2]!) })
-      i++
-      continue
-    }
-    // Horizontal rule
-    if (/^---+\s*$/.test(line)) {
-      blocks.push({ kind: 'hr' })
-      i++
-      continue
-    }
-    // Blockquote
-    if (line.startsWith('> ')) {
-      const quoteLines: string[] = [line.slice(2)]
-      i++
-      while (i < lines.length && lines[i]!.startsWith('> ')) {
-        quoteLines.push(lines[i]!.slice(2))
-        i++
-      }
-      blocks.push({ kind: 'quote', inline: parseInline(quoteLines.join(' ')) })
-      continue
-    }
-    // Unordered list
-    if (/^[-*]\s+/.test(line)) {
-      const items: MdInline[][] = []
-      while (i < lines.length && /^[-*]\s+/.test(lines[i]!)) {
-        items.push(parseInline(lines[i]!.replace(/^[-*]\s+/, '')))
-        i++
-      }
-      blocks.push({ kind: 'ul', items })
-      continue
-    }
-    // Ordered list
-    if (/^\d+\.\s+/.test(line)) {
-      const items: MdInline[][] = []
-      while (i < lines.length && /^\d+\.\s+/.test(lines[i]!)) {
-        items.push(parseInline(lines[i]!.replace(/^\d+\.\s+/, '')))
-        i++
-      }
-      blocks.push({ kind: 'ol', items })
-      continue
-    }
-    // Paragraph: collect consecutive non-blank, non-special lines
-    const paraLines: string[] = [line]
-    i++
-    while (i < lines.length && lines[i]!.trim() !== '' &&
-           !/^(#{1,3}\s|```|[-*]\s|\d+\.\s|>\s|---)/.test(lines[i]!)) {
-      paraLines.push(lines[i]!)
-      i++
-    }
-    blocks.push({ kind: 'para', inline: parseInline(paraLines.join(' ')) })
-  }
-  return blocks
-}
-
-function parseInline(text: string): MdInline[] {
-  const result: MdInline[] = []
-  let remaining = text
-  while (remaining.length > 0) {
-    // Bold: **text** or __text__
-    const bold = remaining.match(/\*\*(.+?)\*\*|__(.+?)__/)
-    // Italic: *text* or _text_ (but not ** or __)
-    const italic = remaining.match(/\*(.+?)\*|(?<!\w)_(.+?)_(?!\w)/)
-    // Inline code: `text`
-    const code = remaining.match(/`([^`]+)`/)
-    // Find the earliest match
-    let bestIdx = Infinity
-    let bestMatch: RegExpMatchArray | null = null
-    let bestKind: 'bold' | 'italic' | 'code' | null = null
-    if (bold && bold.index! < bestIdx) { bestIdx = bold.index!; bestMatch = bold; bestKind = 'bold' }
-    if (italic && italic.index! < bestIdx) { bestIdx = italic.index!; bestMatch = italic; bestKind = 'italic' }
-    if (code && code.index! < bestIdx) { bestIdx = code.index!; bestMatch = code; bestKind = 'code' }
-    if (bestMatch === null || bestKind === null) {
-      result.push({ kind: 'text', text: remaining })
-      break
-    }
-    // Push any text before the match
-    if (bestIdx > 0) result.push({ kind: 'text', text: remaining.slice(0, bestIdx) })
-    // Push the matched element
-    if (bestKind === 'code') {
-      result.push({ kind: 'code', code: bestMatch[1]! })
-    } else if (bestKind === 'bold') {
-      const inner = bestMatch[1] ?? bestMatch[2] ?? ''
-      result.push({ kind: 'bold', inline: parseInline(inner) })
-    } else if (bestKind === 'italic') {
-      const inner = bestMatch[1] ?? bestMatch[2] ?? ''
-      result.push({ kind: 'italic', inline: parseInline(inner) })
-    }
-    remaining = remaining.slice(bestIdx + bestMatch[0].length)
-  }
-  return result
-}
-
-function renderInline(inline: MdInline, key: number): React.ReactNode {
-  switch (inline.kind) {
-    case 'text': return inline.text
-    case 'bold': return <strong key={key}>{inline.inline.map(renderInline)}</strong>
-    case 'italic': return <em key={key}>{inline.inline.map(renderInline)}</em>
-    case 'code': return <code key={key} className="inline-code">{inline.code}</code>
-  }
-}
-
-function renderBlock(block: MdBlock, key: number): React.ReactNode {
-  switch (block.kind) {
-    case 'heading': {
-      const Tag = (block.level <= 1 ? 'h4' : block.level === 2 ? 'h5' : 'h6') as React.ElementType
-      return <Tag key={key} style={{ margin: '0.5em 0 0.3em', fontWeight: 600 }}>{block.inline.map(renderInline)}</Tag>
-    }
-    case 'code':
-      return <pre key={key} className="code-block" style={{ margin: '0.5em 0', maxHeight: 400, overflow: 'auto' }}>{block.code}</pre>
-    case 'para':
-      return <p key={key} style={{ margin: '0.3em 0' }}>{block.inline.map(renderInline)}</p>
-    case 'ul':
-      return <ul key={key} style={{ margin: '0.3em 0', paddingLeft: '1.25em', listStyle: 'disc' }}>
-        {block.items.map((item, i) => <li key={i} style={{ marginBottom: 4 }}>{item.map(renderInline)}</li>)}
-      </ul>
-    case 'ol':
-      return <ol key={key} style={{ margin: '0.3em 0', paddingLeft: '1.25em', listStyle: 'decimal' }}>
-        {block.items.map((item, i) => <li key={i} style={{ marginBottom: 4 }}>{item.map(renderInline)}</li>)}
-      </ol>
-    case 'quote':
-      return <blockquote key={key} style={{ borderLeft: '3px solid var(--border)', margin: '0.3em 0', paddingLeft: '1em', color: 'var(--text-muted)' }}>{block.inline.map(renderInline)}</blockquote>
-    case 'hr':
-      return <hr key={key} style={{ border: 'none', borderTop: '1px solid var(--border)', margin: '0.5em 0' }} />
-  }
+  return <MarkdownView text={text} className="show-human-message" />
 }
 
 const RESULT_PREVIEW_LINES = 4
@@ -1406,12 +1327,17 @@ function isAskHumanQuestion(pq: PendingQuestion): boolean {
 
 function MessageBlock({
   block,
+  markdownMode,
   pendingQuestions,
   matchedQuestionIds,
   onAnswer,
   onCancel,
 }: {
   block: MessageContent
+  /** How message text is displayed: the markdown source verbatim, or parsed
+   *  and rendered. Tool-call input/result bodies are unaffected — they are
+   *  payload data, not prose. */
+  markdownMode: TranscriptViewMode
   pendingQuestions?: PendingQuestion[]
   matchedQuestionIds: Set<string>
   onAnswer?: (qid: string, scope: string) => void
@@ -1471,7 +1397,18 @@ function MessageBlock({
     )
   }
   if (block.text) {
-    return <p className="mb-2 whitespace-pre-wrap" style={{ color: 'var(--text-primary)' }}>{block.text}</p>
+    if (markdownMode === 'rendered') {
+      return <MarkdownView text={block.text} className="mb-2" />
+    }
+    return (
+      <p
+        data-testid="msg-raw-text"
+        className="mb-2 whitespace-pre-wrap"
+        style={{ color: 'var(--text-primary)' }}
+      >
+        {block.text}
+      </p>
+    )
   }
   return null
 }
@@ -1500,13 +1437,16 @@ const ChatMessage = memo(function ChatMessage({
   message,
   onBranch,
   sending,
+  markdownMode,
   pendingQuestions,
   onAnswer,
   onCancel,
 }: {
   message: Message
-  onBranch?: (entryId: string) => void
+  onBranch?: (convLen: number) => void
   sending?: boolean
+  /** 'rendered' (default) formats the markdown; 'raw' shows the source. */
+  markdownMode?: TranscriptViewMode
   pendingQuestions?: PendingQuestion[]
   onAnswer?: (qid: string, scope: string) => void
   onCancel?: (qid: string) => void
@@ -1521,9 +1461,10 @@ const ChatMessage = memo(function ChatMessage({
   // the blocks map runs).
   const matchedQuestionIds = useRef<Set<string>>(new Set())
 
-  // Transient slash-command output bubble. Rendered in a muted, distinct
-  // "command output" style with a "not saved" label so the user can tell it
-  // apart from persisted transcript turns. These rows never enter the
+  // Transient output bubble: slash-command output, or the confirmation that a
+  // plain reply was consumed as an ASK_HUMAN answer. Rendered in a muted,
+  // distinct style with a "not saved" tag so the user can tell it apart from
+  // persisted transcript turns. These rows never enter the
   // transcript and vanish on reload; they carry no branch/JSON affordances.
   if (message.slashBubble) {
     return (
@@ -1543,7 +1484,7 @@ const ChatMessage = memo(function ChatMessage({
             {message.agentName}
           </span>
           <span className="text-xs" style={{ color: 'var(--text-faint)', fontStyle: 'italic' }}>
-            command output &mdash; not saved
+            {message.slashBubbleLabel ?? 'command output — not saved'}
           </span>
           <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
             {message.timestamp}
@@ -1601,9 +1542,9 @@ const ChatMessage = memo(function ChatMessage({
         {message.rawJson !== undefined && (
           <JsonButton kind="message" onClick={() => setJsonOpen(true)} />
         )}
-        {onBranch !== undefined && message.entryId !== undefined && (
+        {onBranch !== undefined && message.convLen !== undefined && (
           <BranchButton
-            onClick={() => onBranch(message.entryId!)}
+            onClick={() => onBranch(message.convLen!)}
             disabled={sending}
           />
         )}
@@ -1614,6 +1555,7 @@ const ChatMessage = memo(function ChatMessage({
           <MessageBlock
             key={block.id ?? i}
             block={block}
+            markdownMode={markdownMode ?? DEFAULT_TRANSCRIPT_VIEW_MODE}
             pendingQuestions={pendingQuestions}
             matchedQuestionIds={matchedQuestionIds.current}
             onAnswer={onAnswer}
@@ -2108,6 +2050,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           messages.push({
             id: e.id + '-skillload',
             entryId: e.id,
+            convLen: e.convLen ?? undefined,
             agentName: channel ? `Skill · ${channel}` : 'Skill',
             agentStatus: 'completed',
             timestamp: ts,
@@ -2118,16 +2061,26 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
         }
         if (opName === 'SETUP_REPO' && parsed.result) {
           // SETUP_REPO result entry — render as a tool-call box so the
-          // clone/no-op/conflict/failure is visible in the chat (not just
-          // the raw transcript). The result carries {status, target}; on
-          // failure the error text is in the conversation message, so the
-          // box shows the status + target as a one-line summary.
-          const input = parsed.input as { url?: string } | undefined
+          // clone/no-op/switch/conflict/failure is visible in the chat (not
+          // just the raw transcript). The result carries {status, target};
+          // on failure the error text is in the conversation message, so the
+          // box shows the status + target (and the branch, from the input)
+          // as a one-line summary.
+          const input = parsed.input as { url?: string; branch?: string } | undefined
           const result = parsed.result as { status?: string; target?: string } | undefined
           const status = result?.status ?? ''
           const target = result?.target ?? ''
-          const summary = status === 'cloned' ? `Cloned into ${target}`
-                        : status === 'noop' ? `Repo already exists — ${target}`
+          // The branch rides in the recorded opcode INPUT (the result is
+          // {status, target} only), so name it here — otherwise a
+          // branch-aware clone/switch would read as a plain clone.
+          // `input` is untrusted JSON straight from the transcript: the
+          // backend treats a non-string branch as absent, so guard the type
+          // here too (a `.trim()` on a number would throw during render).
+          const branch = typeof input?.branch === 'string' ? input.branch.trim() : ''
+          const branchNote = branch ? ` (branch ${branch})` : ''
+          const summary = status === 'cloned' ? `Cloned into ${target}${branchNote}`
+                        : status === 'noop' ? `Repo already exists — ${target}${branchNote}`
+                        : status === 'switched' ? `Switched to ${branch || 'branch'} — ${target}`
                         : status === 'conflict' ? `Conflict at ${target}`
                         : status === 'failed' ? 'Clone failed'
                         : status
@@ -2142,6 +2095,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           messages.push({
             id: e.id + '-setuprepo',
             entryId: e.id,
+            convLen: e.convLen ?? undefined,
             agentName: channel ? `Repo · ${channel}` : 'Repo',
             agentStatus: status === 'failed' ? 'idle' : 'completed',
             timestamp: ts,
@@ -2222,12 +2176,15 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
               messages.push({
                 id: e.id + '-user',
                 entryId: e.id,
+                convLen: e.convLen ?? undefined,
                 // Surface the originating channel (e.g. "telegram", "web")
                 // in the source label so the user can tell where a message
                 // came from. The channel is stamped into the request
                 // entry's erMeta by runTurn's requestMeta and shipped as
                 // a top-level `channel` field on the TranscriptEntry.
-                agentName: e.channel ? `You · ${e.channel}` : 'You',
+                agentName: e.channel
+                  ? (e.userId ? `You · ${e.channel}:${e.userId}` : `You · ${e.channel}`)
+                  : 'You',
                 agentStatus: 'completed',
                 timestamp: ts,
                 blocks: [{ id: 'u-' + e.id, text: textParts }],
@@ -2245,6 +2202,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
               messages.push({
                 id: e.id + '-asst',
                 entryId: e.id,
+                convLen: e.convLen ?? undefined,
                 agentName: e.model ?? 'Assistant',
                 agentStatus: 'completed',
                 timestamp: ts,
@@ -2301,6 +2259,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
         messages.push({
           id: e.id,
           entryId: e.id,
+          convLen: e.convLen ?? undefined,
           agentName: e.model ?? e.harness ?? 'Assistant',
           agentStatus: 'completed',
           timestamp: ts,
@@ -2526,8 +2485,8 @@ export function ChatArea({
   isViewingLatest?: boolean
   loadingMore?: boolean
   loadOlder?: () => void
-  loadFromBeginning?: () => void
-  loadLatest?: () => void
+  loadFromBeginning?: () => LoadResult
+  loadLatest?: () => LoadResult
   onSend?: (message: string) => void
   sending?: boolean
   tokensUsed?: number
@@ -2568,11 +2527,11 @@ export function ChatArea({
    *  the user can type into the new session immediately without an
    *  extra click. */
   selectedId?: string | null
-  /** When defined, each transcript row that carries an `entryId` renders a
-   *  branch button wired to `onBranch(entryId)`. Supplied by App only for
+  /** When defined, each transcript row that carries a `convLen` renders a
+   *  branch button wired to `onBranch(convLen)`. Supplied by App only for
    *  persisted provider sessions; undefined for harness sessions and in
    *  compose mode, which suppresses the button entirely. */
-  onBranch?: (entryId: string) => void
+  onBranch?: (convLen: number) => void
   /** Read-only transcript prefix rendered ABOVE the composer panel in a
    *  branch-draft compose flow. These rows carry no `onBranch` so they
    *  render no branch button and offer no send affordance — the only send
@@ -2630,14 +2589,33 @@ export function ChatArea({
  isSessionThinking?: boolean
 }) {
   const [input, setInput] = useState('')
+  // Transcript rendering mode — 'raw' (markdown source) or 'rendered' (HTML).
+  // Persisted per browser so the choice survives reloads; see
+  // lib/transcriptViewMode.
+  const [markdownMode, setMarkdownMode] = useState<TranscriptViewMode>(
+    () => loadTranscriptViewMode(),
+  )
+  const changeMarkdownMode = useCallback((mode: TranscriptViewMode) => {
+    setMarkdownMode(mode)
+    saveTranscriptViewMode(mode)
+  }, [])
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollerRef = useRef<HTMLDivElement>(null)
-  const wasAtBottom = useRef(true)
- // Guards against duplicate loadLatest calls when the user scrolls to
- // the bottom while isViewingLatest is false. Set to true when
- // loadLatest is triggered; reset when isViewingLatest becomes true.
- const triggeredLoadLatest = useRef(false)
+  // One scroll intent for the transcript viewport, updated only through the
+  // pure reducer in lib/scrollIntent.ts. There is no second "pending" flag
+  // that can disagree with it or get stuck.
+  const scrollIntent = useRef<ScrollIntent>(null)
+  // Shared with useVirtualWindow: the expected scrollTop of the virtual
+  // window's measurement adjustment. Both listeners treat a matching event
+  // as synthetic (no range update, no intent cancellation).
+  const scrollGuard = useRef<number | null>(null)
+  // Expected scrollTop of a button-initiated scroll. A matching event must
+  // NOT cancel the intent, but it DOES update the virtual range.
+  const intentScrollGuard = useRef<number | null>(null)
+  // Whether the viewport is at the bottom. This is an INPUT to the
+  // sticky-follow rule and the virtual window, not a decision variable.
+  const atBottomRef = useRef(true)
  // Derived: treat missing prop as true (backward-compatible with tests).
  const viewingLatest = isViewingLatest ?? true
 
@@ -2646,6 +2624,7 @@ export function ChatArea({
   // smaller transcripts render all messages directly for correct scrolling.
   const virtualWindow = useVirtualWindow(
     messages.length, scrollerRef, selectedId ?? null,
+    { atBottomRef, scrollGuard },
   )
   const useVirtualization = messages.length > 500
 
@@ -2696,15 +2675,14 @@ export function ChatArea({
   // answer via `onSend` (a regular user message) instead of
   // `onAnswerQuestionText` (which requires a live store entry).
   const effectivePendingQuestions = useMemo(() => {
-    // Clean up answered tracking for tool calls that now have a result
-    // (the agent continued past the ASK_HUMAN).
-    for (const msg of messages) {
-      for (const block of msg.blocks) {
-        if (block.toolCall?.name === 'ASK_HUMAN' && block.toolCall.result !== undefined) {
-          answeredAskHumanToolCallIds.current.delete(block.toolCall.id)
-        }
-      }
-    }
+    // NOTE: we deliberately do NOT clean up answeredAskHumanToolCallIds
+    // here. Once a tool call has been marked answered, it must stay
+    // marked — a transcript re-seed (e.g. on harness-status:idle → refresh
+    // after sending a new message) can cause the tool_result to
+    // momentarily disappear from the messages array, which would let
+    // synthesizePendingQuestions revive the old ASK_HUMAN form. The tool
+    // call id is unique and never reused, so there is no false-positive
+    // risk; the set is bounded by the session's ASK_HUMAN call count.
     const synth = synthesizePendingQuestions(messages)
     if (synth.length === 0) return pendingQuestions ?? []
     // Filter out synthesized questions whose tool call was already answered
@@ -2775,42 +2753,82 @@ export function ChatArea({
     return () => window.removeEventListener('hashchange', update)
   }, [])
 
-  // Track sticky-bottom state from real scroll events.
-  useEffect(() => {
-    if (hasFragment) return
+  // Apply a programmatic scroll that belongs to the current intent. The
+  // guard marks the resulting scroll event so it does not cancel that
+  // intent; a non-matching scroll clears it.
+  const applyScroll = useCallback((target: 'top' | 'bottom') => {
     const el = scrollerRef.current
     if (!el) return
-    const onScroll = () => {
-      wasAtBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
-      // Load older entries when scrolled to top
-      if (el.scrollTop < 60 && hasMore && !loadingMore && loadOlder) {
-        loadOlder()
-        wasAtBottom.current = false
+    // The expected scrollTop is the CLAMPED maximum, not scrollHeight:
+    // the browser cannot scroll past scrollHeight - clientHeight, and a
+    // guard set to the unclamped value would never match the resulting
+    // event (so the button's own bottom scroll would cancel its intent).
+    const maxTop = () => Math.max(0, el.scrollHeight - el.clientHeight)
+    const top = target === 'top' ? 0 : maxTop()
+    intentScrollGuard.current = el.scrollTop === top ? null : top
+    el.scrollTo({ top: target === 'top' ? 0 : el.scrollHeight })
+    // Follow-up frame catches layout shifts from async content (code
+    // highlighting, images, markdown) that renders after commit.
+    requestAnimationFrame(() => {
+      const el2 = scrollerRef.current
+      if (!el2) return
+      const nextTop = target === 'top' ? 0 : Math.max(0, el2.scrollHeight - el2.clientHeight)
+      intentScrollGuard.current = el2.scrollTop === nextTop ? null : nextTop
+      el2.scrollTo({ top: target === 'top' ? 0 : el2.scrollHeight })
+    })
+  }, [])
+
+  // The transcript scroll listener. It measures, classifies programmatic
+  // scrolls, and feeds the pure intent reducer. It is NOT gated by
+  // `hasFragment`: deep-link mode only suppresses automatic scrolling (via
+  // the `atBottom` input below), not measurement.
+  useEffect(() => {
+    const el = scrollerRef.current
+    if (!el) return
+    // `userInitiated` is per CALL, never per effect run: the effect
+    // re-registers whenever `loadingMore`/`hasMore` change, and resetting
+    // an "initial" flag there would exempt the first real user scroll after
+    // every chunk from cancelling a pending intent.
+    const onScroll = (userInitiated: boolean) => {
+      const scrollTop = el.scrollTop
+      // The virtual window's measurement adjustment is not a user scroll.
+      if (isSyntheticScroll(scrollTop, scrollGuard.current)) return
+      const ownScroll = isSyntheticScroll(scrollTop, intentScrollGuard.current)
+      scrollGuard.current = null
+      intentScrollGuard.current = null
+      // A real user scroll cancels any pending intent. The button's own
+      // scroll does not.
+      if (userInitiated && !ownScroll) {
+        scrollIntent.current = nextScrollIntent(scrollIntent.current, { type: 'user-scrolled' }).intent
       }
-      // When the user reaches the bottom but the loaded entries don't
-      // include the latest (e.g. after loadFromBeginning), trigger
-      // loadLatest to fetch the newest entries and enter auto-scroll
-      // mode. The triggeredLoadLatest guard prevents duplicate calls
-      // before isViewingLatest flips to true.
-      if (
-        wasAtBottom.current && !viewingLatest &&
-        !triggeredLoadLatest.current && loadLatest && !loadingMore
-      ) {
-        triggeredLoadLatest.current = true
-        pendingScrollToBottom.current = true
-        loadLatest()
+      const metrics = { scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight }
+      atBottomRef.current = isAtBottom(metrics)
+      const step = nextScrollIntent(scrollIntent.current, {
+        type: 'scrolled',
+        atTop: isNearTop(metrics),
+        atBottom: atBottomRef.current,
+        hasNewer: !viewingLatest,
+        canAutoLoadOlder: (hasMore ?? false) && !!loadOlder && !loadingMore,
+      })
+      scrollIntent.current = step.intent
+      if (step.fetch === 'older' && loadOlder && !loadingMore) {
+        loadOlder()
+      } else if (step.fetch === 'latest' && loadLatest && !loadingMore) {
+        const result = loadLatest()
+        if (result === 'unchanged' || result === 'unavailable') {
+          scrollIntent.current = null
+          applyScroll('bottom')
+        }
       }
     }
-    onScroll()
-    el.addEventListener('scroll', onScroll, { passive: true })
-    return () => el.removeEventListener('scroll', onScroll)
+    // Initial measurement: not user-initiated, so it cannot cancel the
+    // session-switch intent that the layout effect just set.
+    onScroll(false)
+    const listener = () => onScroll(true)
+    el.addEventListener('scroll', listener, { passive: true })
+    return () => el.removeEventListener('scroll', listener)
+  }, [hasMore, loadingMore, loadOlder, viewingLatest, loadLatest, applyScroll])
 
-  }, [hasFragment, hasMore, loadingMore, loadOlder, viewingLatest, loadLatest])
-  // Reset the loadLatest trigger when entries become the latest view
-  // (after loadLatest completes or on session switch).
-  useEffect(() => {
-    if (viewingLatest) triggeredLoadLatest.current = false
-  }, [viewingLatest])
   // Measure the time from the start of the message-list render phase to the
   // point the browser has painted the committed DOM. React's <Profiler> is a
   // no-op in production builds, so we use a render-phase timestamp (captured
@@ -2823,141 +2841,80 @@ export function ChatArea({
     if (!perf.isEnabled() || renderStartRef.current === 0) return
     const t0 = renderStartRef.current
     const commitDone = perf.begin('render.ChatArea.commit')
-    // useLayoutEffect fires after DOM commit but before paint. Measure the
-    // commit phase (render→commit).
     perf.record('render.ChatArea.commit', { durMs: Math.round((performance.now() - t0) * 100) / 100, meta: { phase: 'commit', n: messages.length } })
-    // Use rAF to measure the full render→paint cycle (the browser's
-    // style+layout+paint after commit).
     requestAnimationFrame(() => {
       perf.record('render.ChatArea.paint', { durMs: Math.round((performance.now() - t0) * 100) / 100, meta: { phase: 'paint', n: messages.length } })
       commitDone()
     })
   }, [messages])
 
-  // Track the previous session id so we can detect session changes within
-  // the auto-scroll effect. Always update it here so sessionChanged is
-  // only true on the render where the session actually changed.
+  // Track the previous session id so a session switch is detected once.
   const prevSessionIdRef = useRef<string | undefined>(selectedSession?.id)
-  // Stays true from a session switch until we've successfully scrolled to
-  // the bottom with real messages rendered. Survives the async gap between
-  // switching to a session (cache miss → loading view) and the messages
-  // arriving (HTTP fetch completes), so the scroll fires at the right time
-  // rather than on the loading view.
-  const pendingScrollToBottom = useRef(false)
 
-  // Stays true from a "scroll to top" / loadFromBeginning click until the
-  // oldest entries arrive and we've scrolled to top: 0. Without this, the
-  // sticky-bottom effect (wasAtBottom still true from the initial load)
-  // would scroll to the BOTTOM of the newly-arrived oldest entries instead
-  // of the top — the user would see the last of the oldest chunk, not the
-  // first message (SETUP_REPO / System Prompt).
-  const pendingScrollToTop = useRef(false)
-
-  // Session-switch scroll: useLayoutEffect fires after DOM commit but
-  // BEFORE paint, so the user never sees a flash of the wrong position.
-  // This is critical for tab clicks — the user expects to see the latest
-  // messages immediately. We use scrollTo on the scroller directly (rather
-  // than scrollIntoView on the sentinel) for reliable, explicit positioning.
-  // A requestAnimationFrame follow-up catches layout shifts from async
-  // content (code highlighting, images, markdown) that render after commit.
+  // Consume the pending intent when content arrives. useLayoutEffect runs
+  // after DOM commit and before paint, so the position is applied without a
+  // flash. Not gated by `hasFragment`: an explicit button request always
+  // wins; deep links are protected by the `preserveAnchor` input instead.
   useLayoutEffect(() => {
-    if (hasFragment) return
     const sessionChanged = prevSessionIdRef.current !== selectedSession?.id
     prevSessionIdRef.current = selectedSession?.id
     if (sessionChanged) {
-      wasAtBottom.current = true
-      pendingScrollToBottom.current = true
-      // Return early — do NOT scroll on this render. The messages prop
-      // is stale: it still reflects the previous session's data because
-      // useTranscriptStream's session-load effect (which fetches the new
-      // session's entries) runs AFTER this useLayoutEffect. Scrolling now
-      // would scroll to the bottom of the WRONG session's content and
-      // clear pendingScrollToBottom, so when the new session's messages
-      // arrive on the next render, no scroll happens. The next render
-      // (triggered by setEntries in useTranscriptStream) will have the
-      // correct messages and will handle the scroll.
+      atBottomRef.current = true
+      scrollIntent.current = nextScrollIntent(scrollIntent.current, {
+        type: 'select-session',
+        preserveAnchor: hasFragment,
+      }).intent
+      // Do NOT scroll on this render: `messages` still belongs to the
+      // previous session (the transcript hook's load effect runs after this
+      // layout effect). The next render carries the correct messages.
       return
     }
+    const step = nextScrollIntent(scrollIntent.current, {
+      type: 'content-arrived',
+      loading: !!loading,
+      empty: messages.length === 0,
+      atBottom: atBottomRef.current && !hasFragment,
+    })
+    scrollIntent.current = step.intent
+    if (step.scrollTo) applyScroll(step.scrollTo)
+  }, [messages, selectedSession?.id, loading, hasFragment, applyScroll])
 
-    // Scroll to the bottom when a session switch is pending and real
-    // messages are present (not loading, not empty). The pending flag
-    // survives the async gap for cache-miss sessions where messages arrive
-    // via HTTP fetch after the session id has already changed.
-    if (pendingScrollToBottom.current && !loading && messages.length > 0) {
-      const el = scrollerRef.current
-      if (el) {
-        console.log(`[chat] SCROLL-BOTTOM useLayoutEffect: scrolling to scrollHeight=${el.scrollHeight} msgs=${messages.length} loading=${loading}`)
-        el.scrollTo({ top: el.scrollHeight })
-        // Follow-up scroll on the next frame to catch layout shifts from
-        // async content rendering (code blocks, images, markdown). Use a
-        // very large value so the browser clamps to the true bottom even
-        // if scrollHeight changed after the initial scrollTo.
-        requestAnimationFrame(() => {
-          const el2 = scrollerRef.current
-          if (el2) {
-            console.log(`[chat] SCROLL-BOTTOM rAF follow-up: scrollHeight=${el2.scrollHeight} scrollTop=${el2.scrollTop} clientHeight=${el2.clientHeight} atBottom=${el2.scrollHeight - el2.scrollTop - el2.clientHeight < 80}`)
-          }
-          if (el2) el2.scrollTo({ top: 999999 })
-          if (el2) {
-            console.log(`[chat] SCROLL-BOTTOM rAF post-scroll: scrollHeight=${el2.scrollHeight} scrollTop=${el2.scrollTop} clientHeight=${el2.clientHeight} atBottom=${el2.scrollHeight - el2.scrollTop - el2.clientHeight < 80}`)
-          }
-        })
-        pendingScrollToBottom.current = false
+  // Header buttons: the pure reducer decides whether a fetch is needed.
+  const handleScrollToTop = useCallback(() => {
+    const step = nextScrollIntent(scrollIntent.current, {
+      type: 'scroll-to-top',
+      atStart: !hasMore,
+    })
+    scrollIntent.current = step.intent
+    if (step.fetch === 'beginning' && loadFromBeginning) {
+      const result = loadFromBeginning()
+      if (result === 'unchanged' || result === 'unavailable') {
+        scrollIntent.current = null
+        applyScroll('top')
       }
-    } else if (pendingScrollToBottom.current && !loading && messages.length === 0) {
-      pendingScrollToBottom.current = false
+    } else if (step.scrollTo) {
+      scrollIntent.current = null
+      applyScroll(step.scrollTo)
     }
+  }, [hasMore, loadFromBeginning, applyScroll])
 
-    // Scroll to the top when a "scroll to top" / loadFromBeginning is
-    // pending and the new (oldest) entries have arrived. The pending flag
-    // survives the async gap between the button click (WS request) and
-    // the chunk arrival (setEntries → messages prop changes).
-    if (pendingScrollToTop.current && !loading && messages.length > 0) {
-      const el = scrollerRef.current
-      if (el) {
-        el.scrollTo({ top: 0 })
-        requestAnimationFrame(() => {
-          const el2 = scrollerRef.current
-          if (el2) el2.scrollTo({ top: 0 })
-        })
+  const handleScrollToBottom = useCallback(() => {
+    const step = nextScrollIntent(scrollIntent.current, {
+      type: 'scroll-to-bottom',
+      atEnd: viewingLatest,
+    })
+    scrollIntent.current = step.intent
+    if (step.fetch === 'latest' && loadLatest) {
+      const result = loadLatest()
+      if (result === 'unchanged' || result === 'unavailable') {
+        scrollIntent.current = null
+        applyScroll('bottom')
       }
-      // Don't clear here — the sticky-bottom useEffect clears it after
-      // guarding against it. If we clear here, the scroll listener's
-      // onScroll() (which re-runs when hasMore changes) resets
-      // wasAtBottom before the sticky-bottom effect runs, causing an
-      // erroneous scroll-to-bottom.
-    } else if (pendingScrollToTop.current && !loading && messages.length === 0) {
-      pendingScrollToTop.current = false
+    } else if (step.scrollTo) {
+      scrollIntent.current = null
+      applyScroll(step.scrollTo)
     }
-  }, [messages, hasFragment, selectedSession?.id, loading])
-
-  // Sticky-bottom scroll for streaming messages: only auto-scroll when the
-  // user was already near the bottom. Uses scrollIntoView on the sentinel
-  // div (the existing behavior) so tests that spy on scrollIntoView remain
-  // valid. Runs in useEffect (after paint) — less timing-critical than
-  // session switches.
-  useEffect(() => {
-    if (hasFragment) return
-    if (pendingScrollToBottom.current) return
-    if (pendingScrollToTop.current) {
-      // Clear the flag here (not in useLayoutEffect) so the guard is
-      // still active when this effect runs — after the scroll listener's
-      // onScroll() may have reset wasAtBottom.
-      pendingScrollToTop.current = false
-      return
-    }
-    if (wasAtBottom.current) {
-      // Use scrollTo with a large value instead of scrollIntoView on the
-      // sentinel — the sentinel sits above the container's bottom padding
-      // (py-6 = 24px), so scrollIntoView leaves a ~23px gap. A large
-      // value is clamped by the browser to the true bottom.
-      const el = scrollerRef.current
-      if (el) {
-        console.log(`[chat] SCROLL-BOTTOM sticky useEffect: scrollHeight=${el.scrollHeight} scrollTop=${el.scrollTop} clientHeight=${el.clientHeight} atBottom=${el.scrollHeight - el.scrollTop - el.clientHeight < 80}`)
-      }
-      if (el) el.scrollTo({ top: 999999 })
-    }
-  }, [messages, hasFragment, selectedSession?.id])
+  }, [viewingLatest, loadLatest, applyScroll])
 
   // ── Context-window stat (roadmap § 7b deliverable 7) ──────────────────
   // When the session's provider+model are known, fetch the model's context
@@ -3045,33 +3002,15 @@ export function ChatArea({
         {messages.length > 0 && (
           <div className="ml-auto flex items-center gap-1 shrink-0">
            {isThinking && onStop && <StopButton onStop={onStop} />}
-            {selectedSession && <CopySessionIdButton sessionId={selectedSession.id} />}
+            <TranscriptViewToggle mode={markdownMode} onChange={changeMarkdownMode} />
+           {selectedSession && <CopySessionIdButton sessionId={selectedSession.id} />}
+           {selectedSession && <OpenWorkdirLink sessionId={selectedSession.id} />}
             <button
               className="header-scroll-btn"
               title={loadingMore ? "Loading…" : "Scroll to top of transcript"}
               aria-label="Scroll to top"
               disabled={loadingMore}
-              onClick={() => {
-                console.log(`[chat] SCROLL-TOP click hasMore=${hasMore} hasLoadFromBeginning=${!!loadFromBeginning} msgCount=${messages.length}`)
-                if (hasMore && loadFromBeginning) {
-                  pendingScrollToTop.current = true
-                  wasAtBottom.current = false
-                  loadFromBeginning()
-                  // Fallback: if loadFromBeginning was a no-op (pinned
-                  // entries are the same reference → useState bails out →
-                  // no re-render → useLayoutEffect never fires →
-                  // pendingScrollToTop never consumed), do the scroll
-                  // directly after paint.
-                  requestAnimationFrame(() => {
-                    if (pendingScrollToTop.current) {
-                      scrollerRef.current?.scrollTo({ top: 0 })
-                      pendingScrollToTop.current = false
-                    }
-                  })
-                } else {
-                  scrollerRef.current?.scrollTo({ top: 0 })
-                }
-              }}
+              onClick={handleScrollToTop}
             >
               {loadingMore ? (
                 <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
@@ -3092,50 +3031,7 @@ export function ChatArea({
               title={loadingMore ? "Loading…" : "Scroll to bottom of transcript"}
               aria-label="Scroll to bottom"
               disabled={loadingMore}
-              onClick={() => {
-                console.log(`[chat] SCROLL-BOTTOM click hasLoadLatest=${!!loadLatest} msgCount=${messages.length} hasMore=${hasMore}`)
-                const elDebug = scrollerRef.current
-                console.log(`[chat] SCROLL-BOTTOM pre-scroll dims: scrollTop=${elDebug?.scrollTop} scrollHeight=${elDebug?.scrollHeight} clientHeight=${elDebug?.clientHeight}`)
-                if (loadLatest) {
-                  pendingScrollToBottom.current = true
-                  wasAtBottom.current = true
-                  loadLatest()
-                  // Fallback: if loadLatest was a no-op (pinned entries
-                  // are the same reference → useState bails out → no
-                  // re-render → useLayoutEffect never fires →
-                  // pendingScrollToBottom never consumed), do the scroll
-                  // directly after paint.
-                  requestAnimationFrame(() => {
-                    if (pendingScrollToBottom.current) {
-                      const el = scrollerRef.current
-                      if (el) el.scrollTo({ top: el.scrollHeight })
-                      pendingScrollToBottom.current = false
-                    }
-                  })
-                  // Diagnostic: check if loadLatest was a no-op (same
-                  // entries reference → no re-render → useLayoutEffect
-                  // never fires → pendingScrollToBottom never consumed).
-                  // We use a microtask + timeout to check after React
-                  // would have processed state updates.
-                  queueMicrotask(() => {
-                    const el = scrollerRef.current
-                    console.log(`[chat] SCROLL-BOTTOM microtask check: pendingScrollToBottom=${pendingScrollToBottom.current} scrollTop=${el?.scrollTop} scrollHeight=${el?.scrollHeight}`)
-                  })
-                  setTimeout(() => {
-                    const el = scrollerRef.current
-                    console.log(`[chat] SCROLL-BOTTOM 200ms check: pendingScrollToBottom=${pendingScrollToBottom.current} scrollTop=${el?.scrollTop} scrollHeight=${el?.scrollHeight} clientHeight=${el?.clientHeight} atBottom=${el ? (el.scrollHeight - el.scrollTop - el.clientHeight < 80) : 'N/A'}`)
-                  }, 200)
-                  setTimeout(() => {
-                    const el = scrollerRef.current
-                    console.log(`[chat] SCROLL-BOTTOM 500ms check: pendingScrollToBottom=${pendingScrollToBottom.current} scrollTop=${el?.scrollTop} scrollHeight=${el?.scrollHeight} clientHeight=${el?.clientHeight} atBottom=${el ? (el.scrollHeight - el.scrollTop - el.clientHeight < 80) : 'N/A'}`)
-                  }, 500)
-                } else {
-                  const el = scrollerRef.current
-                  if (el) el.scrollTo({ top: el.scrollHeight })
-                  wasAtBottom.current = true
-                  console.log(`[chat] SCROLL-BOTTOM direct scroll to ${el?.scrollHeight}`)
-                }
-              }}
+              onClick={handleScrollToBottom}
             >
               {loadingMore ? (
                 <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
@@ -3155,8 +3051,8 @@ export function ChatArea({
         )}
         {selectedSession && messages.length === 0 && (
           <div className="ml-auto flex items-center gap-1 shrink-0">
-           {isThinking && onStop && <StopButton onStop={onStop} />}
             <CopySessionIdButton sessionId={selectedSession.id} />
+            <OpenWorkdirLink sessionId={selectedSession.id} />
           </div>
         )}
       </div>
@@ -3187,7 +3083,11 @@ export function ChatArea({
                   {prefixMessages.map((msg) => (
                     // Read-only: no onBranch (no branch button) and no send
                     // affordance — the only send path is the composer below.
-                    <ChatMessage key={msg.id} message={msg} />
+                    <ChatMessage
+                      key={msg.id}
+                      message={msg}
+                      markdownMode={markdownMode}
+                    />
                   ))}
                 </div>
               )}
@@ -3234,6 +3134,7 @@ export function ChatArea({
                       <Profiler key={virtualWindow.startIndex + i} id="ChatMessage" onRender={onChatMessageRender}>
                         <ChatMessage
                           message={msg}
+                          markdownMode={markdownMode}
                           onBranch={onBranch}
                           sending={sending}
                           pendingQuestions={effectivePendingQuestions}
@@ -3257,6 +3158,7 @@ export function ChatArea({
                   <Profiler key={index} id="ChatMessage" onRender={onChatMessageRender}>
                     <ChatMessage
                       message={msg}
+                      markdownMode={markdownMode}
                       onBranch={onBranch}
                       sending={sending}
                       pendingQuestions={effectivePendingQuestions}

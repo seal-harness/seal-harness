@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 -- | The @/model@ command group: list known providers/models and set the active
 -- session's provider+model (persisted to session.json). Provider+model are named
 -- explicitly (unambiguous once providers host arbitrary model names).
@@ -48,7 +49,7 @@ import Seal.Core.Types (ModelId (..), SessionId)
 import Seal.Core.TurnEngine (broadcastNewEntries, loadSessionMeta)
 import Seal.Gateway.StreamBroker (StreamBroker)
 import Seal.Handles.Transcript (IndexedTranscriptHandle (..), IndexedTranscriptWrite (..), withIndexedTranscript)
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
+import Seal.Providers.Class (ContentBlock (..), pattern Message, Role (..))
 import Seal.Providers.Registry
   ( KnownProvider, configuredProviders, defaultModelFor, knownProviders, listSome
   , parseProvider, providerLabel, resolveDefaultModel, resolveProvider )

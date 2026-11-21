@@ -18,6 +18,7 @@ module Seal.Channels.Chat.Types
     -- * Gateway config
   , GatewayConfig (..)
   , defaultGatewayConfig
+  , mkGatewayConfig
     -- * Streaming
   , StreamingState (..)
   , newStreamingState
@@ -30,6 +31,7 @@ import Data.IORef (IORef, newIORef, writeIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Time (UTCTime)
 import Seal.Gateway.Types.Core (SessionId)
 import Seal.Gateway.Types.ChannelKind (channelKindToText)
@@ -117,22 +119,46 @@ sessionInsert (SessionMap tv) key sid =
 
 -- | The gateway connection config: where the HTTP API and WS server live.
 data GatewayConfig = GatewayConfig
-  { gcHost     :: Text    -- ^ e.g. @"127.0.0.1"@
+  { gcHost     :: Text    -- ^ e.g. @"localhost"@
   , gcHttpPort :: Int     -- ^ e.g. 8080
   , gcWsPort   :: Int     -- ^ e.g. 8081
-  , gcApiBase  :: Text    -- ^ e.g. @"http://127.0.0.1:8080/api"@
-  , gcWsUrl    :: Text    -- ^ e.g. @"ws://127.0.0.1:8081"@
+  , gcApiBase  :: Text    -- ^ e.g. @"http://localhost:8080/api"@
+  , gcWsUrl    :: Text    -- ^ e.g. @"ws://localhost:8081"@
+  , gcWsSecure :: Bool    -- ^ Connect to the WS server over TLS (@wss@)
+  , gcTlsCert  :: Maybe Text
+    -- ^ PEM certificate to trust for the gateway connection. Used only when
+    -- 'gcWsSecure' is set; the gateway's generated certificate is self-signed.
   } deriving stock (Eq, Show)
 
 -- | Default config for localhost with typical ports.
 defaultGatewayConfig :: GatewayConfig
 defaultGatewayConfig = GatewayConfig
-  { gcHost = "127.0.0.1"
+  { gcHost = "localhost"
   , gcHttpPort = 8080
   , gcWsPort = 8081
-  , gcApiBase = "http://127.0.0.1:8080/api"
-  , gcWsUrl = "ws://127.0.0.1:8081"
+  , gcApiBase = "http://localhost:8080/api"
+  , gcWsUrl = "ws://localhost:8081"
+  , gcWsSecure = False
+  , gcTlsCert = Nothing
   }
+
+-- | Build the client config for a gateway listening on @port@ at @host@.
+-- @secure@ selects @https@ and @wss@; the gateway serves both HTTP and WS on
+-- the same port. @cert@ is the PEM certificate to trust for that connection.
+mkGatewayConfig :: Text -> Int -> Bool -> Maybe Text -> GatewayConfig
+mkGatewayConfig host port secure cert = GatewayConfig
+  { gcHost = host
+  , gcHttpPort = port
+  , gcWsPort = port
+  , gcApiBase = scheme <> "://" <> host <> ":" <> portText <> "/api"
+  , gcWsUrl = wsScheme <> "://" <> host <> ":" <> portText
+  , gcWsSecure = secure
+  , gcTlsCert = cert
+  }
+  where
+    scheme = if secure then "https" else "http"
+    wsScheme = if secure then "wss" else "ws"
+    portText = T.pack (show port)
 
 -- | Mutable streaming state for one conversation's streaming bubble. Lives
 -- in 'IORef's so the WS event handler can call create/edit without passing
@@ -144,12 +170,30 @@ data StreamingState = StreamingState
   , ssLastLen     :: IORef Int
     -- ^ Codepoints in the accumulated text at the last platform edit.
     -- The edit gate measures NEW text since the last edit, not the total.
+  , ssLastEntry   :: IORef Text
+    -- ^ The text of the most recently recorded response entry. The gateway's
+    -- streaming accumulator is turn-scoped, so a later response's text can
+    -- already INCLUDE an earlier one; this is what lets the loop tell "the
+    -- same text arriving again" from "a genuinely new segment".
+  , ssSplices     :: IORef [(Int, Text)]
+    -- ^ Tool-progress lines for the single-edited-bubble style, each paired
+    -- with the length of the turn's cumulative streamed text when it fired.
+    -- The offset lets the renderer splice the line into the text where it
+    -- actually happened instead of appending every tool line at the end.
+    -- Unused by the default ('PsSeparateMessages') style.
   , ssFinalized   :: IORef Bool
     -- ^ 'True' once the turn's final entry has been delivered (the
     -- bubble was finalized). Late entry-updates — which can arrive after
     -- the recorded entry, because the server's streaming path and the
     -- post-turn broadcast are unsynchronized — are ignored while set.
     -- Cleared when a new turn starts (harness-status: thinking).
+  , ssLastBubbleEdit :: IORef (Maybe UTCTime)
+    -- ^ When the last successful single-bubble EDIT landed. Both edit sources
+    -- (streaming frames and tool calls) share this ONE field, so a turn cannot
+    -- exceed one edit per interval by alternating between them. A create does
+    -- not set it (a create is not an edit) and a failed edit does not set it,
+    -- so the next event retries instead of waiting out another interval.
+    -- Unused by the default ('PsSeparateMessages') style.
   }
 
 -- | Create fresh streaming state for one conversation.
@@ -159,13 +203,19 @@ newStreamingState = do
   accum <- newIORef ""
   lastEdit <- newIORef Nothing
   lastLen <- newIORef 0
+  lastEntry <- newIORef ""
+  splices <- newIORef []
   finalized <- newIORef False
+  lastBubbleEdit <- newIORef Nothing
   pure StreamingState
     { ssMsgId = msgId
     , ssAccumulated = accum
     , ssLastEdit = lastEdit
     , ssLastLen = lastLen
+    , ssLastEntry = lastEntry
+    , ssSplices = splices
     , ssFinalized = finalized
+    , ssLastBubbleEdit = lastBubbleEdit
     }
 
 -- | Reset the streaming state for a new segment/turn: the bubble id is
@@ -180,3 +230,6 @@ resetStreamingState ss = do
   writeIORef (ssAccumulated ss) ""
   writeIORef (ssLastEdit ss) Nothing
   writeIORef (ssLastLen ss) 0
+  writeIORef (ssLastEntry ss) ""
+  writeIORef (ssSplices ss) []
+  writeIORef (ssLastBubbleEdit ss) Nothing

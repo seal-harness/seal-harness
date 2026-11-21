@@ -182,12 +182,18 @@ session, not just shallow clones — there is no downside to passing
 
 ### Checking out a different branch in a shallow clone
 
-`SETUP_REPO` does a **shallow clone** (`--depth 1`) of the default branch
-only. Other branches exist on the remote but have no local
-remote-tracking refs, so a plain `git checkout <branch>` fails with
-`pathspec '<branch>' did not match any file(s) known to git`. Two
-commands are needed — first fetch the branch's ref at depth 1 with an
-explicit refspec, then check it out:
+`SETUP_REPO` takes an optional `branch` (a branch **or** a tag): pass
+`{"url": "...", "branch": "my-feature-branch"}` and the shallow clone
+(`--depth 1`) checks that ref out instead of the remote's default branch.
+Calling `SETUP_REPO` again for the same repo with a different `branch`
+**switches** the existing clone (fetch at depth 1 + checkout) and leaves
+your work in place — prefer that over hand-rolling git.
+
+If you must move a shallow clone yourself, other branches exist on the
+remote but have no local remote-tracking refs, so a plain
+`git checkout <branch>` fails with `pathspec '<branch>' did not match any
+file(s) known to git`. Two commands are then needed — first fetch the
+branch's ref at depth 1 with an explicit refspec, then check it out:
 
 ```
 BIN_EXEC { "binary": "git", "args": ["fetch", "origin", "my-feature-branch:refs/remotes/origin/my-feature-branch", "--depth", "1"], "cwd": "seal-harness" }

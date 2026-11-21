@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
 module Seal.Gateway.SendSpec (spec) where
 
@@ -10,6 +11,7 @@ import Control.Concurrent.Async (concurrently)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Monad (void, when)
 import Data.Aeson qualified as A
+import Data.Aeson ((.=))
 import Data.Aeson.Key (fromText)
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Vector qualified as V
@@ -27,6 +29,7 @@ import Network.HTTP.Client (defaultManagerSettings, newManager)
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.Timeout (timeout)
 import Options.Applicative qualified as Opt
 import Options.Applicative (ParserResult (..))
 import Test.Hspec
@@ -37,19 +40,25 @@ import Seal.Channel.Cli (newBackends)
 import Seal.Core.Backends (Backends (bRunRecords))
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Config.Paths (SealPaths (..), sessionDir, sessionWorkdir, sshAgentsDir)
-import Seal.Core.Types (ModelId (..), mkSessionId, SessionId)
+import Seal.Core.ChannelKind (ChannelKind (..))
+import Seal.Core.MessageSource (MessageSource (..), mkConversationId, mkMessageSource, mkUserId)
+import Seal.Core.Types (ModelId (..), mkSessionId, SessionId, sessionIdText)
 import Seal.Core.TurnEngine (TurnAdapter (..), TurnDeps (..), TurnOutcome (..), buildStartWiring, runSessionTurn)
 import Seal.Gateway.Send
   ( SendDeps (..), SendOutcome (..), ensureTabForSession, handleSend, webAskCaps
-  , handleAnswerTextDelivery, parseAnswerBody, newSessionWakeMutex, mkWebTurnDeps )
+  , handleAnswerTextDelivery, parseAnswerBody, newSessionWakeMutex, mkWebTurnDeps
+  , sendOutcomeJson, handleSetupRepo, setupRepoInput, validateSetupRepoArgs
+  , plainTurn, parseSendBody, mkSendMessageSource )
+import Seal.Tools.Args (branchNameText)
 import Seal.Gateway.StreamBroker
   ( BrokerEvent (..), newStreamBroker, subscribe, thinkingSessions )
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Handles.AskReply
-  ( QuestionOption (..), deliverAnswer, newAskReplyStore
-  , newApprovalCache, pendingForSession, PendingQuestionInfo (..)
-  , AskReply (..), ApprovalScope (..), askIdText, askHumanWithOptions )
+  ( AskOutcome, AskReply (..), AskReplyStore, ApprovalScope (..)
+  , QuestionOption (..), askHumanWithOptions, askIdText, deliverAnswer
+  , newApprovalCache, newAskReplyStore, pendingForSession
+  , PendingQuestionInfo (..) )
 import Data.ByteString.Lazy qualified as BL
 import Seal.Handles.Tab (TabKind (KindAi, KindProvider))
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -60,6 +69,7 @@ import Seal.Command.Spec (CommandSpec (..), mkRegistry)
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Security.Vault (VaultHandle)
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
+import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.Session.Lock (newReplyRegistry, newSessionLocks, sessionTurnInFlight)
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry, lookupOrCreateAbortFlag, isAborted, setSessionAbort)
@@ -98,6 +108,7 @@ stubMint = pure SessionMeta
   , smDescription = Nothing
   , smSealFrontMatter = True
   , smRepoUrl = Nothing
+  , smRepoBranch = Nothing
   , smCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
   , smLastActive = UTCTime (fromGregorian 2026 1 1) 0
   , smAllowedSecrets = mempty
@@ -260,7 +271,7 @@ mkSendDepsWith paths resolveStub = do
   testLocks <- newSessionLocks
   testAbortReg <- newSessionAbortRegistry
   testRepeatReg <- newSessionRepeatRegistry
-  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime mempty
+  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing sampleTime sampleTime mempty
   activeRef <- newIORef activeMeta
   let sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
   -- A real ProviderRuntime whose config path is nonexistent (loadRuntimeConfig
@@ -272,10 +283,11 @@ mkSendDepsWith paths resolveStub = do
   execCache <- newSessionExecCache
   agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
   let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-      pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+      pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prOllamaReadiness = noOllamaReadiness }
       sendDeps = SendDeps
         { sdPaths      = paths
         , sdVault      = rt
+        , sdTurnComplete = \_ _ -> pure ()
         , sdRepoReg    = fakeRepoRegistryHandle
         , sdAgentReg   = agentRegH
         , sdProvider   = pr
@@ -317,15 +329,138 @@ seedSessionChannel :: SealPaths -> Text -> SessionId -> IO ()
 seedSessionChannel paths channel sid = do
   let sdir = sessionDir paths sid
   createDirectoryIfMissing True sdir
-  let meta = SessionMeta sid "ollama" "llama3.2" channel Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime mempty
+  let meta = SessionMeta sid "ollama" "llama3.2" channel Nothing Nothing Nothing Nothing Nothing True Nothing Nothing sampleTime sampleTime mempty
   saveSessionMeta paths meta
 
 -- | Seed a session.json on disk for the given sid (channel @web@).
 seedSession :: SealPaths -> SessionId -> IO ()
 seedSession paths = seedSessionChannel paths "web"
 
+-- | Poll until the action holds, or fail after the given number of attempts.
+-- Needed because a plain turn runs in a forked body.
+eventually :: Int -> IO Bool -> IO ()
+eventually attempts act = go attempts
+  where
+    go 0 = expectationFailure "condition did not hold in time"
+    go n = do
+      ok <- act
+      if ok then pure () else threadDelay 10000 >> go (n - 1)
+
 spec :: Spec
 spec = describe "Seal.Gateway.Send auto-tab" $ do
+
+  describe "sdTurnComplete" $ do
+    it "reports Right () once after a successful plain turn" $
+      withSystemTempDirectory "seal-send-complete" $ \dir -> do
+        let tmp = dir
+            paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        providerRef <- newIORef [ CompletionResponse [CbText "ok"] StopEnd (Usage 0 0) ]
+        baseDeps <- mkSendDeps paths providerRef
+        outcomes <- newIORef ([] :: [(T.Text, Either T.Text ())])
+        tabsH <- newTabsHandle
+        let sid = mkSid "20261108-130000-done"
+            sendDeps = baseDeps
+              { sdTabsHandle = tabsH
+              , sdTurnComplete = \s o -> modifyIORef' outcomes (++ [(sessionIdText s, o)])
+              }
+        seedSession paths sid
+        _ <- handleSend sendDeps sid Nothing "hello"
+        -- The turn runs in a forked body; wait for the callback to land.
+        eventually 200 $ do
+          xs <- readIORef outcomes
+          pure (length xs == 1)
+        xs <- readIORef outcomes
+        map snd xs `shouldBe` [Right ()]
+        map fst xs `shouldBe` [sessionIdText sid]
+
+    it "is a no-op for a session with no registered interest" $
+      withSystemTempDirectory "seal-send-nocomplete" $ \dir -> do
+        let tmp = dir
+            paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        providerRef <- newIORef [ CompletionResponse [CbText "ok"] StopEnd (Usage 0 0) ]
+        baseDeps <- mkSendDeps paths providerRef
+        tabsH <- newTabsHandle
+        let sid = mkSid "20261108-130001-skip"
+            meta = SessionMeta sid "ollama" "llama3.2" "web"
+                     Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+                     sampleTime sampleTime mempty
+            sendDeps = baseDeps { sdTabsHandle = tabsH }
+        seedSession paths sid
+        er <- plainTurn sendDeps meta Nothing "hello"
+        er `shouldBe` Right ()
+  describe "mkSendMessageSource" $ do
+    it "reconstructs a source from valid body fields" $
+      mkSendMessageSource (Just "telegram") (Just "12345") (Just "tg:12345")
+        `shouldSatisfy` isJust
+
+    it "rejects a missing conversation id" $
+      mkSendMessageSource (Just "telegram") (Just "12345") Nothing
+        `shouldBe` Nothing
+
+    it "rejects an invalid conversation id (control char)" $
+      mkSendMessageSource (Just "telegram") (Just "12345") (Just "tg:\n12345")
+        `shouldBe` Nothing
+
+    it "rejects an unknown channel" $
+      mkSendMessageSource (Just "discord") (Just "12345") (Just "tg:12345")
+        `shouldBe` Nothing
+
+    it "rejects an invalid user id" $
+      mkSendMessageSource (Just "telegram") (Just "bad id!") (Just "tg:12345")
+        `shouldBe` Nothing
+
+    it "treats a missing user id as no sender" $
+      case mkSendMessageSource (Just "telegram") Nothing (Just "tg:12345") of
+        Nothing -> expectationFailure "expected a source"
+        Just ms -> msUserId ms `shouldBe` Nothing
+
+  describe "parseSendBody" $ do
+    it "extracts message + source from a full body" $ do
+      let (msg, mSrc) = parseSendBody (A.encode (A.object
+            [ "message" .= ("hi" :: Text)
+            , "channel" .= ("telegram" :: Text)
+            , "userId" .= ("12345" :: Text)
+            , "conversationId" .= ("tg:12345" :: Text) ]))
+      msg `shouldBe` "hi"
+      mSrc `shouldSatisfy` isJust
+
+    it "returns the message and Nothing for a message-only body" $
+      parseSendBody (A.encode (A.object ["message" .= ("hi" :: Text)]))
+        `shouldBe` ("hi", Nothing)
+
+    it "returns an empty message and Nothing for a malformed body" $
+      parseSendBody "not json" `shouldBe` ("", Nothing)
+
+  describe "plainTurn provenance" $ do
+    it "stamps channel + userId + conversationId from the MessageSource" $
+      withSystemTempDirectory "seal-send" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        providerRef <- newIORef
+          [ CompletionResponse [CbText "ok"] StopEnd (Usage 0 0) ]
+        baseDeps <- mkSendDeps paths providerRef
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20261108-120000-meta"
+            meta = SessionMeta sid "ollama" "llama3.2" "web"
+                     Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+                     sampleTime sampleTime mempty
+        seedSession paths sid
+        er <- plainTurn sendDeps meta (Just (sendSampleSource (Just "12345"))) "hello"
+        er `shouldBe` Right ()
+        mMeta <- readFirstRequestMeta paths sid
+        case mMeta of
+          Nothing -> expectationFailure "expected a request entry"
+          Just m -> do
+            Map.lookup "channel" m `shouldBe` Just (A.String "telegram")
+            Map.lookup "userId" m `shouldBe` Just (A.String "12345")
+            Map.lookup "conversationId" m `shouldBe` Just (A.String "tg:12345")
+
   describe "ensureTabForSession" $ do
     it "inserts a BoundSession tab when none exists" $ do
       h <- newTabsHandle
@@ -373,7 +508,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
             sid = mkSid "20260701-120000-101"
         seedSession paths sid
-        outcome <- handleSend sendDeps sid "hello"
+        outcome <- handleSend sendDeps sid Nothing "hello"
         outcome `shouldBe` SendAssistant
         -- The turn runs async; auto-tab happens after the turn completes.
         -- Poll for the tab to appear (up to 5 seconds).
@@ -398,7 +533,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sid = mkSid "20261025-120000-bg01"
             convPath = sessionDir paths sid </> "conversation.jsonl"
         seedSessionChannel paths "bg" sid
-        outcome <- handleSend sendDeps sid "hello"
+        outcome <- handleSend sendDeps sid Nothing "hello"
         outcome `shouldBe` SendAssistant
         -- Positive proof the turn actually ran: the scripted reply lands in
         -- the transcript. Without this, "no tab" could pass vacuously (a turn
@@ -432,7 +567,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
             sid = mkSid "20261025-120000-web01"
         seedSessionChannel paths "web" sid
-        outcome <- handleSend sendDeps sid "hello"
+        outcome <- handleSend sendDeps sid Nothing "hello"
         outcome `shouldBe` SendAssistant
         tabSeen <- waitFor 5000000
           (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
@@ -454,7 +589,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
             sid = mkSid "20261025-120000-web02"
         seedSessionChannel paths "web" sid
-        outcome <- handleSend sendDeps sid "/bg hi"
+        outcome <- handleSend sendDeps sid Nothing "/bg hi"
         outcome `shouldBe` SendSlash "unknown command: bg" Nothing
 
     it "SendError (404 missing session) -> no auto-tab" $
@@ -468,7 +603,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
             sid = mkSid "20260701-120000-102"
         -- No session.json seeded -> 404
-        outcome <- handleSend sendDeps sid "hello"
+        outcome <- handleSend sendDeps sid Nothing "hello"
         case outcome of
           SendError 404 _ -> pure ()
           other           -> expectationFailure ("expected 404, got " <> show other)
@@ -486,7 +621,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let sendDeps = baseDeps { sdTabsHandle = tabsH, sdRegistry = mkRegistry [tabCommandSpec paths tabsH noTabCloseNotifier stubMint] }
             sid = mkSid "20260701-120000-103"
         seedSession paths sid
-        outcome <- handleSend sendDeps sid "/tab list"
+        outcome <- handleSend sendDeps sid Nothing "/tab list"
         case outcome of
           SendSlash _ _ -> pure ()
           other         -> expectationFailure ("expected SendSlash, got " <> show other)
@@ -505,7 +640,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sid = mkSid "20260701-120000-104"
         seedSession paths sid
         -- /0 is the terse-grammar Focus route (single tab-char)
-        outcome <- handleSend sendDeps sid "/0"
+        outcome <- handleSend sendDeps sid Nothing "/0"
         case outcome of
           SendSlash _ _ -> pure ()
           other         -> expectationFailure ("expected SendSlash, got " <> show other)
@@ -524,7 +659,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sid = mkSid "20260701-120000-105"
         seedSession paths sid
         -- /0 hello is the terse-grammar Inject route (tab-char + space + payload)
-        outcome <- handleSend sendDeps sid "/0 hello"
+        outcome <- handleSend sendDeps sid Nothing "/0 hello"
         case outcome of
           SendSlash _ _ -> pure ()
           other         -> expectationFailure ("expected SendSlash, got " <> show other)
@@ -543,7 +678,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sid = mkSid "20260701-120000-106"
         seedSession paths sid
         _ <- insertTabH tabsH (BoundSession sid) KindAi Nothing
-        outcome <- handleSend sendDeps sid "/tab"
+        outcome <- handleSend sendDeps sid Nothing "/tab"
         case outcome of
           SendSlash msg _ -> msg `shouldSatisfy` ("0" `T.isInfixOf`)
           other           -> expectationFailure ("expected SendSlash, got " <> show other)
@@ -561,7 +696,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
             sid = mkSid "20260701-120000-107"
         seedSession paths sid
-        outcome <- handleSend sendDeps sid "/tab"
+        outcome <- handleSend sendDeps sid Nothing "/tab"
         case outcome of
           SendSlash "no current tab" _ -> pure ()
           other -> expectationFailure ("expected SendSlash 'no current tab', got " <> show other)
@@ -580,7 +715,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sid = mkSid "20260701-120000-108"
         seedSession paths sid
         _ <- insertTabH tabsH (BoundSession sid) KindAi Nothing
-        outcome <- handleSend sendDeps sid "/tab close 0"
+        outcome <- handleSend sendDeps sid Nothing "/tab close 0"
         case outcome of
           SendSlash msg _ -> msg `shouldSatisfy` ("closed" `T.isInfixOf`)
           other           -> expectationFailure ("expected SendSlash, got " <> show other)
@@ -602,7 +737,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let sendDeps = baseDeps { sdTabsHandle = tabsH, sdBroker = Just broker }
             sid = mkSid "20260701-130000-201"
         seedSession paths sid
-        outcome <- handleSend sendDeps sid "hello"
+        outcome <- handleSend sendDeps sid Nothing "hello"
         -- handleSend returns SendAssistant immediately (async). The
         -- turn runs in a background thread and will crash (throwing
         -- provider). We wait for the idle broadcast to confirm the
@@ -646,7 +781,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         -- background thread with a blocking provider. We wait for the
         -- thinking broadcast, then unblock the provider to let the
         -- turn complete and broadcast idle.
-        _ <- handleSend sendDeps sid "hello"
+        _ <- handleSend sendDeps sid Nothing "hello"
         -- Verify thinking was broadcast.
         thinkingSeen <- waitFor 5000000 (readIORef eventsRef) (hasStatus "thinking")
         thinkingSeen `shouldBe` True
@@ -669,7 +804,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
             sid = mkSid "20260701-130000-203"
         seedSession paths sid
-        _ <- handleSend sendDeps sid "hello"
+        _ <- handleSend sendDeps sid Nothing "hello"
         let logFile = sessionDir paths sid </> "seal.log"
         -- The turn runs async; wait for the log file to appear (the
         -- throwing provider crashes quickly, but we need to give the
@@ -695,7 +830,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sid = mkSid "20260922-140000-301"
         seedSession paths sid
         -- handleSend should return immediately (async) with SendAssistant.
-        outcome <- handleSend sendDeps sid "hello"
+        outcome <- handleSend sendDeps sid Nothing "hello"
         case outcome of
           SendAssistant -> pure ()
           other -> expectationFailure ("expected SendAssistant, got " <> show other)
@@ -826,6 +961,119 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           _ -> expectationFailure "expected one pending ask"
         takeMVar done
 
+  -- The reported production failure: a chat channel with no answer buttons
+  -- (Signal) received an ASK_HUMAN question, and every reply the human sent
+  -- afterwards vanished until the question was answered in the web UI.
+  -- POST /send forked a turn; a turn on a session whose running turn is
+  -- parked inside ASK_HUMAN blocks on the session write lock until the
+  -- question is answered -- so the reply queued forever behind the very
+  -- turn it was supposed to unblock. /send now offers a plain message as
+  -- the answer to a pending question first, and only starts a turn when
+  -- there is none.
+  describe "handleSend delivering a plain reply to a pending ASK_HUMAN" $ do
+    -- Register a pending ASK_HUMAN for the session and block until it is in
+    -- the store ('askHumanCore' registers before firing notify, so this is
+    -- deterministic, unlike a threadDelay). Returns an action yielding the
+    -- answer the blocked agent-loop thread received.
+    let forkPendingAsk :: AskReplyStore -> SessionId -> Text -> [QuestionOption]
+                       -> IO (IO (Either AskOutcome Text))
+        forkPendingAsk store sid q opts = do
+          registered <- newEmptyMVar
+          answered   <- newEmptyMVar
+          _ <- forkIO $ do
+            r <- askHumanWithOptions store sid q opts
+                   (\_ -> putMVar registered ())
+            putMVar answered r
+          takeMVar registered
+          pure (takeMVar answered)
+        askPaths tmp = SealPaths
+          { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+          , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        branchOpts = [ QuestionOption "main" "the default branch"
+                     , QuestionOption "develop" "the integration branch"
+                     ]
+
+    it "consumes an open-ended reply as the answer instead of starting a turn" $
+      withSystemTempDirectory "ask-send" $ \tmp -> do
+        let paths = askPaths tmp
+        -- A provider that records every call: a turn started for this
+        -- message would be visible here (and would deadlock in production).
+        recRef <- newIORef []
+        firstRef <- newIORef True
+        let recResolve _ = pure (Right
+              (SomeProvider (RecordingProvider recRef firstRef Nothing)
+              , ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths recResolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20261104-080418-099"
+            reply = "Hi, I'm Doug. I care about software quality." :: Text
+        seedSession paths sid
+        getAnswer <- forkPendingAsk (sdAskReply sendDeps) sid
+                       "What is your content focus?" []
+        outcome <- handleSend sendDeps sid Nothing reply
+        outcome `shouldBe` SendAnswer reply
+        -- The blocked agent-loop thread received the reply ...
+        mAnswer <- timeout 2000000 getAnswer
+        mAnswer `shouldBe` Just (Right reply)
+        -- ... the question is gone ...
+        pendingForSession (sdAskReply sendDeps) sid `shouldReturn` []
+        -- ... and no turn was started.
+        threadDelay 200000
+        readIORef recRef `shouldReturn` []
+
+    it "resolves a numbered reply to the chosen option's label" $
+      withSystemTempDirectory "ask-send" $ \tmp -> do
+        let paths = askPaths tmp
+        firstRef <- newIORef True
+        recRef <- newIORef []
+        let recResolve _ = pure (Right
+              (SomeProvider (RecordingProvider recRef firstRef Nothing)
+              , ModelId "llama3.2"))
+        baseDeps <- mkSendDepsWith paths recResolve
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20261104-080418-100"
+        seedSession paths sid
+        getAnswer <- forkPendingAsk (sdAskReply sendDeps) sid
+                       "which branch?" branchOpts
+        outcome <- handleSend sendDeps sid Nothing "2"
+        outcome `shouldBe` SendAnswer "develop"
+        mAnswer <- timeout 2000000 getAnswer
+        mAnswer `shouldBe` Just (Right "develop")
+
+    it "never consumes a slash command as an answer" $
+      withSystemTempDirectory "ask-send" $ \tmp -> do
+        let paths = askPaths tmp
+        -- A provider that records nothing (the turn is not run) — the
+        -- slash command must still route as a command.
+        providerRef <- newIORef []
+        baseDeps <- mkSendDeps paths providerRef
+        tabsH <- newTabsHandle
+        let sendDeps = baseDeps { sdTabsHandle = tabsH }
+            sid = mkSid "20261104-080418-101"
+            store = sdAskReply sendDeps
+        seedSession paths sid
+        _ <- forkPendingAsk store sid "which branch?" branchOpts
+        outcome <- handleSend sendDeps sid Nothing "/0"
+        case outcome of
+          SendSlash _ _ -> pure ()
+          other -> expectationFailure
+            ("expected SendSlash (not consumed as an answer), got " <> show other)
+        -- The question is still answerable.
+        ps <- pendingForSession store sid
+        length ps `shouldBe` 1
+        mapM_ (\info ->
+          void (deliverAnswer store (pqiId info) (AskReply ScopeOnce "main"))) ps
+
+    it "encodes a delivered answer as kind=answer with a ✓ confirmation" $ do
+      let (code, body) = sendOutcomeJson (SendAnswer "develop")
+      code `shouldBe` 200
+      fmap (KeyMap.lookup (fromText "kind")) (asObject body)
+        `shouldBe` Just (Just (A.String "answer"))
+      fmap (KeyMap.lookup (fromText "response")) (asObject body)
+        `shouldBe` Just (Just (A.String "✓ develop"))
+
   -- Integration test for the repo agents.md auto-bind feature. This is the
   -- gateway-level end-to-end test the user asked for: it exercises the SAME
   -- handleSend → plainTurn → autoBindRepoAgent → resolveSystemPrompt path the
@@ -862,7 +1110,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           let sdir = sessionDir paths sid
           createDirectoryIfMissing True sdir
           let zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
-              meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime mempty
+              meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing Nothing sampleTime sampleTime mempty
           saveSessionMeta paths meta
         seedRepoAgentsMd :: SealPaths -> SessionId -> T.Text -> IO ()
         seedRepoAgentsMd paths sid marker = do
@@ -886,7 +1134,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         seedSessionWithZoe paths sid
         seedRepoAgentsMd paths sid "REPO_PROJECT_MARKER"
         let sendDeps = baseDeps
-        outcome <- handleSend sendDeps sid "tell me about yourself"
+        outcome <- handleSend sendDeps sid Nothing "tell me about yourself"
         outcome `shouldBe` SendAssistant
         -- The turn runs async; poll for the captured system prompt.
         sysSeen <- waitFor 5000000 (readIORef capRef) isJust
@@ -908,7 +1156,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let sid = mkSid "20260817-151158-282"
         seedSessionWithZoe paths sid
         -- No repo seeded in the workdir.
-        outcome <- handleSend baseDeps sid "tell me about yourself"
+        outcome <- handleSend baseDeps sid Nothing "tell me about yourself"
         outcome `shouldBe` SendAssistant
         sysSeen <- waitFor 5000000 (readIORef capRef) isJust
         sysSeen `shouldBe` True
@@ -950,10 +1198,10 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sdir = sessionDir paths sid
             zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
             -- The front matter is OFF for this session.
-            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing False Nothing sampleTime sampleTime mempty
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing False Nothing Nothing sampleTime sampleTime mempty
         createDirectoryIfMissing True sdir
         saveSessionMeta paths meta
-        outcome <- handleSend sendDeps sid "tell me about yourself"
+        outcome <- handleSend sendDeps sid Nothing "tell me about yourself"
         outcome `shouldBe` SendAssistant
         sysSeen <- waitFor 5000000 (readIORef capRef) isJust
         sysSeen `shouldBe` True
@@ -989,10 +1237,10 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sdir = sessionDir paths sid
             zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
             -- The front matter is ON (the default).
-            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing sampleTime sampleTime mempty
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing Nothing sampleTime sampleTime mempty
         createDirectoryIfMissing True sdir
         saveSessionMeta paths meta
-        outcome <- handleSend sendDeps sid "tell me about yourself"
+        outcome <- handleSend sendDeps sid Nothing "tell me about yourself"
         outcome `shouldBe` SendAssistant
         sysSeen <- waitFor 5000000 (readIORef capRef) isJust
         sysSeen `shouldBe` True
@@ -1032,7 +1280,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         -- Sanity: srActive points at "active", NOT targetSid.
         activeMeta <- readIORef (srActive (sdSession sendDeps))
         smId activeMeta `shouldBe` activeSid
-        outcome <- handleSend sendDeps targetSid "/stop"
+        outcome <- handleSend sendDeps targetSid Nothing "/stop"
         case outcome of
           SendSlash _ _ -> pure ()
           other         -> expectationFailure ("expected SendSlash, got " <> show other)
@@ -1060,7 +1308,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
               { sdTabsHandle = tabsH
               , sdRegistry = mkRegistry [stopSpec]
               }
-        outcome <- handleSend sendDeps targetSid "/stop"
+        outcome <- handleSend sendDeps targetSid Nothing "/stop"
         case outcome of
           SendSlash _ _ -> pure ()
           other         -> expectationFailure ("expected SendSlash, got " <> show other)
@@ -1122,7 +1370,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         seedConversation paths sid 300 5000
         -- The harness delivered a completed sub-agent's message.
         appendCompletionToSidecar paths sid verdict
-        outcome <- handleSend sendDeps sid "hello"
+        outcome <- handleSend sendDeps sid Nothing "hello"
         case outcome of
           SendAssistant -> pure ()
           other         -> expectationFailure ("expected SendAssistant, got " <> show other)
@@ -1157,7 +1405,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         seedConversation paths sid 300 5000
         appendCompletionToSidecar paths sid verdictA
         appendCompletionToSidecar paths sid verdictB
-        outcome <- handleSend sendDeps sid "hello"
+        outcome <- handleSend sendDeps sid Nothing "hello"
         case outcome of
           SendAssistant -> pure ()
           other         -> expectationFailure ("expected SendAssistant, got " <> show other)
@@ -1192,7 +1440,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         tabsH <- newTabsHandle
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
         seedSession paths sid
-        outcome <- handleSend sendDeps sid "hello"
+        outcome <- handleSend sendDeps sid Nothing "hello"
         case outcome of
           SendAssistant -> pure ()
           other         -> expectationFailure ("expected SendAssistant, got " <> show other)
@@ -1220,6 +1468,52 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
   -- internals are deliberately not exported.
   describe "end-of-turn completion delivery" $ do
 
+    -- The wake chain runs inside the parent turn's release action, so its
+    -- duration depends on the machine. A CI failure on x86_64-linux
+    -- (--enable-coverage) reported @expected: 3, but got: 2@ at the
+    -- "exactly three turns" assertion: the count was still rising after
+    -- the old two-sample 200 ms window, so the assertion fired mid-chain.
+    -- Nothing was stranded — the follow-up wake-up turn did run. These
+    -- tests pin the replacement helper's contract, which makes the three
+    -- assertions below sound rather than lucky.
+    describe "the settle helper (regression: slow follow-up wake-up turn)" $ do
+
+      it "waits for the expected value instead of sampling a fixed window" $ do
+        -- Emulates the CI shape: the value reaches 2 immediately, and a
+        -- two-sample 200 ms window would have called that "settled"; it
+        -- only reaches the expected 3 much later.
+        counter <- newIORef (2 :: Int)
+        _ <- forkIO $ do
+          threadDelay 400000
+          writeIORef counter 3
+        settlesTo (readIORef counter) 3
+
+      it "fails when the expected value is never reached (a stranded chain)" $ do
+        -- The failure this suite exists to catch: a completion that is
+        -- never delivered, so the turn count stops at 2 and never reaches
+        -- the expected 3. It must fail — after the deadline, not on the
+        -- first sample.
+        counter <- newIORef (0 :: Int)
+        _ <- forkIO $ do
+          let bump = do
+                threadDelay 5000
+                modifyIORef' counter (+ 1)
+                bump
+          bump
+        -- Never 100: the chain stalls below the expected value.
+        ok <- awaitValueN 200000 5000 (readIORef counter) 100
+        ok `shouldBe` False
+
+      it "fails when the value overshoots the expected value" $ do
+        -- The other direction: the chain ran one turn too many. A helper
+        -- that only waited for "two equal samples" would report success.
+        counter <- newIORef (0 :: Int)
+        _ <- forkIO $ do
+          threadDelay 20000
+          writeIORef counter 5
+        ok <- awaitValueN 200000 5000 (readIORef counter) 3
+        ok `shouldBe` False
+
     it "a completion that arrives during a wake-up turn is delivered by a follow-up wake-up turn" $
       withSystemTempDirectory "seal-send" $ \tmp -> do
         let paths = SealPaths
@@ -1237,7 +1531,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         tabsH <- newTabsHandle
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
         seedSession paths sid
-        outcome <- handleSend sendDeps sid "hello"
+        outcome <- handleSend sendDeps sid Nothing "hello"
         outcome `shouldBe` SendAssistant
         -- The parent turn is in flight (parked on the first gate).
         seen1 <- waitFor 5000000 (readIORef recorded) (not . null)
@@ -1261,11 +1555,9 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
           (elem (BoundSession sid))
         tabSeen `shouldBe` True
-        (n1, n2) <- unchangedAfter 200000 (length <$> readIORef recorded)
-        n1 `shouldBe` n2
         -- Exactly three turns: the user turn, the first wake-up turn
         -- (which delivers verdict A), and the follow-up (verdict B).
-        n2 `shouldBe` 3
+        settlesTo (length <$> readIORef recorded) 3
         reqs <- readIORef recorded
         let textsOf i = case drop i reqs of
               (r : _) -> requestTexts r
@@ -1286,7 +1578,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         tabsH <- newTabsHandle
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
         seedSession paths sid
-        outcome <- handleSend sendDeps sid "hello"
+        outcome <- handleSend sendDeps sid Nothing "hello"
         outcome `shouldBe` SendAssistant
         tabSeen <- waitFor 5000000
           (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
@@ -1294,9 +1586,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         tabSeen `shouldBe` True
         -- No completion ever arrived: the turn count must settle at one
         -- (the user turn), with no synthetic turn behind it.
-        (n1, n2) <- unchangedAfter 200000 (length <$> readIORef recorded)
-        n1 `shouldBe` n2
-        n1 `shouldBe` 1
+        settlesTo (length <$> readIORef recorded) 1
 
     it "the wake chain is bounded: a provider that cannot be resolved produces no unbounded sequence of wake turns, and the completions stay pending" $
       withSystemTempDirectory "seal-send" $ \tmp -> do
@@ -1322,7 +1612,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         tabsH <- newTabsHandle
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
         seedSession paths sid
-        outcome <- handleSend sendDeps sid "hello"
+        outcome <- handleSend sendDeps sid Nothing "hello"
         outcome `shouldBe` SendAssistant
         seen <- waitFor 5000000 (readIORef recorded) (not . null)
         seen `shouldBe` True
@@ -1335,8 +1625,10 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
           (elem (BoundSession sid))
         tabSeen `shouldBe` True
-        (c1, c2) <- unchangedAfter 300000 (readIORef resolveCalls)
-        c1 `shouldBe` c2
+        -- The chain must stop. Its attempt count is produced by the same
+        -- wake machinery whose slow tail flaked at SendSpec:1455, so poll
+        -- for the count to hold still rather than sampling twice.
+        c1 <- awaitStable (readIORef resolveCalls)
         c1 `shouldSatisfy` (> 1)    -- the chain really ran wake attempts
         c1 `shouldSatisfy` (<= 12)  -- ... and it stopped: bounded
         -- No wake turn ever reached the provider, and the completion is
@@ -1363,7 +1655,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         tabsH <- newTabsHandle
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
         seedSession paths sid
-        outcome <- handleSend sendDeps sid "one"
+        outcome <- handleSend sendDeps sid Nothing "one"
         outcome `shouldBe` SendAssistant
         seen1 <- waitFor 5000000 (readIORef recorded) (not . null)
         seen1 `shouldBe` True
@@ -1378,15 +1670,13 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           (do snap <- snapshotTabs tabsH; pure (map tRef (tlTabs snap)))
           (elem (BoundSession sid))
         tabSeen `shouldBe` True
-        (n1, n2) <- unchangedAfter 200000 (length <$> readIORef recorded)
-        n1 `shouldBe` n2
-        n1 `shouldBe` 1
+        settlesTo (length <$> readIORef recorded) 1
         -- The mutex must have been released by the no-meta branch: a
         -- LATER wake still works. Restore the meta and repeat the
         -- mid-turn delivery — the wake for verdict B can only acquire
         -- the mutex if the first wake released it.
         seedSession paths sid
-        outcome2 <- handleSend sendDeps sid "two"
+        outcome2 <- handleSend sendDeps sid Nothing "two"
         outcome2 `shouldBe` SendAssistant
         seen2 <- waitFor 5000000 (readIORef recorded) ((>= 2) . length)
         seen2 `shouldBe` True
@@ -1396,8 +1686,8 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         putMVar gate2 ()
         seen3 <- waitFor 5000000 (readIORef recorded) ((>= 3) . length)
         seen3 `shouldBe` True
-        (m1, m2) <- unchangedAfter 200000 (length <$> readIORef recorded)
-        m1 `shouldBe` m2
+        -- No further turns: the count must reach 3 and then hold still.
+        settlesTo (length <$> readIORef recorded) 3
         reqs <- readIORef recorded
         let textsOf i = case drop i reqs of
               (r : _) -> requestTexts r
@@ -1420,7 +1710,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         tabsH <- newTabsHandle
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
         seedSession paths sid
-        outcome <- handleSend sendDeps sid "hello"
+        outcome <- handleSend sendDeps sid Nothing "hello"
         outcome `shouldBe` SendAssistant
         seen1 <- waitFor 5000000 (readIORef recorded) (not . null)
         seen1 `shouldBe` True
@@ -1470,7 +1760,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         tabsH <- newTabsHandle
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
         seedSession paths sid
-        outcome <- handleSend sendDeps sid "one"
+        outcome <- handleSend sendDeps sid Nothing "one"
         outcome `shouldBe` SendAssistant
         seen1 <- waitFor 5000000 (readIORef recorded) (not . null)
         seen1 `shouldBe` True
@@ -1491,7 +1781,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         -- triggers a second wake — which can only acquire the wake mutex
         -- if the crashed one released it.
         writeIORef phase2Ref True
-        outcome2 <- handleSend sendDeps sid "two"
+        outcome2 <- handleSend sendDeps sid Nothing "two"
         outcome2 `shouldBe` SendAssistant
         seen2 <- waitFor 5000000 (readIORef recorded) ((>= 2) . length)
         seen2 `shouldBe` True
@@ -1531,7 +1821,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         tabsH <- newTabsHandle
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
         seedSession paths sid
-        outcome <- handleSend sendDeps sid "hello"
+        outcome <- handleSend sendDeps sid Nothing "hello"
         outcome `shouldBe` SendAssistant
         seen1 <- waitFor 5000000 (readIORef recorded) (not . null)
         seen1 `shouldBe` True
@@ -1628,7 +1918,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let td = (mkWebTurnDeps deps)
               { tdOnTurnEnd = Just (\_ ->
                   sessionTurnInFlight (sdLocks deps) sid >>= writeIORef hookRef . Just) }
-            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime mempty
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing sampleTime sampleTime mempty
         done <- newEmptyMVar
         _ <- forkIO (void (runSessionTurn td (testTurnAdapter td) meta Nothing "hello") >> putMVar done ())
         seen <- waitFor 5000000 (readIORef recorded) (not . null)
@@ -1641,10 +1931,75 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         _ <- takeMVar done
         readIORef hookRef `shouldReturn` Nothing
 
+  -- ── WU-3: the optional @branch@ on the web setup-repo path. The pure
+  -- payload/validation helpers are pinned directly; 'handleSetupRepo' is
+  -- pinned on its early-reject arm — validation runs BEFORE the session
+  -- lookup, so an invalid branch never touches the session store.
+  describe "setup-repo branch plumbing (WU-3)" $ do
+    let goodUrl = "https://github.com/o/r" :: Text
+
+    describe "setupRepoInput" $ do
+      it "omits the branch key when no branch is requested" $
+        setupRepoInput goodUrl Nothing
+          `shouldBe` A.object ["url" .= goodUrl]
+
+      it "omits the branch key for a blank branch (never a null branch)" $
+        setupRepoInput goodUrl (Just "   ")
+          `shouldBe` A.object ["url" .= goodUrl]
+
+      it "dispatches the trimmed branch when one is requested" $
+        setupRepoInput goodUrl (Just "  dev ")
+          `shouldBe` A.object ["url" .= goodUrl, "branch" .= ("dev" :: Text)]
+
+      it "has no branch key at all when no branch is requested" $
+        case setupRepoInput goodUrl Nothing of
+          A.Object o -> KeyMap.member (fromText "branch") o `shouldBe` False
+          other      -> expectationFailure ("expected an object, got " <> show other)
+
+    describe "validateSetupRepoArgs" $ do
+      it "rejects a branch the opcode parser rejects" $
+        validateSetupRepoArgs goodUrl (Just "bad branch")
+          `leftContaining` "invalid branch"
+
+      it "rejects HEAD (it names a commit, not a branch)" $
+        validateSetupRepoArgs goodUrl (Just "HEAD")
+          `leftContaining` "invalid branch"
+
+      it "treats a blank branch as absent" $
+        fmap (fmap (fmap branchNameText)) (validateSetupRepoArgs goodUrl (Just "   "))
+          `shouldBe` Right (goodUrl, Nothing)
+
+      it "returns the validated, trimmed branch" $
+        fmap (fmap (fmap branchNameText)) (validateSetupRepoArgs goodUrl (Just " dev "))
+          `shouldBe` Right (goodUrl, Just "dev")
+
+      it "still rejects an invalid url" $
+        validateSetupRepoArgs "not-a-url" Nothing
+          `leftContaining` "invalid url"
+
+    it "handleSetupRepo rejects an invalid branch before any session lookup" $
+      withSystemTempDirectory "seal-setup-repo" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        providerRef <- newIORef ([] :: [CompletionResponse])
+        deps <- mkSendDeps paths providerRef
+        -- The sid is *shaped* validly but has no session.json on disk: had
+        -- the handler looked the session up first, the error would have been
+        -- "session not found" rather than the branch diagnostic.
+        res <- handleSetupRepo deps (mkSid "no-such-session") goodUrl (Just "bad branch")
+        res `leftContaining` "invalid branch"
+
 -- | Discriminate a ParserResult Success for informative failure messages.
 isSuccess :: ParserResult a -> Bool
 isSuccess (Success _) = True
 isSuccess _           = False
+
+-- | 'Left' whose message contains the given substring.
+leftContaining :: Either Text a -> Text -> Expectation
+leftContaining eRes needle = case eRes of
+  Left err -> err `shouldSatisfy` T.isInfixOf needle
+  Right _  -> expectationFailure ("expected Left containing " <> T.unpack needle)
 
 -- | Extract the first content block's text from a streaming entry-update JSON.
 -- Used by the ccSend streaming test to assert the accumulated text.
@@ -1679,15 +2034,93 @@ instance Provider ChainProvider where
     pure (Right (CompletionResponse [CbText "ok"] StopEnd (Usage 0 0)))
   listModels _ = pure (Right [ModelId "llama3.2"])
 
--- | Read a value, wait the given microseconds, read it again: the pair is
--- returned so a test can assert the two reads agree — i.e. that whatever
--- produces the value (a wake chain) has terminated.
-unchangedAfter :: Int -> IO a -> IO (a, a)
-unchangedAfter delayUs readAction = do
-  a <- readAction
-  threadDelay delayUs
-  a' <- readAction
-  pure (a, a')
+-- | How long an assertion may wait for the expected value, and the polling
+-- interval (both microseconds).
+awaitDeadlineUs :: Int
+awaitDeadlineUs = 5000000
+
+awaitStepUs :: Int
+awaitStepUs = 10000
+
+-- | Test-visible parameterised form of 'awaitValue'.
+awaitValueN :: forall a. Eq a => Int -> Int -> IO a -> a -> IO Bool
+awaitValueN deadlineUs stepUs readAction want = go deadlineUs
+  where
+    go :: Int -> IO Bool
+    go remaining
+      | remaining <= 0 = pure False
+      | otherwise = do
+          v <- readAction
+          if v /= want
+            then threadDelay stepUs >> go (remaining - stepUs)
+            else pure True
+
+-- | Wait until @readAction@ equals @want@, then require it to *hold* that
+-- value for 'awaitHoldUs'.
+--
+-- "The wake chain has finished" is not observable at any instant: the
+-- chain runs inside the parent turn's release action, so how long it
+-- takes depends on the machine. This is why the old code was wrong. It
+-- sampled the counter twice, 200 ms apart, and asserted the two samples
+-- agreed — on x86_64-linux CI (--enable-coverage) the follow-up wake-up
+-- turn landed after that window, so both samples read 2 *while the chain
+-- was still running*; the next assertion then saw 3 where it had already
+-- been told to expect 2. Reporting @expected: 3, but got: 2@.
+--
+-- Waiting for the *known-expected* value is sound where waiting for
+-- "two equal samples" is not: the expected value is exactly what the test
+-- asserts, so a genuinely stranded completion (the failure this suite
+-- exists to catch) still fails — it just fails at the deadline instead of
+-- on the first sample. The trailing hold catches a value that overshoots
+-- @want@ because the chain ran one turn too many.
+awaitValue :: forall a. Eq a => IO a -> a -> IO Bool
+awaitValue readAction want = do
+  reached <- awaitValueN awaitDeadlineUs awaitStepUs readAction want
+  if not reached
+    then pure False
+    else holdsFor awaitHoldUs want
+  where
+    holdsFor :: Int -> a -> IO Bool
+    holdsFor w v
+      | w <= 0 = pure True
+      | otherwise = do
+          threadDelay awaitStepUs
+          v' <- readAction
+          if v' == v then holdsFor (w - awaitStepUs) v else pure False
+
+-- | Poll a counter until it holds still, and return it. Used where the
+-- final value is not known in advance (a bound, not an exact count), but
+-- "is it still changing?" still has to be answered without a fixed
+-- two-sample window. If it never stabilises it returns the last reading at
+-- the deadline, which is what makes a runaway count visible to the bound
+-- check that follows rather than silently passing.
+awaitStable :: forall a. Eq a => IO a -> IO a
+awaitStable readAction = go awaitDeadlineUs
+  where
+    go :: Int -> IO a
+    go remaining
+      | remaining <= 0 = readAction
+      | otherwise = do
+          a <- readAction
+          threadDelay awaitStepUs
+          b <- readAction
+          if a == b then pure b else go (remaining - awaitStepUs)
+
+-- | The time @awaitValue@ requires the expected value to persist, so that
+-- a chain which produces @want@ and then keeps going is still a failure.
+awaitHoldUs :: Int
+awaitHoldUs = 300000
+
+-- | Assert that @readAction@ reaches @want@ and stays there. Replaces a
+-- @'unchangedAfter' ... >> a \`shouldBe\` b@ pair, which sampled twice and
+-- so raced the chain it was waiting for (see 'awaitValue').
+settlesTo :: (Eq a, Show a) => IO a -> a -> Expectation
+settlesTo readAction want = do
+  ok <- awaitValue readAction want
+  if ok
+    then pure ()
+    else expectationFailure $
+      "timed out waiting for " <> show want <> " to be reached and held"
 
 -- | A minimal 'TurnAdapter' for the tests that drive 'runSessionTurn'
 -- directly (the gateway's 'mkWebTurnAdapter' is not exported). Every
@@ -1717,6 +2150,32 @@ runWithRecordedHook deps sid = do
   let td = (mkWebTurnDeps deps)
         { tdOnTurnEnd = Just (\_ ->
             sessionTurnInFlight (sdLocks deps) sid >>= writeIORef hookRef . Just) }
-      meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing sampleTime sampleTime mempty
+      meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing sampleTime sampleTime mempty
   outcome <- runSessionTurn td (testTurnAdapter td) meta Nothing "hello"
   pure (outcome, hookRef)
+
+-- | A Telegram 'MessageSource' for the provenance tests.
+sendSampleSource :: Maybe Text -> MessageSource
+sendSampleSource mUid =
+  case mkConversationId "tg:12345" of
+    Left _ -> error "sendSampleSource: bad conversation id"
+    Right cid ->
+      case mkMessageSource cid Telegram
+             (mUid >>= either (const Nothing) Just . mkUserId) mempty of
+        Left _   -> error "sendSampleSource: bad message source"
+        Right ms -> ms
+
+-- | Read the @erMeta@ of the first request entry in a session's entries.jsonl.
+readFirstRequestMeta :: SealPaths -> SessionId -> IO (Maybe (Map.Map Text A.Value))
+readFirstRequestMeta paths sid = do
+  let p = sessionDir paths sid </> "entries.jsonl"
+  exists <- doesFileExist p
+  if not exists
+    then pure Nothing
+    else do
+      raw <- BS.readFile p
+      let recs = mapMaybe (A.decode . BL.fromStrict) (BS.split 10 raw) :: [EntryRecord]
+          reqs = [ e | e <- recs, erKind e == EKRequest ]
+      pure (case reqs of
+              (e : _) -> Just (erMeta e)
+              []      -> Nothing)

@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 module Seal.Transcript.ReconstructSpec (spec) where
 
 import Data.Aeson (Value (..), decode, encode, object, (.=))
@@ -8,7 +9,7 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
 import Data.Map.Strict qualified as Map
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, listToMaybe)
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
@@ -17,7 +18,7 @@ import qualified Data.Vector as V
 
 import Seal.Core.Types (ModelId (..), OpName (..), ToolCallId (..))
 import Seal.Providers.Class
-  ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..), Usage (..)
+  ( ContentBlock (..), pattern Message, Role (..), ToolResultPart (..), Usage (..)
   , ToolDefinition (..) )
 import Seal.TestHelpers.Arbitrary ()
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine)
@@ -442,6 +443,38 @@ spec = describe "Seal.Transcript.Reconstruct" $ do
         _ <- buildIndex convPath idxPath
         actual <- reconstructStreaming convPath idxPath entries
         actual `shouldBe` expected
+
+    -- WU-2 regression: a harness entry that DOES add a conversation line
+    -- (a skill load / setup-repo result appends an Assistant message, and
+    -- records erConvLen = 1 — a DELTA). Before the fix, the streaming path
+    -- read the absolute range [., erConvLen) and left `start` unadvanced,
+    -- so the harness message was dropped whenever start > 0 and the
+    -- following response re-read the wrong slice.
+    it "honours a NON-ZERO harness delta (skill-load adds a conversation line)" $
+      withSystemTempDirectory "seal-recon" $ \dir -> do
+        let convPath = dir <> "/conversation.jsonl"
+            idxPath  = dir <> "/conversation.idx"
+            conv = [ Message User [CbText "hi"]
+                   , Message Assistant [CbText "hello"]
+                     -- the line a skill load appends:
+                   , Message Assistant [CbText "skill body"]
+                   , Message User [CbText "next"]
+                   , Message Assistant [CbText "reply"]
+                   ]
+            entries = [ reqEntry emptyEnvelopeDelta 1
+                      , respEntry 2
+                      , skillLoadHarnessEntry 1   -- DELTA of 1 line
+                      , reqEntry emptyEnvelopeDelta 4
+                      , respEntry 5
+                      ]
+            expected = reconstruct conv entries
+        BS.writeFile convPath (BS8.concat (map (\m -> encodeConvLine (ConvLine m) <> "\n") conv))
+        _ <- buildIndex convPath idxPath
+        actual <- reconstructStreaming convPath idxPath entries
+        actual `shouldBe` expected
+        -- The harness row must carry the anchor just after its own line.
+        fmap teConvLen (listToMaybe actual)
+          `shouldBe` Just (Just 1)
 
 isJustArray :: Maybe Value -> Bool
 isJustArray (Just (Array _)) = True

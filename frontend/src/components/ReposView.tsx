@@ -6,6 +6,7 @@ import {
   deleteRepo,
   updateRepo,
   useRepos,
+  useSecrets,
 } from '../hooks/useApi'
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -99,12 +100,19 @@ function autoVaultKey(id: string, kind: RepoCredentialKind): string {
  *
  *  SECURITY INVARIANT: the credential descriptor stored here is a vault
  *  key NAME only — the secret value lives in the Seal vault and is NEVER
- *  rendered in this UI. The vault key is auto-generated from the repo id +
- *  credential kind (no user-facing field for it). The editor exposes
- *  `credential.username` (bot-account name only, machine_user), never a
- *  token/secret/password field. */
+ *  rendered in this UI. For a NEW token the vault key is auto-generated
+ *  from the repo id + credential kind (no free-text field for it); the
+ *  create form may instead REFERENCE an existing vault entry picked from a
+ *  dropdown of key NAMES (`GET /api/secrets` never returns values). The
+ *  editor exposes `credential.username` (bot-account name only,
+ *  machine_user) and the write-only token field (create/rotate only —
+ *  values are never read back from the vault). */
 export function ReposView() {
   const { repos, loaded, error, refresh } = useRepos()
+  // Vault secret KEY NAMES only (never values) — the create form offers them
+  // as an alternative to pasting a token: the repo then references an
+  // existing vault entry instead of writing a new one.
+  const { secrets } = useSecrets()
 
   const [editing, setEditing] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
@@ -112,6 +120,9 @@ export function ReposView() {
   const [submitting, setSubmitting] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null)
+  // Create-mode only: the vault key NAME of an existing vault secret to
+  // reference ('' = paste a new token, the default). Never a secret value.
+  const [existingSecret, setExistingSecret] = useState('')
 
   // Ref holding the latest `repos` list so the seed effect can read it
   // without re-running on every poll tick.
@@ -120,6 +131,8 @@ export function ReposView() {
 
   // Seed the form ONLY when the user picks a repo (or starts creating).
   useEffect(() => {
+    // Any (re)seed starts from "paste a new token".
+    setExistingSecret('')
     if (creating) {
       setForm(emptyInput())
       setFormError(null)
@@ -139,6 +152,18 @@ export function ReposView() {
     [editing, repos],
   )
 
+  // Vault key names for the PAT-source dropdown, sorted for scanability.
+  // Plain code-unit sort: deterministic across engines (no locale collation
+  // differences between the browser and the test runner).
+  const secretNames = useMemo(() => [...secrets].sort(), [secrets])
+
+  // On EDIT the credential kind may be switched (e.g. pat → deploy_key). The
+  // repo's vault key is preserved unless the kind changes, in which case the
+  // deterministic key for the new kind wins (the server best-effort deletes
+  // the old vault entry).
+  const editingKindChanged =
+    !creating && selected !== null && form.credential.kind !== selected.credential.kind
+
   const validateForm = (): string | null => {
     const id = (form.id ?? '').trim()
     if (id.length === 0) return 'id is required'
@@ -152,8 +177,12 @@ export function ReposView() {
     // token in). On EDIT the token is optional (empty = no change / no vault
     // touch — the operator only pastes a new token to rotate).
     if (creating && (form.credential.kind === 'pat' || form.credential.kind === 'machine_user')) {
-      if (!(form.token ?? '').trim()) {
-        return form.credential.kind === 'pat' ? 'PAT is required' : 'Bot token is required'
+      // ...unless the operator picked an EXISTING vault secret, which
+      // supplies the credential without a new token being typed.
+      if (existingSecret === '' && !(form.token ?? '').trim()) {
+        return form.credential.kind === 'pat'
+          ? 'PAT is required — paste a token or pick an existing vault secret'
+          : 'Bot token is required — paste a token or pick an existing vault secret'
       }
     }
     return null
@@ -166,10 +195,28 @@ export function ReposView() {
     setFormError(null)
     const trimmedId = (form.id ?? '').trim()
     const url = (form.url ?? '').trim()
-    const vaultKey = autoVaultKey(trimmedId, form.credential.kind)
+    // Create + a picked vault secret → the repo REFERENCES that existing
+    // vault entry (nothing is written to the vault). Otherwise the key stays
+    // deterministic: seal-<kind>-<id>. The reuse path is valid for the two
+    // token-bearing kinds ONLY: a deploy key's secret is generated
+    // server-side and must never be written over a secret the operator
+    // picked for a PAT (that would destroy it).
+    const reusingSecret = creating
+      && existingSecret !== ''
+      && (form.credential.kind === 'pat' || form.credential.kind === 'machine_user')
+    const vaultKey = creating
+      ? (reusingSecret ? existingSecret : autoVaultKey(trimmedId, form.credential.kind))
+      : editingKindChanged
+        ? autoVaultKey(trimmedId, form.credential.kind)
+        // Kind unchanged → PRESERVE the repo's vault key. It may reference an
+        // existing secret (picked in this form, or added out-of-band via
+        // /vault add); rewriting it to the auto key would orphan that secret
+        // and the server would reject the PUT as a credential change.
+        : (form.credential.vault_key ?? '').trim() || autoVaultKey(trimmedId, form.credential.kind)
     const username = form.credential.username?.trim()
     if (creating) {
-      const token = form.token?.trim()
+      // No token is sent when reusing a stored secret — the vault is untouched.
+      const token = reusingSecret ? '' : form.token?.trim()
       const payload: RepoInput = {
         id: trimmedId,
         url,
@@ -402,6 +449,12 @@ export function ReposView() {
                 value={form.credential.kind}
                 onChange={(e) => {
                   const kind = e.target.value as RepoCredentialKind
+                  // Drop any picked vault secret when switching kinds — same
+                  // rationale as clearing the token below, and load-bearing:
+                  // a deploy key's passphrase is vhPut under the credential's
+                  // vault key, so a stale PAT-secret selection would OVERWRITE
+                  // that secret with a passphrase and destroy it.
+                  setExistingSecret('')
                   setForm((f) => ({
                     ...f,
                     // Clear the token when switching credential kinds so a
@@ -439,34 +492,83 @@ export function ReposView() {
               </Row>
             )}
 
-            {/* PAT / Bot-token password field — write-only. Shown for the
-                two token-bearing credential kinds (pat, machine_user). The
-                field is the primary interaction; the advisory note (below)
-                moves under it so the field is prominent, not the note. On
-                edit the field is empty (no pre-population — the token is not
-                retrievable from the vault via the API); a non-empty value
-                rotates the vault entry. */}
-            {(credKind === 'pat' || credKind === 'machine_user') && (
-              <Row
-                label={credKind === 'pat' ? 'PAT' : 'Bot token'}
-                htmlFor="repo-token"
-                hint={creating
-                  ? undefined
-                  : 'Paste a new token to rotate (leave empty to keep the existing one).'}
-              >
-                <input
-                  id="repo-token"
-                  type="password"
-                  value={form.token ?? ''}
-                  onChange={(e) => setForm((f) => ({ ...f, token: e.target.value }))}
-                  style={inputStyle}
-                  placeholder={creating
-                    ? (credKind === 'pat' ? 'ghp_...' : 'ghp_...')
-                    : 'Paste new token to rotate (leave empty to keep)'}
-                  autoComplete="off"
-                />
-              </Row>
-            )}
+            {/* PAT / Bot-token field — write-only. Shown for the two
+                token-bearing credential kinds (pat, machine_user).
+                On CREATE the operator has two ways to supply the credential:
+                  (a) paste a new token — the server vhPut's it into the
+                      vault under the deterministic key seal-<kind>-<id>; or
+                  (b) pick an EXISTING vault secret from the dropdown, which
+                      lists key NAMES only (GET /api/secrets never returns
+                      values). The repo then REFERENCES that entry — no token
+                      is typed, no value is read, and the vault is untouched.
+                The dropdown is hidden when the vault exposes no listable
+                secrets (locked / unconfigured) — the password field alone
+                still works — and on EDIT: the repo already references a vault
+                key, and changing it would require re-authenticating. On edit
+                the password field is empty (the token is not retrievable via
+                the API); a non-empty value rotates the vault entry. */}
+            {(credKind === 'pat' || credKind === 'machine_user') && (() => {
+              const tokenLabel = credKind === 'pat' ? 'PAT' : 'Bot token'
+              const pickExisting = creating && secretNames.length > 0
+              const usingExisting = pickExisting && existingSecret !== ''
+              // The vault key a pasted token would be stored under.
+              const newKeyName = autoVaultKey((form.id ?? '').trim() || '<id>', credKind)
+              // The vault key the repo currently references (edit mode, kind
+              // unchanged — the key the PUT will send).
+              const currentKeyName = (form.credential.vault_key ?? '').trim() || newKeyName
+              // The row label points at whichever control is on screen: the
+              // token field normally, the dropdown once it stands in for it
+              // (the field is unmounted then — no dangling label).
+              return (
+                <Row
+                  label={tokenLabel}
+                  htmlFor={usingExisting ? 'repo-token-source' : 'repo-token'}
+                  hint={
+                    usingExisting
+                      ? <>This repo references the existing vault secret <strong>{existingSecret}</strong> — its value stays in the vault and is never displayed.</>
+                      : creating
+                        ? <>Paste a new token, stored in the vault as <strong>{newKeyName}</strong>{pickExisting ? ', or reuse an existing secret above.' : '.'}</>
+                        : editingKindChanged
+                          ? 'Paste a new token to rotate (leave empty to keep the existing one).'
+                          : <>References the vault secret <strong>{currentKeyName}</strong> — paste a new token to rotate it (leave empty to keep).</>
+                  }
+                >
+                  {pickExisting && (
+                    <select
+                      id="repo-token-source"
+                      aria-label={`${tokenLabel} source`}
+                      value={existingSecret}
+                      onChange={(e) => {
+                        const name = e.target.value
+                        setExistingSecret(name)
+                        // Reusing a stored secret means no new token: clear
+                        // any typed token so it can never be sent alongside.
+                        if (name !== '') setForm((f) => ({ ...f, token: '' }))
+                      }}
+                      style={inputStyle}
+                    >
+                      <option value="">Paste a new token</option>
+                      {secretNames.map((name) => (
+                        <option key={name} value={name}>{name}</option>
+                      ))}
+                    </select>
+                  )}
+                  {!usingExisting && (
+                    <input
+                      id="repo-token"
+                      type="password"
+                      value={form.token ?? ''}
+                      onChange={(e) => setForm((f) => ({ ...f, token: e.target.value }))}
+                      style={pickExisting ? { ...inputStyle, marginTop: 8 } : inputStyle}
+                      placeholder={creating
+                        ? (credKind === 'pat' ? 'ghp_...' : 'ghp_...')
+                        : 'Paste new token to rotate (leave empty to keep)'}
+                      autoComplete="off"
+                    />
+                  )}
+                </Row>
+              )
+            })()}
 
             {!creating && selected?.deploy_key_public && (() => {
               const deployKeysUrl = githubDeployKeysUrl(selected.url)

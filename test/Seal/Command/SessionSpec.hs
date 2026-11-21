@@ -23,6 +23,7 @@ import Seal.Core.Types (mkSessionId)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), newSession)
 import Seal.TestHelpers.FakeCaps (getSent, makeFakeCaps)
+import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.Vault.Commands (VaultRuntime (..))
 
 aTime :: UTCTime
@@ -31,7 +32,7 @@ aTime = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 43200)
 meta :: T.Text -> SessionMeta
 meta idText =
   let sid = fromRight (error $ "invalid session id: " <> show idText) (mkSessionId idText)
-  in SessionMeta sid "anthropic" "claude-opus-4-8" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing aTime aTime mempty
+  in SessionMeta sid "anthropic" "claude-opus-4-8" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing aTime aTime mempty
 
 mkSR :: FilePath -> SessionMeta -> IO SessionRuntime
 mkSR root active = do
@@ -48,7 +49,7 @@ mkPR cfgPath = do
   cntRef <- newIORef 0
   let sp  = SealPaths cfgPath cfgPath cfgPath cfgPath cfgPath
       vrt = VaultRuntime { vrPaths = sp, vrConfigPath = cfgPath, vrHandleRef = ref }
-  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef }
+  pure ProviderRuntime { prConfigPath = cfgPath, prVault = vrt, prManager = mgr, prCallCounter = cntRef, prOllamaReadiness = noOllamaReadiness }
 
 runSess :: SessionRuntime -> [String] -> ChannelCaps -> IO ()
 runSess sr argv caps =

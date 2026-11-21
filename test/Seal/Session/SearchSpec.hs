@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 -- | Tests for Seal.Session.Search — the session search capability with
 -- three tiers: engram (semantic), ripgrep (literal subprocess), and
 -- in-memory (full-transcript Haskell scan).
@@ -15,7 +16,7 @@ import Test.Hspec
 
 import Seal.Config.Paths (SealPaths (..), sessionConversationPath, sessionDir)
 import Seal.Memory.Embedding (EmbeddingBackend (..), nullEmbeddingBackend)
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
+import Seal.Providers.Class (ContentBlock (..), pattern Message, Role (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Search
 import Seal.Session.Store (newSession, saveSessionMeta)

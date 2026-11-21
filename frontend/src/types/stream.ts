@@ -156,7 +156,10 @@ export interface ReposChangedEvent {
  *  client can preserve the last known value. */
 export interface EntriesChunkPayload {
   entries: TranscriptEntry[]
-  hasMore: boolean
+  /** Omitted by the backend's error frame (the catch handler sends only
+   *  `entries: []` and `requestBefore`). The client treats `undefined` as
+   *  "no window information" rather than "no older entries". */
+  hasMore?: boolean
   totalCount?: number
   requestBefore: string | null
 }
@@ -167,10 +170,21 @@ export interface EntriesChunkEvent {
   type: 'entries-chunk'
   sessionId: string
   entries: TranscriptEntry[]
-  hasMore: boolean
-  totalCount: number
+  hasMore?: boolean
+  totalCount?: number
   requestBefore: string | null
 }
+
+/** Result of a jump-to-top/bottom action.
+ *  - `requested`: a WS request was sent; the scroll applies when the chunk
+ *    arrives.
+ *  - `applied`: a pinned chunk with different entries was dispatched; the
+ *    next render/effect applies the scroll.
+ *  - `unchanged`: the pinned chunk is the same array reference as the
+ *    current entries, so no re-render will happen — the caller must scroll
+ *    directly.
+ *  - `unavailable`: no focused session. */
+export type LoadResult = 'requested' | 'applied' | 'unchanged' | 'unavailable'
 
 export type ServerEvent =
   | HelloEvent
@@ -309,11 +323,12 @@ export interface UseTranscriptStream {
   loadingMore: boolean
   /** Trigger to load the next chunk of older entries. */
   loadOlder: () => void
-  loadFromBeginning: () => void
+  /** Jump to the oldest entries. See 'LoadResult' for the return value. */
+  loadFromBeginning: () => LoadResult
   /** Jump to the newest entries (scroll-to-bottom button). Re-requests the
    *  latest N entries from the backend, replacing whatever is currently
    *  loaded. */
-  loadLatest: () => void
+  loadLatest: () => LoadResult
   /** True when the loaded entries include the latest (tail) entries —
    *  i.e. the user is viewing the newest end of the transcript. False
    *  after `loadFromBeginning` (oldest entries loaded, latest not in

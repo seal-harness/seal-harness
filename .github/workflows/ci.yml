@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Allow re-running the pipeline by hand (e.g. after a cache purge).
+  workflow_dispatch:
 
 # Cancel outdated runs when a new push arrives on the same ref
 concurrency:
@@ -12,11 +14,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build & Test (${{ matrix.system }})
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: write
+  # The gate lives in gate.yml so that release.yml runs the identical set of
+  # checks on a tag. See that file for what it enforces.
+  gate:
+    name: Gate (${{ matrix.system }})
     strategy:
       fail-fast: false
       matrix:
@@ -25,13 +26,30 @@ jobs:
             runner: ubuntu-latest
           - system: aarch64-darwin
             runner: macos-latest
-    # Map the optional S3-cache secrets to env so step-level `if` can test them.
-    # (The `secrets` context is not permitted in `if` conditionals; `env` is.)
-    env:
-      NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
-      NIX_CACHE_AWS_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_AWS_ACCESS_KEY_ID }}
-      NIX_CACHE_AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_AWS_SECRET_ACCESS_KEY }}
+    uses: ./.github/workflows/gate.yml
+    with:
+      system: ${{ matrix.system }}
+      runner: ${{ matrix.runner }}
+      # PR builds from forks get no secrets, so the push is skipped there.
+      push-cache: true
+    secrets: inherit
 
+  # ─────────────────────────────────────────────────────────────────────────
+  # Package the built binary as a download artifact, so users can grab a
+  # binary straight from a CI run without installing Nix.
+  # ─────────────────────────────────────────────────────────────────────────
+  package:
+    name: Package (${{ matrix.system }})
+    needs: gate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-darwin
+            runner: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -39,6 +57,7 @@ jobs:
         with:
           extra-conf: |
             accept-flake-config = true
+            max-jobs = auto
 
       - name: Restore Nix store cache
         uses: nix-community/cache-nix-action/restore@v7
@@ -46,39 +65,13 @@ jobs:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
 
-      - name: Populate Nix store with dependencies
-        run: nix develop --command true
+      - name: Build portable artifact
+        run: nix build --print-build-logs .#dist
 
-      - name: Save Nix store cache
-        uses: nix-community/cache-nix-action/save@v7
-        with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
-          gc-max-store-size-linux: 5G
-          gc-max-store-size-macos: 5G
-          purge: true
-          purge-created: 604800
-
-      - name: Build
-        run: nix build --print-build-logs
-
-      # ─────────────────────────────────────────────────────────────────────
-      # Binary artifact: package the built `seal` executable as a tarball
-      # with a SHA256 checksum and upload it as a GitHub workflow artifact.
-      # This lets users download the binary directly from a CI run without
-      # installing Nix. The frontend dist/ is NOT embedded in the binary
-      # (served from configurable static_dir), so the binary is self-contained
-      # for CLI/TUI use; `seal serve` requires a separate frontend build.
-      # ─────────────────────────────────────────────────────────────────────
       - name: Package binary artifact
         run: |
-          # nix build leaves ./result/bin/seal
-          TARGET="seal-${{ matrix.system }}"
-          ARCHIVE="${TARGET}.tar.gz"
-          mkdir -p staging
-          cp ./result/bin/seal "staging/seal"
-          tar czf "$ARCHIVE" -C staging seal
-          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
-          echo "Packaged $ARCHIVE ($(wc -c < "$ARCHIVE") bytes)"
+          ./scripts/check-portability.sh result
+          ./scripts/package-release.sh "${{ matrix.system }}" "" "seal-${{ matrix.system }}"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
@@ -90,156 +83,28 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Run tests with coverage
-        run: nix develop --command cabal test --enable-coverage
-
-      - name: Post test timing summary
-        if: always()
-        run: |
-          {
-            echo "## Test Case Timing Report"
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          # Check for a hung test (currently-running.txt is non-empty
-          # if the process was killed mid-test).
-          if [ -f currently-running.txt ] && [ -s currently-running.txt ]; then
-            RUNNING=$(cat currently-running.txt)
-            {
-              echo "### ⚠️ Test process was killed while running: \`$RUNNING\`"
-              echo ""
-              echo "This test was still executing when the process terminated."
-              echo "It is the prime suspect for a hang or timeout."
-              echo ""
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-          if [ ! -f test-timings.txt ]; then
-            echo "No test-timings.txt found — timing summary skipped." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          {
-            echo "### Slowest test cases (top 20)"
-            echo ""
-            echo "| # | Duration | Result | Test |"
-            echo "|---:|----------|--------|------|"
-            # Sort by duration descending, take top 20, format as table.
-            # Skip header line, sort numerically on first column.
-            tail -n +2 test-timings.txt \
-              | sort -t$'\t' -k1 -rn \
-              | head -20 \
-              | nl -w1 -s'. ' | while IFS=$'\t' read -r num dur result path; do
-                echo "| $num | ${dur}s | $result | \`$path\` |"
-            done
-            echo ""
-            echo "<details>"
-            echo "<summary>Full timing data (all completed test cases, streaming)</summary>"
-            echo ""
-            echo '```tsv'
-            cat test-timings.txt
-            echo '```'
-            echo ""
-            echo "</details>"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Generate coverage report
-        if: always()
-        run: |
-          nix develop --command bash -c '
-          # The .tix file is named after the cabal test-suite (`tests`).
-          TIX=$(find dist-newstyle -name "tests.tix" 2>/dev/null | head -1)
-          if [ -z "$TIX" ]; then
-            echo "No .tix file found — coverage report skipped."
-            exit 0
-          fi
-
-          # Collect all mix directories
-          MIXDIRS=$(find dist-newstyle -path "*/hpc/vanilla/mix" -type d 2>/dev/null)
-          HPCDIR_ARGS=""
-          for d in $MIXDIRS; do
-            HPCDIR_ARGS="$HPCDIR_ARGS --hpcdir=$d"
-          done
-
-          # Generate text report (library modules only, exclude test harness)
-          echo "=== HPC Coverage Report ==="
-          REPORT=$(hpc report "$TIX" $HPCDIR_ARGS \
-            --exclude=Main \
-            --exclude=Paths_seal_harness \
-            2>&1)
-          echo "$REPORT"
-          echo "$REPORT" > coverage-report.txt
-
-          # Per-module breakdown
-          echo ""
-          echo "=== Per-Module Coverage ==="
-          MODULE_REPORT=$(hpc report "$TIX" $HPCDIR_ARGS \
-            --exclude=Main \
-            --exclude=Paths_seal_harness \
-            --per-module \
-            2>&1)
-          echo "$MODULE_REPORT"
-          echo "$MODULE_REPORT" > coverage-per-module.txt
-          '
-
-      - name: Post coverage to job summary
-        if: always()
-        run: |
-          if [ ! -f coverage-report.txt ]; then
-            echo "No coverage report found." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          {
-            echo "## Code Coverage (HPC)"
-            echo ""
-            echo '```'
-            cat coverage-report.txt
-            echo '```'
-            echo ""
-            echo "<details>"
-            echo "<summary>Per-module breakdown</summary>"
-            echo ""
-            echo '```'
-            cat coverage-per-module.txt
-            echo '```'
-            echo ""
-            echo "</details>"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # ─────────────────────────────────────────────────────────────────────
-      # GitHub Pages: publish the HPC coverage HTML + the OpenAPI spec +
-      # a Swagger UI page to gh-pages on every merge to main.
-      # Patterned after pureclaw/.github/workflows/ci.yml.
-      # Runs only on the linux matrix entry (one deploy, not per-arch) and
-      # only on pushes to main (PR builds generate the artifacts but don't
-      # deploy — the gh-pages branch is main-only for v1).
-      # ─────────────────────────────────────────────────────────────────────
-      - name: Generate OpenAPI spec
-        if: always()
-        run: |
-          # Use the already-built binary from the 'Build' step (the ./result
-          # symlink created by `nix build`). cabal run would print build
-          # progress to stdout, contaminating the JSON output.
-          ./result/bin/seal gen-openapi > openapi.json
-          if [ -s openapi.json ]; then
-            echo "OpenAPI spec generated ($(wc -c < openapi.json) bytes)"
-          else
-            echo "OpenAPI spec generation failed — skipping Pages deploy"
-          fi
-
-      - name: Stage coverage HTML for Pages
-        if: always()
-        run: |
-          HTML_DIR=$(find dist-newstyle -path "*/hpc/vanilla/html" -type d 2>/dev/null | head -1)
-          if [ -n "$HTML_DIR" ]; then
-            mkdir -p new-coverage
-            cp -r "$HTML_DIR"/* new-coverage/
-            [ -f coverage-report.txt ] && cp coverage-report.txt new-coverage/summary.txt
-          fi
+  # ─────────────────────────────────────────────────────────────────────────
+  # GitHub Pages: publish the HPC coverage HTML + the OpenAPI spec + a
+  # Swagger UI page to gh-pages on every merge to main.
+  # Runs only on the linux matrix entry (one deploy, not per-arch) and only on
+  # pushes to main — the gh-pages branch is main-only for v1.
+  # ─────────────────────────────────────────────────────────────────────────
+  pages:
+    name: Deploy docs to Pages
+    needs: gate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download gate docs (linux)
+        uses: actions/download-artifact@v4
+        with:
+          name: gate-docs-x86_64-linux
+          path: gate-docs
+        continue-on-error: true
 
       - name: Fetch existing gh-pages content
-        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.system == 'x86_64-linux'
         uses: actions/checkout@v4
         with:
           ref: gh-pages
@@ -247,7 +112,6 @@ jobs:
         continue-on-error: true
 
       - name: Assemble Pages content
-        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.system == 'x86_64-linux'
         run: |
           PAGES_BASE="https://seal-harness.github.io/seal-harness"
           mkdir -p deploy/coverage deploy/api
@@ -262,17 +126,15 @@ jobs:
 
           # Overwrite the main coverage report with this build's
           rm -rf deploy/coverage/main
-          if [ -d new-coverage ]; then
+          if [ -d gate-docs/new-coverage ]; then
             mkdir -p deploy/coverage/main
-            cp -r new-coverage/* deploy/coverage/main/
+            cp -r gate-docs/new-coverage/* deploy/coverage/main/
           fi
 
-          # Overwrite the OpenAPI spec + Swagger UI
-          if [ -s openapi.json ]; then
-            cp openapi.json deploy/api/openapi.json
+          if [ -s gate-docs/openapi.json ]; then
+            cp gate-docs/openapi.json deploy/api/openapi.json
           fi
 
-          # Swagger UI page (loads the spec from the same directory)
           cat > deploy/api/index.html << 'SWAGGER'
           <!DOCTYPE html>
           <html>
@@ -300,7 +162,6 @@ jobs:
           </html>
           SWAGGER
 
-          # Root index linking to coverage + API docs
           cat > deploy/index.html << 'INDEX'
           <!DOCTYPE html>
           <html>
@@ -326,7 +187,6 @@ jobs:
           INDEX
 
       - name: Deploy to GitHub Pages
-        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.system == 'x86_64-linux'
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -334,65 +194,15 @@ jobs:
           force_orphan: true
           commit_message: "Update docs: coverage + OpenAPI spec"
 
-      # ─────────────────────────────────────────────────────────────────────
-      # Optional: push built store paths to the S3 Nix binary cache.
-      # Runs on pushes to main AND on same-repo PR branches, so PR builds also
-      # warm the cache. The `env.NIX_CACHE_* != ''` guard is what excludes fork
-      # PRs: GitHub withholds secrets from forks, so these are empty there and
-      # the step is skipped. Also skipped when the secrets aren't configured.
-      # ─────────────────────────────────────────────────────────────────────
-      - name: Push to S3 Nix cache
-        if: env.NIX_CACHE_SIGNING_KEY != '' && env.NIX_CACHE_AWS_ACCESS_KEY_ID != ''
-        # `nix copy --to s3://…` authenticates via the AWS SDK, which reads the
-        # standard AWS_* env vars. The job-level NIX_CACHE_AWS_* vars exist only
-        # so the `if` above can gate on them (secrets aren't allowed in `if`), so
-        # re-export them here under the names the SDK actually looks for.
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_AWS_SECRET_ACCESS_KEY }}
-        run: |
-          # Region must match the substituter URL in flake.nix.
-          S3_CACHE='s3://${{ vars.NIX_CACHE_BUCKET }}'
-          KEY=/tmp/nix-cache-priv-key.pem
-          echo "$NIX_CACHE_SIGNING_KEY" > "$KEY"
-
-          echo "Collecting store paths..."
-          RESULT_PATHS=""
-          if [ -e ./result ]; then
-            RESULT_PATHS=$(nix-store -qR ./result)
-          else
-            echo "No ./result found, pushing dev shell only."
-          fi
-
-          DEVSHELL_OUT=$(nix build .#devShells.${{ matrix.system }}.default --print-out-paths --no-link 2>/dev/null || true)
-          DEVSHELL_PATHS=""
-          if [ -n "$DEVSHELL_OUT" ]; then
-            DEVSHELL_PATHS=$(nix-store -qR $DEVSHELL_OUT)
-          fi
-
-          ALL_PATHS=$(echo -e "${RESULT_PATHS}\n${DEVSHELL_PATHS}" | sort -u | grep -v '^$')
-          if [ -z "$ALL_PATHS" ]; then
-            echo "No store paths to push."
-            exit 0
-          fi
-
-          TOTAL=$(echo "$ALL_PATHS" | wc -l)
-          echo "Signing and pushing $TOTAL store paths..."
-          echo "$ALL_PATHS" | xargs nix store sign --key-file "$KEY"
-          echo "$ALL_PATHS" | xargs nix copy --to "$S3_CACHE"
-          echo "Cache push complete: $TOTAL paths."
-
   # ─────────────────────────────────────────────────────────────────────────
-  # Rolling "latest" release: on pushes to main, download the per-platform
-  # tarballs from the build job and attach them to a rolling "latest"
-  # GitHub Release. Users who want bleeding-edge binaries download from the
-  # Releases page; for stable versioned releases, see release.yml (triggered
-  # by `git tag v*`). PR builds upload artifacts (above) but do not create
-  # a release.
+  # Rolling "latest" release: on pushes to main, attach the per-platform
+  # tarballs to a rolling "latest" GitHub Release. For stable versioned
+  # releases, see release.yml (triggered by a release tag). PR builds upload
+  # artifacts but do not create a release.
   # ─────────────────────────────────────────────────────────────────────────
   release:
     name: Rolling latest release
-    needs: build
+    needs: package
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -405,13 +215,10 @@ jobs:
 
       - name: Stage release assets
         run: |
-          # Flatten artifacts: each artifact is in its own subdirectory
-          # (seal-x86_64-linux/seal-x86_64-linux.tar.gz, etc.).
           mkdir -p release-assets
           find artifacts -type f \( -name 'seal-*.tar.gz' -o -name 'seal-*.sha256' \) \
             -exec cp {} release-assets/ \;
-          # Consolidate per-platform checksums into one file.
-          cat release-assets/*.sha256 > release-assets/checksums-sha256.txt
+          ( cd release-assets && sha256sum seal-*.tar.gz > checksums-sha256.txt )
           echo "Release assets:"
           ls -la release-assets/
 

@@ -27,6 +27,8 @@ module Seal.TestHelpers.ApiTestHarness
   , waitForTranscript
   , assertTranscriptContains
   , setScript
+    -- * Offline stubs
+  , noOllamaReadiness
   , uemLabel
   , ghEnvMarkerName
   , readGhEnvMarker
@@ -88,9 +90,10 @@ import Seal.Config.Paths (SealPaths (..), securityFilePath, sshAgentsDir)
 import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..)
   , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig
-  , saveSecurityConfig )
+  , WriteMode (PreserveCredentials), saveSecurityConfig )
 import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Gateway.API (ApiDeps (..), apiApp)
+import Seal.Gateway.Setup (stubSetupDeps)
 import Seal.Gateway.Send (SendDeps (..), newSessionWakeMutex)
 import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
@@ -101,6 +104,7 @@ import Seal.Ingest (emptyChain)
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Providers.Class
   ( CompletionResponse (..), SomeProvider (..) )
+import Seal.Providers.OllamaReadiness (OllamaReadiness (..))
 import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
@@ -120,11 +124,39 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
 import Seal.ISA.RepeatDetect (newSessionRepeatRegistry)
 import Seal.Tools.Exec.Remote (RemoteRunner (..))
-import Seal.Tools.Exec.Types (ExecError)
+import Seal.Tools.Exec.Types (ExecError (..))
+import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
 import Seal.Tools.Exec.Untrusted (UntrustedExecMode (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.Web.UiState (newUiStateHandle)
 import Seal.Memory.Embedding (nullEmbeddingBackend)
+import Seal.Cron.Store (CronStore (..))
+
+-- | The shared Ollama readiness stub (design D6.2). Every @ApiDeps@ and
+-- 'ProviderRuntime' literal in the test suite references this ONE constant, so
+-- adding the readiness seam is a mechanical, one-field churn and no test ever
+-- touches the network or the real PATH.
+--
+-- 'RdPending' rather than 'RdUnknown' is deliberate: @pending@ is the honest
+-- "no probe result yet" value and is the one state the frontend renders as an
+-- empty readiness slot, so existing assertions about the auth badge keep
+-- passing unchanged (design test 34).
+noOllamaReadiness :: IO OllamaReadiness
+noOllamaReadiness = pure RdPending
+
+-- | A pure 'CronStore' stub for ApiDeps literals that don't exercise cron.
+stubCronStore :: CronStore
+stubCronStore = CronStore
+  { csCreate    = \_ -> error "cron store stub: csCreate"
+  , csRead      = \_ -> error "cron store stub: csRead"
+  , csList      = \_ -> error "cron store stub: csList"
+  , csSave      = \_ -> error "cron store stub: csSave"
+  , csDelete    = \_ -> error "cron store stub: csDelete"
+  , csRecordRun = \_ _ -> error "cron store stub: csRecordRun"
+  , csListRuns  = \_ _ -> error "cron store stub: csListRuns"
+  , csUpdateRun = \_ _ -> error "cron store stub: csUpdateRun"
+  , csLock = error "cron store stub: csLock"
+  }
 
 -- ---------------------------------------------------------------------------
 -- The test environment
@@ -432,7 +464,7 @@ buildTestEnv tmp mode mRepo opts = do
 
   -- Session runtime.
   let meta0 = SessionMeta
-        (case mkSessionId "test" of Right s -> s; Left _ -> error "sid") "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing
+        (case mkSessionId "test" of Right s -> s; Left _ -> error "sid") "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
         (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0) mempty
   activeRef <- newIORef meta0
   let sr = SessionRuntime
@@ -445,7 +477,8 @@ buildTestEnv tmp mode mRepo opts = do
   let rt = vaultRt
       pr = ProviderRuntime
         { prConfigPath = configRoot </> "config.toml", prVault = rt
-        , prManager = mgr, prCallCounter = cntRef }
+        , prManager = mgr, prCallCounter = cntRef
+        , prOllamaReadiness = noOllamaReadiness }
 
   -- Provider resolve stub.
   let resolveStub :: SessionMeta -> IO (Either Text (SomeProvider, ModelId))
@@ -467,7 +500,7 @@ buildTestEnv tmp mode mRepo opts = do
       secCfg = if mode == UemRemote
         then buildRemoteSecurityConfig tmp currentUser mKeyfilePath
         else defaultSecurityConfig
-  saveSecurityConfig (securityFilePath paths) secCfg
+  _ <- saveSecurityConfig (securityFilePath paths) secCfg PreserveCredentials
 
   logger <- testSealLogger
   execCache <- newSessionExecCache
@@ -485,7 +518,7 @@ buildTestEnv tmp mode mRepo opts = do
     Nothing  -> pure Nothing
   let sendDeps = SendDeps
         { sdPaths = paths
-        , sdVault = rt
+        , sdVault = rt        , sdTurnComplete = \_ _ -> pure ()
         , sdRepoReg = repoRegH
         , sdAgentReg = agentRegH
         , sdProvider = pr
@@ -529,6 +562,7 @@ buildTestEnv tmp mode mRepo opts = do
         , adAgentDefs = bAgentDefs backends
         , adSkills = bSkills backends
         , adProviders = pure knownProviders
+        , adOllamaReadiness = noOllamaReadiness
         , adUiState = uiState
         , adSend = Just sendDeps
         , adDefaultAgent = pure Nothing
@@ -537,13 +571,21 @@ buildTestEnv tmp mode mRepo opts = do
         , adRepoRegistry = repoRegH
         , adAgentRegistry = agentRegH
         , adConfigRepo = configRepo
-        , adVault = rt
+        , adVault = rt, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
         , adPaths = paths
         
         , adWsHealth = pure (StreamHealth "up" 8081)
         , adAbortReg = testAbortReg
+        , adCronStore = stubCronStore
         , adSecurityConfig = secCfg
         , adMkSessionExec = Nothing
+        , adFileExplorer = mkFailClosedFileExplorer
+        , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
         }
       app = apiApp deps
   pure ApiTestEnv
@@ -612,6 +654,8 @@ mkSetupRepoFakeRunner markerPath ref = do
     { runRemote      = (`record` Nothing)
     , runRemoteStdin = \argv stdin -> record argv (Just stdin)
     , runRemoteEnv   = \_env argv -> record argv Nothing
+    , runRemoteStream = \argv _action -> record argv Nothing >> pure (Left ExecRemoteUnreachable)
+    , runRemoteBytes = \argv -> record argv Nothing >> pure (Right ("", False))
     }
 
 -- | Respond to one recorded ssh invocation (see 'mkSetupRepoFakeRunner').

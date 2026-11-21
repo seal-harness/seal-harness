@@ -2,6 +2,7 @@
 -- | Top-level TUI entry: path resolution -> config -> vault -> registry -> loop.
 module Seal.Tui (runTui) where
 
+import Control.Monad (forM_)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import qualified Data.Text as T
@@ -21,10 +22,14 @@ import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
 import Seal.Command.Spec (mkRegistry)
 import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig)
+import Seal.Providers.OllamaReadinessProbe
+  ( mkOllamaProbes, defaultProbesConfig, oprReadiness )
 import Seal.Config.Migrate (migrateSecurityConfig)
+import Seal.Config.Templates (ensureConfigTemplates)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
 import Seal.Config.Paths
   ( SealPaths (..)
+  , auditDir
   , configFilePath
   , ensureSealDirs
   , getSealPaths
@@ -33,7 +38,8 @@ import Seal.Config.Paths
   , securityFilePath
   , vaultFilePath
   )
-import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
+import Seal.Git.Repo (ensureConfigRepo, openConfigRepo, gitShortHead)
+import Seal.Audit.Log (fileAuditSinkWithGit, setAuditLogger)
 import Seal.Handles.AskReply (newAskReplyStore)
 import Seal.Ingest (emptyChain)
 import Seal.Security.Policy (AutonomyLevel)
@@ -84,6 +90,12 @@ runTui autonomy logger = do
   paths <- getSealPaths
   ensureSealDirs paths
   migrateSecurityConfig paths
+  -- First-run scaffolding: see 'Seal.Config.Templates'. Never overwrites, and a
+  -- failure is a warning — the TUI boots either way.
+  (createdTemplates, templateWarnings) <- ensureConfigTemplates paths
+  forM_ createdTemplates $ \fp ->
+    putStrLn ("Wrote a documented config template at " <> fp)
+  forM_ templateWarnings $ \w -> putStrLn ("Warning: " <> T.unpack w)
   let cfgPath = configFilePath paths
   cfg <- loadRuntimeConfig cfgPath >>= \case
     Left err -> do
@@ -106,11 +118,20 @@ runTui autonomy logger = do
   -- this with the chat provider's manager when the startup hardcode is removed.)
   mgr <- newTlsManager
   callCounter <- newIORef 0
+  -- The TUI probes Ollama INLINE (design D6.3): it is a separate process and
+  -- cannot share the gateway's cache, so @\/provider list@ costs at most one
+  -- 2 s probe plus one RAM read. Acceptable for an interactive command; the
+  -- "never inline" rule (D2.4) is scoped to HTTP request handlers.
+  probes <- mkOllamaProbes
+    (defaultProbesConfig mgr (loadRuntimeConfig cfgPath >>= \case
+        Left _  -> pure defaultRuntimeConfig
+        Right c -> pure c))
   let pr = ProviderRuntime
             { prConfigPath  = cfgPath
             , prVault       = rt
             , prManager     = mgr
             , prCallCounter = callCounter
+            , prOllamaReadiness = oprReadiness probes
             }
   -- The config directory is a git repo (versioning + audit for the
   -- evolutionary stores: skills, agent-defs, memory live as Markdown files
@@ -119,6 +140,8 @@ runTui autonomy logger = do
   let cfgRoot = spConfig paths
   ensureConfigRepo cfgRoot
   let repo = openConfigRepo cfgRoot
+  -- Cross-session audit log: set up the process-global audit logger.
+  setAuditLogger (fileAuditSinkWithGit (auditDir paths) (gitShortHead repo))
   -- The evolutionary-store backends are disk-backed (Markdown + git), created
   -- once and shared between the @\/skill@ \/ @\/agent@ command specs
   -- (read-only) and the ISA opcodes (mutate, auto-commit). Disk is canonical.

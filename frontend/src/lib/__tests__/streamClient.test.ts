@@ -487,6 +487,7 @@ describe('streamClient', () => {
     harness: null,
     model: 'm',
     channel: null,
+    userId: null,
     internal: null,
     raw: '{}',
   })

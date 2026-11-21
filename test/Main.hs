@@ -1,5 +1,6 @@
 module Main (main) where
 
+import qualified Seal.Audit.LogSpec
 import Seal.TestHelpers.SshAgentGuard (withNoLeakedSshAgents)
 import Seal.TestHelpers.TimingFormatter (timingFormatter)
 import Test.Hspec
@@ -13,10 +14,17 @@ import qualified Seal.Core.PagingSpec
 import qualified Seal.Core.SystemPromptSpec
 import qualified Seal.Gateway.ConfigSpec
 import qualified Seal.Gateway.EmbeddedSpec
+import qualified Seal.Gateway.ProviderIconSpec
 import qualified Seal.Gateway.ApiRouteSpec
+import qualified Seal.Gateway.AccessControlSpec
+import qualified Seal.Gateway.OriginGuardSpec
+import qualified Seal.Gateway.MutationGuardSpec
+import qualified Seal.Gateway.AuditSpec
+import qualified Seal.Command.AccessControlSpec
 import qualified Seal.Gateway.ApiIntegrationSpec
 import qualified Seal.Gateway.AgentIntegrationSpec
 import qualified Seal.Gateway.ApiSpec
+import qualified Seal.Gateway.ApiFilesSpec
 import qualified Seal.Gateway.BroadcastSpec
 import qualified Seal.Gateway.EntryCursorSpec
 import qualified Seal.Gateway.OpenApiSpec
@@ -29,6 +37,7 @@ import qualified Seal.Gateway.StreamHealthSpec
 import qualified Seal.Gateway.TranscriptSpec
 import qualified Seal.Util.StrictIOSpec
 import qualified Seal.AppMainSpec
+import qualified Seal.Session.BranchSpec
 import qualified Seal.Session.MetaSpec
 import qualified Seal.Session.AgentMetaCacheSpec
 import qualified Seal.Session.ExecCacheSpec
@@ -44,6 +53,7 @@ import qualified Seal.Tools.Exec.UntrustedIORemoteSpec
 import qualified Seal.Tools.Exec.LocalSpec
 import qualified Seal.Tools.Exec.LogRedactionSpec
 import qualified Seal.Tools.Exec.RemoteSpec
+import qualified Seal.Tools.Exec.FileExplorerSpec
 import qualified Seal.Tools.ArgsSpec
 import qualified Seal.Tools.Ssh.AgentSpec
 import qualified Seal.Tools.Exec.CapabilityScopingFailSpec
@@ -60,13 +70,20 @@ import qualified Seal.Media.ImageSpec
 import qualified Seal.Media.TtsSpec
 import qualified Seal.ConfigSpec
 import qualified Seal.Config.PathsSpec
+import qualified Seal.Config.TemplatesSpec
 import qualified Seal.Security.CryptoSpec
+import qualified Seal.Security.WebAuthnSpec
+import qualified Seal.Security.TlsCertSpec
+import qualified Seal.Security.WebAuthn.CborSpec
+import qualified Seal.Security.WebAuthn.DerSpec
 import qualified Seal.Security.PathSpec
 import qualified Seal.Security.SecretsSpec
 import qualified Seal.Security.Vault.AgeSpec
 import qualified Seal.Security.VaultSpec
 import qualified Seal.Security.PolicySpec
 import qualified Seal.Security.CommandSpec
+import qualified Seal.Security.EnrollmentGrantSpec
+import qualified Seal.Security.DaemonLockSpec
 import qualified Seal.Security.AdoptionSpec
 import qualified Seal.Command.HelpSpec
 import qualified Seal.Command.ModelSpec
@@ -84,12 +101,19 @@ import qualified Seal.Command.ChannelSpec
 import qualified Seal.Command.SpecSpec
 import qualified Seal.Command.TabSpec
 import qualified Seal.Command.NewSpec
+import qualified Seal.Config.BootPlanSpec
+import qualified Seal.Config.CredentialsSpec
 import qualified Seal.Config.FileSpec
 import qualified Seal.Config.MigrateSpec
 import qualified Seal.Config.SecuritySpec
+import qualified Seal.Config.SecurityAccessControlSpec
 import qualified Seal.Config.SecurityScopingFailSpec
 import qualified Seal.CapabilityScopingWorkdirFsFailSpec
 import qualified Seal.Vault.BackendSpec
+import qualified Seal.Vault.ProvisionSpec
+import qualified Seal.Setup.StateSpec
+import qualified Seal.Gateway.SetupApiSpec
+import qualified Seal.Vault.IdentityPathScopingFailSpec
 import qualified Seal.Vault.CommandsSpec
 import qualified Seal.Vault.AccessSpec
 import qualified Seal.IngestSpec
@@ -103,6 +127,7 @@ import qualified Seal.Channels.Chat.RateLimitSpec
 import qualified Seal.Channels.Chat.HttpClientSpec
 import qualified Seal.Channels.Chat.WsClientSpec
 import qualified Seal.Channels.Chat.WatchPersistSpec
+import qualified Seal.Channels.Chat.BubbleSpec
 import qualified Seal.Channels.Chat.LoopSpec
 import qualified Seal.Channels.Chat.SignalAdapterSpec
 import qualified Seal.Channels.Chat.TelegramAdapterSpec
@@ -111,6 +136,7 @@ import qualified Seal.Transcript.TypesSpec
 import qualified Seal.Transcript.ConvSpec
 import qualified Seal.Transcript.ConvIndexSpec
 import qualified Seal.Transcript.EntriesSpec
+import qualified Seal.Transcript.OriginSpec
 import qualified Seal.Transcript.ReconstructSpec
 import qualified Seal.Handles.AskReplySpec
 import qualified Seal.Handles.ChannelSpec
@@ -135,6 +161,11 @@ import qualified Seal.Memory.StoreSpec
 import qualified Seal.Memory.EmbeddingSpec
 import qualified Seal.Memory.EngramBackendSpec
 import qualified Seal.Skills.TypesSpec
+import qualified Seal.Cron.TypesSpec
+import qualified Seal.Cron.StoreSpec
+import qualified Seal.Cron.OperationsSpec
+import qualified Seal.ISA.Ops.CronSpec
+import qualified Seal.Cron.SchedulerSpec
 import qualified Seal.Skills.BackendSpec
 import qualified Seal.Skills.BackendNoDirectFsFailSpec
 import qualified Seal.Skills.PromptSpec
@@ -150,6 +181,7 @@ import qualified Seal.ISA.Ops.MemorySpec
 import qualified Seal.ISA.Ops.SkillsSpec
 import qualified Seal.ISA.Ops.RepoSpec
 import qualified Seal.ISA.Ops.AgentSpec
+import qualified Seal.ISA.Ops.AgentHandoffSpec
 import qualified Seal.ISA.Ops.SessionSpec
 import qualified Seal.ISA.Ops.RegistrySpec
 import qualified Seal.SourceControl.RepoSpec
@@ -167,8 +199,12 @@ import qualified Seal.Telegram.ConfigSpec
 import qualified Seal.Providers.AnthropicSpec
 import qualified Seal.Providers.Anthropic.OAuthSpec
 import qualified Seal.Providers.ClassSpec
+import qualified Seal.Channels.ConfigSpec
 import qualified Seal.Providers.OpenRouterSpec
 import qualified Seal.Providers.OllamaSpec
+import qualified Seal.Providers.OllamaReadinessSpec
+import qualified Seal.Providers.OllamaReadinessProbeSpec
+import qualified Seal.Command.ServeWiringSpec
 import qualified Seal.Providers.ContextWindowSpec
 import qualified Seal.Providers.RegistrySpec
 import qualified Seal.Agent.LoopSpec
@@ -211,8 +247,15 @@ specs = do
   Seal.Core.SystemPromptSpec.spec
   Seal.Gateway.ConfigSpec.spec
   Seal.Gateway.EmbeddedSpec.spec
+  Seal.Gateway.ProviderIconSpec.spec
   Seal.Gateway.ApiRouteSpec.spec
+  Seal.Gateway.AccessControlSpec.spec
+  Seal.Gateway.OriginGuardSpec.spec
+  Seal.Gateway.MutationGuardSpec.spec
+  Seal.Gateway.AuditSpec.spec
+  Seal.Command.AccessControlSpec.spec
   Seal.Gateway.ApiSpec.spec
+  Seal.Gateway.ApiFilesSpec.spec
   Seal.Gateway.ApiIntegrationSpec.spec
   Seal.Gateway.AgentIntegrationSpec.spec
   Seal.Gateway.BroadcastSpec.spec
@@ -227,6 +270,7 @@ specs = do
   Seal.Gateway.OpenApiSpec.spec
   Seal.Util.StrictIOSpec.spec
   Seal.AppMainSpec.spec
+  Seal.Session.BranchSpec.spec
   Seal.Session.MetaSpec.spec
   Seal.Session.AgentMetaCacheSpec.spec
   Seal.Session.ExecCacheSpec.spec
@@ -248,6 +292,7 @@ specs = do
   Seal.Tools.Exec.UIOSpec.spec
   Seal.Tools.Exec.UIOParitySpec.spec
   Seal.Tools.Exec.WorkdirFsSpec.spec
+  Seal.Tools.Exec.FileExplorerSpec.spec
   Seal.ISA.Ops.UIOUnrestrictedFailSpec.spec
   Seal.ISA.Ops.UIOConstructionFailSpec.spec
   Seal.Web.SearchSpec.spec
@@ -258,13 +303,20 @@ specs = do
   Seal.Media.TtsSpec.spec
   Seal.ConfigSpec.spec
   Seal.Config.PathsSpec.spec
+  Seal.Config.TemplatesSpec.spec
   Seal.Security.CryptoSpec.spec
+  Seal.Security.WebAuthnSpec.spec
+  Seal.Security.TlsCertSpec.spec
+  Seal.Security.WebAuthn.CborSpec.spec
+  Seal.Security.WebAuthn.DerSpec.spec
   Seal.Security.PathSpec.spec
   Seal.Security.SecretsSpec.spec
   Seal.Security.Vault.AgeSpec.spec
   Seal.Security.VaultSpec.spec
   Seal.Security.PolicySpec.spec
   Seal.Security.CommandSpec.spec
+  Seal.Security.EnrollmentGrantSpec.spec
+  Seal.Security.DaemonLockSpec.spec
   Seal.Security.AdoptionSpec.spec
   Seal.Command.HelpSpec.spec
   Seal.Command.ModelSpec.spec
@@ -282,12 +334,19 @@ specs = do
   Seal.Command.SpecSpec.spec
   Seal.Command.TabSpec.spec
   Seal.Command.NewSpec.spec
+  Seal.Config.BootPlanSpec.spec
+  Seal.Config.CredentialsSpec.spec
   Seal.Config.FileSpec.spec
   Seal.Config.MigrateSpec.spec
   Seal.Config.SecuritySpec.spec
+  Seal.Config.SecurityAccessControlSpec.spec
   Seal.Config.SecurityScopingFailSpec.spec
   Seal.CapabilityScopingWorkdirFsFailSpec.spec
   Seal.Vault.BackendSpec.spec
+  Seal.Vault.ProvisionSpec.spec
+  Seal.Setup.StateSpec.spec
+  Seal.Gateway.SetupApiSpec.spec
+  Seal.Vault.IdentityPathScopingFailSpec.spec
   Seal.Vault.CommandsSpec.spec
   Seal.Vault.AccessSpec.spec
   Seal.IngestSpec.spec
@@ -301,6 +360,7 @@ specs = do
   Seal.Channels.Chat.HttpClientSpec.spec
   Seal.Channels.Chat.WsClientSpec.spec
   Seal.Channels.Chat.WatchPersistSpec.spec
+  Seal.Channels.Chat.BubbleSpec.spec
   Seal.Channels.Chat.LoopSpec.spec
   Seal.Channels.Chat.SignalAdapterSpec.spec
   Seal.Channels.Chat.TelegramAdapterSpec.spec
@@ -309,6 +369,7 @@ specs = do
   Seal.Transcript.ConvSpec.spec
   Seal.Transcript.ConvIndexSpec.spec
   Seal.Transcript.EntriesSpec.spec
+  Seal.Transcript.OriginSpec.spec
   Seal.Transcript.ReconstructSpec.spec
   Seal.Handles.AskReplySpec.spec
   Seal.Handles.ChannelSpec.spec
@@ -333,6 +394,11 @@ specs = do
   Seal.Memory.EmbeddingSpec.spec
   Seal.Memory.EngramBackendSpec.spec
   Seal.Skills.TypesSpec.spec
+  Seal.Cron.TypesSpec.spec
+  Seal.Cron.StoreSpec.spec
+  Seal.Cron.OperationsSpec.spec
+  Seal.ISA.Ops.CronSpec.spec
+  Seal.Cron.SchedulerSpec.spec
   Seal.Skills.BackendSpec.spec
   Seal.Skills.PromptSpec.spec
   Seal.Agent.Def.TypesSpec.spec
@@ -348,6 +414,7 @@ specs = do
   Seal.ISA.Ops.SkillsSpec.spec
   Seal.ISA.Ops.RepoSpec.spec
   Seal.ISA.Ops.AgentSpec.spec
+  Seal.ISA.Ops.AgentHandoffSpec.spec
   Seal.ISA.Ops.SessionSpec.spec
   Seal.ISA.Ops.RegistrySpec.spec
   Seal.SourceControl.RepoSpec.spec
@@ -362,11 +429,15 @@ specs = do
   Seal.Phase4Spec.spec
   Seal.Signal.ConfigSpec.spec
   Seal.Telegram.ConfigSpec.spec
+  Seal.Channels.ConfigSpec.spec
   Seal.Providers.AnthropicSpec.spec
   Seal.Providers.Anthropic.OAuthSpec.spec
   Seal.Providers.ClassSpec.spec
   Seal.Providers.ContextWindowSpec.spec
   Seal.Providers.OllamaSpec.spec
+  Seal.Providers.OllamaReadinessSpec.spec
+  Seal.Providers.OllamaReadinessProbeSpec.spec
+  Seal.Command.ServeWiringSpec.spec
   Seal.Providers.OpenRouterSpec.spec
   Seal.Providers.RegistrySpec.spec
   Seal.Agent.LoopSpec.spec
@@ -389,6 +460,7 @@ specs = do
   Seal.ISA.RepeatDetectSpec.spec
   Seal.Logging.LoggerSpec.spec
   Seal.Logging.ExceptionsSpec.spec
+  Seal.Audit.LogSpec.spec
   Seal.Tools.TimeoutSpec.spec
   Seal.Tools.Exec.AbortSpec.spec
   Seal.Tools.Exec.HostKeyAdoptionSpec.spec

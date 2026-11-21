@@ -1,19 +1,11 @@
-import { useEffect, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
+import { useEffect, useState } from 'react'
 import {
-  CUSTOM_MODEL_VALUE,
   type HarnessFlavour,
   type NewTabKind,
   type NewTabSpec,
 } from '../hooks/useNewTabSpec'
 import { adoptWindow, createTab, setupRepo, type NewTabResponse } from '../hooks/useApi'
-
-const PROVIDER_LABELS: Record<string, string> = {
-  anthropic: 'Anthropic',
-  openai: 'OpenAI',
-  openrouter: 'OpenRouter',
-  ollama: 'Ollama',
-}
+import { CustomModelCombobox, ProviderSelect, inputStyle } from './ProviderModelFields'
 
 // Human labels for each tab kind. 'harness' is the spawn-a-new-harness flow;
 // 'attach' is the adopt-a-running-harness flow.
@@ -33,18 +25,26 @@ interface NewTabComposerProps {
    *  createTab response). */
   onSubmit: (res: NewTabResponse | null) => void
   onCancel: () => void
-  /** When branching, pre-fills the `branch_from` field and locks the kind to
-   *  provider (branching creates a provider session seeded from an existing
-   *  transcript entry). Undefined for the plain new-tab flow. */
-  branchFrom?: string
+  /** The PARENT SESSION id when branching. Undefined for the plain
+   *  new-tab flow. This must be a session id, never a transcript row id:
+   *  the backend copies `branch_conv_len` conversation lines out of this
+   *  session, and a row index is not a session. */
+  branchParentSid?: string
+  /** The conversation length to inherit from `branchParentSid` — the
+   *  number of `conversation.jsonl` lines the child starts with. */
+  branchConvLen?: number
 }
 
 // ── Component ─────────────────────────────────────────────────────────
 
-export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabComposerProps) {
+export function NewTabComposer({
+  spec, onSubmit, onCancel, branchParentSid, branchConvLen,
+}: NewTabComposerProps) {
+  const branchFrom = branchParentSid !== undefined
+  // Only configured providers are selectable. Unconfigured types stay hidden:
+  // they belong in the Providers screen, not in a "start a new tab" picker.
   // `configured` absent => configured (back-compat with older test mocks).
-  const noProviders =
-    spec.providersLoaded && !spec.configuredProviders.some((p) => p.configured !== false)
+  const selectableProviders = spec.configuredProviders.filter((p) => p.configured !== false)
   const lockedToProvider = branchFrom !== undefined
   const [repoWarning, setRepoWarning] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
@@ -73,7 +73,10 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
       return
     }
     const body = spec.buildBody()
-    if (branchFrom) body.branch_from = branchFrom
+    if (branchParentSid !== undefined && branchConvLen !== undefined) {
+      body.branch_from = branchParentSid
+      body.branch_conv_len = branchConvLen
+    }
     const res = await createTab(body)
     if (res) {
       // If the user entered a repo URL and the new tab has a session id
@@ -84,7 +87,7 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
       // persistOnSubmit regardless of clone success.
       const repoUrl = spec.repo.trim()
       if (repoUrl && res.session_id) {
-        const result = await setupRepo(res.session_id, repoUrl)
+        const result = await setupRepo(res.session_id, repoUrl, spec.repoBranch.trim() || undefined)
         if (!result || !result.ok) {
           const reason = result?.error ?? 'network error'
           setRepoWarning(`Could not set up repo "${repoUrl}": ${reason}. See the SETUP_REPO entry in the transcript for details; try https:// instead of git@.`)
@@ -171,63 +174,26 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
       {spec.kind === 'provider' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           <Row label="Provider" htmlFor="provider-select">
-            <select
+            <ProviderSelect
               id="provider-select"
               value={spec.provider}
-              onChange={(e) => spec.setProvider(e.target.value)}
-              disabled={!spec.providersLoaded || noProviders}
-              className="composer-select"
-              style={inputStyle}
-            >
-              {!spec.providersLoaded && <option value="">Loading…</option>}
-              {noProviders && (
-                <option value="" disabled>
-                  (no providers configured — set an API key or start Ollama)
-                </option>
-              )}
-              {spec.configuredProviders.map((p) => {
-                // `configured` absent => configured (back-compat).
-                const isCfg = p.configured !== false
-                return (
-                  <option key={p.name} value={p.name} disabled={!isCfg}>
-                    {PROVIDER_LABELS[p.name] ?? p.name}
-                    {p.isDefault ? ' (default)' : ''}
-                    {isCfg ? '' : ' (not configured)'}
-                  </option>
-                )
-              })}
-            </select>
+              onChange={spec.setProvider}
+              providers={selectableProviders}
+              loading={!spec.providersLoaded}
+              showNoProvidersNotice
+            />
           </Row>
 
           <Row label="Model" htmlFor="provider-model">
-            <select
+            <CustomModelCombobox
               id="provider-model"
-              value={spec.useCustomModel ? CUSTOM_MODEL_VALUE : spec.model}
-              onChange={(e) => spec.handleModelSelectChange(e.target.value)}
-              disabled={spec.modelsLoading}
-              className="composer-select"
-              style={inputStyle}
-            >
-              {spec.modelsLoading && <option value="">Loading…</option>}
-              {!spec.modelsLoading && spec.models.length === 0 && (
-                <option value="" disabled>(no models — choose Custom… and enter one)</option>
-              )}
-              {spec.models.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
-              <option value={CUSTOM_MODEL_VALUE}>Custom…</option>
-            </select>
+              value={spec.model}
+              onChange={spec.setModel}
+              options={spec.modelOptions}
+              placeholder="model id (pick a suggestion or type your own)"
+              testId="provider-model-list"
+            />
           </Row>
-
-          {spec.useCustomModel && (
-            <Row label="Custom Model" htmlFor="provider-model-custom">
-              <CustomModelCombobox
-                id="provider-model-custom"
-                value={spec.model}
-                onChange={spec.setModel}
-                options={spec.customModels}
-                placeholder="model id (e.g. claude-3-opus-20240229)"
-              />
-            </Row>
-          )}
 
           <Row label="Set up repo" htmlFor="provider-repo">
             <CustomModelCombobox
@@ -240,12 +206,27 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
             />
           </Row>
 
+          {/* Only meaningful alongside a repo: a branch with nothing to
+              clone would silently do nothing. */}
+          {spec.repo.trim() !== '' && (
+            <Row label="Repo Branch" htmlFor="provider-repo-branch">
+              <input
+                id="provider-repo-branch"
+                type="text"
+                value={spec.repoBranch}
+                onChange={(e) => spec.setRepoBranch(e.target.value)}
+                style={inputStyle}
+                placeholder="branch or tag (optional — default branch)"
+              />
+            </Row>
+          )}
+
           {branchFrom && (
             <Row label="Branch From" htmlFor="provider-branch-from">
               <input
                 id="provider-branch-from"
                 type="text"
-                value={branchFrom}
+                value={branchParentSid}
                 readOnly
                 style={{ ...inputStyle, opacity: 0.6, cursor: 'not-allowed' }}
               />
@@ -315,6 +296,18 @@ export function NewTabComposer({ spec, onSubmit, onCancel, branchFrom }: NewTabC
               </div>
             </div>
           ) : null}
+
+          {branchFrom && (
+            <div
+              data-testid="branch-mode-note"
+              style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.4 }}
+            >
+              Inherits {branchConvLen ?? 0} message{branchConvLen === 1 ? '' : 's'} of
+              history, up to the row you picked. The new session starts with an
+              <strong> empty workdir</strong> — files are not carried over. Paste a
+              repo URL above if you want to clone one before the first turn.
+            </div>
+          )}
         </div>
       )}
 
@@ -535,21 +528,6 @@ const labelStyle: React.CSSProperties = {
   color: 'var(--text-muted)',
 }
 
-const inputStyle: React.CSSProperties = {
-  fontSize: 14,
-  padding: '6px 10px',
-  // Use backgroundColor (not the background shorthand) so the composer-select /
-  // composer-datalist classes can supply background-image (the chevron) — the
-  // shorthand would reset background-image to none and clobber the chevron.
-  backgroundColor: 'var(--bg-sunken)',
-  border: '1px solid var(--border)',
-  borderRadius: 'var(--radius-sm)',
-  color: 'var(--text-primary)',
-  outline: 'none',
-  fontFamily: 'inherit',
-  width: '100%',
-}
-
 function Row({
   label, htmlFor, children,
 }: { label: string; htmlFor: string; children: React.ReactNode }) {
@@ -557,140 +535,6 @@ function Row({
     <div style={{ display: 'grid', gridTemplateColumns: '140px 1fr', alignItems: 'center', gap: 12 }}>
       <label htmlFor={htmlFor} style={labelStyle}>{label}</label>
       <div>{children}</div>
-    </div>
-  )
-}
-
-// ── Custom Model combobox ──────────────────────────────────────────────
-/* A self-contained combobox: a text input (free entry) plus a left-aligned
-   popup of suggestions. Replaces the native <datalist>, whose popup position
-   is browser-controlled (Chrome centers it under the input, ignoring CSS) and
-   whose native ▾ indicator fights our shared chevron.
-
-   The popup is rendered through a React Portal to document.body so it escapes
-   the composer's clipping ancestor (`overflow-y-auto` on the composer wrapper
-   in App.tsx) — without the portal the absolutely-positioned popup is clipped
-   to the scroll container and never visible. Its position is derived from the
-   input's getBoundingClientRect() so it stays left-aligned to the input box
-   like the <select> dropdowns. The popup re-positions on scroll/resize while
-   open so it tracks the input if the composer scrolls. The input carries the
-   .composer-datalist class so it gets the same chevron and 10px left text
-   inset as the other composer controls. */
-function CustomModelCombobox({
-  id, value, onChange, options, placeholder, testId,
-}: {
-  id: string
-  value: string
-  onChange: (v: string) => void
-  options: string[]
-  placeholder?: string
-  testId?: string
-}) {
-  const [open, setOpen] = useState(false)
-  const [active, setActive] = useState(-1)
-  const [rect, setRect] = useState<DOMRect | null>(null)
-  const wrapRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLInputElement>(null)
-
-  const filtered = options.filter(
-    (o) => o.toLowerCase().includes(value.toLowerCase()) && o !== value,
-  )
-
-  const measure = () => {
-    if (inputRef.current) setRect(inputRef.current.getBoundingClientRect())
-  }
-
-  useEffect(() => {
-    if (!open) return
-    measure()
-    const onScroll = () => measure()
-    // Capture-phase listeners catch scroll on ancestors (e.g. the composer's
-    // overflow-y-auto wrapper) before it repaints, so the popup tracks the
-    // input instead of lagging behind.
-    window.addEventListener('scroll', onScroll, true)
-    window.addEventListener('resize', onScroll)
-    const onDoc = (e: MouseEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false)
-    }
-    document.addEventListener('mousedown', onDoc)
-    return () => {
-      window.removeEventListener('scroll', onScroll, true)
-      window.removeEventListener('resize', onScroll)
-      document.removeEventListener('mousedown', onDoc)
-    }
-  }, [open])
-
-  const pick = (v: string) => { onChange(v); setOpen(false); setActive(-1) }
-
-  const onKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'ArrowDown') {
-      e.preventDefault()
-      setOpen(true)
-      setActive((a) => Math.min(a + 1, filtered.length - 1))
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault()
-      setActive((a) => Math.max(a - 1, 0))
-    } else if (e.key === 'Enter') {
-      if (open && active >= 0 && active < filtered.length) {
-        e.preventDefault()
-        pick(filtered[active] as string)
-      }
-    } else if (e.key === 'Escape') {
-      setOpen(false)
-      setActive(-1)
-    }
-  }
-
-  return (
-    <div ref={wrapRef} style={{ position: 'relative', width: '100%' }}>
-      <input
-        ref={inputRef}
-        id={id}
-        type="text"
-        value={value}
-        onChange={(e) => { onChange(e.target.value); setOpen(true); setActive(-1) }}
-        onFocus={() => { if (filtered.length > 0) setOpen(true) }}
-        onKeyDown={onKey}
-        className="composer-datalist"
-        style={inputStyle}
-        placeholder={placeholder}
-        autoComplete="off"
-      />
-      {open && filtered.length > 0 && rect && createPortal(
-        <div
-          className="composer-combobox-popup"
-          role="listbox"
-          data-testid={testId ?? 'provider-model-custom-list'}
-          style={{
-            position: 'fixed',
-            left: rect.left,
-            top: rect.bottom + 2,
-            width: rect.width,
-            zIndex: 9999,
-          }}
-        >
-          {filtered.map((o, i) => (
-            <div
-              key={o}
-              role="option"
-              aria-selected={i === active}
-              className="composer-combobox-option"
-              style={{
-                padding: '6px 10px',
-                fontSize: 14,
-                cursor: 'pointer',
-                background: i === active ? 'var(--surface-hover)' : 'var(--bg-elevated)',
-                color: 'var(--text-primary)',
-              }}
-              onMouseDown={(e) => { e.preventDefault(); pick(o) }}
-              onMouseEnter={() => setActive(i)}
-            >
-              {o}
-            </div>
-          ))}
-        </div>,
-        document.body,
-      )}
     </div>
   )
 }

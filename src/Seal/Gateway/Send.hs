@@ -13,7 +13,14 @@ module Seal.Gateway.Send
   , SendOutcome (..)
   , sendOutcomeJson
   , handleSend
+  , mkSendMessageSource
+  , mkWebMessageSource
+  , parseSendBody
+  , plainTurn
+  , plainTurnWithCaps
   , handleSetupRepo
+  , setupRepoInput
+  , validateSetupRepoArgs
   , ensureTabForSession
   , handleAnswerDelivery
   , handleAnswerTextDelivery
@@ -45,8 +52,6 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
-import System.Directory (doesFileExist)
-import System.FilePath ((</>))
 
 import Seal.Agent.Def.Types (AgentDef)
 import Seal.Channels.Chat.RateLimit (StreamProgressConfig (..), shouldEdit)
@@ -61,24 +66,27 @@ import Seal.Command.Skill (skillCommandSpec)
 import Seal.Command.Model (modelCommandSpecForSession, mkModelTranscriptWriter)
 import Seal.Command.Stop (stopCommandSpecForSession, mkStopTranscriptWriter)
 import Seal.Command.Spec (CommandAction (..), CommandName (..), CommandSpec (..), Registry, mkRegistry, registrySpecs)
-import Seal.Config.Paths (SealPaths, sessionDir, sessionLogPath)
+import Seal.Config.Paths (SealPaths, sessionLogPath)
 import Seal.Core.TurnEngine
   (TurnDeps (..), TurnAdapter (..),
    TurnOutcome (..), runSessionTurn, sessionSkillBackend, shouldAutoTab)
 import qualified Seal.Core.TurnEngine as TurnEngine
+import Seal.Core.ChannelKind (channelKindFromText)
+import Seal.Core.MessageSource (MessageSource, mkConversationId, mkMessageSource, mkUserId)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, sessionIdText)
 import Seal.Git.Repo (ConfigRepo)
 import Seal.Handles.AskReply
   ( AskId, ApprovalCache, ApprovalScope (..), AskReply (..), AskReplyStore
   , askHumanWithOptions, askIdText, cancelAsk, deliverAnswer, parseAskId
-  , approvalScopeText, parseApprovalScope )
+  , deliverNextAnswerResolvedId, approvalScopeText, parseApprovalScope )
 import Seal.Handles.Transcript (pendingCompletionCount)
 import Seal.Handles.Tab (TabKind (KindProvider), tabIndexToChar)
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 import Seal.Tabs (TabsHandle, ensureTabForSession, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabRef (..), lookupByRef)
-import Seal.ISA.Ops.Repo (validateRepoUrl)
+import Seal.ISA.Ops.Repo (parseSetupRepoInput)
 import Seal.ISA.Opcode (OpResult (..))
+import Seal.Tools.Args (BranchName, branchNameText)
 import Seal.Providers.Class
   ( SomeProvider, ToolResultPart (..) )
 import Seal.Harness.Registry (HarnessRegistry)
@@ -91,7 +99,7 @@ import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import qualified Seal.Security.Policy as Policy (AutonomyLevel (..))
 import Seal.Session.ExecCache (SessionExecCache)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Session.Lock
   ( ReplyRegistry, replyFanout, replyFanoutMessage
@@ -105,7 +113,6 @@ import Seal.ISA.Ops.Agent (AgentWorkerBuilder)
 import Seal.Logging.Logger (SealLogger)
 import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Vault.Commands (VaultRuntime (..))
-import Seal.Util.StrictIO (decodeFileStrict)
 
 import Katip (Severity (..), ls)
 import Seal.Logging.Global (globalLogIO)
@@ -236,6 +243,11 @@ data SendDeps = SendDeps
     -- parent session is idle. Without this, N completions fire N
     -- wake-up calls, each consuming a scripted response in tests or
     -- causing redundant LLM calls in production.
+  , sdTurnComplete :: SessionId -> Either Text () -> IO ()
+    -- ^ Called exactly once when a plain turn settles, with its outcome, so a
+    -- caller that spawned the session (the cron fire delegate) can record a
+    -- terminal state. Runs in the turn's forked body, including on the path
+    -- where the turn threw. No-op for surfaces that do not track turn outcomes.
   , sdEnableIdleWake :: Bool
     -- ^ When True, the wake-up hook is wired into 'TurnDeps'. When False
     -- (tests with scripted providers), the wake-up is disabled so
@@ -502,6 +514,12 @@ data SendOutcome
     -- (e.g. @\/new@) so the frontend can navigate to it. 'Nothing' for
     -- ordinary slash commands.
   | SendAssistant       -- ^ plain turn; reply lands in the transcript
+  | SendAnswer Text
+    -- ^ a plain message was consumed as the answer to a pending @ASK_HUMAN@
+    -- question for the session, so NO turn was started. Carries the answer
+    -- that was delivered (a chosen option's label when the human replied with
+    -- a number, otherwise their text) so the wire @response@ can confirm it
+    -- to a chat channel.
   | SendError Int Text  -- ^ HTTP status code + message (400/404/500)
   deriving stock (Eq, Show)
 
@@ -518,12 +536,78 @@ sendOutcomeJson = \case
       , "session_id" .= (sessionIdText <$> mSid)
       ])
   SendAssistant  -> (200, object [ "kind" .= ("assistant" :: Text), "response" .= ("" :: Text) ])
+  SendAnswer a   ->
+    -- @kind:"answer"@ is distinct from @assistant@ so a surface knows no
+    -- turn was started (nothing more will arrive on the stream), and the
+    -- @response@ line is a ready-made chat-channel confirmation.
+    (200, object [ "kind" .= ("answer" :: Text), "response" .= ("✓ " <> a) ])
   SendError c m  -> (c, object [ "error" .= m ])
+
+-- | Reconstruct the inbound 'MessageSource' from the optional provenance
+-- fields of a POST /send body. Every leaf is re-validated by the smart
+-- constructors; any invalid leaf makes the whole source 'Nothing' (the turn
+-- then falls back to the arrival channel and carries no user id). The
+-- conversation id is used only for attribution (requestMeta), never for
+-- routing or authorization, so a forged value cannot hijack anything.
+mkSendMessageSource :: Maybe Text -> Maybe Text -> Maybe Text -> Maybe MessageSource
+mkSendMessageSource mChannel mUserId mConversationId = do
+  chText <- mChannel
+  cidText <- mConversationId
+  kind <- channelKindFromText chText
+  cid <- either (const Nothing) Just (mkConversationId cidText)
+  uid <- case mUserId of
+    Nothing     -> Just Nothing
+    Just uidTxt -> Just <$> either (const Nothing) Just (mkUserId uidTxt)
+  either (const Nothing) Just (mkMessageSource cid kind uid mempty)
+
+-- | Mint a 'web'-channel 'MessageSource' for a POST /send that did not carry
+-- explicit provenance. The conversation id is server-derived from the session
+-- id, the (optional) authenticated passkey id is recorded as the user id, and
+-- the client IP (when known) rides in the open metadata map under
+-- @"clientIp"@. Returns 'Nothing' when the session id cannot be turned
+-- into a valid conversation id (should not happen in practice).
+mkWebMessageSource :: SessionId -> Maybe Text -> Maybe Text -> Maybe MessageSource
+mkWebMessageSource sid mPasskey mIp = do
+  cid <- either (const Nothing) Just (mkConversationId ("web:" <> sessionIdText sid))
+  kind <- channelKindFromText "web"
+  uid <- case mPasskey of
+    Nothing -> Just Nothing
+    Just p  -> Just <$> either (const Nothing) Just (mkUserId p)
+  let open = case mIp of
+        Nothing -> Map.empty
+        Just ip -> Map.singleton "clientIp" ip
+  either (const Nothing) Just (mkMessageSource cid kind uid open)
+
+-- | Parse a POST /send body into its message text and (optional) inbound
+-- 'MessageSource'. A missing message reads as @""@ (the routing grammar
+-- treats empty input as 'Plain ""'), and a malformed body yields
+-- @("", Nothing)@.
+parseSendBody :: BL.ByteString -> (Text, Maybe MessageSource)
+parseSendBody body =
+  case A.decode body :: Maybe Value of
+    Just (A.Object o) ->
+      ( messageText (KeyMap.lookup (Key.fromText "message") o)
+      , mkSendMessageSource
+          (asText (KeyMap.lookup (Key.fromText "channel") o))
+          (asText (KeyMap.lookup (Key.fromText "userId") o))
+          (asText (KeyMap.lookup (Key.fromText "conversationId") o)) )
+    _ -> ("", Nothing)
+  where
+    asText (Just (A.String t)) = Just t
+    asText _                   = Nothing
+    messageText (Just (A.String t)) = t
+    messageText _                   = ""
 
 -- | Handle POST /api/sessions/:id/send. Loads the session meta by id, routes
 -- the text, runs the turn, and returns the 'SendOutcome'. A missing session
 -- -> 404; an unknown provider / vault error -> 400; an internal failure ->
 -- 500 (logged to stderr).
+--
+-- A @Plain@ message is offered to the session's pending @ASK_HUMAN@ question
+-- first: if one is open, the text is delivered as the answer and the result
+-- is 'SendAnswer' (no turn is started, and @ask_resolved@ is broadcast). This
+-- is the only way a channel without answer buttons can reply, and it keeps
+-- the message from queueing behind the write lock the blocked turn holds.
 --
 -- After a successful 'Plain'/'SlashCommand'/'NewSession' turn (any outcome
 -- that is NOT 'SendError'), auto-tabs the session via
@@ -532,39 +616,39 @@ sendOutcomeJson = \case
 -- excluded from auto-tabbing. The auto-tab is gated on
 -- 'Seal.Core.TurnEngine.shouldAutoTab' exactly as the turn engine's own is, so
 -- a @\/bg@ session (@channel="bg"@) stays headless.
-handleSend :: SendDeps -> SessionId -> Text -> IO SendOutcome
-handleSend deps sid rawText = do
+handleSend :: SendDeps -> SessionId -> Maybe MessageSource -> Text -> IO SendOutcome
+handleSend deps sid mSrc rawText = do
   mMeta <- loadSessionMeta (sdPaths deps) sid
   case mMeta of
     Nothing -> pure (SendError 404 "session not found")
     Just meta -> case route rawText of
       Left (ParseError e) -> pure (SendSlash e Nothing)
       Right (Plain t) -> do
-        -- Async: fork the turn in a background thread and return
-        -- SendAssistant immediately. The turn streams updates via the
-        -- WS broker (entry-update, entry, activity events). The reply
-        -- is delivered to WS subscribers (web frontend, chat channels).
-        -- Slash commands remain synchronous (they return transient
-        -- output in the response body).
-        let sid' = smId meta
-        void (forkIO (do
-          er <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath (sdPaths deps) sid')) "plainTurn" $
-            plainTurn deps meta t
-          case er of
-            Left _   -> pure ()
-            Right (Left _) -> pure ()
-            Right (Right ()) -> do
-              when (shouldAutoTab meta) $
-                ensureTabForSession (sdTabsHandle deps) KindProvider sid'
-              triggerBroadcast deps))
-        pure SendAssistant
+        -- A blocking ASK_HUMAN keeps the running turn parked on the answer
+        -- slot, and that turn holds the session write lock for as long as it
+        -- waits ('withSessionLock'). A second turn started for this text can
+        -- therefore only queue behind the question it was meant to answer —
+        -- for a chat channel with no answer buttons (Signal, Telegram) that
+        -- is a permanent deadlock, and it was reported as "my replies to the
+        -- bot are ignored". So: offer the text as the answer to a pending
+        -- question for this session first, and start a turn only if there is
+        -- none. A numbered reply ("2") resolves to that option's label, which
+        -- is how a medium without inline keyboards answers a multi-choice ask.
+        mAnswered <- deliverNextAnswerResolvedId (sdAskReply deps) (smId meta) t
+        case mAnswered of
+          Just (qid, answer, True) -> do
+            broadcastAskResolved (sdBroker deps) (smId meta) qid "answered"
+            pure (SendAnswer answer)
+          -- No pending question (or it was resolved concurrently, in which
+          -- case nothing was delivered): route the text as a normal turn.
+          _ -> startPlainTurn deps meta mSrc t
       Right (SlashCommand cmdName) -> do
         -- W5: no srActive swap bracket. The per-request call/skill
         -- dispatcher closes over the request's explicit sid (see
         -- 'runSlash'). /new still swaps srActive via its ndRebind (the
         -- swap is how /new communicates the new session to
         -- 'newSessionIdIfChangedFrom').
-        r <- runSlash deps meta rawText
+        r <- runSlash deps meta mSrc rawText
         case r of
           SendError _ _ -> pure r
           _            -> do
@@ -579,7 +663,7 @@ handleSend deps sid rawText = do
             triggerBroadcast deps
             pure r
       Right (NewSession _args) -> do
-        r <- runSlash deps meta rawText
+        r <- runSlash deps meta mSrc rawText
         case r of
           SendError _ _ -> pure r
           _            -> do
@@ -595,6 +679,35 @@ handleSend deps sid rawText = do
           Nothing -> SendSlash "no current tab" Nothing
       Right (Focus _)        -> pure (SendSlash "(focus is a tab-level operation; use the sidebar)" Nothing)
       Right (Inject _ _)    -> pure (SendSlash "(inject is a tab-level operation; use the sidebar)" Nothing)
+
+-- | Start a plain turn for @t@ asynchronously: fork the turn in a background
+-- thread and return 'SendAssistant' immediately. The turn streams updates via
+-- the WS broker (entry-update, entry, activity events). The reply is delivered
+-- to WS subscribers (web frontend, chat channels).
+--
+-- Split out of 'handleSend' so the ask-answer branch (which starts NO turn)
+-- stays readable.
+startPlainTurn :: SendDeps -> SessionMeta -> Maybe MessageSource -> Text -> IO SendOutcome
+startPlainTurn deps meta mSrc t = do
+  let sid' = smId meta
+  void (forkIO (do
+    er <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath (sdPaths deps) sid')) "plainTurn" $
+      plainTurn deps meta mSrc t
+    -- Report the outcome to whoever spawned this session (no-op unless someone
+    -- registered interest, e.g. the cron scheduler). The thrown-turn case is
+    -- reported as a failure rather than silently dropped: a turn that never
+    -- runs is exactly what leaves a scheduled job looking permanently
+    -- "in flight". A slash command that a cron prompt reached earlier never
+    -- gets here at all, which is why the cron delegate rejects such prompts.
+    case er of
+      Left e -> sdTurnComplete deps sid' (Left (T.pack (show e)))
+      Right (Left e) -> sdTurnComplete deps sid' (Left e)
+      Right (Right ()) -> do
+        sdTurnComplete deps sid' (Right ())
+        when (shouldAutoTab meta) $
+          ensureTabForSession (sdTabsHandle deps) KindProvider sid'
+        triggerBroadcast deps))
+  pure SendAssistant
 
 -- | Render the current tab for the web send endpoint: @<index>  <kind>  [label]@.
 renderWebTab :: Tab -> Text
@@ -627,13 +740,12 @@ triggerBroadcast deps =
 
 -- | Load a single session's 'SessionMeta' by id from disk. Returns Nothing
 -- when the session directory or session.json is missing or undecodable.
+--
+-- Thin wrapper over 'readSessionMeta' (the single reader, in the leaf
+-- "Seal.Session.Meta" module) so the gateway and the delegation worker share
+-- one implementation.
 loadSessionMeta :: SealPaths -> SessionId -> IO (Maybe SessionMeta)
-loadSessionMeta paths sid = do
-  let mp = sessionDir paths sid </> "session.json"
-  exists <- doesFileExist mp
-  if not exists
-    then pure Nothing
-    else decodeFileStrict mp :: IO (Maybe SessionMeta)
+loadSessionMeta = readSessionMeta
 
 -- | Resolve the system prompt for a web turn. An ad-hoc
 -- 'smSystemOverride' (set via PUT /api/sessions/:id/prompt from the
@@ -652,12 +764,12 @@ loadSessionMeta paths sid = do
 -- After the turn, the reply is fanned out to any chat channels (Telegram,
 -- Signal) subscribed to this session via the 'ReplyRegistry', so a web
 -- send on a channel-origin tab also delivers the reply to the channel.
-plainTurn :: SendDeps -> SessionMeta -> Text -> IO (Either Text ())
-plainTurn deps meta t = do
+plainTurn :: SendDeps -> SessionMeta -> Maybe MessageSource -> Text -> IO (Either Text ())
+plainTurn deps meta mSrc t = do
   let td = mkWebTurnDeps deps
   caps <- webAskCaps (sdBroker deps) (sdAskReply deps) (smId meta)
   let adapter = mkWebTurnAdapter deps td caps
-  outcome <- runSessionTurn td adapter meta Nothing t
+  outcome <- runSessionTurn td adapter meta mSrc t
   pure (case toError outcome of
           Just err -> Left err
           Nothing  -> Right ())
@@ -673,8 +785,8 @@ plainTurn deps meta t = do
 -- with, include the new id in the 'SendSlash' outcome so the frontend can
 -- navigate to it. (This avoids widening the 'CommandAction' contract or
 -- threading a per-call IORef through the registry.)
-runSlash :: SendDeps -> SessionMeta -> Text -> IO SendOutcome
-runSlash deps meta fullLine = do
+runSlash :: SendDeps -> SessionMeta -> Maybe MessageSource -> Text -> IO SendOutcome
+runSlash deps meta mSrc fullLine = do
   outVar <- newMVar ([] :: [Text])
   askCaps <- webAskCaps (sdBroker deps) (sdAskReply deps) (smId meta)
   let caps = askCaps { ccSend = \t' -> modifyMVar_ outVar (\acc -> pure (acc <> [t'])) }
@@ -722,13 +834,13 @@ runSlash deps meta fullLine = do
       -- the skill body is already there from 'recordSkillLoadResult'.
       case mFollowUp of
         Just t -> do
-          _ <- plainTurnWithCaps deps meta caps t
+          _ <- plainTurnWithCaps deps meta mSrc caps t
           pure (SendSlash (T.intercalate "\n" chunks) mNewSid)
         Nothing -> pure (SendSlash (T.intercalate "\n" chunks) mNewSid)
     ShowText t -> pure (SendSlash t Nothing)
     Rejected t -> pure (SendError 400 t)
     PlainMessage t -> do
-      er <- plainTurnWithCaps deps meta caps t
+      er <- plainTurnWithCaps deps meta mSrc caps t
       case er of
         Left err -> pure (SendError 400 err)
         Right () -> do
@@ -753,11 +865,11 @@ newSessionIdIfChangedFrom deps beforeSid = do
 -- | The plain-turn helper for a slash-dispatched PlainMessage (when the
 -- preprocess chain passes a leading-/ line through but the registry doesn't
 -- claim it). Mirrors 'plainTurn' but takes the caller's caps.
-plainTurnWithCaps :: SendDeps -> SessionMeta -> ChannelCaps -> Text -> IO (Either Text ())
-plainTurnWithCaps deps meta caps t = do
+plainTurnWithCaps :: SendDeps -> SessionMeta -> Maybe MessageSource -> ChannelCaps -> Text -> IO (Either Text ())
+plainTurnWithCaps deps meta mSrc caps t = do
   let td = mkWebTurnDeps deps
       adapter = mkWebTurnAdapter deps td caps
-  outcome <- runSessionTurn td adapter meta Nothing t
+  outcome <- runSessionTurn td adapter meta mSrc t
   pure (case toError outcome of
           Just err -> Left err
           Nothing  -> Right ())
@@ -875,6 +987,7 @@ streamingEntryJson text = object
   , "harness"   .= (Nothing :: Maybe Text)
   , "model"     .= (Nothing :: Maybe Text)
   , "channel"   .= (Nothing :: Maybe Text)
+  , "userId"    .= (Nothing :: Maybe Text)
   , "internal"  .= (Nothing :: Maybe Bool)
   , "raw"       .= ("" :: Text)
   ]
@@ -906,14 +1019,21 @@ broadcastAskResolved mBroker sid qid resolution =
 -- the dispatch (the web gateway is multi-session; 'webCallDispatcher'
 -- reads 'srActive' to pick the transcript), then restored.
 --
--- Returns @Left err@ for an invalid url or a dispatch failure; @Right msg@
--- with the opcode's text result (the clone/no-op/conflict/failure message)
--- for the API layer to pass through to the frontend.
-handleSetupRepo :: SendDeps -> SessionId -> Text -> IO (Either Text Text)
-handleSetupRepo deps sid url =
-  case validateRepoUrl url of
-    Left err -> pure (Left ("invalid url: " <> err))
-    Right cleanUrl -> do
+-- The optional @branch@ (or tag) is cloned/checked out instead of the
+-- remote's default branch. Both arguments are validated by
+-- 'validateSetupRepoArgs' (the opcode's own input parser) BEFORE the
+-- session lookup, so a rejected url/branch never touches the session
+-- store.
+--
+-- Returns @Left err@ for an invalid url/branch or a dispatch failure;
+-- @Right msg@ with the opcode's text result (the
+-- clone/no-op/switched/conflict/failure message) for the API layer to
+-- pass through to the frontend.
+handleSetupRepo :: SendDeps -> SessionId -> Text -> Maybe Text -> IO (Either Text Text)
+handleSetupRepo deps sid url mBranch =
+  case validateSetupRepoArgs url mBranch of
+    Left err -> pure (Left err)
+    Right (cleanUrl, validBranch) -> do
       mMeta <- loadSessionMeta (sdPaths deps) sid
       case mMeta of
         Nothing -> pure (Left "session not found")
@@ -923,13 +1043,34 @@ handleSetupRepo deps sid url =
           -- W5: the dispatcher takes the explicit sid (no srActive swap).
           let td = mkWebTurnDeps deps
               dispatcher = webCallDispatcher deps td sid
-          res <- dispatcher (OpName "SETUP_REPO") (object ["url" .= cleanUrl])
+              payload = setupRepoInput cleanUrl (fmap branchNameText validBranch)
+          res <- dispatcher (OpName "SETUP_REPO") payload
           case res of
             Left dErr -> pure (Left ("SETUP_REPO dispatch failed: " <> renderDispatchError dErr))
             Right opRes ->
               if orIsError opRes
                 then pure (Left (opResultText opRes))
                 else pure (Right (opResultText opRes))
+
+-- | The SETUP_REPO dispatch payload for the web setup-repo path:
+-- @{\"url\": u}@ when no branch is requested, @{\"url\": u, \"branch\": b}@
+-- otherwise. The branch key is omitted — never @null@ — when it is absent,
+-- blank, or whitespace-only, and is trimmed, so the payload stays backward
+-- compatible with every caller/consumer that predates the field.
+setupRepoInput :: Text -> Maybe Text -> Value
+setupRepoInput url mBranch =
+  case fmap T.strip mBranch of
+    Just b | not (T.null b) -> object ["url" .= url, "branch" .= b]
+    _                       -> object ["url" .= url]
+
+-- | Validate the web setup-repo arguments (url + optional branch) by
+-- building the exact SETUP_REPO dispatch payload and running it through
+-- the opcode's own input parser. Validation therefore has ONE
+-- implementation: the rules, and the error text (including the
+-- @SETUP_REPO:@ prefix), are the opcode's. Returns the cleaned url and the
+-- validated 'BranchName' ('Nothing' when no branch was requested).
+validateSetupRepoArgs :: Text -> Maybe Text -> Either Text (Text, Maybe BranchName)
+validateSetupRepoArgs url mBranch = parseSetupRepoInput (setupRepoInput url mBranch)
 
 -- | Join the text parts of an 'OpResult' into a single message (the
 -- clone/no-op/conflict/failure text from SETUP_REPO).

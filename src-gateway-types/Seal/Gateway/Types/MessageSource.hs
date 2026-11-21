@@ -11,6 +11,12 @@
 -- open field map. The open map is also forbidden from carrying a
 -- @conversationId@ key, so a future caller cannot smuggle a second id in.
 --
+-- The chat-channel client forwards its transport-derived 'ConversationId' to
+-- the gateway over loopback HTTP (POST /send); the gateway re-validates it
+-- with 'mkConversationId' and uses it only for transcript attribution, never
+-- for routing, authorization, or tab cursors, so a forged or stale value
+-- cannot hijack anything.
+--
 -- Canonical home; 'Seal.Core.MessageSource' in the server re-exports from
 -- here.
 module Seal.Gateway.Types.MessageSource

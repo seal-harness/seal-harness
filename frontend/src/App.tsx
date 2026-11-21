@@ -8,7 +8,11 @@ import { AgentsView } from './components/AgentsView'
 import { ProvidersView } from './components/ProvidersView'
 import { SkillsView } from './components/SkillsView'
 import { ReposView } from './components/ReposView'
+import { CronView } from './components/CronView'
 import { SecretsView } from './components/SecretsView'
+import { AccessView } from './components/AccessView'
+import { ChannelsView } from './components/ChannelsView'
+import { FilesView } from './components/FilesView'
 import { PerfOverlay } from './components/PerfOverlay'
 import { startMemoryMonitor, rateLimitedLog, detectLoop } from './lib/diag'
 import { useTranscriptMessages } from './hooks/useTranscriptMessages'
@@ -64,10 +68,14 @@ function sectionFromPath(): TopSection {
   if (typeof window === 'undefined') return 'sessions'
   const path = window.location.pathname
   if (path === '/providers' || path.startsWith('/providers/')) return 'providers'
+  if (path === '/channels' || path.startsWith('/channels/')) return 'channels'
   if (path === '/agents' || path.startsWith('/agents/')) return 'agents'
   if (path === '/skills' || path.startsWith('/skills/')) return 'skills'
   if (path === '/repos' || path.startsWith('/repos/')) return 'repos'
+  if (path === '/cron' || path.startsWith('/cron/')) return 'cron'
   if (path === '/secrets' || path.startsWith('/secrets/')) return 'secrets'
+  if (path === '/files' || path.startsWith('/files/')) return 'files'
+  if (path === '/access' || path.startsWith('/access/')) return 'access'
   return 'sessions'
 }
 
@@ -163,6 +171,12 @@ interface SlashBubble {
   text: string
   at: number       // send seq (ordering among multiple slash bubbles)
   insertAt: number // transcript-messages length when the response arrived
+  /** Header title of the bubble: "Command output" for a slash command, or
+   *  "Answer" for an ASK_HUMAN answer the gateway consumed (kind:"answer"). */
+  title: string
+  /** The muted italic tag after the title. Both kinds are ephemeral: they
+   *  never enter the transcript and vanish on reload. */
+  label: string
 }
 
 // ── App ──────────────────────────────────────────────────────────────────
@@ -292,7 +306,14 @@ export default function App() {
 
   // ── Composer state ────────────────────────────────────────────────────
   const [composerOpen, setComposerOpen] = useState(false)
-  const [branchFrom, setBranchFrom] = useState<string | undefined>(undefined)
+  // Branch state: the PARENT SESSION id (what the wire wants) plus the
+  // conversation anchor. The row's entryId is deliberately NOT stored — it
+  // is a render index, and putting it in `branch_from` is the original bug.
+  // A ref (not state) so the shared composer hook can read it at submit
+  // time without re-creating the hook.
+  const branchModeRef = useRef(false)
+  const [branchParentSid, setBranchParentSid] = useState<string | undefined>(undefined)
+  const [branchConvLen, setBranchConvLen] = useState<number | undefined>(undefined)
   // `newTabFocusTick` is no longer needed (composer is a standalone pane),
   const [newTabFocusTick, setNewTabFocusTick] = useState(0)
 
@@ -303,7 +324,7 @@ export default function App() {
   // ── Diagnostic: start memory monitor on mount ──
   useEffect(() => { startMemoryMonitor() }, [])
 
-  const composerSpec = useNewTabSpec()
+  const composerSpec = useNewTabSpec({ branchModeRef })
 
   // ── Preserve the focused session across tab-list mutations ──────────────
   // When the backend removes a tab above the focused one it compacts the
@@ -535,9 +556,16 @@ export default function App() {
 
   const syncSection = useCallback((s: TopSection) => {
     if (typeof window !== 'undefined') {
-      window.history.pushState(null, '', pathFromSection(s))
+      // When switching back to the sessions section, preserve the
+      // currently-focused session/tab in the URL instead of resetting
+      // to '/'. This prevents the session header buttons (Copy ID,
+      // Open workdir) from disappearing when toggling Files → Sessions.
+      const target = s === 'sessions' && selectedId
+        ? pathFromSelectedId(selectedId)
+        : pathFromSection(s)
+      window.history.pushState(null, '', target)
     }
-  }, [])
+  }, [selectedId])
 
   const handleSectionChange = useCallback((s: TopSection) => {
     setSection(s)
@@ -558,9 +586,16 @@ export default function App() {
   // A `kind:"slash"` send response adds no transcript entry: render a
   // transient bubble and clear the optimistic spinner. When the slash
   // command mints a fresh session (e.g. /new), `session_id` is set and the
-  // SPA navigates to it so the new session becomes the focused one. Any
-  // other kind falls through to the transcript-driven clear path. Returns
-  // true when the caller must NOT keep a pending spinner.
+  // SPA navigates to it so the new session becomes the focused one.
+  //
+  // `kind:"answer"` needs the same treatment for the same reason: the
+  // backend consumed the message as the reply to a pending ASK_HUMAN
+  // question and started no turn, so the transcript-driven clear below
+  // would never fire and the message would sit in a permanent "thinking"
+  // state. The response carries a ready-made `✓ <answer>` confirmation.
+  //
+  // Any other kind falls through to the transcript-driven clear path.
+  // Returns true when the caller must NOT keep a pending spinner.
   // Ref that mirrors the current transcript-messages count so
   // `handleSendResult` can capture the insert position for a slash bubble
   // without adding `transcriptMessages` to its dependency array (which
@@ -569,8 +604,16 @@ export default function App() {
   const transcriptMsgCountRef = useRef(0)
 
   const handleSendResult = useCallback((res: SendResult | null, seq: number): boolean => {
-    if (res && res.kind === 'slash') {
-      setSlashBubbles((b) => [...b, { id: `slash-${seq}`, text: res.response, at: seq, insertAt: transcriptMsgCountRef.current }])
+    if (res && (res.kind === 'slash' || res.kind === 'answer')) {
+      const isAnswer = res.kind === 'answer'
+      setSlashBubbles((b) => [...b, {
+        id: `slash-${seq}`,
+        text: res.response,
+        at: seq,
+        insertAt: transcriptMsgCountRef.current,
+        title: isAnswer ? 'Answer' : 'Command output',
+        label: isAnswer ? 'sent as the answer — not saved' : 'command output — not saved',
+      }])
       setPendingMessage(null)
       setPendingMessageModel(null)
       // /new swaps the backend's active session; navigate the SPA to it so
@@ -688,11 +731,12 @@ export default function App() {
       const idx = Math.min(sb.insertAt + offset, merged.length)
       merged.splice(idx, 0, {
         id: sb.id,
-        agentName: 'Command output',
+        agentName: sb.title,
         agentStatus: 'idle' as const,
         timestamp: now,
         blocks: [{ id: sb.id + '-text', text: sb.text }],
         slashBubble: true,
+        slashBubbleLabel: sb.label,
       })
       offset++
     }
@@ -808,18 +852,30 @@ export default function App() {
     setNewTabFocusTick((n) => n + 1)
     syncPath(null)
     setCustomPromptFile(null)
-    setBranchFrom(undefined)
+    branchModeRef.current = false
+    setBranchParentSid(undefined)
+    setBranchConvLen(undefined)
     setComposerOpen(true)
   }, [syncPath])
 
-  const handleBranch = useCallback((entryId: string) => {
-    setBranchFrom(entryId)
+  // The parent session id is supplied HERE (App knows it); the ChatArea row
+  // only knows the row it rendered, so it reports the conversation anchor.
+  const handleBranch = useCallback((convLen: number) => {
+    if (!currentSessionId) return
+    branchModeRef.current = true
+    // The branch's workdir starts EMPTY and nothing is inherited, so clear
+    // the repo box: NewTabComposer dispatches SETUP_REPO for any non-empty
+    // repo, and a leftover value would clone into the fresh workdir.
+    composerSpec.setRepo('')
+    composerSpec.setRepoBranch('')
+    setBranchParentSid(currentSessionId)
+    setBranchConvLen(convLen)
     setComposerOpen(true)
     setSelectedId(null)
     setNewTabFocusTick((n) => n + 1)
     syncPath(null)
     setCustomPromptFile(null)
-  }, [syncPath])
+  }, [syncPath, currentSessionId])
 
   // The NewTabComposer owns the createTab/adoptWindow call; App navigates to
   // the newly-created tab on success (so the chat input wires up to the new
@@ -829,7 +885,9 @@ export default function App() {
   // on the previous selection.
   const handleComposerSubmit = useCallback((res: NewTabResponse | null) => {
     setComposerOpen(false)
-    setBranchFrom(undefined)
+    branchModeRef.current = false
+    setBranchParentSid(undefined)
+    setBranchConvLen(undefined)
     if (res) {
       // Prefer the session id when present — `session:<id>` resolves
       // `currentSessionId` directly without waiting for the tabs list to
@@ -874,7 +932,9 @@ export default function App() {
 
   const handleComposerCancel = useCallback(() => {
     setComposerOpen(false)
-    setBranchFrom(undefined)
+    branchModeRef.current = false
+    setBranchParentSid(undefined)
+    setBranchConvLen(undefined)
   }, [])
 
   // ── Tab/session mutators ──────────────────────────────────────────────
@@ -1008,14 +1068,22 @@ export default function App() {
       <TopBar section={section} onSectionChange={handleSectionChange} />
       {section === 'providers' ? (
         <ProvidersView />
+      ) : section === 'channels' ? (
+        <ChannelsView />
       ) : section === 'agents' ? (
         <AgentsView />
       ) : section === 'skills' ? (
         <SkillsView />
       ) : section === 'repos' ? (
         <ReposView />
+      ) : section === 'cron' ? (
+        <CronView />
       ) : section === 'secrets' ? (
         <SecretsView />
+      ) : section === 'files' ? (
+        <FilesView />
+      ) : section === 'access' ? (
+        <AccessView />
       ) : (
         <div className="flex flex-1 min-h-0">
           <Sidebar
@@ -1041,7 +1109,8 @@ export default function App() {
                 spec={composerSpec}
                 onSubmit={handleComposerSubmit}
                 onCancel={handleComposerCancel}
-                branchFrom={branchFrom}
+                branchParentSid={branchParentSid}
+                branchConvLen={branchConvLen}
               />
             </div>
           ) : selectedHarnessTab ? (

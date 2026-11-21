@@ -45,6 +45,8 @@ import {
   stopSession,
   fetchSessionAgents,
   useConfiguredProviders,
+  useAllProviders,
+  notifyProvidersChanged,
   setSessionDescription,
   setSessionArchived,
   setSessionPrompt,
@@ -58,6 +60,7 @@ import {
   adoptWindow,
   fetchProviderModels,
   fetchModelContext,
+  setupRepo,
 } from '../useApi'
 import type { TabInfoWire } from '../useApi'
 import { POLL_INTERVAL, WS_GRACE_MS } from '../useApi'
@@ -578,6 +581,51 @@ describe('useConfiguredProviders', () => {
     await waitFor(() => expect(result.current.providers).toHaveLength(1))
     expect(result.current.loaded).toBe(true)
   })
+
+  it('re-fetches when a provider mutation is announced', async () => {
+    setNextResponse([{ name: 'anthropic' }])
+    const { result } = renderHook(() => useConfiguredProviders())
+    await waitFor(() => expect(result.current.providers).toHaveLength(1))
+    setNextResponse([{ name: 'anthropic' }, { name: 'local-vllm' }])
+    act(() => notifyProvidersChanged())
+    await waitFor(() => expect(result.current.providers).toHaveLength(2))
+    expect(result.current.providers.map((p) => p.name)).toContain('local-vllm')
+  })
+})
+
+describe('readiness focus refetch (test 43, design D2.5)', () => {
+  it('useConfiguredProviders re-fetches when the window regains focus', async () => {
+    setNextResponse([{ name: 'ollama', readiness: 'not-running' }])
+    const before = fetchCalls.length
+    const { result } = renderHook(() => useConfiguredProviders())
+    await waitFor(() => expect(result.current.providers).toHaveLength(1))
+    expect(result.current.providers[0]!.readiness).toBe('not-running')
+
+    // The operator starts the daemon in another window; coming back fires
+    // `focus`, and the annotation must update without a reload.
+    setNextResponse([{ name: 'ollama', readiness: 'ready', readiness_models: 2 }])
+    act(() => { window.dispatchEvent(new Event('focus')) })
+    await waitFor(() =>
+      expect(result.current.providers[0]?.readiness).toBe('ready'),
+    )
+    expect(result.current.providers[0]!.readiness_models).toBe(2)
+    // A second fetch actually happened (not just a state reshuffle).
+    expect(fetchCalls.length).toBeGreaterThan(before + 1)
+  })
+
+  it('useAllProviders re-fetches when the window regains focus', async () => {
+    setNextResponse([{ name: 'ollama', authStatus: 'keyless', readiness: 'not-running' }])
+    const { result } = renderHook(() => useAllProviders())
+    await waitFor(() => expect(result.current.loaded).toBe(true))
+    expect(result.current.providers[0]!.readiness).toBe('not-running')
+
+    setNextResponse([{ name: 'ollama', authStatus: 'keyless', readiness: 'ready', readinessModels: 3 }])
+    act(() => { window.dispatchEvent(new Event('focus')) })
+    await waitFor(() =>
+      expect(result.current.providers[0]?.readiness).toBe('ready'),
+    )
+    expect(result.current.providers[0]!.readinessModels).toBe(3)
+  })
 })
 
 describe('fetchProviderModels', () => {
@@ -1068,5 +1116,38 @@ describe('useSecrets', () => {
     const initialCalls = fetchCalls.length
     act(() => result.current.refresh())
     await waitFor(() => expect(fetchCalls.length).toBeGreaterThan(initialCalls))
+  })
+})
+
+describe('setupRepo', () => {
+  function lastSetupCall() {
+    const call = [...fetchCalls].reverse().find((c) => c.url.includes('/setup-repo'))
+    expect(call).toBeTruthy()
+    return call!
+  }
+
+  it('POSTs {url} when no branch is given', async () => {
+    setNextResponse({ ok: true, message: 'cloned' })
+    const res = await setupRepo('sess1', 'https://github.com/o/r.git')
+    expect(res).toEqual({ ok: true, message: 'cloned' })
+    const call = lastSetupCall()
+    expect(call.url).toBe('/api/sessions/sess1/setup-repo')
+    expect(call.init?.method).toBe('POST')
+    expect(JSON.parse(String(call.init?.body))).toEqual({ url: 'https://github.com/o/r.git' })
+  })
+
+  it('POSTs {url, branch} with a trimmed branch when one is given', async () => {
+    setNextResponse({ ok: true })
+    await setupRepo('sess2', 'https://github.com/o/r.git', '  dev  ')
+    const body = JSON.parse(String(lastSetupCall().init?.body))
+    expect(body).toEqual({ url: 'https://github.com/o/r.git', branch: 'dev' })
+  })
+
+  it('omits a blank branch (never sends null)', async () => {
+    setNextResponse({ ok: true })
+    await setupRepo('sess3', 'https://github.com/o/r.git', '   ')
+    const body = JSON.parse(String(lastSetupCall().init?.body))
+    expect(body).toEqual({ url: 'https://github.com/o/r.git' })
+    expect('branch' in body).toBe(false)
   })
 })

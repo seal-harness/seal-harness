@@ -34,6 +34,7 @@ import Seal.Providers.Class (Provider (..), SomeProvider (..))
 import Seal.Security.Vault (VaultHandle)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.TestHelpers.FakeCaps (makeFakeCaps)
+import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.Vault.Commands (VaultRuntime (..))
 
 -- | A shared test abort flag (top-level, created once via unsafePerformIO).
@@ -60,7 +61,7 @@ metaWith p m =
   let sid = fromRight (error "unreachable: literal session id")
               (mkSessionId "20260701-120000-002")
       t   = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 43200)
-  in SessionMeta sid p m "cli" Nothing Nothing Nothing Nothing Nothing True Nothing t t mempty
+  in SessionMeta sid p m "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing t t mempty
 
 -- | A 'ChannelCaps' that records every 'ccSend' call into @ref@ (prepended;
 -- reverse for chronological order).  Prompt functions return the empty string.
@@ -120,7 +121,8 @@ spec = do
                      { vrPaths = SealPaths "/x" "/x" "/x" "/x" "/x"
                      , vrConfigPath = "/x/config.toml", vrHandleRef = ref }
                  , prManager = mgr
-                 , prCallCounter = cntRef }
+                 , prCallCounter = cntRef
+                 , prOllamaReadiness = noOllamaReadiness }
       r <- resolveSessionProvider pr (metaWith "anthropic" "claude-opus-4-8")
       case r of
         Left e  -> e `shouldSatisfy` ("vault not configured" `T.isInfixOf`)
@@ -136,7 +138,8 @@ spec = do
                      { vrPaths = SealPaths "/x" "/x" "/x" "/x" "/x"
                      , vrConfigPath = "/x/config.toml", vrHandleRef = ref }
                  , prManager = mgr
-                 , prCallCounter = cntRef }
+                 , prCallCounter = cntRef
+                 , prOllamaReadiness = noOllamaReadiness }
       r <- resolveSessionProvider pr (metaWith "bogus" "m")
       case r of
         Left e  -> e `shouldSatisfy` ("unknown provider" `T.isInfixOf`)

@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 module Seal.ISA.Ops.SessionSpec (spec) where
 
 import Control.Concurrent (threadDelay)
@@ -22,7 +23,7 @@ import Seal.Core.Types
   ( OpName (..), SessionId, ToolCallId (..), mkSessionId, sessionIdText )
 import Seal.ISA.Opcode
 import Seal.ISA.Ops.Session
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
+import Seal.Providers.Class (ContentBlock (..), pattern Message, Role (..), ToolResultPart (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (newSession, saveSessionMeta)
 import Seal.Session.Search (inMemorySessionSearchBackend)
@@ -122,6 +123,7 @@ seedMeta sid t mDesc = SessionMeta
   , smDescription = mDesc
   , smSealFrontMatter = True
   , smRepoUrl = Nothing
+  , smRepoBranch = Nothing
   , smCreatedAt = t, smLastActive = t
   , smAllowedSecrets = mempty }
 

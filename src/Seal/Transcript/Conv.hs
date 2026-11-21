@@ -1,10 +1,17 @@
 -- | The @conversation.jsonl@ model: one raw 'Message' per line, in order — the
 -- pure content list of the session. Reading is @mapMaybe decode . lines@ →
--- @[Message]@, fed straight to the provider with zero transformation. Appending
+-- @[Message]@. Appending
 -- a turn appends only the *new* message lines, so the file grows by deltas
 -- rather than re-serializing the whole prior conversation each turn (the old
 -- @transcript.jsonl@ format's O(N²) growth). No timestamps or ids live here —
 -- those are derived from @entries.jsonl@ ('Seal.Transcript.Entries').
+--
+-- Each line DOES carry the message's own provenance when it has one: a user
+-- message from an authenticated chat channel encodes its 'MessageOrigin'
+-- alongside role and content ('Seal.Providers.Class.msgOrigin'), so the file
+-- the model reads can distinguish senders without consulting @entries.jsonl@.
+-- The text itself is stored exactly as it arrived; the @[channel:userId]@ tag
+-- the model sees is rendered per request by 'Seal.Transcript.Origin'.
 module Seal.Transcript.Conv
   ( ConvLine (..)
   , encodeConvLine

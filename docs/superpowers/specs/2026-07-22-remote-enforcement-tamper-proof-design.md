@@ -125,10 +125,12 @@ signed updates), not a config-tamper concern. Excluded from this design.
   file via `fileConfigCodec`. The current handlers only touch
   `fcDefaultAgent`, but the *capability surface* is the entire config,
   including `fcUntrustedExec`.
-- The Gateway binds `127.0.0.1` by default (`Gateway/Config.hs:33`), but a
-  non-loopback bind only **warns** to stderr (`Gateway/Server.hs:72-74`) — it
-  does **not** refuse. There is **no authentication** anywhere in
-  `Seal/Gateway/` (no `Authorization` header check, no token — verified by
+- The Gateway binds `localhost` by default (`Gateway/Config.hs`), and
+  `[gateway] host` is the bind: `runGateway` passes it to Warp (see
+  `Server.warpSettingsFor`), so a loopback default really is loopback-only. A
+  non-loopback bind only **warns** to stderr (`Gateway/Server.hs`) — it does
+  **not** refuse. There is **no authentication** anywhere in `Seal/Gateway/`
+  beyond passkey access control (no `Authorization` header check — verified by
   grep).
 
 **Implication:** if an operator binds the gateway non-loopback, any network
@@ -560,7 +562,7 @@ The operator can see these messages. Each has a one-line remediation.
 | Hardened build with `mode=local` in `security.toml` (existing `enforceRemoteOnly`) | `remote-only-untrusted build: untrusted_execution.mode=local is rejected (the local executor is absent from this binary)` | Set `mode=remote` in `security.toml` or use a default build |
 | Migration of `[untrusted_execution]` from `config.toml` to `security.toml` (first boot after upgrade) | `[seal] migrating [untrusted_execution] from config.toml to security.toml (one-time). Edit security.toml for future changes.` | None (automatic) |
 | Migration fails (write permission denied) | `[seal] WARNING: could not write security.toml — reading untrusted_execution from config.toml for this session. Fix permissions at ~/.seal/ and restart.` | Fix `~/.seal/` permissions and restart |
-| Gateway binds non-loopback with `mode=remote` (V6 mitigation) | `refusing to start gateway on non-loopback address <addr> in remote-only mode — bind 127.0.0.1 or disable remote-only` | Bind loopback or set `mode=local` (if you accept the risk) |
+| Gateway binds non-loopback with `mode=remote` (V6 mitigation) | (no refusal: the control was retired with `fcUntrustedExec` — a non-loopback bind only warns, see `Seal.Gateway.Server.runGateway`) | Bind a loopback address (`localhost`) if you want the guarantee |
 | `security.toml` absent and no `[untrusted_execution]` anywhere | (silent — defaults to `mode=local` on default build; fail-closed at call time on hardened build) | Create `security.toml` with `[untrusted_execution] mode = "remote"` + remote block |
 
 ## 9. Test specifications (TDD readiness)

@@ -18,7 +18,7 @@
 
 ---
 
-> **Status:** Pre-alpha. Active design and development.
+> **Status:** Beta, active design and development.
 
 Most agent harnesses can't guarantee their own integrity. Actions happen off the record. You can't trust what you can't verify.
 
@@ -75,7 +75,11 @@ Seal Harness treats every agent session as a first-class, persistent object
 - **Session transcript is the source of truth.** Web frontend renders the
   transcript directly with full fidelity — every message, tool call, skill
   load, and permission prompt, with channel attribution, timestamps, raw JSON
-  inspection, and branching from any point. This is where you do deep work.
+  inspection, and branching from any point. A branch inherits the transcript
+  up to the row you pick and starts with an **empty workdir** — files are not
+  carried over, because a past workdir state cannot be reconstructed. Paste a
+  repo URL in the composer if you want to clone one before the first turn.
+  This is where you do deep work.
 - **Manage multiple in-flight tasks.** Easily juggle multiple tasks even with
   append-only chat interfaces. Get notified when tasks are waiting on you, and
   direct them from your phone wherever you are.
@@ -109,11 +113,62 @@ decisions.
 directly — every message, tool call, skill load, and permission prompt with
 full fidelity: channel attribution, timestamps, raw JSON inspection,
 collapsible structured views. Nothing is summarized behind the scenes. Branch
-from any point and you branch from the real record.
+from any point and you branch from the real record: the new session inherits
+the transcript up to that row, and nothing else (its workdir starts empty).
 
 **Agents can't tamper with the logs.** Prevent agents from tampering with your
 audit trail and rest easy knowing that you have full visibily into the workings
 of your agent organization.
+
+### One Gateway API for Every Surface You Automate
+
+The web UI is one client of Seal Harness, not the only one.
+
+`seal serve` exposes the entire agent surface over a single HTTP + WebSocket
+listener — loopback `:8080` by default. Sessions, transcripts, sends, slash
+commands, agents, skills, repos, providers, channels, cron jobs and the file
+explorer are all JSON routes; the browser frontend, the Signal and Telegram
+channels and anything you write yourself are peers on that API, and they see
+the same transcript because they drive the same turns.
+
+That is what makes an agent programmable rather than merely clickable:
+
+- **Automation from outside a browser.** Create a session, bind an agent, point
+  it at a repo, send it a message, read the result back — JSON in, JSON out:
+
+  ```bash
+  SID=$(curl -s localhost:8080/api/sessions/new -d '{"agent":"coder"}' | jq -r .session_id)
+  curl -s localhost:8080/api/sessions/$SID/setup-repo -d '{"url":"git@github.com:acme/api.git"}'
+  curl -s localhost:8080/api/sessions/$SID/send -d '{"message":"fix the failing test"}'
+  curl -s "localhost:8080/api/sessions/$SID/transcript?limit=50" | jq length
+  ```
+
+  (Send returns as soon as the turn starts; the reply lands in the transcript
+  and on the stream. A `passkey` install answers `401` until you authenticate,
+  so sign in first and reuse the `seal_session` cookie.)
+
+- **Live state instead of polling.** One WebSocket on the same port streams
+  entries as they are recorded, coalesced `entry-update` frames while a reply is
+  still being written, `ask` frames the moment the agent needs a human, and
+  `lists` snapshots as tabs open and close. A `since` cursor replays what a
+  dropped connection missed, so a phone that slept through a turn catches up
+  without re-reading the session.
+
+- **The opcode surface, over HTTP.** A message of `/call OPNAME {"json":"args"}`
+  is routed like any other slash command, so an automation reaches the same
+  opcodes an in-session turn does — same authorization, same ACK-before-execute
+  durability, same transcript entry.
+
+Every mutating request is origin-guarded before it reaches a handler, and the
+WebSocket handshake is authorized by the same single decision function as the
+HTTP routes, so the two surfaces cannot disagree about who you are. Passkeys,
+enrollment and TLS are covered in
+[`docs/web-access-control.md`](docs/web-access-control.md).
+
+Machine-readable clients: `GET /api/openapi.json` serves the OpenAPI 3.1
+document, `GET /api/openapi` renders it as Swagger UI, and `seal gen-openapi`
+prints it for a pipeline. `GET /api/health` is reachable without a session and
+reports the stream's real status, not its configured one.
 
 ## The SealOp ISA
 
@@ -173,22 +228,44 @@ Pre-built binaries are available on the
 
 ```bash
 # Linux (x86_64)
-curl -L https://github.com/seal-harness/seal-harness/releases/download/v0.1.0/seal-v0.1.0-seal-x86_64-linux.tar.gz | tar xz
-chmod +x seal
-./seal --help
+curl -L https://github.com/seal-harness/seal-harness/releases/download/v0.1.0/seal-0.1.0-x86_64-linux.tar.gz | tar xz
+./bin/seal --help
 ```
+
+Pre-releases (tags like `beta-0`, `alpha-1`, `rc-0.1.0`) are published on the
+same page and are flagged as pre-releases. Their tarball name uses the tag
+without the leading keyword, e.g. `seal-0-x86_64-linux.tar.gz` for `beta-0`.
 
 **Bleeding edge** (rolling `latest` tag, rebuilt on every push to main):
 
 ```bash
 # Linux (x86_64)
 curl -L https://github.com/seal-harness/seal-harness/releases/download/latest/seal-x86_64-linux.tar.gz | tar xz
-chmod +x seal
-./seal --help
+./bin/seal --help
 ```
 
 Verify download integrity with the SHA256 checksums provided alongside
 each release asset.
+
+The tarball is self-contained — no Nix and no other installs required. It
+extracts to `bin/seal`. On macOS it is accompanied by the `bin/dylibs/` shared
+libraries it loads from beside itself; keep the `bin/` tree together — if you
+move the binary, move the whole tree. The web UI is compiled into the binary,
+so `seal serve` needs no static files and no configuration.
+
+**Linux (x86_64) is a fully static musl binary.** It has no dynamic loader and
+embeds no `/nix/store` paths, so it runs on any recent x86_64 Linux without Nix.
+`scripts/check-portability.sh` enforces this in CI: a dynamically linked Linux
+artifact, or one carrying an embedded store path, fails the build.
+
+**macOS Gatekeeper.** Release binaries are not yet signed with an Apple
+Developer ID, so a freshly downloaded `seal` is quarantined and macOS reports
+"Apple could not verify…". Clear the flag once:
+
+```bash
+xattr -dr com.apple.quarantine bin/
+./bin/seal --help
+```
 
 #### Build from source
 
@@ -207,18 +284,37 @@ cabal build
 cabal run seal
 ```
 
-### Start a Chat
+## Configuration files
 
-From a running frontend, start a session with the `/new` command:
+The first run writes two documented files and never overwrites either: an
+existing one is yours, and is left byte-for-byte alone (so an upgrade does not
+re-hand you a template — copy one out of `config/templates/` in the repository
+if you want to see it next to a file you already have).
 
-```
-/new                              # fresh session in the current tab
-/new -p anthropic -m claude       # Anthropic, explicit model
-/new -p ollama -m llama3          # local Ollama, no API key needed
-```
+* `~/.seal/config/config.toml` — the runtime options: session defaults, tool
+  timeouts, sub-agents, web tools, prompt sections, memory search, chat
+  channels. Also a git repository (`~/.seal/config`), so edits are diffable and
+  revertable.
+* `~/.seal/security.toml` — boot-only, agent-immutable settings: the vault, where
+  untrusted code runs, the web gateway's bind address / Origin allowlist / TLS
+  pair, and passkey access control. No opcode, tool or agent can read or write
+  it. The gateway settings live here because they decide who can reach the
+  agent, and a bind address is not a value to guess from.
 
-Provider credentials are read from the vault (set them with
-`seal vault save`). Resume old sessions with `/session` and `/tab`.
+Both files spell out the default for every option. A key is written out only
+where writing it resolves to exactly what leaving it out resolves to;
+everything else is commented out with its default named in the comment — an
+unset value, a name only you know, a machine-absolute path, or a value derived
+from another key. Seal re-encodes a file when it changes it (a `/provider`
+change, `/vault setup`), and a re-encode does not keep comments.
+
+## Web Access Control (passkeys)
+
+`seal serve` exposes the whole agent surface over HTTP and WebSocket, with
+passkey-based access control configured in `~/.seal/security.toml`. See
+[`docs/web-access-control.md`](docs/web-access-control.md) for the full guide
+covering enrollment, TLS termination, secure contexts, certificate trust, and
+remote-access options (SSH tunnel, Tailscale, mkcert).
 
 ## Development
 

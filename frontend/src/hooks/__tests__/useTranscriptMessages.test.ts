@@ -23,6 +23,7 @@ function makeEntry(overrides: Partial<TranscriptEntry> = {}): TranscriptEntry {
     harness: null,
     model: null,
     channel: null,
+    userId: null,
     internal: null,
     raw: '{}',
     ...overrides,
@@ -317,6 +318,63 @@ describe('useTranscriptMessages', () => {
     expect(sysRows[0]!.blocks[0]!.collapsedText).toBe('sys-A')
   })
 
+  it('names the branch and renders a switch summary for SETUP_REPO', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'op-branch',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [],
+          op: { name: 'SETUP_REPO' },
+          // The branch is recorded on the opcode INPUT; the result is
+          // {status, target} only.
+          input: { url: 'https://github.com/example/repo.git', branch: 'dev' },
+          result: { status: 'cloned', target: 'repo' },
+        }),
+      }),
+      makeEntry({
+        id: 'op-switch',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [],
+          op: { name: 'SETUP_REPO' },
+          input: { url: 'https://github.com/example/repo.git', branch: 'main' },
+          result: { status: 'switched', target: 'repo' },
+        }),
+      }),
+    ]
+    const { result } = renderHook(() => useTranscriptMessages(entries, 's1'))
+    const summaries = result.current.flatMap((m) => m.blocks)
+      .flatMap((b) => (b.toolCall ? [b.toolCall] : []))
+      .map((tc) => tc.result)
+    expect(summaries).toEqual([
+      'Cloned into repo (branch dev)',
+      'Switched to main — repo',
+    ])
+  })
+
+  it('treats a non-string branch as absent instead of throwing (untrusted transcript JSON)', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'op-badbranch',
+        direction: 'request',
+        payload: JSON.stringify({
+          messages: [],
+          op: { name: 'SETUP_REPO' },
+          // The backend coerces a non-string branch to "absent"; the
+          // renderer must not call .trim() on it.
+          input: { url: 'https://github.com/example/repo.git', branch: 123 },
+          result: { status: 'cloned', target: 'repo' },
+        }),
+      }),
+    ]
+    const { result } = renderHook(() => useTranscriptMessages(entries, 's1'))
+    const summaries = result.current.flatMap((m) => m.blocks)
+      .flatMap((b) => (b.toolCall ? [b.toolCall] : []))
+      .map((tc) => tc.result)
+    expect(summaries).toEqual(['Cloned into repo'])
+  })
+
   it('anchors the preamble on the first LLM request, not on a preceding opcode entry', () => {
     // A session starts with a SETUP_REPO opcode entry — request-direction,
     // but not an LLM request. The preamble belongs to the first LLM
@@ -509,5 +567,45 @@ describe('useTranscriptMessages', () => {
     rerender({ entries: session2, sid: 's2' })
     const expected = resolveRawJson(transcriptToMessages(session2))
     expect(resolveRawJson(result.current)).toEqual(expected)
+  })
+
+  // ── Branch anchor (WU-5 regression guard) ──────────────────────────────
+  // This asserts on the LIVE renderer (useTranscriptMessages) rather than
+  // the test-only transcriptToMessages: the app renders through this hook,
+  // so a convLen added only to ChatArea would leave the production branch
+  // request without an anchor.
+  it('carries convLen onto user and assistant rows (the branch anchor)', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'u1',
+        convLen: 1,
+        payload: JSON.stringify({
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'branch me' }] }],
+        }),
+      }),
+      makeEntry({
+        id: 'a1',
+        direction: 'response',
+        convLen: 2,
+        payload: JSON.stringify({ content: [{ type: 'text', text: 'hello' }] }),
+      }),
+    ]
+    const { result } = renderHook(() => useTranscriptMessages(entries, 's1'))
+    const userRow = result.current.find((m) => m.id === 'u1-user')
+    const assistantRow = result.current.find((m) => m.id === 'a1')
+    expect(userRow?.convLen).toBe(1)
+    expect(assistantRow?.convLen).toBe(2)
+  })
+
+  it('leaves convLen undefined on rows whose entry has no anchor', () => {
+    const entries: TranscriptEntry[] = [makeEntry({
+      id: 'u1',
+      payload: JSON.stringify({
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'no anchor' }] }],
+      }),
+    })]
+    const { result } = renderHook(() => useTranscriptMessages(entries, 's1'))
+    const userRow = result.current.find((m) => m.id === 'u1-user')
+    expect(userRow?.convLen).toBeUndefined()
   })
 })

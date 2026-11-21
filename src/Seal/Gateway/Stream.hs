@@ -31,12 +31,15 @@ module Seal.Gateway.Stream
   , extractId
   , entriesBeforeId
   , clampLimit
+  , readLimitFor
+  , shapeChunk
+  , handleRequestEntriesCore
   , sendErrorFrame
   ) where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (concurrently_)
-import Control.Exception (SomeException, catch)
+import Control.Concurrent.Async (race_)
+import Control.Exception (SomeException, catch, finally)
 import Control.Monad (forM_, forever)
 import Data.Maybe (fromMaybe)
 import Data.Aeson (object, (.=))
@@ -48,9 +51,10 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (getCurrentTime)
+import Network.HTTP.Types (status401)
 import Network.Wai
-  ( Application )
-import Network.Wai.Handler.WebSockets (websocketsOr)
+  ( Application, responseLBS )
+import Network.Wai.Handler.WebSockets (isWebSocketsReq, websocketsOr)
 import Network.WebSockets
   ( PendingConnection, acceptRequest, receiveData, sendTextData
   , withPingThread, sendClose, Connection, defaultConnectionOptions )
@@ -62,8 +66,10 @@ import Seal.Core.Types (mkSessionId, sessionIdText, SessionId)
 import Seal.Core.TurnEngine (loadSessionMeta)
 import Seal.Gateway.Broadcast (broadcastListsSnapshot)
 import Seal.Gateway.StreamBroker
-  ( BrokerEvent (..), StreamBroker, subscribe, updateSubscriberSession )
+  ( BrokerEvent (..), StreamBroker, subscribe, unsubscribe, updateSubscriberSession )
 import Seal.Gateway.Transcript (readTranscriptEntriesTimed, ttEntryCount, showIso, ReadLimit (..))
+import Seal.Gateway.AccessControl
+  ( AccessControlHandle, AuthDecision (..), accessControlAuthorize )
 import Seal.Logging.Global (globalLogIO)
 import Seal.Session.Meta (smModel, smCreatedAt)
 import Seal.Tabs (TabsHandle)
@@ -120,6 +126,11 @@ data StreamGuard = StreamGuard
   -- inside the frontend's 90s watchdog. Tests override it to keep the suite
   -- fast, or raise it to keep heartbeat frames out of unrelated assertions.
   , sgHeartbeatSeconds :: Int
+  -- | The access-control handle, when the gateway has one. A handshake is
+  -- rejected before the upgrade when 'accessControlAuthorize' says no, so a
+  -- browser without a session never gets a live transcript stream (design §7
+  -- "WebSocket"). 'Nothing' (tests, access control unwired) skips the check.
+  , sgAccessControl :: Maybe AccessControlHandle
   }
 
 -- | The WebSocket stream endpoint, as a WAI middleware.
@@ -139,8 +150,22 @@ streamMiddleware
   -> StreamBroker
   -> Application
   -> Application
-streamMiddleware guard broker =
-  websocketsOr defaultConnectionOptions (streamApp guard broker)
+streamMiddleware guard broker backup = \req respond ->
+  if isWebSocketsReq req
+    then case sgAccessControl guard of
+      Nothing -> wsApp req respond
+      Just access -> do
+        decision <- accessControlAuthorize access req
+        if decision == AuthAllow
+          then wsApp req respond
+          else do
+            globalLogIO InfoS "[ws] rejected handshake: access control"
+            respond (responseLBS status401
+                      [("Content-Type", "application/json"), ("Cache-Control", "no-store")]
+                      "{\"error\":\"a passkey session is required\",\"code\":\"unauthenticated\"}")
+    else backup req respond
+  where
+    wsApp = websocketsOr defaultConnectionOptions (streamApp guard broker) backup
 
 -- | The per-connection WS app: check the Origin, accept, send hello, then
 -- race the broker-forwarder against the focus-reader.
@@ -215,35 +240,47 @@ streamApp guard broker pending = do
       -- is in the broker's subscriber list and actually receives the frame.
       -- Without this, the snapshot is broadcast to zero subscribers, the
       -- frontend never flips wsLive, and REST /api/lists polling stays on.
-      broadcastListsSnapshot broker (sgTabsHandle guard) (sgPaths guard)
-      -- Keep-alives, at one interval: the protocol-level PING ('withPingThread')
-      -- so intermediaries and dead-peer detection stay honest, and the
-      -- application-level heartbeat frame ('heartbeatLoop') because that is
-      -- the only one a browser's JavaScript can observe. The heartbeat is
-      -- cancelled as soon as the reader loop ends (peer closed), so it never
-      -- outlives the connection.
-      let hbSeconds = sgHeartbeatSeconds guard
-      withPingThread conn hbSeconds (pure ()) $ do
-        let readerLoop = forever $ do
-              msg <- receiveData conn
-              case A.decode msg :: Maybe ClientMessage of
-                Just (CmFocus focusOp) ->
-                  case mkSessionId (foSession focusOp) of
-                    Right s  -> do
-                      globalLogIO InfoS ("[ws] focus → " <> ls (sessionIdText s))
-                      updateSubscriberSession subSessionRef s
-                      -- When the client sends a `since` entry id, replay
-                      -- all transcript entries after that id from disk so
-                      -- entries broadcast during the WS gap are recovered.
-                      forM_ (foSince focusOp) $ \sinceId ->
-                        replayEntriesSince conn (sgPaths guard) s sinceId
-                    Left _e  -> sendErrorFrame conn "invalid session id"
-                Just (CmRequestEntries reqOp) ->
-                  handleRequestEntries conn (sgPaths guard) reqOp
-                Nothing -> sendErrorFrame conn "unknown op"
-        concurrently_
-          (heartbeatLoop conn hbSeconds)
-          (readerLoop `catch` \(_e :: SomeException) -> pure ())
+      (do
+        broadcastListsSnapshot broker (sgTabsHandle guard) (sgPaths guard)
+        -- Keep-alives, at one interval: the protocol-level PING ('withPingThread')
+        -- so intermediaries and dead-peer detection stay honest, and the
+        -- application-level heartbeat frame ('heartbeatLoop') because that is
+        -- the only one a browser's JavaScript can observe. The heartbeat is
+        -- cancelled as soon as the reader loop ends (peer closed), so it never
+        -- outlives the connection.
+        let hbSeconds = sgHeartbeatSeconds guard
+        withPingThread conn hbSeconds (pure ()) $ do
+          let readerLoop = forever $ do
+                msg <- receiveData conn
+                case A.decode msg :: Maybe ClientMessage of
+                  Just (CmFocus focusOp) ->
+                    case mkSessionId (foSession focusOp) of
+                      Right s  -> do
+                        globalLogIO InfoS ("[ws] focus → " <> ls (sessionIdText s))
+                        updateSubscriberSession subSessionRef s
+                        -- When the client sends a `since` entry id, replay
+                        -- all transcript entries after that id from disk so
+                        -- entries broadcast during the WS gap are recovered.
+                        forM_ (foSince focusOp) $ \sinceId ->
+                          replayEntriesSince conn (sgPaths guard) s sinceId
+                      Left _e  -> sendErrorFrame conn "invalid session id"
+                  Just (CmRequestEntries reqOp) ->
+                    handleRequestEntries conn (sgPaths guard) reqOp
+                  Nothing -> sendErrorFrame conn "unknown op"
+          -- 'race_', not 'concurrently_'. The reader loop catches its own
+          -- exception and returns normally when the peer goes away, so
+          -- 'concurrently_' would keep waiting on 'heartbeatLoop' forever:
+          -- the handler thread (and its broker subscriber) would outlive
+          -- every disconnected client. 'race_' cancels the loser.
+          race_
+            (heartbeatLoop conn hbSeconds)
+            (readerLoop `catch` \(_e :: SomeException) -> pure ()))
+        -- Remove the subscriber however this ends: clean close, reader
+        -- exception, or a throw from the connect-side work above
+        -- ('broadcastListsSnapshot' walks every subscriber and reads the
+        -- session tree, so it can throw). Scoping 'finally' to just the
+        -- 'withPingThread' block would leak on any of those.
+        `finally` unsubscribe broker subSessionRef
 
 -- | Push a content-free @{"type":"heartbeat"}@ frame every
 -- @intervalSeconds@ for as long as the connection lives.
@@ -356,6 +393,55 @@ extractId v = case v of
     _                 -> ""
   _ -> ""
 
+-- | How much of the transcript to read for a request-entries op.
+--
+-- A @before@ cursor must read the WHOLE transcript: the cursor can be
+-- arbitrarily far from the tail, and truncating the read makes
+-- 'entriesBeforeId' miss the cursor (empty chunk) or makes 'hasMore' lie
+-- (a partial page reports "no entries before me"). That lie is what
+-- stranded the frontend's scroll-to-top button. The initial and
+-- @__beginning__@ requests keep their bounded reads.
+readLimitFor :: Maybe Text -> Int -> ReadLimit
+readLimitFor mBefore limit = case mBefore of
+  Nothing              -> ReadLastN limit
+  Just "__beginning__" -> ReadFirstN limit
+  Just _               -> ReadAll
+
+-- | Shape the read window into the chunk to send.
+--
+-- For a @before@ cursor the window must be the full transcript (see
+-- 'readLimitFor'); 'hasMore' then means "entries exist before this chunk"
+-- and is independent of any count. For the initial and @__beginning__@
+-- requests the bounded window is already the chunk, and 'totalCount' (a
+-- conservative upper bound) decides whether anything remains.
+shapeChunk :: Maybe Text -> Int -> Int -> [A.Value] -> ([A.Value], Bool)
+shapeChunk mBefore limit totalCount window = case mBefore of
+  Nothing -> (window, totalCount > limit)
+  Just before
+    | before == "__beginning__" -> (take limit window, totalCount > limit)
+    | otherwise -> case entriesBeforeId before window of
+        Just beforeEntries ->
+          ( drop (max 0 (length beforeEntries - limit)) beforeEntries
+          , length beforeEntries > limit
+          )
+        Nothing -> ([], False)
+
+-- | Testable core of 'handleRequestEntries'. The caller supplies the reader
+-- (which must honour the 'ReadLimit') and the frame sink, so the production
+-- decision path — read mode plus chunk shaping — is exercised by tests
+-- without a live WebSocket connection.
+handleRequestEntriesCore
+  :: (ReadLimit -> IO ([A.Value], Int))
+  -> ([A.Value] -> Bool -> Int -> Maybe Text -> IO ())
+  -> Maybe Text
+  -> Int
+  -> IO ()
+handleRequestEntriesCore readEntries sendChunk mBefore limit = do
+  putStrLn $ "[ws] request-entries: limit=" <> show limit <> " mBefore=" <> show mBefore
+  (window, totalCount) <- readEntries (readLimitFor mBefore limit)
+  let (chunk, hasMore) = shapeChunk mBefore limit totalCount window
+  sendChunk chunk hasMore totalCount mBefore
+
 -- | Handle a @request-entries@ op: read the transcript from disk, slice it
 -- to the requested chunk, and send an @entries-chunk@ event. Includes a
 -- catch handler so a corrupt/missing transcript sends an error frame
@@ -365,60 +451,34 @@ handleRequestEntries :: Connection -> SealPaths -> RequestEntriesOp -> IO ()
 handleRequestEntries conn paths (RequestEntriesOp sidTxt mBefore mLimit) =
   case mkSessionId sidTxt of
     Left _ -> sendErrorFrame conn "invalid session id"
-    Right sid -> do
-      let go = do
-            mMeta <- loadSessionMeta paths sid
-            let model = maybe "" smModel mMeta
-                fallbackTs = maybe "" (showIso . smCreatedAt) mMeta
-                limit = clampLimit mLimit
-            putStrLn $ "[ws] handleRequestEntries: limit=" <> show limit <> " mBefore=" <> show mBefore
-            -- Use the paginated read to avoid loading all entries into
-            -- memory. For the initial chunk (mBefore == Nothing), read
-            -- only the last `limit` entries. For before/id pagination,
-            -- read a wider window. For __beginning__, we need the FIRST
-            -- entries — use ReadFirstN to read only the first `limit`
-            -- entries instead of loading the entire transcript.
-            (allEntries, tt) <- readTranscriptEntriesTimed paths model fallbackTs sid
-              (case mBefore of
-                Nothing              -> ReadLastN limit
-                Just "__beginning__" -> ReadFirstN limit
-                Just _               -> ReadLastN (limit * 3))
-            -- totalCount comes from the timings (full entry count before
-            -- limiting), NOT from length allEntries (which is the limited count).
-            let totalCount = ttEntryCount tt
-                (chunk, hasMore) = case mBefore of
-                  Nothing ->
-                    -- allEntries already contains only the last `limit`
-                    -- entries; the chunk is all of them, hasMore = totalCount > limit
-                    (allEntries, totalCount > limit)
-                  Just before ->
-                   if before == "__beginning__"
-                     -- allEntries already contains only the first `limit`
-                     -- entries (ReadFirstN); no take needed.
-                     then (allEntries, totalCount > limit)
-                     else
-                    case entriesBeforeId before allEntries of
-                      Just beforeEntries ->
-                        let taken = drop (max 0 (length beforeEntries - limit)) beforeEntries
-                            hasMoreBefore = length beforeEntries > limit
-                        in (taken, hasMoreBefore)
-                      Nothing -> ([], False)
-            sendTextData conn (A.encode (A.object
-              [ "type" A..= ("entries-chunk" :: Text)
-              , "sessionId" A..= sidTxt
-              , "entries" A..= chunk
-              , "hasMore" A..= hasMore
-              , "totalCount" A..= totalCount
-              , "requestBefore" A..= mBefore
-              ]))
-      go `catch` \(e :: SomeException) -> do
-        globalLogIO InfoS ("[ws] request-entries error: " <> ls (T.pack (show e)))
-        sendTextData conn (A.encode (A.object
-          [ "type" A..= ("entries-chunk" :: Text)
-          , "sessionId" A..= sidTxt
-          , "entries" A..= ([] :: [A.Value])
-          , "requestBefore" A..= mBefore
-          ]))
+    Right sid ->
+      handleRequestEntriesCore (readEntries sid) sendChunk
+        mBefore (clampLimit mLimit)
+        `catch` \(e :: SomeException) -> do
+          globalLogIO InfoS ("[ws] request-entries error: " <> ls (T.pack (show e)))
+          sendTextData conn (A.encode (A.object
+            [ "type" A..= ("entries-chunk" :: Text)
+            , "sessionId" A..= sidTxt
+            , "entries" A..= ([] :: [A.Value])
+            , "requestBefore" A..= mBefore
+            ]))
+  where
+    readEntries sid rlim = do
+      mMeta <- loadSessionMeta paths sid
+      let model = maybe "" smModel mMeta
+          fallbackTs = maybe "" (showIso . smCreatedAt) mMeta
+      (entries, tt) <- readTranscriptEntriesTimed paths model fallbackTs sid rlim
+      pure (entries, ttEntryCount tt)
+
+    sendChunk chunk hasMore totalCount before =
+      sendTextData conn (A.encode (A.object
+        [ "type" A..= ("entries-chunk" :: Text)
+        , "sessionId" A..= sidTxt
+        , "entries" A..= chunk
+        , "hasMore" A..= hasMore
+        , "totalCount" A..= totalCount
+        , "requestBefore" A..= before
+        ]))
 
 -- | Return entries before the entry with id @before@ (exclusive).
 -- Returns 'Nothing' when the id is not found (distinct from

@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
+{-# LANGUAGE PatternSynonyms #-}
 -- | Shared 'Arbitrary' instances for the 'Seal.Core.Types' newtypes and the
 -- provider-agnostic message model.
 --
@@ -19,7 +20,7 @@ import Test.QuickCheck
 import Seal.Core.Paging (PageParams (..))
 import Seal.Core.Types (ModelId (..), OpName (..), ProviderId (..), SessionId, mkSessionId, mkSystemSessionId, ToolCallId (..))
 import Seal.Providers.Class
-  ( CompletionResponse (..), ContentBlock (..), Message (..)
+  ( CompletionResponse (..), ContentBlock (..), Message, pattern Message
   , Role (..), StopReason (..), Usage (..), ToolChoice (..)
   , ToolDefinition (..), ToolResultPart (..) )
 import Seal.Transcript.Entries (EnvelopeDelta (..))

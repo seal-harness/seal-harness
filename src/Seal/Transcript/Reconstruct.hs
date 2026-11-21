@@ -116,27 +116,34 @@ reconstruct conv = go 0 Nothing
                         then Just (envTools env)
                         else Nothing
               payload = requestPayload env sys tools msgs
-              entry = toEntry e Request (modelOf env) payload
+              entry = toEntry end e Request (modelOf env) payload
           in entry : go end (Just env) es
         EKResponse ->
           let end = erConvLen e
               msgs = take (end - start) (drop start conv)
               payload = responsePayload mEnv msgs e
-              entry = toEntry e Response (mEnv >>= modelOf) payload
+              entry = toEntry end e Response (mEnv >>= modelOf) payload
           in entry : go end mEnv es
         EKHarness ->
-          -- A harness entry (opcode invocation) adds no conversation lines
-          -- (erConvLen = 0), so the conversation cursor is preserved — the
-          -- next response entry must slice from the same @start@, not from 0.
-          -- Resetting the cursor here would make the next response's
-          -- @take end (drop 0 conv)@ return the ENTIRE conversation, which
-          -- the frontend renders as one giant duplicate response row.
-          let payload = harnessPayload (take (erConvLen e) (drop start conv)) e
-              entry = toEntry e Request Nothing payload
-          in entry : go start mEnv es
+          -- A harness entry's erConvLen is a DELTA: the number of
+          -- conversation lines IT contributed (0 for a plain opcode
+          -- invocation; 1 for a skill-load or setup-repo result, which
+          -- append a message). The writer records it that way
+          -- (Handles/Transcript.hs:360-366), so slice @erConvLen@ lines
+          -- starting at @start@ and advance by that much.
+          --
+          -- Advancing by 0 for a plain invocation leaves the cursor put, so
+          -- the next response slices from the same @start@ — resetting it
+          -- would make that response return the whole conversation.
+          let delta = erConvLen e
+              end = start + delta
+              payload = harnessPayload (take delta (drop start conv)) e
+              entry = toEntry end e Request Nothing payload
+          in entry : go end mEnv es
         EKCompaction ->
-          let entry = toEntry e Request Nothing Null
-          in entry : go (erConvLen e) mEnv es
+          let end = erConvLen e
+              entry = toEntry end e Request Nothing Null
+          in entry : go end mEnv es
 
 -- | The effective envelope at a request entry. The first request has no
 -- prior envelope, so its delta is folded against a default baseline; in
@@ -174,6 +181,14 @@ modelOf env = case envModel env of
 -- (used when the value is unchanged from the prior request, so the frontend
 -- skips the redundant row). Mirrors the old 'ToJSON CompletionRequest'
 -- encoding so a "view raw" reproduces the bytes the old format stored.
+--
+-- Messages are encoded exactly as stored. A user message that arrived over a
+-- chat channel carries its structured @origin@ (channel + sender id) here, but
+-- NOT the @[channel:userId]@ tag the model read: that tag is a rendering
+-- applied when the request is built
+-- ('Seal.Transcript.Origin.annotateOrigins'), and the bytes actually sent live
+-- in @requests.jsonl@. Keeping the tag out of the reconstructed payload keeps
+-- the user's own words intact in the transcript view and in search.
 requestPayload :: Envelope -> Maybe Text -> Maybe [ToolDefinition] -> [Message] -> Value
 requestPayload env sys mTools msgs = object $
   [ "model"      .= envModel env
@@ -247,8 +262,10 @@ harnessPayload msgs e =
 -- @model@ field, which labels each LLM message with the model that produced
 -- it instead of a fixed "Assistant". Opcode-invocation ('EKHarness') and
 -- compaction entries are not LLM messages, so they carry 'Nothing'.
-toEntry :: EntryRecord -> Direction -> Maybe ModelId -> Value -> TranscriptEntry
-toEntry e dir model payload = TranscriptEntry
+toEntry
+  :: Int                    -- ^ conversation cursor AFTER this entry (the branch anchor)
+  -> EntryRecord -> Direction -> Maybe ModelId -> Value -> TranscriptEntry
+toEntry convLenAfter e dir model payload = TranscriptEntry
   { teId = erId e
   , teTimestamp = erTimestamp e
   , teModel = model
@@ -256,6 +273,7 @@ toEntry e dir model payload = TranscriptEntry
   , tePayload = payload
   , teDurationMs = erDurationMs e
   , teCorrelation = erCorrelation e
+  , teConvLen = Just convLenAfter
   , teMeta = erMeta e
   }
 
@@ -291,25 +309,30 @@ reconstructStreaming convPath idxPath entries = do
                         then Just (envTools env)
                         else Nothing
               payload = requestPayload env sys tools (msgsFromEither eMsgs)
-              entry = toEntry e Request (modelOf env) payload
+              entry = toEntry end e Request (modelOf env) payload
           rest <- go hs lc end (Just env) es
           pure (entry : rest)
         EKResponse -> do
           let end = erConvLen e
           eMsgs <- readMsgsH hs lc (capStart start end) end
           let payload = responsePayload mEnv (msgsFromEither eMsgs) e
-              entry = toEntry e Response (mEnv >>= modelOf) payload
+              entry = toEntry end e Response (mEnv >>= modelOf) payload
           rest <- go hs lc end mEnv es
           pure (entry : rest)
         EKHarness -> do
-          eMsgs <- readMsgsH hs lc (capStart start (erConvLen e)) (erConvLen e)
+          -- erConvLen is a DELTA for harness entries (see the pure
+          -- 'reconstruct' above): read that many lines from @start@ and
+          -- advance by that much, not to an absolute @erConvLen@.
+          let end = start + erConvLen e
+          eMsgs <- readMsgsH hs lc (capStart start end) end
           let payload = harnessPayload (msgsFromEither eMsgs) e
-              entry = toEntry e Request Nothing payload
-          rest <- go hs lc start mEnv es
+              entry = toEntry end e Request Nothing payload
+          rest <- go hs lc end mEnv es
           pure (entry : rest)
         EKCompaction -> do
-          let entry = toEntry e Request Nothing Null
-          rest <- go hs lc (erConvLen e) mEnv es
+          let end = erConvLen e
+              entry = toEntry end e Request Nothing Null
+          rest <- go hs lc end mEnv es
           pure (entry : rest)
 
     readMsgsH :: ConvIndexHandles -> Int -> Int -> Int -> IO (Either a [Message])
@@ -369,7 +392,7 @@ reconstructStreamingPage convPath idxPath entries startEntry limit = do
             EKResponse ->
               foldToStart es (erConvLen e) mEnv (n - 1)
             EKHarness ->
-              foldToStart es start mEnv (n - 1)
+              foldToStart es (start + erConvLen e) mEnv (n - 1)
             EKCompaction ->
               foldToStart es (erConvLen e) mEnv (n - 1)
 
@@ -389,25 +412,30 @@ reconstructStreamingPage convPath idxPath entries startEntry limit = do
                         then Just (envTools env)
                         else Nothing
               payload = requestPayload env sys tools (msgsFromEither eMsgs)
-              entry = toEntry e Request (modelOf env) payload
+              entry = toEntry end e Request (modelOf env) payload
           rest <- go hs lc end (Just env) es
           pure (entry : rest)
         EKResponse -> do
           let end = erConvLen e
           eMsgs <- readMsgsH hs lc (capStart start end) end
           let payload = responsePayload mEnv (msgsFromEither eMsgs) e
-              entry = toEntry e Response (mEnv >>= modelOf) payload
+              entry = toEntry end e Response (mEnv >>= modelOf) payload
           rest <- go hs lc end mEnv es
           pure (entry : rest)
         EKHarness -> do
-          eMsgs <- readMsgsH hs lc (capStart start (erConvLen e)) (erConvLen e)
+          -- erConvLen is a DELTA for harness entries (see the pure
+          -- 'reconstruct' above): read that many lines from @start@ and
+          -- advance by that much, not to an absolute @erConvLen@.
+          let end = start + erConvLen e
+          eMsgs <- readMsgsH hs lc (capStart start end) end
           let payload = harnessPayload (msgsFromEither eMsgs) e
-              entry = toEntry e Request Nothing payload
-          rest <- go hs lc start mEnv es
+              entry = toEntry end e Request Nothing payload
+          rest <- go hs lc end mEnv es
           pure (entry : rest)
         EKCompaction -> do
-          let entry = toEntry e Request Nothing Null
-          rest <- go hs lc (erConvLen e) mEnv es
+          let end = erConvLen e
+              entry = toEntry end e Request Nothing Null
+          rest <- go hs lc end mEnv es
           pure (entry : rest)
 
     readMsgsH :: ConvIndexHandles -> Int -> Int -> Int -> IO (Either a [Message])

@@ -20,10 +20,13 @@ module Seal.Config.File
   , WorkdirConfig (..)
   , SkillsConfig (..)
   , AgentConfig (..)
+  , ToolTimeoutFileConfig (..)
   , defaultRuntimeConfig
   , defaultRetrievalConfig
   , defaultRetrievalMaxScanBytes
   , defaultMaxTurns
+  , defaultMaxModelRetries
+  , defaultModelRetryBaseDelayMs
   , defaultDelegationConfig
   , defaultWebConfig
   , emptyProviderConfig
@@ -31,6 +34,7 @@ module Seal.Config.File
   , loadRuntimeConfig
   , providerBaseUrl
   , providerDefaultModel
+  , providerModels
   , retrievalMaxScanBytes
   , maxTurnsConfig
   , onDemandSchemas
@@ -45,6 +49,10 @@ module Seal.Config.File
   , saveRuntimeConfig
   , updateRuntimeConfig
   , upsertProvider
+  , deleteProvider
+  , migrateLegacyChannels
+  , upsertChannel
+  , deleteChannel
   , toolTimeoutConfig
   , toolTimeoutConfigCodec
   ) where
@@ -67,7 +75,10 @@ import Toml.Type.Key (pattern (:||))
 
 import Seal.Signal.Config (SignalConfig (..), signalConfigCodec)
 import Seal.Telegram.Config (TelegramConfig (..), telegramConfigCodec)
-import Seal.Gateway.Config (PartialGatewayConfig (..), gatewayConfigCodec)
+import Seal.Channels.Config (ChannelId (..), ChannelConfig (..), channelConfigCodec, keyChannelIdBiMap, fromSignalConfig, fromTelegramConfig)
+import Seal.Core.AllowList (AllowList (..))
+import Seal.Core.ChannelKind (ChannelKind (..))
+import Seal.Gateway.Config (loadLegacyGatewayTable)
 import Seal.Tools.Timeout
   ( ToolTimeoutConfig (..), defaultToolTimeoutConfig )
 
@@ -95,10 +106,6 @@ data RuntimeConfig = RuntimeConfig
   , rcTelegram :: Maybe TelegramConfig
     -- ^ Optional @[telegram]@ section (Telegram channel config). Absent
     -- means the Telegram channel is not configured.
-  , rcGateway :: Maybe PartialGatewayConfig
-    -- ^ Optional @[gateway]@ section (web gateway config). Absent means the
-    -- gateway is not configured. Each field inside is optional too; the
-    -- call site merges with 'Seal.Gateway.Config.withGatewayDefaults'.
   , rcDebugSessionTranscript :: Maybe Bool
     -- ^ Optional @debug_session_transcript@ flag. When @true@, every
     -- 'CompletionRequest' sent to the LLM is also appended (redundantly,
@@ -152,7 +159,7 @@ data RuntimeConfig = RuntimeConfig
   , rcMaxTurns :: Maybe Int
     -- ^ Optional top-level @max_turns@ key: the maximum number of
     -- tool-use iterations per turn before the loop stops. Absent →
-    -- 'defaultMaxTurns' (90). Values < 1 are clamped to 1 at resolution
+    -- 'defaultMaxTurns' (200). Values < 1 are clamped to 1 at resolution
     -- time. Mirrors Hermes' default.
   , rcToolTimeout :: Maybe ToolTimeoutFileConfig
     -- ^ Optional @[tool_timeout]@ section (per-call timeout/abort/retry
@@ -163,12 +170,20 @@ data RuntimeConfig = RuntimeConfig
     -- ^ Optional @[embedding]@ section (semantic search backend for
     -- memory). Absent means the null backend is used (substring search
     -- only). Set @backend = "engram"@ to enable engram subprocess search.
+  , rcChannels :: Map ChannelId ChannelConfig
+    -- ^ Per-channel config sections (@[channels.\<id\>]@). Multi-instance
+    -- chat channel management (design §3.1). Legacy @[signal]@\/@[telegram]@
+    -- sections are migrated into this map at load time ('migrateLegacyChannels').
   } deriving stock (Eq, Show)
 
 -- | One @[providers.<label>]@ section: per-provider overrides.
 data ProviderConfig = ProviderConfig
   { pcDefaultModel :: Maybe Text
   , pcBaseUrl      :: Maybe Text
+  , pcModels       :: Maybe [Text]
+    -- ^ Models the operator frequently uses with this provider. Surfaced as
+    -- suggestions in the "new tab" model combobox; a free-form model id is
+    -- still accepted. Absent means no suggestions.
   } deriving stock (Eq, Show)
 
 -- | The @[retrieval]@ section: Dynamic Retrieval tuning. Every field is
@@ -189,7 +204,7 @@ data DelegationFileConfig = DelegationFileConfig
   , dfcChildTimeoutSeconds  :: Maybe Double
     -- ^ Hard per-child timeout in seconds. Default 600, floor 30.
   , dfcMaxSpawnDepth         :: Maybe Int
-    -- ^ Max delegation tree depth. Default 1 (flat), clamped to [1,3].
+    -- ^ Max delegation tree depth. Default 3, clamped to [1,3].
   , dfcOrchestratorEnabled   :: Maybe Bool
     -- ^ Kill switch for the orchestrator role. Default True.
   , dfcProvider              :: Maybe Text
@@ -248,7 +263,7 @@ data EmbeddingConfig = EmbeddingConfig
   } deriving stock (Eq, Show)
 
 emptyProviderConfig :: ProviderConfig
-emptyProviderConfig = ProviderConfig Nothing Nothing
+emptyProviderConfig = ProviderConfig Nothing Nothing Nothing
 
 -- | The @[web]@ section: web tool configuration. Every field is optional;
 -- a missing key decodes as 'Nothing' and the resolved default applies at
@@ -289,7 +304,6 @@ defaultRuntimeConfig = RuntimeConfig
   , rcRetrieval       = Nothing
   , rcSignal          = Nothing
   , rcTelegram        = Nothing
-  , rcGateway         = Nothing
   , rcDebugSessionTranscript = Nothing
   , rcDebugModelResponses = Nothing
   , rcMaxModelRetries = Nothing
@@ -303,6 +317,7 @@ defaultRuntimeConfig = RuntimeConfig
   , rcMaxTurns         = Nothing
   , rcToolTimeout      = Nothing
   , rcEmbedding        = Nothing
+  , rcChannels         = Map.empty
   }
 
 -- | 'WebConfig' with all fields absent (operator did not set them).
@@ -399,11 +414,23 @@ defaultDelegationConfig = DelegationFileConfig
 defaultRetrievalMaxScanBytes :: Int
 defaultRetrievalMaxScanBytes = 131072   -- 128 KiB
 
+-- | The compiled-in default for @max_model_retries@: how many times a failed
+-- model call is retried before the turn gives up. Used by
+-- 'Seal.Core.TurnEngine.modelRetriesFromConfig' and written out by the
+-- first-run @config.toml@ template, so a change lands in both.
+defaultMaxModelRetries :: Int
+defaultMaxModelRetries = 3
+
+-- | The compiled-in default for @model_retry_base_delay_ms@: the delay before
+-- the first retry. Same two consumers as 'defaultMaxModelRetries'.
+defaultModelRetryBaseDelayMs :: Int
+defaultModelRetryBaseDelayMs = 1000
+
 -- | The compiled-in default for the maximum tool-use iterations per turn.
 -- Used when the @max_turns@ key is absent (or the whole config is absent).
--- Mirrors Hermes' default (90).
+-- Raised from 90: long tool-driven tasks routinely hit the old ceiling.
 defaultMaxTurns :: Int
-defaultMaxTurns = 90
+defaultMaxTurns = 200
 
 -- | Resolve the per-turn max-iterations bound from the loaded config. Absent
 -- or non-positive values fall back to 'defaultMaxTurns'; values below 1 are
@@ -446,7 +473,6 @@ runtimeConfigCodec = RuntimeConfig
   <*> Toml.dioptional (Toml.table retrievalConfigCodec "retrieval") .= rcRetrieval
   <*> Toml.dioptional (Toml.table signalConfigCodec "signal")       .= rcSignal
   <*> Toml.dioptional (Toml.table telegramConfigCodec "telegram")   .= rcTelegram
-  <*> Toml.dioptional (Toml.table gatewayConfigCodec "gateway")    .= rcGateway
   <*> Toml.dioptional (Toml.bool "debug_session_transcript") .= rcDebugSessionTranscript
   <*> Toml.dioptional (Toml.bool "debug_model_responses") .= rcDebugModelResponses
   <*> Toml.dioptional (Toml.int "max_model_retries") .= rcMaxModelRetries
@@ -460,12 +486,14 @@ runtimeConfigCodec = RuntimeConfig
   <*> Toml.dioptional (Toml.int "max_turns")                    .= rcMaxTurns
   <*> Toml.dioptional (Toml.table toolTimeoutConfigCodec "tool_timeout") .= rcToolTimeout
   <*> Toml.dioptional (Toml.table embeddingConfigCodec "embedding")       .= rcEmbedding
+  <*> Toml.tableMap keyChannelIdBiMap (Toml.table channelConfigCodec) "channels" .= rcChannels
 
 -- | Bidirectional tomland codec for one @[providers.<label>]@ section.
 providerConfigCodec :: Toml.TomlCodec ProviderConfig
 providerConfigCodec = ProviderConfig
   <$> Toml.dioptional (Toml.text "default_model") .= pcDefaultModel
   <*> Toml.dioptional (Toml.text "base_url")      .= pcBaseUrl
+  <*> Toml.dioptional (arrayOfText "models")      .= pcModels
 
 -- | Bidirectional tomland codec for the @[tool_timeout]@ section. Every
 -- field is optional at the TOML layer; a missing key decodes as 'Nothing'
@@ -584,6 +612,55 @@ normalizeProvidersTable t =
         Toml.Leaf ("providers" :|| []) (mempty { Toml.tomlTables = Toml.single (p :|| ps) v })
 
 -- ---------------------------------------------------------------------------
+-- @channels@ table normalization
+-- ---------------------------------------------------------------------------
+
+-- | Parallel to 'normalizeProvidersTable' for the @[channels.\<id\>]@
+-- table. tomland's 'Toml.tableMap' silently returns an empty map when a
+-- config declares only @[channels.\<id\>]@ sub-tables and no bare
+-- @[channels]@ header (the idiomatic hand-written style). This walks the
+-- parsed AST once before decoding and makes that node explicit so both
+-- styles decode correctly. Round-tripped files (written by
+-- 'saveRuntimeConfig') already have an explicit node and pass through
+-- unchanged.
+normalizeChannelsTable :: Toml.TOML -> Toml.TOML
+normalizeChannelsTable t =
+  t { Toml.tomlTables = HashMap.adjust explicitNode "channels" (Toml.tomlTables t) }
+  where
+    explicitNode :: Toml.PrefixTree Toml.TOML -> Toml.PrefixTree Toml.TOML
+    explicitNode tree = case tree of
+      Toml.Branch pref Nothing children ->
+        Toml.Leaf pref (mempty { Toml.tomlTables = children })
+      Toml.Branch _ (Just _) _ -> tree
+      Toml.Leaf (_ :|| [])  _  -> tree
+      Toml.Leaf (_ :|| (p : ps)) v ->
+        Toml.Leaf ("channels" :|| []) (mempty { Toml.tomlTables = Toml.single (p :|| ps) v })
+
+-- ---------------------------------------------------------------------------
+-- Legacy channel migration (design §3.3)
+-- ---------------------------------------------------------------------------
+
+-- | Migrate legacy @[signal]@\/@[telegram]@ sections into 'rcChannels' on
+-- load. Per-id synthesis (not whole-map-empty): a legacy section is
+-- synthesized only when its default id (@\"signal\"@\/@\"telegram\"@) is
+-- /not/ already present in 'rcChannels', so an explicit
+-- @[channels.signal]@ wins over a legacy @[signal]@. A legacy section is
+-- migrated even when 'rcChannels' is non-empty (coexistence during the
+-- upgrade transition). 'fromTelegramConfig' preserves 'tcToken' in
+-- 'ccToken' so token-in-config setups survive migration. This is read-only
+-- migration — the legacy sections are NOT removed from the file.
+migrateLegacyChannels :: RuntimeConfig -> RuntimeConfig
+migrateLegacyChannels cfg =
+  let chans0 = rcChannels cfg
+      chans1 = case (Map.notMember (ChannelId "signal") chans0, rcSignal cfg) of
+        (True, Just sig) -> Map.insert (ChannelId "signal") (fromSignalConfig sig) chans0
+        _                -> chans0
+      chans2 = case (Map.notMember (ChannelId "telegram") chans1, rcTelegram cfg) of
+        (True, Just tg) -> Map.insert (ChannelId "telegram") (fromTelegramConfig tg) chans1
+        _               -> chans1
+  in cfg { rcChannels = chans2 }
+
+-- ---------------------------------------------------------------------------
 -- Public API
 -- ---------------------------------------------------------------------------
 
@@ -600,8 +677,8 @@ loadRuntimeConfig path = do
       contents <- TIO.readFile path
       pure $ case Toml.parse contents of
         Left err   -> Left (Toml.unTomlParseError err)
-        Right toml -> case Toml.runTomlCodec runtimeConfigCodec (normalizeProvidersTable toml) of
-          Success cfg  -> Right cfg
+        Right toml -> case Toml.runTomlCodec runtimeConfigCodec (normalizeChannelsTable (normalizeProvidersTable toml)) of
+          Success cfg  -> Right (migrateLegacyChannels cfg)
           Failure errs -> Left (Toml.prettyTomlDecodeErrors errs)
 
 -- | Save @cfg@ to @path@ atomically: write @path.tmp@, rename over @path@.
@@ -633,10 +710,28 @@ configWriteLock = unsafePerformIO (newMVar ())
 -- lost-update races (design V7).
 updateRuntimeConfig :: FilePath -> (RuntimeConfig -> RuntimeConfig) -> IO (Either Text ())
 updateRuntimeConfig path f = withMVar configWriteLock $ \_ -> do
-  result <- loadRuntimeConfig path
-  case result of
-    Left err  -> pure (Left err)
-    Right cfg -> saveRuntimeConfig path (f cfg) >> pure (Right ())
+  stillLegacy <- loadLegacyGatewayTable path
+  case stillLegacy of
+    Just _    -> pure (Left gatewayTableRefusal)
+    Nothing   -> do
+      result <- loadRuntimeConfig path
+      case result of
+        Left err  -> pure (Left err)
+        Right cfg -> saveRuntimeConfig path (f cfg) >> pure (Right ())
+
+-- | Why a @config.toml@ write stops while the file still carries @[gateway]@.
+--
+-- The gateway table lives in @security.toml@. A re-encode through
+-- 'runtimeConfigCodec' cannot carry a section the codec no longer knows, so
+-- writing here would delete the operator's bind address, and the migration
+-- could never recover it. Refusing is the only outcome that cannot lose the
+-- setting: the next @seal serve@ or @seal tui@ boot moves the table into
+-- @security.toml@ and the refusal clears.
+gatewayTableRefusal :: Text
+gatewayTableRefusal =
+  "config.toml still carries a [gateway] table, which this build cannot write "
+    <> "back. Start `seal serve` or `seal tui` once to move it into "
+    <> "~/.seal/security.toml, then retry."
 
 -- | The configured default model for provider @lbl@, if any.
 providerDefaultModel :: RuntimeConfig -> Text -> Maybe Text
@@ -645,6 +740,12 @@ providerDefaultModel cfg lbl = pcDefaultModel =<< Map.lookup lbl (rcProviders cf
 -- | The configured base URL for provider @lbl@, if any.
 providerBaseUrl :: RuntimeConfig -> Text -> Maybe Text
 providerBaseUrl cfg lbl = pcBaseUrl =<< Map.lookup lbl (rcProviders cfg)
+
+-- | The operator's frequently-used models for provider @lbl@. Absent means
+-- no suggestions (an empty list).
+providerModels :: RuntimeConfig -> Text -> [Text]
+providerModels cfg lbl =
+  fromMaybe [] (pcModels =<< Map.lookup lbl (rcProviders cfg))
 
 -- | The resolved operator ceiling on bytes scanned per retrieval. Falls back
 -- to 'defaultRetrievalMaxScanBytes' (128 KiB) when the @[retrieval]@ section
@@ -727,3 +828,35 @@ resolvedAvailableAgents cfg =
 upsertProvider :: Text -> (ProviderConfig -> ProviderConfig) -> RuntimeConfig -> RuntimeConfig
 upsertProvider lbl f cfg =
   cfg { rcProviders = Map.insertWith (\_ old -> f old) lbl (f emptyProviderConfig) (rcProviders cfg) }
+
+-- | Remove one provider section by name (used when deleting a custom
+-- OpenAI-compatible instance; built-ins keep their section).
+deleteProvider :: Text -> RuntimeConfig -> RuntimeConfig
+deleteProvider lbl cfg =
+  cfg { rcProviders = Map.delete lbl (rcProviders cfg) }
+
+-- | A 'ChannelConfig' with all optional fields absent and 'ccKind' defaulting
+-- to 'Signal'. Used by 'upsertChannel' as the seed when the id is absent.
+emptyChannelConfig :: ChannelConfig
+emptyChannelConfig = ChannelConfig
+  { ccKind           = Signal
+  , ccLabel          = Nothing
+  , ccAccount        = Nothing
+  , ccToken          = Nothing
+  , ccTextChunkLimit = Nothing
+  , ccAllowFrom      = AllowAll
+  }
+
+-- | Insert or update one channel by applying @f@ to its current config (or
+-- to 'emptyChannelConfig' if absent). Mirrors 'upsertProvider'.
+upsertChannel :: ChannelId -> (ChannelConfig -> ChannelConfig) -> RuntimeConfig -> RuntimeConfig
+upsertChannel cid f cfg =
+  cfg { rcChannels = Map.insertWith (\_ old -> f old) cid (f emptyChannelConfig) (rcChannels cfg) }
+
+-- | Remove a channel from 'rcChannels'. Idempotent — a no-op when the id is
+-- absent. (Nullifying the corresponding legacy @[signal]@\/@[telegram]@
+-- field to prevent re-synthesis on the next load is the caller's
+-- responsibility — see design §3.3 deletion-respawn prevention.)
+deleteChannel :: ChannelId -> RuntimeConfig -> RuntimeConfig
+deleteChannel cid cfg =
+  cfg { rcChannels = Map.delete cid (rcChannels cfg) }

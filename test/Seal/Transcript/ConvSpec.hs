@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 module Seal.Transcript.ConvSpec (spec) where
 
 import Data.ByteString (ByteString)
@@ -7,7 +8,8 @@ import Data.Text (Text)
 import Test.Hspec
 import Test.QuickCheck
 
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
+import Seal.Providers.Class
+  ( ContentBlock (..), Message (msgOrigin), pattern Message, MessageOrigin (..), Role (..) )
 import Seal.TestHelpers.Arbitrary ()
 import Seal.Transcript.Conv
 
@@ -28,6 +30,11 @@ appendAndRead written new =
 
 textMsgSimple :: Text -> Message
 textMsgSimple t = Message User [CbText t]
+
+-- | Drop every origin, so a property can state "nothing to render, nothing
+-- changes" over arbitrary messages.
+stripOrigins :: [Message] -> [Message]
+stripOrigins = map (\m -> m { msgOrigin = Nothing })
 
 spec :: Spec
 spec = describe "Seal.Transcript.Conv" $ do
@@ -62,6 +69,21 @@ spec = describe "Seal.Transcript.Conv" $ do
 
     it "reading an empty file yields no messages" $
       readConversation "" `shouldBe` []
+
+  describe "message origin" $ do
+    it "survives the round-trip through a conversation line" $ do
+      -- The origin travels with the message: the writer encodes whatever
+      -- 'Message' it is handed, so per-message provenance needs no extra
+      -- column in entries.jsonl.
+      let m = (textMsgSimple "hi")
+                { msgOrigin = Just (MessageOrigin "signal" (Just "+15551234567")
+                                     (Just "sig:+15551234567:abc") Nothing Nothing) }
+      readConversation (roundTripBody [m]) `shouldBe` [m]
+
+    it "keeps messages without an origin origin-less" $
+      property $ \msgs ->
+        readConversation (roundTripBody (stripOrigins msgs))
+          === stripOrigins msgs
 
   describe "end-to-end write-then-read" $
     it "writing the diff then reading back equals the full conversation" $

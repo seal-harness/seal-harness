@@ -24,6 +24,8 @@ module Seal.Gateway.Transcript
   , lastUserMessageAtFast
   , showIso
   , reconEntryToFrontend
+  , teLineToFrontend
+  , convLineToFrontend
   , trailingConvEntries
   ) where
 
@@ -482,6 +484,11 @@ teLineToFrontend rawLine =
           Just (A.String ch) -> Just ch
           _                  -> Nothing
         _ -> Nothing
+      mUserId = case KeyMap.lookup (k "meta") o of
+        Just (A.Object mo) -> case KeyMap.lookup (k "userId") mo of
+          Just (A.String u) -> Just u
+          _                 -> Nothing
+        _ -> Nothing
       mInternal = case KeyMap.lookup (k "meta") o of
         Just (A.Object mo) -> case KeyMap.lookup (k "internal") mo of
           Just (A.Bool b) -> Just b
@@ -491,10 +498,14 @@ teLineToFrontend rawLine =
      [ "id"        .= lookupT "id"
      , "timestamp" .= lookupT "timestamp"
      , "direction" .= lookupT "direction"
+     -- No convLen: a legacy transcript.jsonl line carries no trustworthy
+     -- position in conversation.jsonl, so these rows offer no branch
+     -- button rather than guessing one.
      , "payload"   .= payloadVal
      , "harness"   .= lookupT "correlation"
      , "model"     .= lookupT "model"
      , "channel"   .= mChannel
+     , "userId"    .= mUserId
     , "internal"  .= mInternal
      , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
      ]
@@ -545,6 +556,18 @@ convLineToFrontend model entryTimestamps fallbackTs idx rawLine =
       content = A.Array (V.fromList contentBlocks)
       direction :: Text
       direction = if T.toCaseFold role == "user" then "request" else "response"
+      -- A conversation line carries its own origin (channel + sender) when it
+      -- arrived over an authenticated chat channel. Surface it on the
+      -- synthesized entry so a session whose entries.jsonl is missing or torn
+      -- still labels each message with who sent it, exactly as the
+      -- entries-backed path does from erMeta.
+      mOrigin = KeyMap.lookup (k "origin") o
+      originField :: Text -> Maybe Text
+      originField key = case mOrigin of
+        Just (A.Object om) -> case KeyMap.lookup (k key) om of
+          Just (A.String t) -> Just t
+          _                 -> Nothing
+        _ -> Nothing
       payloadJson = if direction == "request"
         then A.object ["messages" A..= [A.object ["role" A..= ("user" :: Text), "content" A..= content]]]
         else A.object ["content" A..= content]
@@ -557,7 +580,12 @@ convLineToFrontend model entryTimestamps fallbackTs idx rawLine =
        , "payload"   .= payloadJson
        , "harness"   .= (Nothing :: Maybe Text)
        , "model"     .= model
-       , "channel"   .= (Nothing :: Maybe Text)
+       -- The branch anchor. This path has no entries.jsonl, so the line
+       -- index IS the position: after consuming line `idx`, the
+       -- conversation is `idx + 1` messages long.
+       , "convLen"   .= (idx + 1 :: Int)
+       , "channel"   .= originField "channel"
+       , "userId"    .= originField "userId"
       , "internal"  .= (Nothing :: Maybe Bool)
       , "raw"       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))
       ]
@@ -722,6 +750,9 @@ reconEntryToFrontend idx te =
           mChannel = case Map.lookup "channel" (teMeta te) of
             Just (A.String ch) -> Just ch
             _                  -> Nothing
+          mUserId = case Map.lookup "userId" (teMeta te) of
+            Just (A.String u) -> Just u
+            _                 -> Nothing
           mInternal = case Map.lookup "internal" (teMeta te) of
             Just (A.Bool b) -> Just b
             _               -> Nothing
@@ -748,7 +779,13 @@ reconEntryToFrontend idx te =
          -- "Assistant". Null for entries that have no model (non-LLM
          -- events, and legacy lines that never recorded one).
          , "model"     .= teModel te
+         -- The branch anchor: the conversation length AFTER this entry.
+         -- The web frontend needs a position in conversation.jsonl to
+         -- branch from; its row `id` is only a render index. Null when
+         -- the entry has no trustworthy position (legacy lines).
+         , "convLen"   .= teConvLen te
          , "channel"   .= mChannel
+         , "userId"    .= mUserId
         , "internal"  .= mInternal
          -- The `raw` field carries the full rewritten payload with tool
          -- input_schemas preserved, so the frontend's "View raw JSON"

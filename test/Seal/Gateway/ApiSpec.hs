@@ -1,21 +1,23 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PatternSynonyms #-}
 module Seal.Gateway.ApiSpec (spec) where
 
 import Control.Exception (try, SomeException)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent (threadDelay)
-import Control.Monad (forM_, replicateM_, void)
+import Control.Monad (forM_, replicateM_, void, when)
 import Data.Aeson ((.=))
 import Data.Aeson qualified as A
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString.Builder qualified as BSB
+import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromJust, isJust)
+import Data.Maybe (fromJust, fromMaybe, isJust, listToMaybe, mapMaybe)
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -27,7 +29,9 @@ import Network.Wai
   ( Application, Request, defaultRequest, pathInfo, requestMethod, responseStatus
   , queryString, setRequestBodyChunks )
 import Network.Wai.Internal (Response (..), ResponseReceived (..))
-import System.Directory (createDirectoryIfMissing, doesFileExist, findExecutable, removeDirectoryRecursive)
+import System.Directory
+  ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist, findExecutable
+  , removeDirectoryRecursive )
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.IO.Unsafe (unsafePerformIO)
@@ -40,26 +44,35 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec
   ( Availability (..), CommandGroup (..), CommandName (..), CommandSpec (..)
   , commandAction, mkRegistry )
+import Seal.Channels.Config (ChannelId (..), ChannelConfig (..), telegramVaultKeyFor)
+import Seal.Core.ChannelKind (ChannelKind (..))
+import Seal.Telegram.Config (TelegramConfig (..), defaultTelegramConfig)
 import Seal.Command.Skill (skillCommandSpec)
-import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig)
-import Seal.Config.Paths (SealPaths (..), sessionDir, sessionMetaPath, sshAgentsDir)
+import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerModels, saveRuntimeConfig)
+import Seal.Config.Paths
+  ( SealPaths (..), sessionConversationPath, sessionDir, sessionMetaPath
+  , sessionWorkdir, sshAgentsDir )
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types
   ( ModelId (..), SessionId, mkSystemSessionId, mkSessionId, sessionIdText
   , ToolCallId (..), OpName (..) )
 import Seal.Gateway.API
+import Seal.Gateway.Setup (stubSetupDeps)
 import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webCallDispatcher, mkWebTurnDeps, newSessionWakeMutex)
 import Seal.Gateway.Stream (StreamHealth (..))
 import Seal.Gateway.StreamBroker (newStreamBroker, setThinking)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
+import Seal.Cron.Store (CronStore (..), memoryCronStore)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Harness.Tmux (mkRealTmuxRunner)
 import Seal.Handles.AskReply (newApprovalCache, newAskReplyStore)
 import Seal.Ingest (emptyChain)
 import Seal.Providers.Class
-  ( ContentBlock (..), Message (..), Role (..), ToolResultPart (..)
+  ( ContentBlock (..), Message, pattern Message, Role (..), ToolResultPart (..)
   , SomeProvider (..), Provider (..), CompletionResponse (..), StopReason (..), Usage (..) )
+import Seal.Providers.ContextWindow (modelContextWindow)
+import Seal.Providers.OllamaReadiness (OllamaReadiness (..))
 import Seal.Providers.Registry (KnownProvider (..), knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
@@ -77,10 +90,11 @@ import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store
   ( SessionRuntime (..), listSessions, newSession, saveSessionMeta )
 import Seal.TestHelpers.ApiTestHarness
-  ( ApiTestEnv (..), defaultApiTestOptions, runApiTestLocal )
+  ( ApiTestEnv (..), defaultApiTestOptions, noOllamaReadiness, runApiTestLocal )
 import Options.Applicative (info)
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry, replySubscribe)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
 import Seal.ISA.RepeatDetect (SessionRepeatRegistry, newSessionRepeatRegistry)
 import Seal.Skills.Backend qualified as Skill (noneBackend, sbCreate)
 import Seal.Skills.Types (Skill (..), mkSkillId)
@@ -154,7 +168,7 @@ stubHandle = ChannelHandle
 fakeMeta :: SessionMeta
 fakeMeta =
   let sid = case mkSessionId "test" of Right s -> s; Left _ -> error "sid"
-  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0) mempty
+  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0) mempty
 
 -- | Look up a string-keyed field in an Aeson object, for test assertions.
 lookupK :: T.Text -> KeyMap.KeyMap A.Value -> Maybe A.Value
@@ -217,6 +231,14 @@ runAppStatus app req = do
 -- | Run the app against a test request, capturing the status code and body.
 -- The API builds responses with `responseLBS` (a `ResponseBuilder`), so we
 -- pattern-match on the constructor and run the builder to a lazy ByteString.
+-- | A conversation.jsonl line carrying a single user text message.
+userConvLine :: T.Text -> BS.ByteString
+userConvLine t =
+  BL.toStrict (A.encode (A.object
+    [ "role" .= ("user" :: T.Text)
+    , "content" .= [ A.object [ "tag" .= ("CbText" :: T.Text), "contents" .= t ] ]
+    ])) <> "\n"
+
 runAppBody :: Application -> Request -> IO (Int, BL.ByteString)
 runAppBody app req = do
   mv <- newEmptyMVar
@@ -243,6 +265,17 @@ runAppBodyHeaders app req = do
     putMVar mv (st, body, hdrs)
     pure ResponseReceived)
   takeMVar mv
+
+-- | Extract the status code + body from a 'Response' the API built directly
+-- (with `responseLBS`, so a `ResponseBuilder`), for unit-testing the pure
+-- response mappers without going through 'Application'.
+respStatusBody :: Response -> (Int, BL.ByteString)
+respStatusBody resp =
+  ( statusCode (responseStatus resp)
+  , case resp of
+      ResponseBuilder _ _ b -> BSB.toLazyByteString b
+      _                     -> BL.fromStrict BC.empty
+  )
 
 -- | A test scribe that captures log items into an IORef for assertions.
 -- Mirrors 'Seal.Logging.LoggerSpec.mkCaptureScribe' and the pattern in
@@ -294,6 +327,7 @@ mkDepsFor paths = do
     , adAgentDefs       = adb
     , adSkills          = skills
     , adProviders       = pure knownProviders
+    , adOllamaReadiness = noOllamaReadiness
     , adUiState         = uiState
     , adSend            = Nothing
     , adDefaultAgent    = pure Nothing
@@ -302,8 +336,16 @@ mkDepsFor paths = do
     , adRepoRegistry     = repoRegH
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
     }
@@ -464,6 +506,7 @@ mkProviderTestDeps tmp cfgRoot vr = do
     , adAgentDefs       = adb
     , adSkills          = skills
     , adProviders       = pure knownProviders
+    , adOllamaReadiness = noOllamaReadiness
     , adUiState         = uiState
     , adSend            = Nothing
     , adDefaultAgent    = pure Nothing
@@ -472,11 +515,19 @@ mkProviderTestDeps tmp cfgRoot vr = do
     , adRepoRegistry     = fakeRepoRegistryHandle
     , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-    , adVault            = vr
+    , adVault            = vr, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
     , adPaths            = fakePaths
     
     , adWsHealth = pure (StreamHealth "up" 8081)
     , adAbortReg         = testAbortReg
+    , adCronStore = stubCronStore
+    , adFileExplorer = mkFailClosedFileExplorer
+    , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig   = defaultSecurityConfig
     , adMkSessionExec    = Nothing
     }
@@ -517,6 +568,19 @@ waitForPoll totalWaitUs readAction predicate = go totalWaitUs
               threadDelay stepUs
               go (remaining - stepUs)
 
+stubCronStore :: CronStore
+stubCronStore = CronStore
+  { csCreate    = \_ -> error "cron store stub: csCreate"
+  , csRead      = \_ -> error "cron store stub: csRead"
+  , csList      = \_ -> error "cron store stub: csList"
+  , csSave      = \_ -> error "cron store stub: csSave"
+  , csDelete    = \_ -> error "cron store stub: csDelete"
+  , csRecordRun = \_ _ -> error "cron store stub: csRecordRun"
+  , csListRuns  = \_ _ -> error "cron store stub: csListRuns"
+  , csUpdateRun = \_ _ -> error "cron store stub: csUpdateRun"
+  , csLock = error "cron store stub: csLock"
+  }
+
 spec :: Spec
 spec = describe "Seal.Gateway.API" $ do
   -- Shared temp dir for all mkApp-based tests. POST /api/tabs/new with
@@ -533,6 +597,11 @@ spec = describe "Seal.Gateway.API" $ do
   let mkPaths = fakePaths { spState = sharedStateDir }
       mkApp = apiApp <$> mkDepsFor mkPaths
       mkAppWithHealth health = apiApp <$> mkDepsWithHealth mkPaths health
+      -- An app whose Ollama readiness seam reports a chosen state, so the
+      -- wire shape can be asserted (tests 9/10/11/31/32).
+      mkAppWithReadiness r = do
+        d <- mkDepsFor mkPaths
+        pure (apiApp d { adOllamaReadiness = pure r })
 
   it "GET /api/health returns 200" $ do
     app <- mkApp
@@ -610,6 +679,115 @@ spec = describe "Seal.Gateway.API" $ do
     -- session, so any on-disk session here is an orphan from this call.
     sessions <- listSessions paths
     sessions `shouldSatisfy` null
+
+  it "POST /api/tabs/new {branch_from} WITHOUT branch_conv_len returns 400 (never a silent empty session)" $ do
+    app <- mkApp
+    req <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("provider" :: T.Text)
+        , "provider" .= ("anthropic" :: T.Text)
+        , "model" .= ("claude-sonnet-4" :: T.Text)
+        , "branch_from" .= ("20260101-000000-000" :: T.Text)
+        ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "POST /api/tabs/new {branch_from} naming an unknown session returns 404" $ do
+    app <- mkApp
+    req <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("provider" :: T.Text)
+        , "provider" .= ("anthropic" :: T.Text)
+        , "model" .= ("claude-sonnet-4" :: T.Text)
+        , "branch_from" .= ("20260101-000000-000" :: T.Text)
+        , "branch_conv_len" .= (3 :: Int)
+        ]))
+    status <- runAppStatus app req
+    status `shouldBe` 404
+
+  it "POST /api/tabs/new with NEITHER branch field is a plain provider session (unchanged)" $ do
+    dir <- withSystemTempDirectory "seal-api-plain" $ \d -> do
+      createDirectoryIfMissing True (d </> "sessions")
+      pure d
+    let pathsPlain = fakePaths { spState = dir }
+    deps <- mkDepsFor pathsPlain
+    let appPlain = apiApp deps
+    req <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("provider" :: T.Text)
+        , "provider" .= ("anthropic" :: T.Text)
+        , "model" .= ("claude-sonnet-4" :: T.Text)
+        ]))
+    status <- runAppStatus appPlain req
+    status `shouldBe` 200
+    sessionsPlain <- listSessions pathsPlain
+    length sessionsPlain `shouldBe` (1 :: Int)
+
+  it "END-TO-END: branching copies the parent transcript prefix into the child" $ do
+    dir <- withSystemTempDirectory "seal-api-branch-e2e" $ \d -> do
+      createDirectoryIfMissing True (d </> "sessions")
+      pure d
+    let pathsB = fakePaths { spState = dir }
+    deps <- mkDepsFor pathsB
+    let appB = apiApp deps
+    -- 1. Create a parent session via the real endpoint.
+    reqParent <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("provider" :: T.Text)
+        , "provider" .= ("anthropic" :: T.Text)
+        , "model" .= ("claude-sonnet-4" :: T.Text)
+        ]))
+    (statusParent, bodyParent) <- runAppBody appB reqParent
+    statusParent `shouldBe` 200
+    parentSidText <- case A.decode bodyParent of
+      Just (A.Object o) -> case KeyMap.lookup (Key.fromText "session_id") o of
+        Just (A.String t) -> pure t
+        _                 -> expectationFailure "no session_id" >> pure ""
+      _ -> expectationFailure "bad body" >> pure ""
+    parentSid <- case mkSessionId parentSidText of
+      Right x  -> pure x
+      Left err -> expectationFailure (T.unpack err) >> fail "bad sid"
+    -- 2. Give the parent a conversation.
+    createDirectoryIfMissing True (sessionDir pathsB parentSid)
+    BS.writeFile (sessionConversationPath pathsB parentSid)
+      (BS.concat [ userConvLine "one", userConvLine "two", userConvLine "three" ])
+    -- 2b. Session ids are timestamp-derived to the MILLISECOND, so minting
+    -- the child in the same millisecond as the parent yields the SAME id —
+    -- and branchSession refuses to clobber an existing session (a
+    -- deliberate guard). Pause past a millisecond before branching. Real
+    -- usage always has a human click between the two.
+    threadDelay 20000
+    -- 3. Branch from it at 2 lines.
+    reqBranch <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("provider" :: T.Text)
+        , "provider" .= ("anthropic" :: T.Text)
+        , "model" .= ("claude-sonnet-4" :: T.Text)
+        , "branch_from" .= parentSidText
+        , "branch_conv_len" .= (2 :: Int)
+        ]))
+    (statusBranch, bodyBranch) <- runAppBody appB reqBranch
+    when (statusBranch /= 200) $
+      expectationFailure
+        ("branch failed: status=" <> show statusBranch
+         <> " body=" <> show bodyBranch)
+    childSidText <- case A.decode bodyBranch of
+      Just (A.Object o) -> case KeyMap.lookup (Key.fromText "session_id") o of
+        Just (A.String t) -> pure t
+        _                 -> expectationFailure "no child session_id" >> pure ""
+      _ -> expectationFailure "bad body" >> pure ""
+    childSid <- case mkSessionId childSidText of
+      Right x  -> pure x
+      Left err -> expectationFailure (T.unpack err) >> fail "bad child sid"
+    -- 4. The child has exactly the first two conversation lines.
+    childConv <- BS.readFile (sessionConversationPath pathsB childSid)
+    childConv `shouldBe` BS.concat [ userConvLine "one", userConvLine "two" ]
+    -- 5. The child's workdir does not exist (empty by construction).
+    wdExists <- doesDirectoryExist (sessionWorkdir pathsB childSid)
+    wdExists `shouldBe` False
+    -- 6. The child does not inherit the parent's repo metadata.
+    meta <- readSessionMeta pathsB childSid
+    smRepoUrl meta `shouldBe` Nothing
 
   it "POST /api/tabs/new with kind=shell returns 501" $ do
     app <- mkApp
@@ -704,6 +882,14 @@ spec = describe "Seal.Gateway.API" $ do
         , "allowed_secrets" .= A.Array (V.fromList [ A.String "foo" ]) ]))
     status <- runAppStatus app req
     status `shouldBe` 200
+
+  it "POST /api/sessions/new honors an explicit channel (chat-channel origin)" $ do
+    metaTg <- postSessionNewMeta (A.object [ "channel" .= ("telegram" :: T.Text) ])
+    smChannel metaTg `shouldBe` "telegram"
+    -- headless still wins: a bg session must stay "bg".
+    metaBg <- postSessionNewMeta
+      (A.object [ "channel" .= ("telegram" :: T.Text), "headless" .= True ])
+    smChannel metaBg `shouldBe` "bg"
 
   it "POST /api/sessions/:id/new on a nonexistent session returns 404" $ do
     app <- mkApp
@@ -851,6 +1037,73 @@ spec = describe "Seal.Gateway.API" $ do
           , "provider"     .= ("p" :: T.Text)
           , "model"        .= ("m" :: T.Text)
           ]
+
+  -- ── WU-3: the POST /api/sessions/:id/setup-repo body parser (widened from
+  -- the url-only 'parseRepoUrl') and the response mapper. Both are pure, so
+  -- they are pinned directly rather than through the HTTP wiring.
+  describe "parseSetupRepoBody" $ do
+    let url = "https://github.com/o/r" :: T.Text
+    it "returns the url with no branch when the branch is absent" $
+      parseSetupRepoBody (A.encode (A.object ["url" .= url]))
+        `shouldBe` Just (url, Nothing)
+
+    it "returns the branch when it is a non-blank string" $
+      parseSetupRepoBody (A.encode (A.object
+        [ "url" .= url, "branch" .= ("dev" :: T.Text) ]))
+        `shouldBe` Just (url, Just "dev")
+
+    it "treats an empty branch as absent" $
+      parseSetupRepoBody (A.encode (A.object
+        [ "url" .= url, "branch" .= ("" :: T.Text) ]))
+        `shouldBe` Just (url, Nothing)
+
+    it "treats a whitespace-only branch as absent" $
+      parseSetupRepoBody (A.encode (A.object
+        [ "url" .= url, "branch" .= ("   " :: T.Text) ]))
+        `shouldBe` Just (url, Nothing)
+
+    it "treats a null branch as absent" $
+      parseSetupRepoBody (A.encode (A.object
+        [ "url" .= url, "branch" .= A.Null ]))
+        `shouldBe` Just (url, Nothing)
+
+    it "never reads a non-string branch as a branch" $
+      parseSetupRepoBody (A.encode (A.object
+        [ "url" .= url, "branch" .= (42 :: Int) ]))
+        `shouldBe` Just (url, Nothing)
+
+    it "rejects a body with no url" $
+      parseSetupRepoBody (A.encode (A.object ["branch" .= ("dev" :: T.Text)]))
+        `shouldBe` (Nothing :: Maybe (T.Text, Maybe T.Text))
+
+    it "rejects a blank url" $
+      parseSetupRepoBody (A.encode (A.object ["url" .= ("" :: T.Text)]))
+        `shouldBe` (Nothing :: Maybe (T.Text, Maybe T.Text))
+
+    it "rejects a body that is not a JSON object" $ do
+      parseSetupRepoBody "not json"
+        `shouldBe` (Nothing :: Maybe (T.Text, Maybe T.Text))
+      parseSetupRepoBody "[1,2,3]"
+        `shouldBe` (Nothing :: Maybe (T.Text, Maybe T.Text))
+
+  -- The response mapper is pinned directly (rather than over HTTP): the route
+  -- hands 'handleSetupRepo's 'Either' straight to it.
+  describe "handleSetupRepoResponse" $ do
+    it "maps a Left to 400 carrying the error text" $ do
+      let (st, body) = respStatusBody
+            (handleSetupRepoResponse (Left "SETUP_REPO: invalid branch: bad branch"))
+      st `shouldBe` 400
+      o <- decodedObject body
+      lookupK "error" o
+        `shouldBe` Just (A.String "SETUP_REPO: invalid branch: bad branch")
+
+    it "maps a Right to 200 {ok:true, message}" $ do
+      let (st, body) = respStatusBody
+            (handleSetupRepoResponse (Right "cloned r (dev)"))
+      st `shouldBe` 200
+      o <- decodedObject body
+      lookupK "ok" o `shouldBe` Just (A.Bool True)
+      lookupK "message" o `shouldBe` Just (A.String "cloned r (dev)")
 
   -- ── WU-6: GET /api/commands — the slash-command menu the chat channels
   -- render (/help on Signal/Telegram). Canonical names only, no aliases.
@@ -1025,7 +1278,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -1055,7 +1308,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -1086,7 +1339,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -1109,7 +1362,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -1149,7 +1402,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -1641,7 +1894,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -1676,7 +1929,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = (SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = (SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty)
                   { smDescription = Just "old name" }
@@ -1704,7 +1957,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -1721,7 +1974,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -1801,7 +2054,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -1832,7 +2085,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -1857,7 +2110,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -1883,7 +2136,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -1922,7 +2175,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -1940,7 +2193,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -1965,7 +2218,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -1983,7 +2236,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -2016,7 +2269,7 @@ spec = describe "Seal.Gateway.API" $ do
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
       let aid = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "aid"
-          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just aid) (Just "one-off") Nothing Nothing True mempty
+          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just aid) (Just "one-off") Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -2043,7 +2296,7 @@ spec = describe "Seal.Gateway.API" $ do
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
       let aid = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "aid"
-          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just aid) Nothing Nothing Nothing True mempty
+          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just aid) Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -2068,7 +2321,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing (Just "one-off") Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing (Just "one-off") Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -2096,7 +2349,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -2120,7 +2373,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -2150,7 +2403,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -2168,7 +2421,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -2191,7 +2444,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
           fileContent = "---\nid: my-uploaded-agent\n---\nYou are a helpful agent."
@@ -2218,7 +2471,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
           fileContent = "You are a helpful agent with no frontmatter."
@@ -2243,7 +2496,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing (Just "my-uploaded-agent") Nothing True mempty
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing (Just "my-uploaded-agent") Nothing True Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0) mempty
       saveSessionMeta paths meta
@@ -2257,6 +2510,34 @@ spec = describe "Seal.Gateway.API" $ do
       case arr of
         (A.Object o : _) -> lookupK "agent" o `shouldBe` Just (A.String "my-uploaded-agent")
         _                -> expectationFailure "no session row"
+
+  it "GET /api/sessions/:id/workdir returns 200 + the local workdir path" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let cacheDir = stateDir </> "cache"
+          paths = fakePaths { spState = stateDir, spCache = cacheDir }
+          sidTxt = "20260701-120000-099"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0) mempty
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sidTxt, "workdir"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> case lookupK "path" o of
+          Just (A.String p) ->
+            p `shouldBe` T.pack (cacheDir </> "workdirs" </> T.unpack sidTxt)
+          other -> expectationFailure ("expected path string, got: " <> show other)
+        _ -> expectationFailure ("expected JSON object, got: " <> show body)
+
+  it "GET /api/sessions/:id/workdir returns 404 for an unknown session" $ do
+    app <- mkApp
+    status <- runAppStatus app (testRequest methodGet ["api", "sessions", "unknown-sid-999", "workdir"])
+    status `shouldBe` 404
 
   it "GET /api/agents returns 200 with a JSON array" $ do
     app <- mkApp
@@ -2289,6 +2570,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adAgentDefs       = adb
                 , adSkills          = skills
                 , adProviders       = pure knownProviders
+                , adOllamaReadiness = noOllamaReadiness
                 , adUiState         = uiState
                 , adSend            = Nothing
                  , adDefaultAgent    = pure (Just "zoe")
@@ -2297,8 +2579,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                  }
@@ -2365,6 +2655,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = adb
             , adSkills          = bSkills backends
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Nothing
              , adDefaultAgent    = do
@@ -2375,8 +2666,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2433,6 +2732,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = adb
             , adSkills          = bSkills backends
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = do
@@ -2443,8 +2743,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -2504,6 +2812,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2512,8 +2821,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2598,6 +2915,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2606,8 +2924,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2657,6 +2983,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2665,8 +2992,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2715,6 +3050,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2723,8 +3059,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2754,6 +3098,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2762,8 +3107,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2845,6 +3198,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2853,8 +3207,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2902,6 +3264,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2910,8 +3273,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -2958,6 +3329,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -2966,8 +3338,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3008,6 +3388,7 @@ spec = describe "Seal.Gateway.API" $ do
           , adAgentDefs       = adb
           , adSkills          = skills
           , adProviders       = pure knownProviders
+          , adOllamaReadiness = noOllamaReadiness
           , adUiState         = uiState
           , adSend            = Nothing
           , adDefaultAgent    = pure Nothing
@@ -3016,8 +3397,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
           }
@@ -3067,6 +3456,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = adb
             , adSkills          = skills
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = pure Nothing
@@ -3075,8 +3465,16 @@ spec = describe "Seal.Gateway.API" $ do
             , adRepoRegistry     = repoRegH
         , adAgentRegistry    = fakeAgentRegH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3328,6 +3726,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adAgentDefs       = adb
                 , adSkills          = skills
                 , adProviders       = pure knownProviders
+                , adOllamaReadiness = noOllamaReadiness
                 , adUiState         = uiState
                 , adSend            = Nothing
                 , adDefaultAgent    = pure Nothing
@@ -3336,11 +3735,19 @@ spec = describe "Seal.Gateway.API" $ do
                 , adRepoRegistry     = repoRegH
         , adAgentRegistry    = fakeAgentRegH
                 , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = vault
+                , adVault            = vault, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = paths
                 
                 , adWsHealth = pure (StreamHealth "up" 8081)
                 , adAbortReg         = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
                 }
@@ -3518,6 +3925,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adAgentDefs       = adb
                 , adSkills          = skills
                 , adProviders       = pure knownProviders
+                , adOllamaReadiness = noOllamaReadiness
                 , adUiState         = uiState
                 , adSend            = Nothing
                 , adDefaultAgent    = pure Nothing
@@ -3526,11 +3934,19 @@ spec = describe "Seal.Gateway.API" $ do
                 , adRepoRegistry     = repoRegH
         , adAgentRegistry    = fakeAgentRegH
                 , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = vault
+                , adVault            = vault, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = paths
                 
                 , adWsHealth = pure (StreamHealth "up" 8081)
                 , adAbortReg         = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
                 , adSecurityConfig   = defaultSecurityConfig
                 , adMkSessionExec    = Nothing
                 }
@@ -3593,6 +4009,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = adb
             , adSkills          = skills
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = pure Nothing
@@ -3601,8 +4018,16 @@ spec = describe "Seal.Gateway.API" $ do
             , adRepoRegistry     = corruptH
         , adAgentRegistry    = fakeAgentRegH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -3637,6 +4062,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = adb
             , adSkills          = skills
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = pure Nothing
@@ -3645,11 +4071,19 @@ spec = describe "Seal.Gateway.API" $ do
             , adRepoRegistry     = repoRegH
             , adAgentRegistry    = fakeAgentRegH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-            , adVault            = vr
+            , adVault            = vr, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
             , adPaths            = fakePaths
             
             , adWsHealth = pure (StreamHealth "up" 8081)
             , adAbortReg         = testAbortReg
+            , adCronStore = stubCronStore
+            , adFileExplorer = mkFailClosedFileExplorer
+            , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
             }
@@ -3822,6 +4256,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = adb
             , adSkills          = skills
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Nothing
             , adDefaultAgent    = pure Nothing
@@ -3830,11 +4265,19 @@ spec = describe "Seal.Gateway.API" $ do
             , adRepoRegistry     = repoRegH
         , adAgentRegistry    = fakeAgentRegH
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-            , adVault            = vr
+            , adVault            = vr, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
             , adPaths            = paths
             
             , adWsHealth = pure (StreamHealth "up" 8081)
             , adAbortReg         = testAbortReg
+            , adCronStore = stubCronStore
+            , adFileExplorer = mkFailClosedFileExplorer
+            , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
             , adSecurityConfig   = defaultSecurityConfig
             , adMkSessionExec    = Nothing
             }
@@ -4153,6 +4596,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adAgentDefs       = adb
                 , adSkills          = skills
                 , adProviders       = pure [OllamaProvider]
+                , adOllamaReadiness = noOllamaReadiness
                 , adUiState         = uiState
                 , adSend            = Nothing
                 , adDefaultAgent    = pure Nothing
@@ -4161,8 +4605,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -4172,7 +4624,7 @@ spec = describe "Seal.Gateway.API" $ do
     let arr = case A.decode body :: Maybe [A.Value] of
           Just xs -> xs
           Nothing -> error ("could not decode providers body: " ++ show body)
-    -- Every known provider is present (anthropic, ollama, openrouter).
+    -- Every known provider is present (all six, in D2 order).
     length arr `shouldBe` length knownProviders
     -- Each entry has a name; build a name -> configured map.
     let entries = [ (n, c) | e <- arr, A.Object o <- [e]
@@ -4186,7 +4638,10 @@ spec = describe "Seal.Gateway.API" $ do
     byName `shouldBe` Map.fromList
               [ ("anthropic", False)
               , ("ollama", True)
+              , ("ollama-cloud", False)
               , ("openrouter", False)
+              , ("openai", False)
+              , ("openai-compatible", False)
               ]
 
   it "GET /api/providers/anthropic/models returns 200" $ do
@@ -4199,6 +4654,131 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app (testRequest methodGet
       ["api", "providers", "anthropic", "models", "claude-sonnet-4-20250514", "context"])
     status `shouldBe` 200
+
+  -- Design item 21: the OpenAI static list is non-empty, and EVERY id in it is
+  -- sized by ContextWindow.hs (modelContextWindow returns Int, not Maybe, so
+  -- an unknown id scores 0 and the UI would render no percentage). Also pins
+  -- that Ollama Cloud's list stays empty - its catalogue is the operator's own.
+  it "item 21: the OpenAI static model list is non-empty and every id is sized" $ do
+    app <- mkApp
+    (status, body) <- runAppBody app
+      (testRequest methodGet ["api", "providers", "openai", "models"])
+    status `shouldBe` 200
+    let entries = case A.decode body :: Maybe [A.Value] of
+          Just xs -> xs
+          Nothing -> error ("could not decode models body: " ++ show body)
+        ids = [ i | A.Object o <- entries, Just (A.String i) <- [lookupK "name" o] ]
+    ids `shouldSatisfy` (not . null)
+    -- Every published id must resolve to a positive context window, or the UI
+    -- shows a model it cannot size.
+    forM_ ids $ \i ->
+      modelContextWindow i `shouldSatisfy` (> 0)
+    -- The contextWindow field the wire carries agrees with the lookup.
+    forM_ entries $ \case
+      A.Object o -> case (lookupK "name" o, lookupK "contextWindow" o) of
+        (Just (A.String i), Just (A.Number w)) ->
+          w `shouldBe` fromIntegral (modelContextWindow i)
+        _ -> expectationFailure "expected name + contextWindow"
+      _ -> expectationFailure "expected object"
+    -- gpt-4o is deliberately absent: ContextWindow's clause is "gpt-4o-" with a
+    -- trailing dash, so the bare id scores 0.
+    ids `shouldSatisfy` notElem "gpt-4o"
+
+  it "item 21: the Ollama Cloud static model list is empty" $ do
+    app <- mkApp
+    (status, body) <- runAppBody app
+      (testRequest methodGet ["api", "providers", "ollama-cloud", "models"])
+    status `shouldBe` 200
+    (A.decode body :: Maybe [A.Value]) `shouldBe` Just []
+
+  -- Items 26-27: /api/providers/all carries the two 1:1 booleans, and a custom
+  -- instance is typed openai-compatible. Uses the real temp-config harness so
+  -- the routes see a genuine install.
+  it "items 26-27: /api/providers/all carries requiresBaseUrl/requiresName" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      (status, body) <- runAppBody (apiApp deps)
+        (testRequest methodGet ["api", "providers", "all"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode providers/all: " ++ show body)
+          row n = [ o | A.Object o <- arr, lookupK "name" o == Just (A.String n) ]
+          boolAt n k = case row n of
+            (o:_) -> case lookupK k o of
+              Just (A.Bool b) -> Just b
+              _ -> Nothing
+            [] -> Nothing
+      -- Only the generic type requires an operator-supplied endpoint and name.
+      boolAt "openai-compatible" "requiresBaseUrl" `shouldBe` Just True
+      boolAt "openai-compatible" "requiresName" `shouldBe` Just True
+      boolAt "openai" "requiresBaseUrl" `shouldBe` Just False
+      boolAt "openai" "requiresName" `shouldBe` Just False
+      boolAt "ollama-cloud" "requiresBaseUrl" `shouldBe` Just False
+      boolAt "ollama-cloud" "requiresName" `shouldBe` Just False
+      -- Ollama's base URL is optional but STILL SHOWN, so the flag is False
+      -- while the field renders (D7: required is not visible).
+      boolAt "ollama" "requiresBaseUrl" `shouldBe` Just False
+
+  -- Item 27b: the PUT path's typeId (resolveExistingTarget) is a SECOND
+  -- literal from the create path's; a create-only test cannot see it.
+  it "item 27b: a PUT on a custom instance echoes type openai-compatible" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("local-vllm" :: T.Text)
+          , "type" .= ("openai-compatible" :: T.Text)
+          , "api_key" .= ("sk-local" :: T.Text)
+          , "base_url" .= ("http://localhost:8000/v1" :: T.Text)
+          ]))
+      (createStatus, _) <- runAppBody app req
+      createStatus `shouldBe` 201
+      putReq <- testPut ["api", "providers", "local-vllm"]
+        (A.encode (A.object [ "default_model" .= ("my-model" :: T.Text) ]))
+      (status, body) <- runAppBody app putReq
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) ->
+          lookupK "type" o `shouldBe` Just (A.String "openai-compatible")
+        _ -> expectationFailure "expected a JSON object"
+
+  -- Item 33: a custom instance must NOT inherit Ollama readiness. The typeId
+  -- guard at API.hs:3246 becomes a tautology if it still says "openai".
+  it "item 33: a custom instance carries no readiness keys" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("local-vllm" :: T.Text)
+          , "type" .= ("openai-compatible" :: T.Text)
+          , "api_key" .= ("sk-local" :: T.Text)
+          , "base_url" .= ("http://localhost:8000/v1" :: T.Text)
+          ]))
+      (createStatus, _) <- runAppBody app req
+      createStatus `shouldBe` 201
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "providers", "all"])
+      let arr = fromMaybe [] (A.decode body :: Maybe [A.Value])
+          row = [ o | A.Object o <- arr, lookupK "name" o == Just (A.String "local-vllm") ]
+      case row of
+        (o:_) -> do
+          lookupK "readiness" o `shouldBe` Nothing
+          lookupK "readinessModels" o `shouldBe` Nothing
+        [] -> expectationFailure "custom instance missing from providers/all"
 
   it "GET /api/providers/unknown/models returns 200 with []" $ do
     app <- mkApp
@@ -4219,6 +4799,168 @@ spec = describe "Seal.Gateway.API" $ do
         lookupK "isDefault" o `shouldSatisfy` isJust
         lookupK "authStatus" o `shouldSatisfy` isJust
       _ -> expectationFailure "expected object"
+
+  describe "readiness on the wire (tests 9-11, 30-33b)" $ do
+
+    it "31: GET /api/providers emits readiness + readiness_models for Ollama only" $ do
+      app <- mkAppWithReadiness (RdReady 3)
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe [A.Value] of
+        Nothing -> expectationFailure "could not decode /api/providers"
+        Just arr -> forM_ arr $ \case
+          A.Object o -> case lookupK "name" o of
+            Just (A.String "ollama") -> do
+              lookupK "readiness" o `shouldBe` Just (A.String "ready")
+              -- snake_case on this endpoint.
+              lookupK "readiness_models" o `shouldBe` Just (A.Number 3)
+            Just (A.String _) -> do
+              -- ABSENT, not null, for every other provider.
+              lookupK "readiness" o `shouldBe` Nothing
+              lookupK "readiness_models" o `shouldBe` Nothing
+            _ -> pure ()
+          _ -> expectationFailure "expected object"
+
+    it "31b: for a non-Ollama provider the keys are ABSENT, not null" $ do
+      -- `(.=)` on a Maybe emits an explicit null, which is a THIRD state no
+      -- frontend consumer handles (`readiness === undefined` is the
+      -- absent-field fallback). This asserts key absence, not null-ness.
+      app <- mkAppWithReadiness (RdReady 2)
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
+      case A.decode body :: Maybe [A.Value] of
+        Nothing -> expectationFailure "could not decode /api/providers"
+        Just arr -> forM_ arr $ \case
+          A.Object o -> case lookupK "name" o of
+            Just (A.String "ollama") -> pure ()
+            Just (A.String _) -> do
+              KeyMap.member (Key.fromText "readiness") o `shouldBe` False
+              KeyMap.member (Key.fromText "readiness_models") o `shouldBe` False
+            _ -> pure ()
+          _ -> expectationFailure "expected object"
+
+    it "9: a not-running Ollama carries readiness and NO count" $ do
+      app <- mkAppWithReadiness RdNotRunning
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
+      case A.decode body :: Maybe [A.Value] of
+        Nothing -> expectationFailure "could not decode /api/providers"
+        Just arr -> forM_ arr $ \case
+          A.Object o -> case lookupK "name" o of
+            Just (A.String "ollama") -> do
+              lookupK "readiness" o `shouldBe` Just (A.String "not-running")
+              lookupK "readiness_models" o `shouldBe` Nothing
+            _ -> pure ()
+          _ -> pure ()
+
+    it "10: GET /api/providers/all emits readiness + readinessModels (camelCase)" $ do
+      app <- mkAppWithReadiness (RdReady 2)
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "providers", "all"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe [A.Value] of
+        Nothing -> expectationFailure "could not decode providers/all"
+        Just arr -> forM_ arr $ \case
+          A.Object o -> case lookupK "name" o of
+            Just (A.String "ollama") -> do
+              lookupK "readiness" o `shouldBe` Just (A.String "ready")
+              -- camelCase on this endpoint (1:1 wire mapping).
+              lookupK "readinessModels" o `shouldBe` Just (A.Number 2)
+              lookupK "readiness_models" o `shouldBe` Nothing
+            Just (A.String _) -> do
+              lookupK "readiness" o `shouldBe` Nothing
+              lookupK "readinessModels" o `shouldBe` Nothing
+            _ -> pure ()
+          _ -> expectationFailure "expected object"
+
+    it "30: configured is unchanged for every readiness value (the no-gate-flap invariant)" $ do
+      let configuredFor r = do
+            app <- mkAppWithReadiness r
+            (_, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
+            pure $ case A.decode body :: Maybe [A.Value] of
+              Nothing -> Nothing
+              Just arr -> listToMaybe
+                [ c | A.Object o <- arr
+                    , lookupK "name" o == Just (A.String "ollama")
+                    , Just (A.Bool c) <- [lookupK "configured" o] ]
+      results <- mapM configuredFor
+        [RdPending, RdUnknown, RdNotInstalled, RdNotRunning, RdNoModels
+        , RdNoFittingModel, RdReady 2, RdCloud]
+      -- Every value agrees: readiness never touches `configured`, so a daemon
+      -- going down cannot re-open the blocking gate or eject Ollama from the
+      -- dropdowns.
+      results `shouldBe` replicate 8 (Just True)
+
+    it "WU-B DoD 10: RdNoFittingModel is advisory — configured and required_complete unchanged" $ do
+      -- The advisory state must never gate the wizard or flip `configured`.
+      app <- mkAppWithReadiness RdNoFittingModel
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "providers"])
+      case A.decode body :: Maybe [A.Value] of
+        Nothing -> expectationFailure "could not decode /api/providers"
+        Just arr -> do
+          let ollamaCfg = listToMaybe
+                [ c | A.Object o <- arr
+                    , lookupK "name" o == Just (A.String "ollama")
+                    , Just (A.Bool c) <- [lookupK "configured" o] ]
+          ollamaCfg `shouldBe` Just True
+          let ollamaRd = listToMaybe
+                [ r | A.Object o <- arr
+                    , lookupK "name" o == Just (A.String "ollama")
+                    , Just (A.String r) <- [lookupK "readiness" o] ]
+          ollamaRd `shouldBe` Just "no-fitting-model"
+      -- And the setup gate is unaffected.
+      (setupStatus, setupBody) <- runAppBody app (testRequest methodGet ["api", "setup"])
+      setupStatus `shouldBe` 200
+      case A.decode setupBody :: Maybe A.Value of
+        Just (A.Object o) -> do
+          lookupK "required_complete" o `shouldSatisfy` isJust
+          -- The Ollama CARD carries the readiness; a non-Ollama card OMITS
+          -- both keys (absent, never null). Asserting on a card, not on the
+          -- top-level object, which has no such key either way.
+          let cards = case lookupK "providers" o of
+                Just (A.Array xs) -> [c | A.Object c <- V.toList xs]
+                _                 -> []
+              ollamaCard = [c | c <- cards, lookupK "id" c == Just (A.String "ollama")]
+              otherCard  = [c | c <- cards, lookupK "id" c /= Just (A.String "ollama")]
+          ollamaCard `shouldSatisfy` (not . null)
+          forM_ ollamaCard $ \c ->
+            lookupK "readiness" c `shouldBe` Just (A.String "no-fitting-model")
+          forM_ otherCard $ \c -> do
+            lookupK "readiness" c `shouldBe` Nothing
+            lookupK "readiness_models" c `shouldBe` Nothing
+        _ -> expectationFailure "could not decode /api/setup"
+
+    it "10b: a PUT mutation response carries the same readiness (test 33b)" $
+      -- providerDetailJsonFor is shared by /all and both mutations, so this
+      -- pins that a saved Ollama cannot flip back to Keyless.
+      withSystemTempDirectory "seal-prov-readiness" $ \tmp -> do
+        let cfgRoot = tmp </> "config"
+        createDirectoryIfMissing True cfgRoot
+        ensureConfigRepo cfgRoot
+        vault <- makeFakeVaultRuntime []
+        deps <- mkProviderTestDeps tmp cfgRoot vault
+        let app = apiApp deps { adOllamaReadiness = pure RdNoModels }
+        req <- testWithBody methodPut ["api", "providers", "ollama"]
+          (A.encode (A.object ["default_model" .= ("llama3.2" :: T.Text)]))
+        (status, body) <- runAppBody app req
+        status `shouldBe` 200
+        case A.decode body :: Maybe A.Value of
+          Nothing -> expectationFailure "could not decode PUT response"
+          Just (A.Object o) -> do
+            lookupK "readiness" o `shouldBe` Just (A.String "no-models")
+            lookupK "readinessModels" o `shouldBe` Nothing
+          _ -> expectationFailure "expected object"
+
+    it "10c: DELETE is unchanged — 204 with an empty body" $
+      withSystemTempDirectory "seal-prov-del" $ \tmp -> do
+        let cfgRoot = tmp </> "config"
+        createDirectoryIfMissing True cfgRoot
+        ensureConfigRepo cfgRoot
+        vault <- makeFakeVaultRuntime []
+        deps <- mkProviderTestDeps tmp cfgRoot vault
+        let app = apiApp deps { adOllamaReadiness = pure RdNotRunning }
+        (status, body) <- runAppBody app (testRequest methodDelete ["api", "providers", "anthropic"])
+        status `shouldBe` 204
+        -- The bodiless 204 is asserted explicitly: DELETE returns noContent,
+        -- and adding a readiness body here would be a wire change.
+        BL.toStrict body `shouldBe` ""
 
   it "GET /api/providers/all returns authStatus for locked vault" $ do
     app <- mkApp
@@ -4312,6 +5054,41 @@ spec = describe "Seal.Gateway.API" $ do
         Just (A.Object o) -> lookupK "defaultModel" o `shouldBe` Just (A.String "claude-sonnet-4")
         _ -> expectationFailure "expected JSON object"
 
+  it "POST + PUT /api/providers store the frequent-model list in config.toml" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("anthropic" :: T.Text)
+          , "api_key" .= ("sk-test-123" :: T.Text)
+          , "models" .= (["claude-opus-4-8", " claude-sonnet-4 ", ""] :: [T.Text])
+          ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 201
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) ->
+          lookupK "models" o `shouldBe`
+            Just (A.Array (V.fromList [A.String "claude-opus-4-8", A.String "claude-sonnet-4"]))
+        _ -> expectationFailure "expected JSON object"
+      eCfg <- loadRuntimeConfig (cfgRoot </> "config.toml")
+      case eCfg of
+        Right cfg -> providerModels cfg "anthropic" `shouldBe` ["claude-opus-4-8", "claude-sonnet-4"]
+        Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
+      -- PUT replaces the list (and [] clears it).
+      req2 <- testPut ["api", "providers", "anthropic"]
+        (A.encode (A.object [ "models" .= (["gpt-4o"] :: [T.Text]) ]))
+      (status2, body2) <- runAppBody app req2
+      status2 `shouldBe` 200
+      case A.decode body2 :: Maybe A.Value of
+        Just (A.Object o) ->
+          lookupK "models" o `shouldBe` Just (A.Array (V.fromList [A.String "gpt-4o"]))
+        _ -> expectationFailure "expected JSON object"
+
   it "PUT /api/providers/:name with api_key rotates the vault key" $
     withSystemTempDirectory "seal-prov" $ \tmp -> do
       let cfgRoot = tmp </> "config"
@@ -4350,6 +5127,111 @@ spec = describe "Seal.Gateway.API" $ do
     let app = apiApp deps
     status <- runAppStatus app (testRequest methodDelete ["api", "providers", "unknown"])
     status `shouldBe` 400
+
+  it "POST /api/providers creates a named OpenAI-compatible instance" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("local-vllm" :: T.Text)
+          , "type" .= ("openai-compatible" :: T.Text)
+          , "api_key" .= ("sk-local" :: T.Text)
+          , "base_url" .= ("http://localhost:8000/v1" :: T.Text)
+          ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 201
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          lookupK "name" o `shouldBe` Just (A.String "local-vllm")
+          lookupK "type" o `shouldBe` Just (A.String "openai-compatible")
+          lookupK "authStatus" o `shouldBe` Just (A.String "api-key")
+        _ -> expectationFailure "expected JSON object"
+      eCfg <- loadRuntimeConfig (cfgRoot </> "config.toml")
+      case eCfg of
+        Right cfg -> do
+          rcDefaultProvider cfg `shouldBe` Just "local-vllm"
+          Map.member "local-vllm" (rcProviders cfg) `shouldBe` True
+        Left e -> expectationFailure ("config load failed: " <> T.unpack e)
+      -- It is listed as a configured provider by name (the shape the
+      -- session composers consume).
+      (_, listedBody) <- runAppBody app (testRequest methodGet ["api", "providers"])
+      let listedNames = case A.decode listedBody :: Maybe [A.Value] of
+            Just xs -> [ n | A.Object o <- xs, Just (A.String n) <- [lookupK "name" o] ]
+            Nothing -> []
+      listedNames `shouldContain` ["local-vllm"]
+      -- ...and by the CRUD list's detail endpoint.
+      (_, allBody) <- runAppBody app (testRequest methodGet ["api", "providers", "all"])
+      let names = case A.decode allBody :: Maybe [A.Value] of
+            Just xs -> [ n | A.Object o <- xs, Just (A.String n) <- [lookupK "name" o] ]
+            Nothing -> []
+      names `shouldContain` ["local-vllm"]
+
+  it "POST /api/providers rejects a duplicate custom name" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      saveRuntimeConfig (cfgRoot </> "config.toml")
+        defaultRuntimeConfig { rcProviders = Map.fromList
+          [("local-vllm", ProviderConfig { pcDefaultModel = Nothing
+                                         , pcBaseUrl = Just "http://localhost:8000/v1"
+                                         , pcModels = Nothing })] }
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "providers"]
+        (A.encode (A.object
+          [ "name" .= ("local-vllm" :: T.Text)
+          , "type" .= ("openai-compatible" :: T.Text)
+          , "api_key" .= ("sk-local" :: T.Text)
+          , "base_url" .= ("http://localhost:9000/v1" :: T.Text)
+          ]))
+      status <- runAppStatus app req
+      status `shouldBe` 409
+
+  it "POST /api/providers rejects an invalid custom name" $ do
+    vault <- makeFakeVaultRuntime []
+    deps <- mkProviderTestDeps "/tmp/seal-prov-err" "/tmp/seal-prov-err" vault
+    let app = apiApp deps
+    req <- testPost ["api", "providers"]
+      (A.encode (A.object
+        [ "name" .= ("Bad Name" :: T.Text)
+        , "type" .= ("openai-compatible" :: T.Text)
+        , "api_key" .= ("k" :: T.Text)
+        , "base_url" .= ("http://localhost:8000/v1" :: T.Text)
+        ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "DELETE /api/providers/:name removes a custom instance's section" $
+    withSystemTempDirectory "seal-prov" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath defaultRuntimeConfig
+        { rcDefaultProvider = Just "local-vllm"
+        , rcProviders = Map.fromList
+            [("local-vllm", ProviderConfig { pcDefaultModel = Nothing
+                                           , pcBaseUrl = Just "http://localhost:8000/v1"
+                                           , pcModels = Nothing }) ]
+        }
+      vault <- makeFakeVaultRuntime [("PROVIDER_APIKEY_LOCAL_VLLM", "sk-local")]
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      status <- runAppStatus app (testRequest methodDelete ["api", "providers", "local-vllm"])
+      status `shouldBe` 204
+      eCfg <- loadRuntimeConfig cfgPath
+      case eCfg of
+        Right cfg -> do
+          Map.member "local-vllm" (rcProviders cfg) `shouldBe` False
+          rcDefaultProvider cfg `shouldBe` Nothing
+        Left e -> expectationFailure ("config load failed: " <> T.unpack e)
 
   -- ── Default provider endpoints (GET/PUT /api/providers/default) ──────
 
@@ -4414,6 +5296,447 @@ spec = describe "Seal.Gateway.API" $ do
     status <- runAppStatus app req
     status `shouldBe` 400
 
+
+  -- ── Channel CRUD (GET/POST/PUT/DELETE /api/channels) ─────────────────
+
+  it "GET /api/channels returns 200 with empty array when no channels" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe [A.Value] of
+        Just xs -> xs `shouldBe` []
+        Nothing -> expectationFailure ("expected JSON array: " ++ show body)
+
+  it "GET /api/channels returns camelCase JSON (textChunkLimit, allowFrom, authStatus)" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcChannels = Map.fromList
+            [ (ChannelId "work-signal", ChannelConfig
+                { ccKind = Signal
+                , ccLabel = Just "Work"
+                , ccAccount = Just "+15555550123"
+                , ccToken = Nothing
+                , ccTextChunkLimit = Just 1998
+                , ccAllowFrom = AllowOnly (Set.fromList ["+15555550123"])
+                })
+            ]
+        })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode channels body: " ++ show body)
+      arr `shouldSatisfy` (not . null)
+      forM_ arr $ \case
+        A.Object o -> do
+          lookupK "id" o `shouldBe` Just (A.String "work-signal")
+          lookupK "kind" o `shouldBe` Just (A.String "signal")
+          lookupK "label" o `shouldBe` Just (A.String "Work")
+          lookupK "account" o `shouldBe` Just (A.String "+15555550123")
+          lookupK "textChunkLimit" o `shouldBe` Just (A.Number 1998)
+          lookupK "allowFrom" o `shouldSatisfy` isJust
+          lookupK "authStatus" o `shouldBe` Just (A.String "configured")
+        _ -> expectationFailure "expected object"
+
+  it "POST /api/channels creates a Signal channel" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "channels"]
+        (A.encode (A.object
+          [ "id" .= ("work-signal" :: T.Text)
+          , "kind" .= ("signal" :: T.Text)
+          , "account" .= ("+15555550123" :: T.Text)
+          ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 201
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          lookupK "id" o `shouldBe` Just (A.String "work-signal")
+          lookupK "kind" o `shouldBe` Just (A.String "signal")
+          lookupK "authStatus" o `shouldBe` Just (A.String "configured")
+        _ -> expectationFailure "expected JSON object"
+      (gStatus, gBody) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      gStatus `shouldBe` 200
+      case A.decode gBody :: Maybe [A.Value] of
+        Just xs -> xs `shouldSatisfy` (not . null)
+        Nothing -> expectationFailure "expected array"
+
+  it "POST /api/channels creates a Telegram channel + stores token in vault" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "channels"]
+        (A.encode (A.object
+          [ "id" .= ("dev-bot" :: T.Text)
+          , "kind" .= ("telegram" :: T.Text)
+          , "token" .= ("123:abc" :: T.Text)
+          ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 201
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          lookupK "id" o `shouldBe` Just (A.String "dev-bot")
+          lookupK "kind" o `shouldBe` Just (A.String "telegram")
+          lookupK "token" o `shouldBe` Nothing
+          lookupK "authStatus" o `shouldBe` Just (A.String "configured")
+        _ -> expectationFailure "expected JSON object"
+      mh <- readIORef (vrHandleRef vault)
+      case mh of
+        Just vh -> vhGet vh (telegramVaultKeyFor (ChannelId "dev-bot")) `shouldReturn` Right "123:abc"
+        Nothing -> expectationFailure "vault handle missing"
+
+  it "POST /api/channels rejects duplicate id (409)" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcChannels = Map.fromList
+            [(ChannelId "dup", ChannelConfig Signal Nothing Nothing Nothing Nothing AllowAll)] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPost ["api", "channels"]
+        (A.encode (A.object
+          [ "id" .= ("dup" :: T.Text)
+          , "kind" .= ("signal" :: T.Text)
+          , "account" .= ("+1" :: T.Text)
+          ]))
+      status <- runAppStatus app req
+      status `shouldBe` 409
+
+  it "POST /api/channels rejects invalid id (400)" $ do
+    vault <- makeFakeVaultRuntime []
+    deps <- mkProviderTestDeps "/tmp/seal-chan-err" "/tmp/seal-chan-err" vault
+    let app = apiApp deps
+    req <- testPost ["api", "channels"]
+      (A.encode (A.object
+        [ "id" .= ("bad id" :: T.Text)
+        , "kind" .= ("signal" :: T.Text)
+        ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "POST /api/channels rejects invalid kind (400)" $ do
+    vault <- makeFakeVaultRuntime []
+    deps <- mkProviderTestDeps "/tmp/seal-chan-err2" "/tmp/seal-chan-err2" vault
+    let app = apiApp deps
+    req <- testPost ["api", "channels"]
+      (A.encode (A.object
+        [ "id" .= ("ok-id" :: T.Text)
+        , "kind" .= ("slack" :: T.Text)
+        ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+
+  it "PUT /api/channels/:id updates label + chunk limit" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcChannels = Map.fromList
+            [(ChannelId "sig1", ChannelConfig Signal Nothing (Just "+1") Nothing Nothing AllowAll)] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPut ["api", "channels", "sig1"]
+        (A.encode (A.object
+          [ "label" .= ("Sig One" :: T.Text)
+          , "text_chunk_limit" .= (1998 :: Int)
+          ]))
+      (status, body) <- runAppBody app req
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          lookupK "label" o `shouldBe` Just (A.String "Sig One")
+          lookupK "textChunkLimit" o `shouldBe` Just (A.Number 1998)
+        _ -> expectationFailure "expected JSON object"
+
+  it "PUT /api/channels/:id rotates telegram token in vault" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcChannels = Map.fromList
+            [(ChannelId "tg1", ChannelConfig Telegram Nothing Nothing Nothing Nothing AllowAll)] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      req <- testPut ["api", "channels", "tg1"]
+        (A.encode (A.object [ "token" .= ("new-token" :: T.Text) ]))
+      status <- runAppStatus app req
+      status `shouldBe` 200
+      mh <- readIORef (vrHandleRef vault)
+      case mh of
+        Just vh -> vhGet vh (telegramVaultKeyFor (ChannelId "tg1")) `shouldReturn` Right "new-token"
+        Nothing -> expectationFailure "vault handle missing"
+
+  it "PUT /api/channels/:id returns 404 for unknown id" $ do
+    vault <- makeFakeVaultRuntime []
+    deps <- mkProviderTestDeps "/tmp/seal-chan-404" "/tmp/seal-chan-404" vault
+    let app = apiApp deps
+    req <- testPut ["api", "channels", "nope"]
+      (A.encode (A.object [ "label" .= ("x" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 404
+
+  it "DELETE /api/channels/:id removes channel" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcChannels = Map.fromList
+            [(ChannelId "sig1", ChannelConfig Signal Nothing (Just "+1") Nothing Nothing AllowAll)] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      dStatus <- runAppStatus app (testRequest methodDelete ["api", "channels", "sig1"])
+      dStatus `shouldBe` 204
+      (gStatus, gBody) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      gStatus `shouldBe` 200
+      case A.decode gBody :: Maybe [A.Value] of
+        Just xs -> xs `shouldBe` []
+        Nothing -> expectationFailure "expected array"
+
+  it "DELETE /api/channels/:id deletes vault key for telegram" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+          key = telegramVaultKeyFor (ChannelId "tg1")
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcChannels = Map.fromList
+            [(ChannelId "tg1", ChannelConfig Telegram Nothing Nothing Nothing Nothing AllowAll)] })
+      vault <- makeFakeVaultRuntime [(key, "tok")]
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      dStatus <- runAppStatus app (testRequest methodDelete ["api", "channels", "tg1"])
+      dStatus `shouldBe` 204
+      mh <- readIORef (vrHandleRef vault)
+      case mh of
+        Just vh -> do
+          r <- vhGet vh key
+          case r of
+            Left _  -> pure ()
+            Right _ -> expectationFailure "expected vault key to be deleted"
+        Nothing -> expectationFailure "vault handle missing"
+
+  it "DELETE /api/channels/:id nullifies legacy field for 'telegram' id" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig { rcTelegram = Just defaultTelegramConfig })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      dStatus <- runAppStatus app (testRequest methodDelete ["api", "channels", "telegram"])
+      dStatus `shouldBe` 204
+      eCfg <- loadRuntimeConfig cfgPath
+      case eCfg of
+        Right cfg -> rcTelegram cfg `shouldBe` Nothing
+        Left e    -> expectationFailure ("config load failed: " <> T.unpack e)
+
+  it "DELETE /api/channels/:id is idempotent (204 for missing id)" $ do
+    vault <- makeFakeVaultRuntime []
+    deps <- mkProviderTestDeps "/tmp/seal-chan-idem" "/tmp/seal-chan-idem" vault
+    let app = apiApp deps
+    status <- runAppStatus app (testRequest methodDelete ["api", "channels", "ghost"])
+    status `shouldBe` 204
+
+  it "GET /api/channels authStatus: 'missing-credential' for signal without account" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcChannels = Map.fromList
+            [(ChannelId "sig-bare", ChannelConfig Signal Nothing Nothing Nothing Nothing AllowAll)] })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode channels body: " ++ show body)
+      forM_ arr $ \case
+        A.Object o -> lookupK "authStatus" o `shouldBe` Just (A.String "missing-credential")
+        _ -> pure ()
+
+  it "GET /api/channels authStatus: 'vault-locked' for telegram when vault locked" $
+    withSystemTempDirectory "seal-chan" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcChannels = Map.fromList
+            [(ChannelId "tg-locked", ChannelConfig Telegram Nothing Nothing Nothing Nothing AllowAll)] })
+      vault <- makeLockedVaultRuntime
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode channels body: " ++ show body)
+      forM_ arr $ \case
+        A.Object o -> lookupK "authStatus" o `shouldBe` Just (A.String "vault-locked")
+        _ -> pure ()
+
+
+
+  -- ── Channel CRUD integration (W6) ────────────────────────────────
+
+  it "channel CRUD integration: full lifecycle create → list → update → delete" $
+    withSystemTempDirectory "seal-chan-int" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          hasId v = case v of
+            A.Object o -> lookupK "id" o == Just (A.String "lifecycle-sig")
+            _ -> False
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      -- create
+      req <- testPost ["api", "channels"]
+        (A.encode (A.object
+          [ "id" .= ("lifecycle-sig" :: T.Text)
+          , "kind" .= ("signal" :: T.Text)
+          , "account" .= ("+15555550123" :: T.Text)
+          ]))
+      (cStatus, _) <- runAppBody app req
+      cStatus `shouldBe` 201
+      -- list → present
+      (_, gBody) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      case A.decode gBody :: Maybe [A.Value] of
+        Just xs -> xs `shouldSatisfy` any hasId
+        Nothing -> expectationFailure "expected array after create"
+      -- update
+      uReq <- testPut ["api", "channels", "lifecycle-sig"]
+        (A.encode (A.object [ "label" .= ("Updated" :: T.Text) ]))
+      (uStatus, _) <- runAppBody app uReq
+      uStatus `shouldBe` 200
+      -- delete
+      (dStatus, _) <- runAppBody app (testRequest methodDelete ["api", "channels", "lifecycle-sig"])
+      dStatus `shouldBe` 204
+      -- list → absent
+      (_, gBody2) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      case A.decode gBody2 :: Maybe [A.Value] of
+        Just xs -> xs `shouldSatisfy` not . any hasId
+        Nothing -> expectationFailure "expected array after delete"
+
+  it "channel CRUD integration: multiple channels of same type coexist" $
+    withSystemTempDirectory "seal-chan-multi" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      -- create sig1
+      r1 <- testPost ["api", "channels"] (A.encode (A.object
+        [ "id" .= ("sig1" :: T.Text), "kind" .= ("signal" :: T.Text)
+        , "account" .= ("+1111" :: T.Text) ]))
+      (s1, _) <- runAppBody app r1
+      s1 `shouldBe` 201
+      -- create sig2 (same kind, different id)
+      r2 <- testPost ["api", "channels"] (A.encode (A.object
+        [ "id" .= ("sig2" :: T.Text), "kind" .= ("signal" :: T.Text)
+        , "account" .= ("+2222" :: T.Text) ]))
+      (s2, _) <- runAppBody app r2
+      s2 `shouldBe` 201
+      -- GET → both present
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      case A.decode body :: Maybe [A.Value] of
+        Just xs -> length xs `shouldBe` 2
+        Nothing -> expectationFailure "expected array with 2 channels"
+
+  it "channel CRUD integration: legacy [telegram] with vault token migrates" $
+    withSystemTempDirectory "seal-chan-leg" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          hasTelegramId v = case v of
+            A.Object o -> lookupK "id" o == Just (A.String "telegram")
+            _ -> False
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      -- seed legacy config: [telegram] with no tcToken, token in vault
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcTelegram = Just defaultTelegramConfig })
+      vault <- makeFakeVaultRuntime
+        [("TELEGRAM_BOT_TOKEN", "999:legacy-token")]
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode: " ++ show body)
+      -- the migrated "telegram" channel appears
+      let found = any hasTelegramId arr
+      found `shouldBe` True
+      -- authStatus is "configured" (vault has the token)
+      forM_ arr $ \case
+        A.Object o | lookupK "id" o == Just (A.String "telegram") ->
+          lookupK "authStatus" o `shouldBe` Just (A.String "configured")
+        _ -> pure ()
+
+  it "channel CRUD integration: legacy [telegram] with tcToken in config migrates" $
+    withSystemTempDirectory "seal-chan-leg2" $ \tmp -> do
+      let cfgRoot = tmp </> "config"
+          hasTelegramId v = case v of
+            A.Object o -> lookupK "id" o == Just (A.String "telegram")
+            _ -> False
+      createDirectoryIfMissing True cfgRoot
+      ensureConfigRepo cfgRoot
+      let cfgPath = cfgRoot </> "config.toml"
+      -- seed legacy config: [telegram] with tcToken (config-level token)
+      saveRuntimeConfig cfgPath (defaultRuntimeConfig
+        { rcTelegram = Just defaultTelegramConfig
+            { tcToken = Just "888:config-token" } })
+      vault <- makeFakeVaultRuntime []
+      deps <- mkProviderTestDeps tmp cfgRoot vault
+      let app = apiApp deps
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "channels"])
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode: " ++ show body)
+      arr `shouldSatisfy` any hasTelegramId
+      forM_ arr $ \case
+        A.Object o | lookupK "id" o == Just (A.String "telegram") ->
+          lookupK "authStatus" o `shouldBe` Just (A.String "configured")
+        _ -> pure ()
 
   -- ── UI state (persisted "new tab" recall) ─────────────────────────────
   -- GET /api/ui/state returns the empty state by default (no file). PUT
@@ -4554,6 +5877,157 @@ spec = describe "Seal.Gateway.API" $ do
           _ -> expectationFailure "expected session_id string"
       _ -> expectationFailure "expected JSON object"
 
+
+  describe "/api/cron provider + model" $ do
+    -- Each test gets its own in-memory cron store bound into ApiDeps, so the
+    -- CRUD assertions are isolated from every other test's jobs. The store is
+    -- a plain record field on ApiDeps, so a record update is enough.
+    let withCronStore body = withSystemTempDirectory "seal-cron-provider" $ \tmp -> do
+          let paths = fakePaths { spState = tmp </> "state", spConfig = tmp </> "config" }
+          createDirectoryIfMissing True (spState paths </> "sessions")
+          createDirectoryIfMissing True (spConfig paths)
+          base <- mkDepsFor paths
+          store <- memoryCronStore
+          body (base { adCronStore = store }) store
+
+    it "POST /api/cron stores and echoes provider + model" $ do
+      withCronStore $ \deps _ -> do
+        let app = apiApp deps
+        req <- testPost ["api", "cron"] (A.encode (A.object
+          [ "name" .= ("Daily" :: T.Text)
+          , "schedule" .= ("0 9 * * *" :: T.Text)
+          , "prompt" .= ("summarize" :: T.Text)
+          , "provider" .= ("anthropic" :: T.Text)
+          , "model" .= ("claude-opus-4-8" :: T.Text)
+          ]))
+        (status, body) <- runAppBody app req
+        status `shouldBe` 201
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> do
+            lookupK "provider" o `shouldBe` Just (A.String "anthropic")
+            lookupK "model" o `shouldBe` Just (A.String "claude-opus-4-8")
+          _ -> expectationFailure "expected a cron job object"
+
+    it "POST /api/cron with neither field returns nulls" $ do
+      withCronStore $ \deps _ -> do
+        let app = apiApp deps
+        req <- testPost ["api", "cron"] (A.encode (A.object
+          [ "name" .= ("Daily" :: T.Text)
+          , "schedule" .= ("0 9 * * *" :: T.Text)
+          , "prompt" .= ("summarize" :: T.Text)
+          ]))
+        (status, body) <- runAppBody app req
+        status `shouldBe` 201
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> do
+            lookupK "provider" o `shouldBe` Just A.Null
+            lookupK "model" o `shouldBe` Just A.Null
+          _ -> expectationFailure "expected a cron job object"
+
+    it "GET /api/cron lists provider + model per job" $ do
+      withCronStore $ \deps _ -> do
+        let app = apiApp deps
+        createReq <- testPost ["api", "cron"] (A.encode (A.object
+          [ "name" .= ("Daily" :: T.Text)
+          , "schedule" .= ("0 9 * * *" :: T.Text)
+          , "prompt" .= ("summarize" :: T.Text)
+          , "provider" .= ("ollama" :: T.Text)
+          , "model" .= ("llama3.2" :: T.Text)
+          ]))
+        _ <- runAppBody app createReq
+        (status, body) <- runAppBody app (testRequest methodGet ["api", "cron"])
+        status `shouldBe` 200
+        case A.decode body :: Maybe [A.Value] of
+          Just [A.Object o] -> do
+            lookupK "provider" o `shouldBe` Just (A.String "ollama")
+            lookupK "model" o `shouldBe` Just (A.String "llama3.2")
+          _ -> expectationFailure "expected a one-element cron job array"
+
+    it "PUT with an empty provider clears it and leaves model untouched" $ do
+      withCronStore $ \deps _ -> do
+        let app = apiApp deps
+        createReq <- testPost ["api", "cron"] (A.encode (A.object
+          [ "name" .= ("Daily" :: T.Text)
+          , "schedule" .= ("0 9 * * *" :: T.Text)
+          , "prompt" .= ("summarize" :: T.Text)
+          , "provider" .= ("anthropic" :: T.Text)
+          , "model" .= ("claude-opus-4-8" :: T.Text)
+          ]))
+        (_, created) <- runAppBody app createReq
+        jid <- case A.decode created :: Maybe A.Value of
+          Just (A.Object o) -> case lookupK "id" o of
+            Just (A.String i) -> pure i
+            _ -> expectationFailure "expected id" >> pure ""
+          _ -> expectationFailure "expected job object" >> pure ""
+        putReq <- testPut ["api", "cron", jid] (A.encode (A.object
+          [ "provider" .= ("" :: T.Text) ]))
+        (status, body) <- runAppBody app putReq
+        status `shouldBe` 200
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> do
+            -- "" clears the provider...
+            lookupK "provider" o `shouldBe` Just A.Null
+            -- ...and the model, never supplied, survives untouched.
+            lookupK "model" o `shouldBe` Just (A.String "claude-opus-4-8")
+          _ -> expectationFailure "expected a cron job object"
+
+    it "PUT omitting both fields leaves them unchanged" $ do
+      withCronStore $ \deps _ -> do
+        let app = apiApp deps
+        createReq <- testPost ["api", "cron"] (A.encode (A.object
+          [ "name" .= ("Daily" :: T.Text)
+          , "schedule" .= ("0 9 * * *" :: T.Text)
+          , "prompt" .= ("summarize" :: T.Text)
+          , "provider" .= ("anthropic" :: T.Text)
+          , "model" .= ("claude-opus-4-8" :: T.Text)
+          ]))
+        (_, created) <- runAppBody app createReq
+        jid <- case A.decode created :: Maybe A.Value of
+          Just (A.Object o) -> case lookupK "id" o of
+            Just (A.String i) -> pure i
+            _ -> expectationFailure "expected id" >> pure ""
+          _ -> expectationFailure "expected job object" >> pure ""
+        putReq <- testPut ["api", "cron", jid] (A.encode (A.object
+          [ "name" .= ("Renamed" :: T.Text) ]))
+        (status, body) <- runAppBody app putReq
+        status `shouldBe` 200
+        case A.decode body :: Maybe A.Value of
+          Just (A.Object o) -> do
+            lookupK "name" o `shouldBe` Just (A.String "Renamed")
+            lookupK "provider" o `shouldBe` Just (A.String "anthropic")
+            lookupK "model" o `shouldBe` Just (A.String "claude-opus-4-8")
+          _ -> expectationFailure "expected a cron job object"
+
+    it "POST with an injection-shaped provider is rejected with 400" $ do
+      withCronStore $ \deps _ -> do
+        let app = apiApp deps
+        req <- testPost ["api", "cron"] (A.encode (A.object
+          [ "name" .= ("Daily" :: T.Text)
+          , "schedule" .= ("0 9 * * *" :: T.Text)
+          , "prompt" .= ("summarize" :: T.Text)
+          , "provider" .= ("Not A Provider" :: T.Text)
+          ]))
+        status <- runAppStatus app req
+        status `shouldBe` 400
+
+    it "PUT with an injection-shaped provider is rejected with 400" $ do
+      withCronStore $ \deps _ -> do
+        let app = apiApp deps
+        createReq <- testPost ["api", "cron"] (A.encode (A.object
+          [ "name" .= ("Daily" :: T.Text)
+          , "schedule" .= ("0 9 * * *" :: T.Text)
+          , "prompt" .= ("summarize" :: T.Text)
+          ]))
+        (_, created) <- runAppBody app createReq
+        jid <- case A.decode created :: Maybe A.Value of
+          Just (A.Object o) -> case lookupK "id" o of
+            Just (A.String i) -> pure i
+            _ -> expectationFailure "expected id" >> pure ""
+          _ -> expectationFailure "expected job object" >> pure ""
+        putReq <- testPut ["api", "cron", jid] (A.encode (A.object
+          [ "provider" .= ("../seal" :: T.Text) ]))
+        status <- runAppStatus app putReq
+        status `shouldBe` 400
   describe "/api/sessions/:id/agents (session-scoped agent defs)" $ do
     -- Build a session.json + a workdir with a repo carrying
     -- .agents/agents.md + a sub-agent, plus a user agent-def backend with
@@ -4611,11 +6085,20 @@ spec = describe "Seal.Gateway.API" $ do
                 , adHarnessRegistry = reg, adAdoptConsent = Just CcWeb
                 , adAgentDefs = userAdb, adSkills = skillsBackend
                 , adProviders = pure knownProviders, adUiState = uiState
+                , adOllamaReadiness = noOllamaReadiness
                 , adSend = Nothing, adDefaultAgent = pure mDefault
                 , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
                 , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
         , adAgentRegistry    = fakeAgentRegH
-                , adVault = fakeLockedVaultRuntime, adPaths = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps, adPaths = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
                 }
@@ -4744,15 +6227,24 @@ spec = describe "Seal.Gateway.API" $ do
             , adHarnessRegistry = reg, adAdoptConsent = Just CcWeb
             , adAgentDefs = userAdb, adSkills = skillsBackend
             , adProviders = pure knownProviders, adUiState = uiState
+            , adOllamaReadiness = noOllamaReadiness
             , adSend = Nothing, adDefaultAgent = pure Nothing
             , adBroker = Nothing, adTabCloseNotifier = noTabCloseNotifier
             , adRepoRegistry = repoRegH, adConfigRepo = openConfigRepo "/tmp/nonexistent-seal-test"
         , adAgentRegistry    = fakeAgentRegH
-            , adVault = fakeLockedVaultRuntime, adPaths = fakePaths
+            , adVault = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps, adPaths = fakePaths
             , adWsHealth = pure (StreamHealth "up" 8081)
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Just (const (pure stubExec))
             , adAbortReg = testAbortReg
+            , adCronStore = stubCronStore
+            , adFileExplorer = mkFailClosedFileExplorer
+            , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
             }
           app = apiApp deps
       (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sidTxt, "agents"])
@@ -4791,7 +6283,7 @@ spec = describe "Seal.Gateway.API" $ do
       let sr = SessionRuntime { srPaths = fakePaths { spState = tmp }, srConfigPath = "", srActive = activeRef }
           sendDeps = SendDeps
             { sdPaths      = fakePaths { spState = tmp }
-            , sdVault      = error "sdVault: unused on the 404 path"
+            , sdVault      = error "sdVault: unused on the 404 path"            , sdTurnComplete = \_ _ -> pure ()
             , sdRepoReg    = fakeRepoRegistryHandle
             , sdAgentReg   = fakeAgentRegH
             , sdProvider   = error "sdProvider: unused on the 404 path"
@@ -4832,6 +6324,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = adb
             , adSkills          = skills
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -4840,8 +6333,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -4887,7 +6388,7 @@ spec = describe "Seal.Gateway.API" $ do
       cntRef <- newIORef 0
       execCache <- newSessionExecCache
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prOllamaReadiness = noOllamaReadiness }
           paths = SealPaths
             { spHome = tmp, spState = stateRoot, spConfig = configRoot, spKeys = tmp </> "keys" , spCache = ""}
           meta0 = fakeMeta { smId = case mkSessionId "e2e" of Right s -> s; Left _ -> error "sid" }
@@ -4900,7 +6401,7 @@ spec = describe "Seal.Gateway.API" $ do
           resolveStub _ = pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2"))
           sendDeps = SendDeps
             { sdPaths      = paths
-            , sdVault      = rt
+            , sdVault      = rt            , sdTurnComplete = \_ _ -> pure ()
             , sdRepoReg    = fakeRepoRegistryHandle
             , sdAgentReg   = fakeAgentRegH
             , sdProvider   = pr
@@ -4941,6 +6442,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = adb
             , adSkills          = bSkills backends
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -4949,8 +6451,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -4975,7 +6485,11 @@ spec = describe "Seal.Gateway.API" $ do
         Just sidTxt -> do
           -- 2. Send a message.
           sendReq <- testPost ["api", "sessions", sidTxt, "send"]
-            (A.encode (A.object [ "message" .= ("hello" :: T.Text) ]))
+            (A.encode (A.object
+              [ "message" .= ("hello" :: T.Text)
+              , "channel" .= ("telegram" :: T.Text)
+              , "userId" .= ("12345" :: T.Text)
+              , "conversationId" .= ("tg:12345" :: T.Text) ]))
           (sendStatus, _sendBody) <- runAppBody app sendReq
           sendStatus `shouldBe` 200
           -- 3. Poll the transcript; the turn runs async so the reply
@@ -4994,6 +6508,23 @@ spec = describe "Seal.Gateway.API" $ do
                     pure hasReply
           replyFound <- waitForPoll 5000000 pollTranscript id
           replyFound `shouldBe` True
+          -- The request entry's metadata carries the channel + sender id
+          -- forwarded from the /send body. This proves the API handler threads
+          -- the parsed MessageSource into handleSend (passing Nothing there
+          -- would leave channel "web" and no userId).
+          case mkSessionId sidTxt of
+            Left _ -> expectationFailure "bad session id"
+            Right sid' -> do
+              raw <- BC.readFile (sessionDir paths sid' </> "entries.jsonl")
+              let entries = mapMaybe (A.decode . BL.fromStrict) (BC.lines raw)
+                  metas = [ m | Just (A.Object o) <- entries
+                              , Just (A.Object m) <- [KeyMap.lookup (Key.fromText "meta") o] ]
+              case metas of
+                (m : _) -> do
+                  KeyMap.lookup (Key.fromText "channel") m `shouldBe` Just (A.String "telegram")
+                  KeyMap.lookup (Key.fromText "userId") m `shouldBe` Just (A.String "12345")
+                  KeyMap.lookup (Key.fromText "conversationId") m `shouldBe` Just (A.String "tg:12345")
+                [] -> expectationFailure "no request entry with meta"
 
   -- ── Regression: subscribed chat channels must receive the final reply
   -- EXACTLY ONCE after a web-originated turn ──────────────────────────────
@@ -5045,13 +6576,13 @@ spec = describe "Seal.Gateway.API" $ do
       activeRef' <- newIORef meta0
       uiState <- newUiStateHandle paths
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prOllamaReadiness = noOllamaReadiness }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef' }
           resolveStub :: SessionMeta -> IO (Either T.Text (SomeProvider, ModelId))
           resolveStub _ = pure (Right (SomeProvider (ScriptProvider providerRef), ModelId "llama3.2"))
           sendDeps = SendDeps
             { sdPaths      = paths
-            , sdVault      = rt
+            , sdVault      = rt            , sdTurnComplete = \_ _ -> pure ()
             , sdRepoReg    = fakeRepoRegistryHandle
             , sdProvider   = pr
             , sdSession    = sr
@@ -5092,6 +6623,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = bAgentDefs backends
             , adSkills          = bSkills backends
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = uiState
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -5099,8 +6631,16 @@ spec = describe "Seal.Gateway.API" $ do
             , adTabCloseNotifier = noTabCloseNotifier
             , adRepoRegistry     = fakeRepoRegistryHandle
             , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-            , adVault            = fakeLockedVaultRuntime
+            , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
             , adPaths            = paths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+            , adCronStore = stubCronStore
+            , adFileExplorer = mkFailClosedFileExplorer
+            , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
             , adSecurityConfig = defaultSecurityConfig
             , adMkSessionExec = Nothing
             , adAgentRegistry    = fakeAgentRegH
@@ -5172,12 +6712,12 @@ spec = describe "Seal.Gateway.API" $ do
       cntRef <- newIORef 0
       execCache <- newSessionExecCache
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prOllamaReadiness = noOllamaReadiness }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
           registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps (mkWebTurnDeps sendDeps) requestSid) ]
           sendDeps = SendDeps
             { sdPaths      = paths
-            , sdVault      = rt
+            , sdVault      = rt            , sdTurnComplete = \_ _ -> pure ()
             , sdRepoReg    = fakeRepoRegistryHandle
             , sdAgentReg   = fakeAgentRegH
             , sdProvider   = pr
@@ -5218,6 +6758,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = bAgentDefs backends
             , adSkills          = bSkills backends
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = error "adUiState: unused on the slash path"
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -5226,8 +6767,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }
@@ -5301,12 +6850,12 @@ spec = describe "Seal.Gateway.API" $ do
       cntRef <- newIORef 0
       execCache <- newSessionExecCache
       let rt = VaultRuntime { vrPaths = paths, vrConfigPath = configRoot </> "config.toml", vrHandleRef = vaultRef }
-          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef }
+          pr = ProviderRuntime { prConfigPath = configRoot </> "config.toml", prVault = rt, prManager = mgr, prCallCounter = cntRef, prOllamaReadiness = noOllamaReadiness }
           sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
           registry = mkRegistry [ skillCommandSpec (bSkills backends) (webCallDispatcher sendDeps (mkWebTurnDeps sendDeps) requestSid) ]
           sendDeps = SendDeps
             { sdPaths      = paths
-            , sdVault      = rt
+            , sdVault      = rt            , sdTurnComplete = \_ _ -> pure ()
             , sdRepoReg    = fakeRepoRegistryHandle
             , sdAgentReg   = fakeAgentRegH
             , sdProvider   = pr
@@ -5347,6 +6896,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adAgentDefs       = bAgentDefs backends
             , adSkills          = bSkills backends
             , adProviders       = pure knownProviders
+            , adOllamaReadiness = noOllamaReadiness
             , adUiState         = error "adUiState: unused on the slash path"
             , adSend            = Just sendDeps
             , adDefaultAgent    = pure Nothing
@@ -5355,8 +6905,16 @@ spec = describe "Seal.Gateway.API" $ do
         , adRepoRegistry     = fakeRepoRegistryHandle
         , adAgentRegistry    = fakeAgentRegH
     , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-                , adVault            = fakeLockedVaultRuntime
+                , adVault            = fakeLockedVaultRuntime, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
                 , adPaths            = fakePaths, adWsHealth = pure (StreamHealth "up" 8081), adAbortReg = testAbortReg
+                , adCronStore = stubCronStore
+                , adFileExplorer = mkFailClosedFileExplorer
+                , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
     , adSecurityConfig = defaultSecurityConfig
     , adMkSessionExec = Nothing
             }

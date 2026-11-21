@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 -- | WU-C — real tests for the OpenRouter provider. Exercises the pure
 -- request/response mapping + the no-key branch + the static listModels +
 -- the bearer header builder, WITHOUT a network round-trip. A live
@@ -16,7 +17,11 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Network.HTTP.Client.TLS (newTlsManager)
-import Network.HTTP.Types.Header (hAuthorization, hContentType)
+import Network.HTTP.Client
+  ( HttpException (..), HttpExceptionContent (..)
+  , parseRequest )
+import Control.Exception (toException)
+import Network.HTTP.Types.Header (hAuthorization, hContentType, RequestHeaders)
 import Test.Hspec
 
 import qualified OpenAI.V1.Chat.Completions as Chat (ChatCompletionObject)
@@ -24,11 +29,12 @@ import qualified OpenAI.V1.Chat.Completions as Chat (ChatCompletionObject)
 import Seal.Core.Types (ModelId (ModelId), OpName (OpName), ToolCallId (ToolCallId))
 import Seal.Providers.Class
   ( CompletionRequest (..), CompletionResponse (..), ContentBlock (..)
-  , Message (..), Provider (..), Role (..), StopReason (..), ToolChoice (..)
+  , pattern Message, Provider (..), Role (..), StopReason (..), ToolChoice (..)
   , ToolResultPart (..), Usage (..), textMsg )
 import Seal.Providers.OpenRouter
-  ( bearerHeaders, decodeResponse, encodeRequest, mapFinishReason, mkOpenRouter
-  , defaultOpenRouterBaseUrl )
+  ( bearerHeaders, decodeModelIds, decodeResponse, encodeRequest
+  , mapFinishReason, mkOpenRouter, defaultOpenRouterBaseUrl
+  , sendChatCompletion, httpTransportErrorText, chatCompletionTimeoutMicro )
 
 -- | A minimal request: one user text message, no tools, ToolAuto, 256 tokens.
 minimalReq :: CompletionRequest
@@ -102,11 +108,13 @@ chatObj mContent finishReason mToolCalls = object
 
 -- | Decode a JSON 'Value' as a 'Chat.ChatCompletionObject' and run
 -- 'decodeResponse'. Fails the test (Left) if the JSON doesn't parse.
-decodeFromJson :: Value -> Either Text CompletionResponse
-decodeFromJson v =
+-- The endpoint label is the OpenRouter default (the tests that check for
+-- generic error messages pass their own — see "decodeResponse (empty choices)").
+decodeFromJson :: Text -> Value -> Either Text CompletionResponse
+decodeFromJson endpoint v =
   case eitherDecode (encode v) :: Either String Chat.ChatCompletionObject of
     Left e  -> Left ("decode: " <> T.pack e)
-    Right o -> decodeResponse o
+    Right o -> decodeResponse endpoint o
 
 -- ── Spec ────────────────────────────────────────────────────────────────────
 
@@ -159,7 +167,7 @@ spec = describe "Seal.Providers.OpenRouter — WU-C" $ do
 
   describe "decodeResponse" $ do
     it "decodes a plain assistant text choice with stop + usage" $ do
-      case decodeFromJson (chatObj (Just "hi") "stop" Nothing) of
+      case decodeFromJson defaultOpenRouterBaseUrl (chatObj (Just "hi") "stop" Nothing) of
         Left e  -> expectationFailure ("Left: " <> T.unpack e)
         Right (CompletionResponse blocks stop (Usage i o)) -> do
           blocks `shouldBe` [CbText "hi"]
@@ -175,7 +183,7 @@ spec = describe "Seal.Providers.OpenRouter — WU-C" $ do
                 , "arguments" .= ("{\"q\":\"rust\"}" :: Text)
                 ]
             ]
-      case decodeFromJson (chatObj Nothing "tool_calls" (Just [toolCallVal])) of
+      case decodeFromJson defaultOpenRouterBaseUrl (chatObj Nothing "tool_calls" (Just [toolCallVal])) of
         Left e -> expectationFailure ("Left: " <> T.unpack e)
         Right (CompletionResponse blocks stop _) -> do
           stop `shouldBe` StopToolUse
@@ -198,7 +206,25 @@ spec = describe "Seal.Providers.OpenRouter — WU-C" $ do
                 , "total_tokens" .= (0 :: Int)
                 ]
             ]
-      decodeFromJson emptyObj `shouldSatisfy` isLeft
+      decodeFromJson defaultOpenRouterBaseUrl emptyObj `shouldSatisfy` isLeft
+
+  describe "decodeResponse (empty choices — error message is generic)" $ do
+    it "does not say 'OpenRouter' in the error" $ do
+      let emptyObj = object
+            [ "id" .= ("chatcmpl-2" :: Text)
+            , "object" .= ("chat.completion" :: Text)
+            , "created" .= (0 :: Int)
+            , "model" .= ("deepseek/deepseek-v4.1-flash-1017" :: Text)
+            , "choices" .= ([] :: [Value])
+            , "usage" .= object
+                [ "prompt_tokens" .= (0 :: Int)
+                , "completion_tokens" .= (0 :: Int)
+                , "total_tokens" .= (0 :: Int)
+                ]
+            ]
+      case decodeFromJson "https://ollama.com/v1" emptyObj of
+        Left e -> e `shouldSatisfy` (not . T.isInfixOf "OpenRouter")
+        Right _ -> expectationFailure "expected Left, got Right"
 
   describe "complete (no key)" $ do
     it "returns Left when the API key is absent" $ do
@@ -207,12 +233,76 @@ spec = describe "Seal.Providers.OpenRouter — WU-C" $ do
       r <- complete prov minimalReq
       r `shouldSatisfy` isLeft
 
+    it "error message does not say 'OpenRouter' for a non-OpenRouter endpoint" $ do
+      mgr <- newTlsManager
+      let customUrl = "https://ollama.com/v1"
+          prov = mkOpenRouter mgr Nothing customUrl (ModelId "deepseek-v4.1-flash:cloud")
+      r <- complete prov minimalReq
+      case r of
+        Left e -> e `shouldSatisfy` (not . T.isInfixOf "OpenRouter")
+        Right _ -> expectationFailure "expected Left, got Right"
+
+  describe "sendChatCompletion (transport error — error message names the endpoint)" $ do
+    it "includes the base URL, not 'OpenRouter', on a connection failure" $ do
+      mgr <- newTlsManager
+      -- An unreachable endpoint: the port is chosen to refuse connections.
+      let badUrl = "http://127.0.0.1:1/v1"
+          hdrs = bearerHeaders ("sk-test" :: ByteString) :: RequestHeaders
+      r <- sendChatCompletion mgr badUrl hdrs (encodeRequest minimalReq)
+      case r of
+        Left e -> do
+          e `shouldSatisfy` T.isInfixOf "127.0.0.1:1"
+          e `shouldSatisfy` (not . T.isInfixOf "OpenRouter")
+        Right _ -> expectationFailure "expected Left (connection failure), got Right"
+
+  describe "chatCompletionTimeoutMicro" $ do
+    it "is at least 300 seconds (5 minutes) — cloud models need headroom" $ do
+      chatCompletionTimeoutMicro `shouldSatisfy` (>= 300_000_000)
+
+  describe "httpTransportErrorText" $ do
+    -- Construct a real Request via parseRequest so HttpExceptionRequest
+    -- typechecks; the actual URL contents don't matter for the error message
+    -- (the base URL is passed separately to httpTransportErrorText).
+    let mkReq = parseRequest "POST https://example.com/v1/chat/completions"
+
+    it "distinguishes a response timeout from a generic transport error" $ do
+      req <- mkReq
+      let msg = httpTransportErrorText "https://ollama.com/v1"
+                  (HttpExceptionRequest req ResponseTimeout)
+      msg `shouldSatisfy` T.isInfixOf "timed out"
+      msg `shouldSatisfy` T.isInfixOf "ollama.com"
+      msg `shouldSatisfy` (not . T.isInfixOf "connection or transport error")
+
+    it "uses the generic message for a non-timeout transport error" $ do
+      req <- mkReq
+      let msg = httpTransportErrorText "https://ollama.com/v1"
+                  (HttpExceptionRequest req (ConnectionFailure
+                    (toException (userError "connection refused"))))
+      msg `shouldSatisfy` T.isInfixOf "connection or transport error"
+      msg `shouldSatisfy` T.isInfixOf "ollama.com"
+
+    it "uses the generic message for InvalidUrlException" $ do
+      let msg = httpTransportErrorText "https://ollama.com/v1"
+                  (InvalidUrlException "bad%url" "invalid URL")
+      msg `shouldSatisfy` T.isInfixOf "connection or transport error"
+
   describe "listModels" $ do
     it "returns Right with the default model" $ do
       mgr <- newTlsManager
       let prov = mkOpenRouter mgr Nothing defaultOpenRouterBaseUrl (ModelId "deepseek/deepseek-v4.1-flash-1017")
       r <- listModels prov
       r `shouldBe` Right [ModelId "deepseek/deepseek-v4.1-flash-1017"]
+
+  describe "decodeModelIds" $ do
+    it "reads the OpenAI-compatible model list" $
+      decodeModelIds "{\"data\":[{\"id\":\"gpt-4o-mini\"},{\"id\":\"local-llama\"}]}"
+        `shouldBe` Right [ModelId "gpt-4o-mini", ModelId "local-llama"]
+
+    it "rejects a payload that is not a model list" $
+      decodeModelIds "<html>not json</html>" `shouldSatisfy` isLeft
+
+    it "rejects entries without an id" $
+      decodeModelIds "{\"data\":[{\"object\":\"model\"}]}" `shouldSatisfy` isLeft
 
   describe "bearerHeaders" $ do
     it "puts the raw key bytes only in Authorization: Bearer + json content-type" $ do

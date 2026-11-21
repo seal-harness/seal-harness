@@ -6,6 +6,7 @@
 module Seal.Channels.Chat.HttpClient
   ( -- * Send a message
     httpSend
+  , sendBodyJson
   , SendResult (..)
   , parseSendResult
     -- * Tabs
@@ -34,6 +35,8 @@ module Seal.Channels.Chat.HttpClient
   , httpAnswerQuestion
   , answerBodyJson
   , httpCancelQuestion
+  , httpGetQuestions
+  , PendingQuestionJson (..)
     -- * Helpers
   , parseJsonBody
   , parseErrorBody
@@ -52,7 +55,10 @@ import Network.HTTP.Client
   (Manager, Request (..), Response, HttpException, httpLbs,
    parseRequest, RequestBody (..), responseBody, responseStatus)
 import Network.HTTP.Types (Method, statusCode, methodPost, methodGet)
+import Seal.Gateway.Types.ChannelKind (channelKindToText)
 import Seal.Gateway.Types.Core (SessionId, sessionIdText)
+import Seal.Gateway.Types.MessageSource
+  (MessageSource (..), conversationIdText, userIdText)
 
 -- | The result of a @POST /api/sessions/:id/send@ call.
 data SendResult = SendResult
@@ -94,13 +100,32 @@ data ListsJson = ListsJson
   , ljThinkingSessionIds :: [Text]
   } deriving stock (Eq, Show)
 
--- | @POST /api/sessions/:id/send@ — send a message to a session.
-httpSend :: Manager -> Text -> SessionId -> Text -> IO (Either Text SendResult)
-httpSend mgr apiBase sid message = do
+-- | @POST /api/sessions/:id/send@ — send a message to a session. When a
+-- 'MessageSource' is present (a chat channel), its channel name, sender user
+-- id, and conversation id travel with the message so the gateway can stamp
+-- them into the turn's transcript metadata.
+httpSend
+  :: Manager -> Text -> SessionId -> Maybe MessageSource -> Text
+  -> IO (Either Text SendResult)
+httpSend mgr apiBase sid mSrc message = do
   let url = T.unpack apiBase <> "/sessions/" <> T.unpack (sessionIdText sid) <> "/send"
-  doRequest mgr url methodPost (Just (A.object ["message" .= message])) >>= \case
+  doRequest mgr url methodPost (Just (sendBodyJson mSrc message)) >>= \case
     Left e -> pure (Left e)
     Right body -> pure (parseSendResult body)
+
+-- | Build the JSON body of a @POST /api/sessions/:id/send@ request. Always
+-- carries @message@; a present 'MessageSource' adds @channel@, @userId@
+-- (only when the channel identified the sender), and @conversationId@.
+-- Absent fields are omitted entirely — never sent as JSON @null@.
+sendBodyJson :: Maybe MessageSource -> Text -> Value
+sendBodyJson mSrc message = A.object $
+  [ "message" .= message ]
+  <> case mSrc of
+       Nothing -> []
+       Just ms ->
+         [ "channel" .= channelKindToText (msChannelKind ms) ]
+         <> maybe [] (\u -> ["userId" .= userIdText u]) (msUserId ms)
+         <> [ "conversationId" .= conversationIdText (msConversationId ms) ]
 
 -- | @GET /api/tabs@ — list all tabs.
 httpGetTabs :: Manager -> Text -> IO (Either Text [TabJson])
@@ -205,15 +230,30 @@ rebindBody mProvider mModel mChannel = A.object (catMaybes
 -- | The request body for @POST \/api\/sessions\/new@ on the @\/new@ path
 -- (no prior session): provider\/model overrides only. The gateway labels
 -- such a session @"web"@.
-mintBody :: Maybe Text -> Maybe Text -> Value
-mintBody mProvider mModel = A.object (catMaybes
+mintBody :: Maybe Text -> Maybe Text -> Maybe Text -> Value
+mintBody mProvider mModel mChannel = A.object (catMaybes
   [ ("provider" .=) <$> mProvider
   , ("model" .=) <$> mModel
+  , ("channel" .=) <$> mChannel
   ])
 
--- | The request body of @POST \/api\/sessions\/:id\/setup-repo@.
-setupRepoBody :: Text -> Value
-setupRepoBody url = A.object ["url" .= url]
+-- | The request body of @POST \/api\/sessions\/:id\/setup-repo@:
+-- @{"url": u}@, plus @{"branch": b}@ when a branch was requested.
+--
+-- The branch is trimmed and the key is OMITTED — never sent as JSON @null@ —
+-- when it is absent or blank, so the no-branch body is byte-identical to what
+-- chat sent before @-b@ existed. @Nothing@ and the empty string therefore
+-- both ask the gateway for the remote's default branch.
+setupRepoBody :: Text -> Maybe Text -> Value
+setupRepoBody url mBranch = A.object (("url" .= url) : catMaybes
+  [ ("branch" .=) <$> nonBlank mBranch
+  ])
+
+-- | 'Just' the trimmed text, or 'Nothing' when it is absent or blank.
+nonBlank :: Maybe Text -> Maybe Text
+nonBlank mText = case T.strip <$> mText of
+  Just b | not (T.null b) -> Just b
+  _                       -> Nothing
 
 -- | @POST /api/sessions/:id/setup-repo@ — clone a repo into the session's
 -- workdir before the first turn. Errors carry the gateway's @error@ text
@@ -303,6 +343,51 @@ httpAnswerQuestion mgr apiBase sid qid answer = do
   doRequest mgr url methodPost (Just (answerBodyJson answer)) >>= \case
     Left e -> pure (Left e)
     Right body -> pure (Right (acceptedFrom body))
+
+-- | One pending question as @GET /api/sessions/:id/questions@ reports it.
+-- The id and options are what a chat channel needs to render the question and
+-- to answer it later by plain text.
+data PendingQuestionJson = PendingQuestionJson
+  { pqjId       :: !Text
+  , pqjQuestion :: !Text
+  , pqjOptions  :: ![Value]
+    -- ^ The raw @options@ objects (@{label, description}@); kept as 'Value'
+    -- so the caller reuses the same decoder the ask event uses.
+  } deriving stock (Eq, Show)
+
+-- | @GET /api/sessions/:id/questions@ — the session's pending ASK_HUMAN
+-- questions, oldest first. An empty list means the session is not waiting on
+-- anyone. Used by the @\/watch@ path to tell "needs your input" apart from
+-- "finished thinking": both surface as a @harness-status idle@ activity, so
+-- the activity alone cannot distinguish them.
+httpGetQuestions :: Manager -> Text -> SessionId -> IO (Either Text [PendingQuestionJson])
+httpGetQuestions mgr apiBase sid = do
+  let url = T.unpack apiBase <> "/sessions/" <> T.unpack (sessionIdText sid)
+            <> "/questions"
+  doRequest mgr url methodGet Nothing >>= \case
+    Left e -> pure (Left e)
+    Right body -> pure (Right (questionsFrom body))
+
+-- | Decode the questions array. Tolerant: questions without an @id@ cannot be
+-- answered, so they are dropped. Pure.
+questionsFrom :: BL.ByteString -> [PendingQuestionJson]
+questionsFrom body =
+  case A.decode body :: Maybe Value of
+    Just (A.Array arr) -> mapMaybe parseOne (foldr (:) [] arr)
+    _                  -> []
+  where
+    parseOne (A.Object o) = do
+      qid <- lookupText "id" o
+      let question = fromMaybe "" (lookupText "question" o)
+          opts = case KeyMap.lookup (Key.fromText "options") o of
+            Just (A.Array os) -> foldr (:) [] os
+            _                 -> []
+      pure (PendingQuestionJson qid question opts)
+    parseOne _ = Nothing
+
+    lookupText k o = case KeyMap.lookup (Key.fromText k) o of
+      Just (A.String t) -> Just t
+      _                 -> Nothing
 
 -- | Read the @accepted@ flag from an answer response. Absent/malformed
 -- (e.g. a server that predates the flag) counts as accepted.

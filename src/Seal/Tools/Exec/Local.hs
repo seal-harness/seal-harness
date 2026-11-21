@@ -32,6 +32,7 @@ module Seal.Tools.Exec.Local
   , withManagedProcess
   , killProcessGroup
   , readBounded
+  , readBoundedBytes
   ) where
 
 import Control.Concurrent (threadDelay)
@@ -300,3 +301,18 @@ readBounded h maxBytes = do
       hClose h
       pure (content <> "\n[output truncated at " <> T.pack (show maxBytes)
                      <> " bytes — redirect to a file and FILE_READ with pagination for full output]")
+
+-- | Like 'readBounded' but returns raw 'ByteString' (no UTF-8 decode).
+-- Used by the file explorer's download endpoint via 'runRemoteBytes' so
+-- binary files are served without UTF-8 corruption. Truncation is
+-- indicated by appending a marker (same as 'readBounded') — callers
+-- that need to detect truncation should check the byte count.
+readBoundedBytes :: Handle -> Int -> IO (BS.ByteString, Bool)
+readBoundedBytes h maxBytes = do
+  bs <- BS.hGet h maxBytes
+  eof <- hIsEOF h
+  if eof
+    then pure (bs, False)
+    else do
+      hClose h
+      pure (BS.take maxBytes bs, True)

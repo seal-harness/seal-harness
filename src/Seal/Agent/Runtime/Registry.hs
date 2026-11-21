@@ -35,7 +35,9 @@ module Seal.Agent.Runtime.Registry
   , hasRunningChildren
   ) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId)
+import Control.Concurrent
+  ( ThreadId, forkIO, killThread, myThreadId, newEmptyMVar, putMVar
+  , readMVar )
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch)
 import Data.Map.Strict (Map)
@@ -124,7 +126,17 @@ hasRunningChildren (AgentRuntime tv) parentSid = do
 -- succeeds, or 'Crashed' on exception.
 startAgent :: AgentRuntime -> AgentDefId -> SubagentId -> SessionId -> SessionId -> Int -> IO () -> IO (Either Text AgentInstance)
 startAgent (AgentRuntime tv) aid subagentId parentSession session depth worker = do
-  tid <- forkIO (runWorker tv subagentId worker)
+  -- The worker may not start until its registry entry exists.
+  --
+  -- 'runWorker' reports a crash with a @Map.adjust@ keyed by subagent id. Fork
+  -- first, and an agent that throws on its first line can reach that update
+  -- before this function has inserted the entry: the adjust finds nothing, the
+  -- insert then writes 'Running' over the top, and the instance reports a live
+  -- agent for the rest of the process's life (surfaced by the crash test, which
+  -- failed about half the time under full-suite load). The gate is released
+  -- only after the insert succeeds.
+  gate <- newEmptyMVar
+  tid  <- forkIO (readMVar gate >> runWorker tv subagentId worker)
   mInst <- atomically $ do
     insts <- readTVar tv
     if Map.member subagentId insts
@@ -134,8 +146,11 @@ startAgent (AgentRuntime tv) aid subagentId parentSession session depth worker =
         writeTVar tv (Map.insert subagentId inst insts)
         pure (Just inst)
   case mInst of
-    Just inst -> pure (Right inst)
+    Just inst -> do
+      putMVar gate ()
+      pure (Right inst)
     Nothing   -> do
+      -- The worker is still parked on the gate, so killing it runs nothing.
       killThread tid
       pure (Left "agent already running for this subagent id")
 

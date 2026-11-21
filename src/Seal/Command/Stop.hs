@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 -- | The @\/stop@ slash command: abort a session's in-flight tool call (and
 -- any future tool call until the next turn starts). Wires the
 -- 'SessionAbortRegistry' (design Blocker Resolution #2) to the channel
@@ -45,7 +46,7 @@ import Seal.Core.TurnEngine (broadcastNewEntries, loadSessionMeta)
 import Seal.Agent.Runtime.RunRecord (RunRecordRegistry, cancelRunsForParent)
 import Seal.Gateway.StreamBroker (StreamBroker)
 import Seal.Handles.Transcript (IndexedTranscriptHandle (..), IndexedTranscriptWrite (..), withIndexedTranscript)
-import Seal.Providers.Class (Message (..), Role (..), ContentBlock (..))
+import Seal.Providers.Class (pattern Message, Role (..), ContentBlock (..))
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, setSessionAbort)

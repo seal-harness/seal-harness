@@ -1,4 +1,10 @@
 cabal-version: 3.0
+extra-source-files:
+    -- Inputs for the `file-embed` splices in Seal.Config.Templates, and what
+    -- makes a source distribution buildable.
+    config/templates/config.toml
+    config/templates/security.toml
+
 name: seal-harness
 version: 0.1.0.0
 synopsis: A harness for secure AI agent execution around the SealOp ISA
@@ -80,6 +86,7 @@ library seal-chat-channels
         Seal.Channels.Chat.Class
         Seal.Channels.Chat.Loop
         Seal.Channels.Chat.ToolRender
+        Seal.Channels.Chat.Bubble
         Seal.Channels.Chat.TabRender
         Seal.Channels.Chat.Signal
         Seal.Channels.Chat.Telegram
@@ -95,6 +102,10 @@ library seal-chat-channels
       , http-client
       , http-types
       , websockets
+      , crypton-connection
+      , crypton-x509-store
+      , crypton-x509-system
+      , tls
       , network
       , async
       , process
@@ -117,6 +128,8 @@ library
         Seal.Providers.Class
         Seal.Providers.ContextWindow
         Seal.Providers.Ollama
+        Seal.Providers.OllamaReadiness
+        Seal.Providers.OllamaReadinessProbe
         Seal.Providers.Registry
         Seal.Providers.OpenRouter
         Seal.Util.AesonUtils
@@ -127,6 +140,7 @@ library
         Seal.Transcript.Conv
         Seal.Transcript.ConvIndex
         Seal.Transcript.Entries
+        Seal.Transcript.Origin
         Seal.Transcript.Reconstruct
         Seal.Handles.Channel
         Seal.Handles.AskReply
@@ -169,20 +183,25 @@ library
         Seal.Command.Tab
         Seal.Command.Agent
         Seal.Command.Background
+        Seal.Command.AccessControl
         Seal.Command.Call
         Seal.Command.New
         Seal.Command.Registry
         Seal.Command.Spec
         Seal.Command.Channel
+        Seal.Config.BootPlan
+        Seal.Config.Credentials
         Seal.Config.File
         Seal.Config.Migrate
         Seal.Config.Paths
         Seal.Config.Security
+        Seal.Config.Templates
         Seal.Git.Repo
         Seal.Store.Markdown
         Seal.Ingest
         Seal.Session.AgentMetaCache
         Seal.Session.ExecCache
+        Seal.Session.Branch
         Seal.Session.Meta
         Seal.Session.Store
         Seal.Session.Workdir
@@ -195,11 +214,20 @@ library
           Seal.SourceControl.GithubKeys
          Seal.Signal.Config
          Seal.Telegram.Config
+         Seal.Channels.Config
          Seal.Security.Command
          Seal.Security.Crypto
+         Seal.Security.DaemonLock
+         Seal.Security.EnrollmentGrant
          Seal.Security.Path
+        Seal.Security.AccessControl
          Seal.Security.Policy
          Seal.Security.Secrets
+        Seal.Security.WebAuthn
+        Seal.Security.TlsCert
+        Seal.Security.WebAuthn.Cbor
+        Seal.Security.WebAuthn.Der
+        Seal.Security.WebAuthn.Types
          Seal.Security.Vault
          Seal.Security.Vault.Age
          Seal.Text.LineFile
@@ -211,6 +239,7 @@ library
           Seal.Tools.Exec.Types
           Seal.Tools.Exec.Untrusted
           Seal.Tools.Exec.UntrustedIO
+          Seal.Tools.Exec.FileExplorer
           Seal.Tools.Exec.UIO
           Seal.Tools.Exec.UIO.Internal
           Seal.Tools.Exec.UIOGit
@@ -225,7 +254,12 @@ library
         Seal.Media.Image
         Seal.Media.Tts
          Seal.Gateway.Config
-          Seal.Gateway.API
+          Seal.Gateway.AccessControl
+         Seal.Gateway.OriginGuard
+         Seal.Gateway.Setup
+         Seal.Gateway.Audit
+         Seal.Gateway.ProviderIcon
+        Seal.Gateway.API
          Seal.Gateway.Embedded
          Seal.Gateway.Route
          Seal.Gateway.Send
@@ -243,6 +277,10 @@ library
         Seal.Types.Config
         Seal.Types.Env
         Seal.Vault.Backend
+
+        Seal.Vault.Provision
+        Seal.Setup.State
+        Seal.Vault.IdentityPath
         Seal.Vault.Commands
         Seal.Vault.Access
         Seal.Agent.Env
@@ -286,9 +324,16 @@ library
         Seal.Skills.Prompt
         Seal.Skills.Builtins
         Seal.Logging.Logger
+        Seal.Cron.Types
+        Seal.Cron.Store
+        Seal.Cron.Scheduler
+        Seal.Cron.Operations
+        Seal.ISA.Ops.Cron
         Seal.Logging.ChannelContext
         Seal.Logging.Exceptions
         Seal.Logging.Global
+        Seal.Audit.Log
+        Seal.Audit.Predicate
     -- The local untrusted executor is omitted under -f remote-only-untrusted
     -- (the hardened build: untrusted execution can only run remotely).
     if !flag(remote-only-untrusted)
@@ -308,6 +353,10 @@ library
       , containers
       , conduit
       , crypton
+      , crypton-connection
+      , crypton-x509
+      , crypton-x509-store
+      , crypton-x509-system
       , directory
       , exceptions
       , filepath
@@ -315,7 +364,7 @@ library
       , haskeline
       , katip
       , lens
-      , memory
+      , ram
       , mtl
       , optparse-applicative
       , stm
@@ -326,6 +375,7 @@ library
       , http-client-tls
       , http-types
       , network
+      , network-info
       , tomland
       , process
       , temporary
@@ -338,6 +388,9 @@ library
         , uuid-types
       , wai
       , warp
+      , warp-tls
+      , tls
+      , time-hourglass
       , websockets
       , wai-websockets
       , case-insensitive
@@ -349,6 +402,8 @@ library
       , openai >=2.5.4
       , seal-gateway-types
       , seal-chat-channels
+      , cron
+      , tz
     hs-source-dirs: src
 
 executable seal
@@ -378,17 +433,25 @@ test-suite tests
       , containers
       , directory
       , filepath
+      , crypton
+      , crypton-x509
+      , crypton-x509-store
+      , ram
+      , file-embed
+      , template-haskell
        , hspec
       , hspec-core
        , http-client
        , http-client-tls
        , katip
       , network
+      , network-info
        , optparse-applicative
        , stm
        , temporary
        , text
        , time
+       , time-hourglass
        , process
        , unix
        , random
@@ -397,6 +460,7 @@ test-suite tests
       , case-insensitive
       , wai
       , warp
+      , tls
       , http-types
       , vector
       , tomland
@@ -405,6 +469,7 @@ test-suite tests
       , lens
       , openapi-hs
       , seal-gateway-types
+     , trasa
        , seal-chat-channels
     hs-source-dirs: test
     other-modules:
@@ -418,8 +483,14 @@ test-suite tests
         Seal.Core.SystemPromptSpec
         Seal.Gateway.ConfigSpec
         Seal.Gateway.EmbeddedSpec
-        Seal.Gateway.ApiRouteSpec
+        Seal.Gateway.ProviderIconSpec
+        Seal.Gateway.AccessControlSpec
+        Seal.Gateway.OriginGuardSpec
+        Seal.Gateway.MutationGuardSpec
+        Seal.Gateway.AuditSpec
+       Seal.Gateway.ApiRouteSpec
         Seal.Gateway.ApiSpec
+        Seal.Gateway.ApiFilesSpec
         Seal.Gateway.ApiIntegrationSpec
         Seal.Gateway.AgentIntegrationSpec
         Seal.Gateway.BroadcastSpec
@@ -449,6 +520,7 @@ test-suite tests
         Seal.Transcript.ConvSpec
         Seal.Transcript.ConvIndexSpec
         Seal.Transcript.EntriesSpec
+        Seal.Transcript.OriginSpec
         Seal.Transcript.ReconstructSpec
         Seal.Handles.ChannelSpec
         Seal.Handles.AskReplySpec
@@ -462,6 +534,11 @@ test-suite tests
         Seal.Skills.TypesSpec
          Seal.Skills.BackendSpec
          Seal.Skills.BackendNoDirectFsFailSpec
+        Seal.Cron.TypesSpec
+        Seal.Cron.StoreSpec
+       Seal.Cron.OperationsSpec
+        Seal.ISA.Ops.CronSpec
+        Seal.Cron.SchedulerSpec
         Seal.Skills.AutoloadSpec
         Seal.Skills.PromptSpec
         Seal.Skills.BuiltinsSpec
@@ -477,6 +554,7 @@ test-suite tests
         Seal.ISA.Ops.SkillsSpec
         Seal.ISA.Ops.RepoSpec
         Seal.ISA.Ops.AgentSpec
+        Seal.ISA.Ops.AgentHandoffSpec
         Seal.ISA.Ops.SessionSpec
         Seal.ISA.Ops.RegistrySpec
         Seal.Phase6aSpec
@@ -487,6 +565,7 @@ test-suite tests
         Seal.AppMainSpec
         Seal.Signal.ConfigSpec
         Seal.Telegram.ConfigSpec
+        Seal.Channels.ConfigSpec
         Seal.Channel.CliSpec
         Seal.Channel.WiringSpec
         Seal.Channels.Chat.RouteSpec
@@ -497,6 +576,7 @@ test-suite tests
         Seal.Channels.Chat.WsClientSpec
         Seal.Channels.Chat.WatchPersistSpec
         Seal.Channels.Chat.LoopSpec
+        Seal.Channels.Chat.BubbleSpec
         Seal.Channels.CursorSpec
         Seal.Channels.Chat.SignalAdapterSpec
         Seal.Channels.Chat.TelegramAdapterSpec
@@ -513,26 +593,39 @@ test-suite tests
         Seal.Command.AgentSpec
         Seal.Command.BackgroundSpec
         Seal.Command.CallSpec
+        Seal.Command.AccessControlSpec
         Seal.Command.ChannelSpec
         Seal.Command.SpecSpec
         Seal.Command.TabSpec
         Seal.Command.NewSpec
+        Seal.Config.BootPlanSpec
+        Seal.Config.CredentialsSpec
         Seal.Config.FileSpec
         Seal.Config.MigrateSpec
-        Seal.Config.SecuritySpec
+        Seal.Config.SecurityAccessControlSpec
+       Seal.Config.SecuritySpec
          Seal.Config.SecurityScopingFailSpec
          Seal.CapabilityScopingWorkdirFsFailSpec
         Seal.Config.PathsSpec
+        Seal.Config.TemplatesSpec
         Seal.ConfigSpec
         Seal.IngestSpec
         Seal.Security.CommandSpec
+        Seal.Security.EnrollmentGrantSpec
+        Seal.Security.DaemonLockSpec
         Seal.Security.AdoptionSpec
         Seal.Security.CryptoSpec
+       Seal.Security.WebAuthnSpec
+       Seal.Security.WebAuthn.CborSpec
+       Seal.Security.WebAuthn.DerSpec
+       Seal.Security.TlsCertSpec
+       Seal.Security.WebAuthnSpecFixture
         Seal.Security.PathSpec
         Seal.Security.PolicySpec
         Seal.Security.SecretsSpec
         Seal.Session.AgentMetaCacheSpec
         Seal.Session.ExecCacheSpec
+        Seal.Session.BranchSpec
         Seal.Session.MetaSpec
         Seal.Session.StoreSpec
         Seal.Session.LogSpec
@@ -557,6 +650,7 @@ test-suite tests
           Seal.Tools.Exec.UIOSpec
           Seal.Tools.Exec.UIOParitySpec
           Seal.Tools.Exec.WorkdirFsSpec
+          Seal.Tools.Exec.FileExplorerSpec
           Seal.Tools.Exec.LogRedactionSpec
          Seal.ISA.Ops.UIOUnrestrictedFailSpec
          Seal.ISA.Ops.UIOConstructionFailSpec
@@ -586,10 +680,17 @@ test-suite tests
         Seal.Providers.Anthropic.OAuthSpec
         Seal.Providers.ClassSpec
         Seal.Providers.OllamaSpec
+        Seal.Providers.OllamaReadinessSpec
+        Seal.Providers.OllamaReadinessProbeSpec
+        Seal.Command.ServeWiringSpec
         Seal.Providers.ContextWindowSpec
         Seal.Providers.OpenRouterSpec
         Seal.Providers.RegistrySpec
         Seal.Vault.BackendSpec
+        Seal.Vault.ProvisionSpec
+        Seal.Setup.StateSpec
+        Seal.Gateway.SetupApiSpec
+        Seal.Vault.IdentityPathScopingFailSpec
         Seal.Vault.CommandsSpec
         Seal.Vault.AccessSpec
         Seal.Agent.LoopSpec
@@ -611,3 +712,4 @@ test-suite tests
         Seal.ISA.RepeatDetectSpec
         Seal.Logging.LoggerSpec
         Seal.Logging.ExceptionsSpec
+        Seal.Audit.LogSpec

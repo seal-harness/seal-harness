@@ -7,7 +7,7 @@ module Seal.Channels.Chat.LoopSpec (spec) where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (wait, withAsync)
-import Control.Concurrent.STM (newTVarIO, readTVarIO, TVar)
+import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO, TVar)
 import Data.IORef
 import Data.Aeson ((.=))
 import Data.Aeson qualified as A
@@ -16,14 +16,16 @@ import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Time (UTCTime (..), addUTCTime, fromGregorian)
 import Data.Vector qualified as V
 import Network.HTTP.Client (Manager, newManager, defaultManagerSettings)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy, expectationFailure)
 
-import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..))
+import Seal.Channels.Chat.Class (ChatChannel (..), QuestionOption (..), ProgressStyle (..))
 import Seal.Channels.Chat.Loop
 import Seal.Channels.Chat.HttpClient
-  ( ListsJson (..), NewSessionResult (..), SendResult (..), TabJson (..) )
+  ( ListsJson (..), NewSessionResult (..), PendingQuestionJson (..), SendResult (..)
+  , TabJson (..) )
 import Seal.Channels.Chat.RateLimit (defaultStreamProgressConfig)
 import Seal.Channels.Chat.Types
   ( ChatMessageId (..)
@@ -33,6 +35,7 @@ import Seal.Channels.Chat.Types
   , defaultGatewayConfig
   , sessionInsert
   , sessionLookup
+  , convKeyFromSource
   )
 import Seal.Channels.Chat.WsClient (WsClient (..), WsEventCallback)
 import Seal.Gateway.Types.ChannelKind (ChannelKind (..))
@@ -54,6 +57,13 @@ data MockChan = MockChan
     -- ^ (question, option labels) pairs passed to 'ccSendWithOptions', in
     -- order.
   , mcNextId   :: IORef Int
+  , mcEditFails :: IORef Bool
+    -- ^ When 'True', 'ccEditMessage' reports failure. Used to pin the
+    -- no-resend-on-failed-edit policy: a failed edit must NOT be turned into
+    -- a fresh notifying message.
+  , mcSilentSends :: IORef [Text]
+    -- ^ Bodies sent through 'ccSendWithIdSilently'. Recorded separately so a
+    -- test can distinguish a silent (non-notifying) send from a normal one.
   }
 
 instance ChatChannel MockChan where
@@ -65,12 +75,88 @@ instance ChatChannel MockChan where
     modifyIORef' (mcSendIds ch) ((t, T.pack (show n)) :)
     pure (Just (ChatMessageId (T.pack (show n))))
   ccEditMessage ch (ChatMessageId i) content = do
-    modifyIORef' (mcEdits ch) ((i, content) :)
-    pure True
+    fails <- readIORef (mcEditFails ch)
+    if fails
+      then pure False
+      else do
+        modifyIORef' (mcEdits ch) ((i, content) :)
+        pure True
   ccSendWithOptions ch question opts _prefix = do
     modifyIORef' (mcWithOpts ch) ((question, map qoLabel opts) :)
     pure (Just (ChatMessageId "with-options"))
+  ccSendWithIdSilently ch t = do
+    modifyIORef' (mcSilentSends ch) (t :)
+    ccSendWithId ch t
   ccLabel _ = "mock"
+
+-- | A second mock that opts into the single-edited-bubble style. Used to
+-- assert the WU-2 behaviour without disturbing the default-style mock that
+-- the existing tests pin.
+newtype BubbleChan = BubbleChan MockChan
+
+mkBubbleChan :: IO BubbleChan
+mkBubbleChan = BubbleChan <$> mkMockChan
+
+instance ChatChannel BubbleChan where
+  ccReceive (BubbleChan c) = ccReceive c
+  ccSend (BubbleChan c) = ccSend c
+  ccSendWithId (BubbleChan c) = ccSendWithId c
+  ccEditMessage (BubbleChan c) = ccEditMessage c
+  ccSendWithOptions (BubbleChan c) = ccSendWithOptions c
+  ccSendWithIdSilently (BubbleChan c) = ccSendWithIdSilently c
+  ccLabel (BubbleChan c) = ccLabel c
+  ccProgressStyle _ = PsSingleBubble
+  ccChunkLimit _ = Just 1998
+
+-- | A mock with no inline-keyboard support (Signal-like): 'ccSendWithOptions'
+-- returns 'Nothing', so the loop must fall back to text rendering.
+newtype NoKeyboardChan = NoKeyboardChan MockChan
+
+mockNoKeyboard :: IO NoKeyboardChan
+mockNoKeyboard = NoKeyboardChan <$> mkMockChan
+
+instance ChatChannel NoKeyboardChan where
+  ccReceive (NoKeyboardChan c) = ccReceive c
+  ccSend (NoKeyboardChan c) = ccSend c
+  ccSendWithId (NoKeyboardChan c) = ccSendWithId c
+  ccEditMessage (NoKeyboardChan c) = ccEditMessage c
+  ccSendWithIdSilently (NoKeyboardChan c) = ccSendWithIdSilently c
+  ccLabel (NoKeyboardChan c) = ccLabel c
+  -- No inline-keyboard support: the loop must fall back to text rendering.
+  ccSendWithOptions _ _ _ _ = pure Nothing
+
+-- | A single-bubble mock with the edit gate permanently open (interval 0).
+-- Lets a test assert per-event edit CONTENT without the rate limiter
+-- coalescing events; only for tests where the gate is not the subject.
+newtype NoGateChan = NoGateChan MockChan
+
+instance ChatChannel NoGateChan where
+  ccReceive (NoGateChan c) = ccReceive c
+  ccSend (NoGateChan c) = ccSend c
+  ccSendWithId (NoGateChan c) = ccSendWithId c
+  ccEditMessage (NoGateChan c) = ccEditMessage c
+  ccSendWithOptions (NoGateChan c) = ccSendWithOptions c
+  ccLabel (NoGateChan c) = ccLabel c
+  ccSendWithIdSilently (NoGateChan c) = ccSendWithIdSilently c
+  ccProgressStyle _ = PsSingleBubble
+  ccChunkLimit _ = Just 1998
+  ccEditIntervalMs _ = 0
+
+-- | A single-bubble mock whose silent send always fails. Used to prove the
+-- loop falls back to a notifying create rather than losing the progress
+-- bubble entirely.
+newtype NoSilentChan = NoSilentChan MockChan
+
+instance ChatChannel NoSilentChan where
+  ccReceive (NoSilentChan c) = ccReceive c
+  ccSend (NoSilentChan c) = ccSend c
+  ccSendWithId (NoSilentChan c) = ccSendWithId c
+  ccEditMessage (NoSilentChan c) = ccEditMessage c
+  ccSendWithOptions (NoSilentChan c) = ccSendWithOptions c
+  ccLabel (NoSilentChan c) = ccLabel c
+  ccSendWithIdSilently _ _ = pure Nothing
+  ccProgressStyle _ = PsSingleBubble
+  ccChunkLimit _ = Just 1998
 
 mkMockChan :: IO MockChan
 mkMockChan = MockChan
@@ -79,6 +165,8 @@ mkMockChan = MockChan
   <*> newIORef []
   <*> newIORef []
   <*> newIORef 0
+  <*> newIORef False
+  <*> newIORef []
 
 getSends :: MockChan -> IO [Text]
 getSends ch = reverse <$> readIORef (mcSends ch)
@@ -209,12 +297,15 @@ data Seams = Seams
   , smAnswerQueue :: IORef [Either Text Bool]
     -- ^ Queued answer results (Right False = already resolved); an empty
     -- queue yields an accepted answer.
+  , smQuestionQueue :: IORef [Either Text [PendingQuestionJson]]
+    -- ^ Queued @GET \/questions@ results; an empty queue yields @[]@ (no
+    -- pending question).
   }
 
 mkSeams :: IO Seams
 mkSeams = Seams
   <$> newIORef [] <*> newIORef [] <*> newIORef [] <*> newIORef []
-  <*> newIORef [] <*> newIORef [] <*> newIORef []
+  <*> newIORef [] <*> newIORef [] <*> newIORef [] <*> newIORef []
   <*> newIORef [] <*> newIORef [] <*> newIORef [] <*> newIORef []
   <*> newIORef [] <*> newIORef [] <*> newIORef []
 
@@ -252,7 +343,7 @@ stubCfg mgr seams = (defaultChatChannelConfig mgr defaultGatewayConfig)
       nextQueued (smRepoSetupQueue seams) (Right ())
   , cccGetRepos = \_mgr _apiBase ->
       nextQueued (smReposQueue seams) (Right [])
-  , cccSendMessage = \_mgr _apiBase sid prompt -> do
+  , cccSendMessage = \_mgr _apiBase sid _mSrc prompt -> do
       modifyIORef' (smSends seams) ((sid, prompt) :)
       nextQueued (smSendQueue seams) (Right okSendResult)
   , cccStartWs = \_host _port cb -> do
@@ -273,6 +364,8 @@ stubCfg mgr seams = (defaultChatChannelConfig mgr defaultGatewayConfig)
   , cccAnswerQuestion = \_mgr _apiBase sid askId answer -> do
       modifyIORef' (smAnswers seams) ((sid, askId, answer) :)
       nextQueued (smAnswerQueue seams) (Right True)
+  , cccGetQuestions = \_mgr _apiBase _sid ->
+      nextQueued (smQuestionQueue seams) (Right [])
   }
 
 getMints :: Seams -> IO [A.Value]
@@ -364,7 +457,50 @@ bgReplyJson = entryJsonFor
 
 spec :: Spec
 spec = do
+  describe "handleInboundWithSource" $ do
+    it "forwards the inbound MessageSource to the HTTP send" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      recorded <- newIORef (Nothing :: Maybe MessageSource)
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let src = mkSourceFor "sig:+15551234567"
+          key = convKeyFromSource src
+          sid = mkSid "sid-1"
+          cfg = (stubCfg mgr seams)
+            { cccSendMessage = \_mgr _apiBase _sid mSrc _prompt -> do
+                writeIORef recorded mSrc
+                pure (Right okSendResult) }
+      sessionInsert sessions key sid
+      handleInboundWithSource cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs key (Just src) "hello"
+      readIORef recorded `shouldReturn` Just src
+    it "mints a new session on the inbound channel" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+          src = mkSourceFor "sig:+15551234567"
+          key = convKeyFromSource src
+      handleInboundWithSource cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs key (Just src) "hello"
+      getMints seams `shouldReturn` [A.object ["channel" .= ("signal" :: Text)]]
+
   describe "loop streaming behavior (issue #198 follow-up)" $ do
+
     it "finalizes the pre-tool bubble when a tool call fires, so post-tool text starts a new message" $ do
       -- Symptom 1: pre-tool text, tool line, and post-tool text were
       -- landing in the same platform message. The loop must finalize
@@ -377,7 +513,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "sess1", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -415,7 +551,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "sess2", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -453,7 +589,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "sess3", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -479,6 +615,740 @@ spec = do
       edits <- getEdits chan
       -- And nothing edited the old bubble with turn-two text.
       edits `shouldSatisfy` not . any (T.isInfixOf "turn two text")
+
+  describe "single-edited-bubble style (WU-2)" $ do
+    -- A turn whose first response carries text, then two tool calls, then
+    -- more text. The default style produces one message per segment plus one
+    -- per tool (the notification spam). The single-bubble style must create
+    -- exactly one message and edit it.
+    let runTurn mkChan = do
+          ch <- mkChan
+          let key = ConversationKey "signal" "conv1"
+          mgr <- newManager defaultManagerSettings
+          let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
+                        { cccStreamCfg = defaultStreamProgressConfig }
+          ss <- newStreamingState
+          conns <- newTVarIO (Map.singleton key (mkSid "sess-b", stubWs, ss))
+          pendingAsks <- newPendingAsks
+          tabTracker <- newTVarIO Map.empty
+          watchState <- newWatchState
+          thinkingTabs <- newThinkingTabs
+          bg <- newBgSessions
+          let sid = mkSid "sess-b"
+              fire = handleServerEvent cfg ch key conns pendingAsks bg
+                       tabTracker watchState thinkingTabs sid
+          -- Turn start clears the finalized flag (production sequence).
+          fire (SeActivity sid (statusJson "thinking"))
+          -- Segment 1 streams (throttled: one frame is enough to create).
+          fire (SeEntryUpdate sid (streamingJsonFor "pre-tool text"))
+          -- The recorded entry for response 1 (exact text).
+          fire (SeEntry sid (entryJsonFor "pre-tool text"))
+          -- Two tool calls.
+          fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+          fire (SeActivity sid (toolCallJson "BIN_EXEC"))
+          -- Segment 2 streams, then its recorded entry.
+          fire (SeEntryUpdate sid (streamingJsonFor "pre-tool text\n\npost-tool text"))
+          fire (SeEntry sid (entryJsonFor "pre-tool text\n\npost-tool text"))
+          fire (SeActivity sid (statusJson "idle"))
+          pure ch
+
+    it "creates exactly one message for a multi-tool turn" $ do
+      ch <- runTurn mkBubbleChan
+      let MockChan { mcSendIds = ids } = case ch of BubbleChan c -> c
+      sends <- readIORef ids
+      length sends `shouldBe` 1
+
+    it "keeps tool lines in the progress bubble and the answer in its own message" $ do
+      ch <- runTurn mkBubbleChan
+      let MockChan { mcEdits = eds, mcSendIds = ids } = case ch of BubbleChan c -> c
+      -- The bubble is the edited progress message: tool lines only.
+      edits <- map snd . reverse <$> readIORef eds
+      creates <- map fst . reverse <$> readIORef ids
+      -- The bubble's FINAL state is tool progress only. (Answer text may
+      -- preview in it transiently while the turn streams, then be stripped.)
+      let finalBubble = lastOrCrash (creates <> edits)
+      finalBubble `shouldSatisfy` T.isInfixOf "SHELL_EXEC"
+      finalBubble `shouldSatisfy` T.isInfixOf "BIN_EXEC"
+      finalBubble `shouldSatisfy` not . T.isInfixOf "post-tool text"
+      -- The answer is sent as its own (notifying) message.
+      answer <- lastOrCrash <$> getSends (case ch of BubbleChan c -> c)
+      answer `shouldBe` "pre-tool text\n\npost-tool text"
+
+    it "still creates a bubble for a tools-only turn" $ do
+      ch <- mkBubbleChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
+                    { cccStreamCfg = defaultStreamProgressConfig }
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (mkSid "sess-t", stubWs, ss))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "sess-t"
+          fire = handleServerEvent cfg ch key conns pendingAsks bg
+                   tabTracker watchState thinkingTabs sid
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeActivity sid (statusJson "idle"))
+      let MockChan { mcSendIds = ids } = case ch of BubbleChan c -> c
+      sends <- readIORef ids
+      length sends `shouldBe` 1
+
+    it "delivers a single recorded answer with no preceding frame" $ do
+      -- The /bg connection never receives entry-update (it ignores them), so
+      -- the answer must survive with no streaming frame to preview it. It is
+      -- delivered at idle, as its own notifying message.
+      ch <- mkBubbleChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
+                    { cccStreamCfg = defaultStreamProgressConfig }
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (mkSid "sess-bg", stubWs, ss))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "sess-bg"
+          fire = handleServerEvent cfg ch key conns pendingAsks bg tabTracker
+                   watchState thinkingTabs sid
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntry sid (entryJsonFor "bg reply text"))
+      fire (SeActivity sid (statusJson "idle"))
+      sends <- getSends (case ch of BubbleChan c -> c)
+      -- One delivery, as a real message.
+      sends `shouldBe` ["bg reply text"]
+
+    it "keeps both segments of a StopMaxTokens continuation" $ do
+      ch <- mkBubbleChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
+                    { cccStreamCfg = defaultStreamProgressConfig }
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (mkSid "sess-c", stubWs, ss))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "sess-c"
+          fire = handleServerEvent cfg ch key conns pendingAsks bg
+                   tabTracker watchState thinkingTabs sid
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntry sid (entryJsonFor "first part"))
+      fire (SeEntryUpdate sid (streamingJsonFor "first part second part"))
+      fire (SeEntry sid (entryJsonFor "first part second part"))
+      fire (SeActivity sid (statusJson "idle"))
+      -- Both segments survive into the delivered answer (they are separate
+      -- recorded responses, joined rather than overwriting one another).
+      answer <- lastOrCrash <$> getSends (case ch of BubbleChan c -> c)
+      answer `shouldSatisfy` T.isInfixOf "first part"
+      answer `shouldSatisfy` T.isInfixOf "second part"
+
+  describe "over-limit single-bubble turn (regression: final text was dropped)" $ do
+    -- Reported from a real Signal session: the bubble edited correctly as
+    -- tools ran, but when the turn finished the final message never arrived.
+    -- Cause: once the rendered body exceeded the platform's message limit,
+    -- updateBubble skipped the send/edit entirely and returned, so the text
+    -- was discarded and the turn then finalized.
+    it "still delivers the text when the body exceeds the chunk limit" $ do
+      inner <- mkMockChan
+      let chan = BubbleChan inner
+          key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (mkSid "sess-big", stubWs, ss))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "sess-big"
+          fire = handleServerEvent cfg chan key conns pendingAsks bg
+                   tabTracker watchState thinkingTabs sid
+          bigText = T.replicate 3000 "x"
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntryUpdate sid (streamingJsonFor bigText))
+      fire (SeEntry sid (entryJsonFor bigText))
+      fire (SeActivity sid (statusJson "idle"))
+      sends <- getSends inner
+      -- The text reached the channel rather than being dropped.
+      T.length (T.concat sends) `shouldSatisfy` (>= 3000)
+      -- ...exactly once, not once per event that hit the overflow branch.
+      T.length (T.concat sends) `shouldSatisfy` (<= 3100)
+
+  describe "failed bubble edit does not resend (WU-1)" $ do
+    -- A bubble holds tool progress only; the answer is delivered separately
+    -- ('finalizeSingleBubble' step 2). So when an edit fails - a 429 flood
+    -- control, a deleted message, a lost right - re-sending the body is pure
+    -- loss: it notifies, duplicates, and (because the new id used to be
+    -- discarded) repeats on EVERY later tool call. The policy is now: leave
+    -- the bubble alone; the next event re-renders the whole body.
+    let setup = do
+          inner <- mkMockChan
+          mgr <- newManager defaultManagerSettings
+          let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+          ss' <- newStreamingState
+          conns <- newTVarIO (Map.singleton (ConversationKey "signal" "conv1")
+                                (mkSid "s1", stubWs, ss'))
+          pendingAsks <- newPendingAsks
+          tabTracker <- newTVarIO Map.empty
+          watchState <- newWatchState
+          thinkingTabs <- newThinkingTabs
+          bg <- newBgSessions
+          let sid = mkSid "s1"
+              key = ConversationKey "signal" "conv1"
+              fire = handleServerEvent cfg (BubbleChan inner) key conns
+                       pendingAsks bg tabTracker watchState thinkingTabs sid
+          pure (inner, fire, sid)
+
+        -- The same harness with the edit gate permanently open, so a test can
+        -- assert per-event edit CONTENT without the rate limiter coalescing
+        -- events. Use this only where the gate is not the subject.
+        setupNoGate = do
+          inner <- mkMockChan
+          mgr <- newManager defaultManagerSettings
+          let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+          ss' <- newStreamingState
+          conns <- newTVarIO (Map.singleton (ConversationKey "signal" "conv1")
+                                (mkSid "s1", stubWs, ss'))
+          pendingAsks <- newPendingAsks
+          tabTracker <- newTVarIO Map.empty
+          watchState <- newWatchState
+          thinkingTabs <- newThinkingTabs
+          bg <- newBgSessions
+          let sid = mkSid "s1"
+              key = ConversationKey "signal" "conv1"
+              fire = handleServerEvent cfg (NoGateChan inner) key conns
+                       pendingAsks bg tabTracker watchState thinkingTabs sid
+          pure (inner, fire, sid)
+
+    it "does not send a fresh message when a live edit fails" $ do
+      (inner, fire, sid) <- setup
+      writeIORef (mcEditFails inner) True
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeActivity sid (toolCallJson "BIN_EXEC"))
+      created <- reverse <$> readIORef (mcSendIds inner)
+      -- Exactly one create (the bubble) and NO fallback sends.
+      length created `shouldBe` 1
+
+    it "still delivers the answer after a failed edit" $ do
+      (inner, fire, sid) <- setup
+      writeIORef (mcEditFails inner) True
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeEntry sid (entryJsonFor "the answer"))
+      fire (SeActivity sid (statusJson "idle"))
+      sends <- getSends inner
+      -- The answer is its own message, unaffected by the edit outcome.
+      sends `shouldSatisfy` elem "the answer"
+      -- ...and it is delivered exactly once.
+      length (filter (== "the answer") sends) `shouldBe` 1
+
+    it "re-renders the whole body on the next successful edit" $ do
+      (inner, fire, sid) <- setupNoGate
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      -- Fail one edit, then let the next one succeed.
+      writeIORef (mcEditFails inner) True
+      fire (SeActivity sid (toolCallJson "BIN_EXEC"))
+      writeIORef (mcEditFails inner) False
+      fire (SeActivity sid (toolCallJson "PROCESS_MANAGE"))
+      edits <- reverse <$> readIORef (mcEdits inner)
+      let lastEdit = case reverse edits of
+                       (x:_) -> Just x
+                       []    -> Nothing
+      -- The recovered edit carries ALL three tool lines, not just the newest,
+      -- so a failed edit loses no progress.
+      case lastEdit of
+        Nothing -> expectationFailure "expected a successful edit after recovery"
+        Just (_, body) -> do
+          body `shouldSatisfy` T.isInfixOf "SHELL_EXEC"
+          body `shouldSatisfy` T.isInfixOf "BIN_EXEC"
+          body `shouldSatisfy` T.isInfixOf "PROCESS_MANAGE"
+
+  describe "single-bubble edit gate (WU-3)" $ do
+    -- Telegram allows roughly 20 messages/minute per group and about one per
+    -- second per chat. Before this gate the PsSingleBubble frame path edited on
+    -- EVERY gateway frame, and the tool path on every tool call - on a fast
+    -- model that is 100+ edits/minute. Both sources now share ONE bucket, so a
+    -- turn cannot exceed one edit per interval by alternating between them.
+    let setup = do
+          inner <- mkMockChan
+          mgr <- newManager defaultManagerSettings
+          clock <- newIORef (UTCTime (fromGregorian 2026 1 1) 0)
+          let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
+                      { cccNow = readIORef clock }
+              advance = modifyIORef' clock (addUTCTime 5)
+          ss' <- newStreamingState
+          conns <- newTVarIO (Map.singleton (ConversationKey "signal" "conv1")
+                                (mkSid "s1", stubWs, ss'))
+          pendingAsks <- newPendingAsks
+          tabTracker <- newTVarIO Map.empty
+          watchState <- newWatchState
+          thinkingTabs <- newThinkingTabs
+          bg <- newBgSessions
+          let sid = mkSid "s1"
+              key = ConversationKey "signal" "conv1"
+              fire = handleServerEvent cfg (BubbleChan inner) key conns
+                       pendingAsks bg tabTracker watchState thinkingTabs sid
+          pure (inner, fire, sid, advance)
+
+        editCount inner = length <$> readIORef (mcEdits inner)
+
+    it "coalesces a burst of tool calls into one edit" $ do
+      (inner, fire, sid, _) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      mapM_ (\n -> fire (SeActivity sid (toolCallJson ("SHELL_EXEC" <> T.pack (show n)))))
+            [1 .. 10 :: Int]
+      n <- editCount inner
+      -- The first tool call CREATES the bubble (a create, not an edit); the
+      -- other nine land inside one interval and are coalesced into at most one
+      -- edit. The invariant that matters: ten tool calls do NOT mean ten
+      -- platform round-trips.
+      n `shouldSatisfy` (<= 1)
+
+    it "loses no tool line by coalescing" $ do
+      -- Coalescing suppresses intermediate REDRAWS, never content: the body is
+      -- re-rendered from the whole splice list, and the idle close is
+      -- deliberately UNGATED, so the final bubble carries every line.
+      (inner, fire, sid, _) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      mapM_ (\n -> fire (SeActivity sid (toolCallJson ("TOOL" <> T.pack (show n)))))
+            [1 .. 10 :: Int]
+      fire (SeActivity sid (statusJson "idle"))
+      edits <- reverse <$> readIORef (mcEdits inner)
+      let body = case reverse edits of
+                   ((_, b):_) -> b
+                   []         -> ""
+      mapM_ (\n -> body `shouldSatisfy` T.isInfixOf ("TOOL" <> T.pack (show n)))
+            [1 .. 10 :: Int]
+
+    it "edits again once the interval elapses" $ do
+      (inner, fire, sid, advance) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      before <- editCount inner
+      advance
+      fire (SeActivity sid (toolCallJson "BIN_EXEC"))
+      after <- editCount inner
+      after `shouldBe` before + 1
+
+    it "shares one bucket between frames and tools" $ do
+      (inner, fire, sid, _) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      before <- editCount inner
+      -- Interleave both sources inside one interval. With two INDEPENDENT
+      -- buckets each source would get its own edit (>=2 more); with ONE shared
+      -- bucket at most one edit total is possible.
+      fire (SeEntryUpdate sid (streamingJsonFor "some text"))
+      fire (SeActivity sid (toolCallJson "BIN_EXEC"))
+      fire (SeEntryUpdate sid (streamingJsonFor "some more text"))
+      after <- editCount inner
+      after `shouldSatisfy` (<= before + 1)
+
+    it "is not blocked by the previous turn's timestamp" $ do
+      -- 'resetStreamingState' clears the bucket at turn end, so the next turn's
+      -- bubble is created and edited straight away instead of waiting out the
+      -- previous turn's interval. (A fresh turn's first tool call CREATES, so
+      -- the observable is the create count plus an immediate edit.)
+      (inner, fire, sid, _) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeEntry sid (entryJsonFor "first"))
+      fire (SeActivity sid (statusJson "idle"))
+      createsBefore <- length <$> readIORef (mcSendIds inner)
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "BIN_EXEC"))
+      createsAfter <- length <$> readIORef (mcSendIds inner)
+      -- A new bubble was created immediately (no stale interval blocked it).
+      createsAfter `shouldBe` createsBefore + 1
+
+    it "does not advance the bucket when an edit fails" $ do
+      -- A failed edit must retry on the next event rather than being
+      -- suppressed for another interval.
+      (inner, fire, sid, _) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      writeIORef (mcEditFails inner) True
+      fire (SeActivity sid (toolCallJson "BIN_EXEC"))
+      writeIORef (mcEditFails inner) False
+      before <- editCount inner
+      -- The failed edit did not open an interval, so the very next event -
+      -- still inside the window - edits immediately and recovers the content.
+      -- (Had the failure advanced the bucket, this would be suppressed and the
+      -- bubble would stay stale for another interval.)
+      fire (SeActivity sid (toolCallJson "PROCESS_MANAGE"))
+      after <- editCount inner
+      after `shouldBe` before + 1
+
+    it "keeps a StopMaxTokens continuation whole under the gate" $ do
+      -- A second recorded response entry (a continuation) must survive the
+      -- gate: coalescing affects redraws, never delivered text.
+      (inner, fire, sid, _) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeEntry sid (entryJsonFor "first part"))
+      fire (SeEntryUpdate sid (streamingJsonFor "first part second part"))
+      fire (SeEntry sid (entryJsonFor "first part second part"))
+      fire (SeActivity sid (statusJson "idle"))
+      answer <- lastOrCrash <$> getSends inner
+      answer `shouldSatisfy` T.isInfixOf "first part"
+      answer `shouldSatisfy` T.isInfixOf "second part"
+
+    it "delivers a /bg reply that never saw a frame, under the gate" $ do
+      -- A background connection receives no entry-updates at all, so the
+      -- bucket is never opened by a frame; the recorded entry must still reach
+      -- the human exactly once.
+      (inner, fire, sid, _) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntry sid (entryJsonFor "bg reply text"))
+      fire (SeActivity sid (statusJson "idle"))
+      getSends inner `shouldReturn` ["bg reply text"]
+
+    it "does not gate the watch notification (it is a send, not an edit)" $ do
+      -- /watch notifies through ccSend, so the edit gate cannot suppress it.
+      (inner, fire, sid, _) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeActivity sid (statusJson "idle"))
+      -- The tools-only close notice is a send and still arrives.
+      sends <- getSends inner
+      length sends `shouldBe` 1
+
+  describe "ASK_HUMAN must notify (WU-4)" $ do
+    -- The operator named this explicitly: a message that needs user input must
+    -- generate a notification. The silent-create seam added for progress
+    -- bubbles is exactly the kind of thing that could silently capture an ask,
+    -- so this is a regression guard rather than a restatement.
+    let setup mkChan = do
+          ch <- mkChan
+          mgr <- newManager defaultManagerSettings
+          let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+          ss' <- newStreamingState
+          conns <- newTVarIO (Map.singleton (ConversationKey "signal" "conv1")
+                                (mkSid "s1", stubWs, ss'))
+          pendingAsks <- newPendingAsks
+          tabTracker <- newTVarIO Map.empty
+          watchState <- newWatchState
+          thinkingTabs <- newThinkingTabs
+          bg <- newBgSessions
+          let sid = mkSid "s1"
+              key = ConversationKey "signal" "conv1"
+              fire = handleServerEvent cfg ch key conns pendingAsks bg
+                       tabTracker watchState thinkingTabs sid
+          pure (ch, fire, sid)
+
+        optionsAsk = A.object
+          [ "id" .= ("abcdef12-0000-0000-0000-000000000000" :: Text)
+          , "question" .= ("Which branch?" :: Text)
+          , "options" .= [ A.object [ "label" .= ("main" :: Text)
+                                    , "description" .= ("default" :: Text) ] ]
+          ]
+        openAsk = A.object
+          [ "id" .= ("12345678-0000-0000-0000-000000000000" :: Text)
+          , "question" .= ("What next?" :: Text)
+          , "options" .= ([] :: [A.Value])
+          ]
+
+    it "sends an options ask as a notifying keyboard message" $ do
+      (ch, fire, sid) <- setup mkBubbleChan
+      fire (SeAsk sid optionsAsk)
+      let MockChan { mcWithOpts = wo, mcSilentSends = silent } =
+            case ch of BubbleChan c -> c
+      -- It went through the inline-keyboard path (a real sendMessage)...
+      opts <- readIORef wo
+      length opts `shouldBe` 1
+      -- ...and NOT through the silent progress path.
+      readIORef silent `shouldReturn` []
+
+    it "falls back to a NOTIFYING send when the keyboard send fails" $ do
+      -- The fallback fires when ccSendWithOptions returns Nothing. It must be
+      -- an ordinary send: a silent fallback would leave a pending question
+      -- with no notification.
+      inner <- mkMockChan
+      let chan = NoKeyboardChan inner
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ss' <- newStreamingState
+      conns <- newTVarIO (Map.singleton (ConversationKey "signal" "conv1")
+                            (mkSid "s1", stubWs, ss'))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "s1"
+          key = ConversationKey "signal" "conv1"
+          fire = handleServerEvent cfg chan key conns pendingAsks bg
+                   tabTracker watchState thinkingTabs sid
+      fire (SeAsk sid optionsAsk)
+      sends <- getSends inner
+      length sends `shouldBe` 1
+      -- The fallback body carries the question and the numbered options.
+      sends `shouldSatisfy` any (T.isInfixOf "Which branch?")
+      readIORef (mcSilentSends inner) `shouldReturn` []
+
+    it "sends an open-ended ask as a notifying message" $ do
+      (ch, fire, sid) <- setup mkBubbleChan
+      fire (SeAsk sid openAsk)
+      let MockChan { mcSends = snds, mcSilentSends = silent } =
+            case ch of BubbleChan c -> c
+      sends <- readIORef snds
+      length sends `shouldBe` 1
+      sends `shouldSatisfy` any (T.isInfixOf "What next?")
+      readIORef silent `shouldReturn` []
+
+    it "never uses the silent path for an ask, even mid-turn" $ do
+      -- Sequence a tool call (which opens a silent bubble) then an ask, so a
+      -- careless implementation that reuses the bubble's send for asks is
+      -- caught.
+      (ch, fire, sid) <- setup mkBubbleChan
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeAsk sid optionsAsk)
+      let MockChan { mcSilentSends = silent } = case ch of BubbleChan c -> c
+      -- Exactly one silent send: the bubble. The ask did not add another.
+      silentBodies <- readIORef silent
+      length silentBodies `shouldBe` 1
+      silentBodies `shouldSatisfy` all (T.isInfixOf "SHELL_EXEC")
+
+  describe "Telegram-style turn shapes (WU-2)" $ do
+    -- The operator's requirement in one place: a tool turn must notify exactly
+    -- ONCE (the answer); a tools-only turn must also notify exactly once; a
+    -- plain Q&A turn notifies once with no bubble.
+    let setup = do
+          inner <- mkMockChan
+          mgr <- newManager defaultManagerSettings
+          let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+          ss' <- newStreamingState
+          conns <- newTVarIO (Map.singleton (ConversationKey "signal" "conv1")
+                                (mkSid "s1", stubWs, ss'))
+          pendingAsks <- newPendingAsks
+          tabTracker <- newTVarIO Map.empty
+          watchState <- newWatchState
+          thinkingTabs <- newThinkingTabs
+          bg <- newBgSessions
+          let sid = mkSid "s1"
+              key = ConversationKey "signal" "conv1"
+              fire = handleServerEvent cfg (BubbleChan inner) key conns
+                       pendingAsks bg tabTracker watchState thinkingTabs sid
+          pure (inner, fire, sid)
+
+    it "creates the progress bubble silently" $ do
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      silent <- readIORef (mcSilentSends inner)
+      -- The bubble's create went through the silent path...
+      silent `shouldSatisfy` (not . null)
+      -- ...so nothing notifying was sent yet.
+      getSends inner `shouldReturn` []
+
+    it "notifies exactly once for a tool turn (the answer)" $ do
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeEntry sid (entryJsonFor "the answer"))
+      fire (SeActivity sid (statusJson "idle"))
+      sends <- getSends inner
+      -- Exactly one notifying send, and it carries the answer.
+      sends `shouldBe` ["the answer"]
+
+    it "still notifies exactly once for a tools-only turn" $ do
+      -- The bubble is silent and edits are silent, so without a close notice
+      -- this turn would notify ZERO times - breaking the rule that the last
+      -- message before idle notifies.
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeActivity sid (statusJson "idle"))
+      sends <- getSends inner
+      length sends `shouldBe` 1
+      -- ...and it is a close notice, not an answer.
+      sends `shouldSatisfy` not . any (T.isInfixOf "SHELL_EXEC")
+
+    it "does not repeat the close notice on a duplicate idle" $ do
+      -- Idle can arrive more than once (a withheld idle for background
+      -- children, then the real one). ssFinalized must stop a second close
+      -- notice, or the operator gets the same ping twice.
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeActivity sid (statusJson "idle"))
+      fire (SeActivity sid (statusJson "idle"))
+      sends <- getSends inner
+      length sends `shouldBe` 1
+
+    it "notifies exactly once for a plain Q&A turn, with no bubble" $ do
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntryUpdate sid (streamingJsonFor "the answer"))
+      fire (SeEntry sid (entryJsonFor "the answer"))
+      fire (SeActivity sid (statusJson "idle"))
+      sends <- getSends inner
+      sends `shouldBe` ["the answer"]
+      -- No bubble was created, so the silent path was never used.
+      silent <- readIORef (mcSilentSends inner)
+      silent `shouldBe` []
+
+    it "sends nothing for an empty turn" $ do
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (statusJson "idle"))
+      getSends inner `shouldReturn` []
+      readIORef (mcSilentSends inner) `shouldReturn` []
+
+    it "falls back to a notifying create when the silent send fails" $ do
+      inner <- mkMockChan
+      -- A channel whose silent send fails but whose normal send works.
+      let chan = NoSilentChan inner
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ss' <- newStreamingState
+      conns <- newTVarIO (Map.singleton (ConversationKey "signal" "conv1")
+                            (mkSid "s1", stubWs, ss'))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "s1"
+          key = ConversationKey "signal" "conv1"
+          fire = handleServerEvent cfg chan key conns pendingAsks bg
+                   tabTracker watchState thinkingTabs sid
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      -- Progress was not lost: a notifying create happened instead.
+      created <- readIORef (mcSendIds inner)
+      length created `shouldBe` 1
+
+    it "closes an over-limit bubble with a deliberate line, not a frozen prefix" $ do
+      -- An abandoned bubble used to keep a truncated prefix AND a streaming
+      -- cursor on screen, which reads as "still working" forever. It now gets
+      -- one short closing edit; the full text arrives via the chunked send.
+      --
+      -- The limit applies to the BUBBLE BODY (tool progress), not the answer,
+      -- so the body must itself exceed ccChunkLimit - many tool calls, each
+      -- contributing a line.
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      -- A tool call first: under PsSingleBubble it is the only bubble creator.
+      mapM_ (\_ -> fire (SeActivity sid (toolCallJson "SHELL_EXEC"))) [1 .. 120 :: Int]
+      fire (SeEntry sid (entryJsonFor "the answer"))
+      fire (SeActivity sid (statusJson "idle"))
+      edits <- reverse <$> readIORef (mcEdits inner)
+      let bodies = map snd edits
+      -- The last edit is the over-limit closing line.
+      case reverse bodies of
+        (lastBody:_) -> do
+          lastBody `shouldBe` "turn finished - answer below"
+          lastBody `shouldSatisfy` not . T.isInfixOf "\x2589"
+        [] -> expectationFailure "expected a closing edit for the over-limit bubble"
+      -- The answer still reached the channel.
+      sends <- getSends inner
+      sends `shouldBe` ["the answer"]
+
+    it "does not apply the over-limit close to a plain Q&A turn" $ do
+      -- No bubble exists, so the close is a no-op and the answer is unchanged.
+      (inner, fire, sid) <- setup
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntry sid (entryJsonFor "short answer"))
+      fire (SeActivity sid (statusJson "idle"))
+      getSends inner `shouldReturn` ["short answer"]
+      readIORef (mcEdits inner) `shouldReturn` []
+
+
+  describe "final answer is a NEW message (so it notifies)" $ do
+    -- A Signal edit does not notify, so a final answer edited into the
+    -- progress bubble arrives silently. The answer must be its own message;
+    -- the bubble carries progress (tool lines) only.
+    let mkCfg = do
+          mgr <- newManager defaultManagerSettings
+          pure (defaultChatChannelConfig mgr defaultGatewayConfig)
+        mkState = do
+          ss' <- newStreamingState
+          conns <- newTVarIO (Map.singleton (ConversationKey "signal" "conv1")
+                                (mkSid "s1", stubWs, ss'))
+          pure (ss', conns)
+
+    it "sends a plain answer as its own message, with no progress bubble" $ do
+      inner <- mkMockChan
+      cfg <- mkCfg
+      conns <- snd <$> mkState
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "s1"
+          key = ConversationKey "signal" "conv1"
+          fire = handleServerEvent cfg (BubbleChan inner) key conns pendingAsks bg
+                   tabTracker watchState thinkingTabs sid
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntryUpdate sid (streamingJsonFor "the answer"))
+      fire (SeEntry sid (entryJsonFor "the answer"))
+      fire (SeActivity sid (statusJson "idle"))
+      got <- getSends inner
+      -- Exactly one message, carrying the answer, and no bubble was created.
+      got `shouldBe` ["the answer"]
+      bubbleIds <- map snd . reverse <$> readIORef (mcSendIds inner)
+      bubbleIds `shouldBe` []
+
+    it "keeps the progress bubble free of the answer text" $ do
+      inner <- mkMockChan
+      cfg <- mkCfg
+      conns <- snd <$> mkState
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "s1"
+          key = ConversationKey "signal" "conv1"
+          fire = handleServerEvent cfg (BubbleChan inner) key conns pendingAsks bg
+                   tabTracker watchState thinkingTabs sid
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntry sid (entryJsonFor "let me look"))
+      fire (SeActivity sid (toolCallJson "SHELL_EXEC"))
+      fire (SeEntry sid (entryJsonFor "let me look\n\nthe final answer"))
+      fire (SeActivity sid (statusJson "idle"))
+      -- The tool line is in the bubble (a new-message create)...
+      created <- map fst . reverse <$> readIORef (mcSendIds inner)
+      created `shouldSatisfy` any (T.isInfixOf "SHELL_EXEC")
+      created `shouldSatisfy` not . any (T.isInfixOf "the final answer")
+      -- ...and the answer is delivered as its own notifying message.
+      sent <- getSends inner
+      sent `shouldSatisfy` any (T.isInfixOf "the final answer")
+
+    it "delivers the answer exactly once across bubble and new message" $ do
+      inner <- mkMockChan
+      cfg <- mkCfg
+      conns <- snd <$> mkState
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sid = mkSid "s1"
+          key = ConversationKey "signal" "conv1"
+          fire = handleServerEvent cfg (BubbleChan inner) key conns pendingAsks bg
+                   tabTracker watchState thinkingTabs sid
+      fire (SeActivity sid (statusJson "thinking"))
+      fire (SeEntry sid (entryJsonFor "answer text"))
+      fire (SeActivity sid (statusJson "idle"))
+      sent <- getSends inner
+      created <- map fst . reverse <$> readIORef (mcSendIds inner)
+      let everything = T.concat (sent <> created)
+      T.count "answer text" everything `shouldBe` 1
 
   describe "extractEntryText" $ do
     it "extracts text from a payload with content array" $ do
@@ -599,7 +1469,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "emoji-test", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -619,7 +1489,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "emoji-test2", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -638,7 +1508,7 @@ spec = do
       let cfg = (defaultChatChannelConfig mgr defaultGatewayConfig)
                     { cccStreamCfg = defaultStreamProgressConfig }
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "emoji-test3", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -695,8 +1565,46 @@ spec = do
       formatQuestionWithOptions "Which?" [QuestionOption "yes" "proceed", QuestionOption "no" ""]
         `shouldBe` "Which?\n\n1) yes \8212 proceed\n2) no\n\nReply with a number or type your own answer."
 
-    it "returns just the question when no options" $ do
-      formatQuestionWithOptions "Hello?" [] `shouldBe` "Hello?"
+    it "adds a reply hint when there are no options" $ do
+      -- An open-ended ask previously arrived as a bare question, giving the
+      -- human no signal that a answer was expected.
+      formatQuestionWithOptions "Hello?" [] `shouldBe` "Hello?\n\nReply with your answer."
+
+  describe "handleAsk rendering (WU-4)" $ do
+    it "sends an open-ended ask with a reply hint on a keyboard-less channel" $ do
+      nk <- mockNoKeyboard
+      let NoKeyboardChan chan = nk
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+          key = ConversationKey "signal" "conv1"
+          val = A.object
+            [ "id" .= ("aaaaaaaa-0000-0000-0000-000000000000" :: Text)
+            , "question" .= ("Which branch?" :: Text)
+            ]
+      asks <- newPendingAsks
+      handleAsk cfg nk key asks (mkSid "s1") val
+      sends <- getSends chan
+      sends `shouldBe` ["Which branch?\n\nReply with your answer."]
+
+    it "sends an options ask as a numbered list with the numeric hint" $ do
+      nk <- mockNoKeyboard
+      let NoKeyboardChan chan = nk
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+          key = ConversationKey "signal" "conv1"
+          val = A.object
+            [ "id" .= ("aaaaaaaa-0000-0000-0000-000000000000" :: Text)
+            , "question" .= ("Pick" :: Text)
+            , "options" .=
+                [ A.object ["label" .= ("red" :: Text), "description" .= ("warm" :: Text)]
+                , A.object ["label" .= ("blue" :: Text), "description" .= ("" :: Text)]
+                ]
+            ]
+      asks <- newPendingAsks
+      handleAsk cfg nk key asks (mkSid "s1") val
+      sends <- getSends chan
+      sends `shouldBe`
+        ["Pick\n\n1) red \8212 warm\n2) blue\n\nReply with a number or type your own answer."]
   describe "handleInbound inject behavior" $ do
     -- When the user sends "/N payload" (ChatInject), the message should
     -- be sent to tab N's session WITHOUT changing the focused tab. The
@@ -883,7 +1791,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -902,13 +1810,123 @@ spec = do
       sends <- getSends chan
       sends `shouldSatisfy` any (T.isInfixOf "finished thinking")
 
+    it "watched session that ASKS posts a needs-input notification with the question" $ do
+      -- A watched tab blocked on ASK_HUMAN broadcasts an all-subscriber
+      -- harness-status idle (wrapCapsForAskStatus fires it before blocking),
+      -- which is indistinguishable from a finished turn by the event alone.
+      -- The loop must consult the session's pending questions and say
+      -- "needs your input", with the question, instead of "finished".
+      chan <- mkMockChan
+      seams <- mkSeams
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = stubCfg mgr seams
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let otherSid = mkSid "other"
+      writeIORef (smQuestionQueue seams)
+        [Right [PendingQuestionJson "q-1" "Which branch?" []]]
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
+        watchState thinkingTabs (mkSid "focused")
+        (SeActivity otherSid (statusJson "thinking"))
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
+        watchState thinkingTabs (mkSid "focused")
+        (SeActivity otherSid (statusJson "idle"))
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "needs your input")
+      sends `shouldSatisfy` any (T.isInfixOf "Which branch?")
+      sends `shouldSatisfy` not . any (T.isInfixOf "finished thinking")
+      -- The question is registered so a plain-text reply can answer it.
+      asks <- pendingAsksFor pendingAsks
+      case Map.lookup otherSid asks of
+        Just (a : _) -> paAskId a `shouldBe` "q-1"
+        _            -> expectationFailure "expected the watched ask to be registered"
+
+    it "does not re-announce a watched ask it already notified about" $ do
+      chan <- mkMockChan
+      seams <- mkSeams
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = stubCfg mgr seams
+      ss <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let otherSid = mkSid "other"
+      writeIORef (smQuestionQueue seams)
+        [ Right [PendingQuestionJson "q-1" "Which branch?" []]
+        , Right [PendingQuestionJson "q-1" "Which branch?" []]
+        ]
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      let fireIdle = handleServerEvent cfg chan key conns pendingAsks bg tabTracker
+                       watchState thinkingTabs (mkSid "focused")
+                       (SeActivity otherSid (statusJson "idle"))
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
+        watchState thinkingTabs (mkSid "focused")
+        (SeActivity otherSid (statusJson "thinking"))
+      fireIdle
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
+        watchState thinkingTabs (mkSid "focused")
+        (SeActivity otherSid (statusJson "thinking"))
+      fireIdle
+      sends <- getSends chan
+      -- The question is announced once; the second idle sees it already
+      -- registered and stays silent rather than also emitting "finished
+      -- thinking". (The /watch confirmation is dropped: it now mentions
+      -- "needs your input" too.)
+      let notices = filter (T.isInfixOf "Which branch?") sends
+      length notices `shouldBe` 1
+      length (filter (T.isInfixOf "finished thinking") sends) `shouldBe` 0
+
+    it "answers a watched ask by plain text against its own session" $ do
+      chan <- mkMockChan
+      seams <- mkSeams
+      sessions <- newSessionMap
+      let key = ConversationKey "signal" "conv1"
+      sessionInsert sessions key (mkSid "focused")
+      ss <- newStreamingState
+      wsConns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let otherSid = mkSid "other"
+      mgr <- newManager defaultManagerSettings
+      let cfg = stubCfg mgr seams
+      writeIORef (smQuestionQueue seams)
+        [Right [PendingQuestionJson "q-1" "Which branch?" []]]
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      let fire = handleServerEvent cfg chan key wsConns pendingAsks bg
+                   tabTracker watchState thinkingTabs (mkSid "focused")
+      fire (SeActivity otherSid (statusJson "thinking"))
+      fire (SeActivity otherSid (statusJson "idle"))
+      _ <- getSends chan
+      -- A plain reply is consumed as the answer for the watched session.
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs key "main"
+      answers <- getAnswers seams
+      answers `shouldBe` [(otherSid, "q-1", "main")]
+
     it "non-focused session idle does NOT send a notification when watch is off" $ do
       chan <- mkMockChan
       let key = ConversationKey "signal" "conv1"
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -931,7 +1949,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -953,7 +1971,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -977,7 +1995,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -1004,7 +2022,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -1037,7 +2055,7 @@ spec = do
       mgr <- newManager defaultManagerSettings
       let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
       ss <- newStreamingState
-      conns <- newTVarIO (Map.singleton key (mkSid "conn-sid", stubWs, ss))
+      conns <- newTVarIO (Map.singleton key (mkSid "focused", stubWs, ss))
       pendingAsks <- newPendingAsks
       tabTracker <- newTVarIO Map.empty
       watchState <- newWatchState
@@ -1059,6 +2077,56 @@ spec = do
         (SeActivity otherSid (statusJson "idle"))
       sends <- getSends chan
       sends `shouldSatisfy` not . any (T.isInfixOf "finished thinking")
+
+    it "stale callback (after re-target) does not send a partial reply fragment" $ do
+      -- When the user changes focus while a tab is finishing, the old WS
+      -- callback (bound to the old focusedSid) may still process one more
+      -- event before its reader loop exits. Without the staleness guard,
+      -- the old callback would find the old streaming state (still in
+      -- wsConns) and send the accumulated text — a partial reply fragment
+      -- that arrives BEFORE the watch notification from the new callback.
+      -- With the guard, the old callback checks wsConns and sees its
+      -- focusedSid no longer matches the boundSid, so it ignores the event.
+      chan <- mkMockChan
+      let key = ConversationKey "signal" "conv1"
+      mgr <- newManager defaultManagerSettings
+      let cfg = defaultChatChannelConfig mgr defaultGatewayConfig
+      ssA <- newStreamingState
+      conns <- newTVarIO (Map.singleton key (mkSid "sess-a", stubWs, ssA))
+      pendingAsks <- newPendingAsks
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      bg <- newBgSessions
+      let sidA = mkSid "sess-a"
+          sidB = mkSid "sess-b"
+      handleWatchToggle chan watchState key "/watch on"
+      _ <- getSends chan
+      -- Session A starts thinking — old callback (focusedSid = sidA)
+      -- processes it via the focused path.
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
+        watchState thinkingTabs sidA
+        (SeActivity sidA (statusJson "thinking"))
+      -- Text accumulates for session A.
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
+        watchState thinkingTabs sidA
+        (SeEntryUpdate sidA (streamingJsonFor "partial reply text"))
+      -- Simulate re-target: replace the wsConns entry with session B.
+      ssB <- newStreamingState
+      atomically $ modifyTVar' conns (Map.insert key (sidB, stubWs, ssB))
+      -- The old callback (focusedSid = sidA) receives the idle event.
+      -- Without the staleness guard, withStreamingState would find ssB
+      -- (the new streaming state, which is empty) and send nothing —
+      -- but if the old entry hadn't been replaced yet, it would find ssA
+      -- and send "partial reply text" as a fragment. The guard ensures
+      -- the old callback ignores the event entirely.
+      handleServerEvent cfg chan key conns pendingAsks bg tabTracker
+        watchState thinkingTabs sidA
+        (SeActivity sidA (statusJson "idle"))
+      sendsAfterStale <- getSends chan
+      -- No partial reply fragment was sent by the stale callback.
+      sendsAfterStale `shouldSatisfy`
+        not . any (T.isInfixOf "partial reply text")
 
   describe "/bg (background sessions)" $ do
     let bgKey = ConversationKey "signal" "conv-bg"
@@ -1206,6 +2274,36 @@ spec = do
         []       -> expectationFailure "expected a bg WS callback"
       sent <- getAllSent chan
       sent `shouldSatisfy` any (T.isInfixOf "the background answer")
+
+    it "delivers a /bg reply as exactly ONE message on the single-bubble style" $ do
+      -- The bg connection never receives entry-update, so handleEntry must
+      -- CREATE the bubble rather than only editing one. And because bg idle
+      -- retires the session without finalizing, the reply must not be sent a
+      -- second time. Guarded here directly on handleBgServerEvent, since the
+      -- /bg path is what regressed twice during review.
+      inner <- mkMockChan
+      let chan = BubbleChan inner
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueMints seams ["bgsid-1"]
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs bgKey "/bg hi"
+      cbs <- getCallbacks seams
+      case cbs of
+        (cb : _) -> do
+          cb (SeEntry bgSid1 (bgReplyJson "the background answer"))
+          cb (SeActivity bgSid1 (statusJson "idle"))
+        [] -> expectationFailure "expected a bg WS callback"
+      sent <- getAllSent inner
+      length (filter (T.isInfixOf "the background answer") sent) `shouldBe` 1
 
     it "ignores entry-updates, list snapshots, and other sessions on the bg connection" $ do
       chan <- mkMockChan
@@ -2071,7 +3169,8 @@ spec = do
       getMints seams `shouldReturn`
         [A.object
           [ "provider" .= ("anthropic" :: Text)
-          , "model" .= ("claude-sonnet-4" :: Text) ]]
+          , "model" .= ("claude-sonnet-4" :: Text)
+          , "channel" .= ("mock" :: Text) ]]
       getRebinds seams `shouldReturn` []
       -- No prior session: nothing to warn about and nothing to resume.
       getSends chan `shouldReturn` ["new session fresh-sid"]
@@ -2163,6 +3262,53 @@ spec = do
       getRepoSetups seams `shouldReturn`
         [(newSid, A.object ["url" .= ("git@github.com:o/r.git" :: Text)])]
       -- A successful setup is silent: only the confirmation.
+      getSends chan `shouldReturn` [confirmNew]
+
+    it "threads -b into the setup-repo body dispatched to the NEW session" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueRebinds seams [Right (rebindOk "new-sid" "p" "m")]
+      queueRepos seams
+        [Right [A.object
+          [ "id" .= ("seal" :: Text)
+          , "url" .= ("git@github.com:o/r.git" :: Text) ]]]
+      sessions <- newSessionMap
+      sessionInsert sessions newKey oldSid
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs newKey "/new -r seal -b dev"
+      -- The -r value was resolved against the registry AND the branch rode
+      -- along in the same body.
+      getRepoSetups seams `shouldReturn`
+        [(newSid, A.object
+          [ "url"    .= ("git@github.com:o/r.git" :: Text)
+          , "branch" .= ("dev" :: Text) ])]
+      getSends chan `shouldReturn` [confirmNew]
+
+    it "performs no repo setup for -b without -r" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      queueRebinds seams [Right (rebindOk "new-sid" "p" "m")]
+      sessions <- newSessionMap
+      sessionInsert sessions newKey oldSid
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs newKey "/new -b dev"
+      getRepoSetups seams `shouldReturn` []
       getSends chan `shouldReturn` [confirmNew]
 
     it "uses -r verbatim when the repo registry cannot be read" $ do

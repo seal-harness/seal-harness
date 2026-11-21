@@ -19,7 +19,8 @@ import Seal.Handles.AskReply
   , newAskReplyStore, parseAskId, pendingForSession
   , QuestionOption (..), validateOptions
   , askHumanWithOptions, PendingQuestionInfo (..), AskId (..)
-  , deliverNextAnswerResolved, deliverNextAnswerResolvedAny )
+  , deliverNextAnswerResolved, deliverNextAnswerResolvedAny
+  , deliverNextAnswerResolvedId )
 
 -- | A valid UUID v4 text for tests that need a pre-known id (not minted).
 dummyUuidText :: Text
@@ -443,6 +444,36 @@ spec = describe "Seal.Handles.AskReply" $ do
       (delivered, accepted) <- deliverNextAnswerResolved store sid "2"
       accepted `shouldBe` False
       delivered `shouldBe` "2"
+
+    -- The gateway's POST /send path resolves a plain reply in one
+    -- transaction AND needs the id of the question it answered, so it can
+    -- broadcast ask_resolved (dismissing the question in the web UI).
+    -- Reading the id first and delivering second would reintroduce the
+    -- TOCTOU race the resolved-delivery design exists to remove.
+    it "deliverNextAnswerResolvedId returns the id of the ask it answered" $ do
+      store <- newAskReplyStore 0
+      registered <- newEmptyMVar
+      done <- newEmptyMVar
+      _ <- forkIO $ do
+        r <- askHumanWithOptions store sid "which branch?" opts
+               (\_ -> putMVar registered ())
+        putMVar done r
+      takeMVar registered
+      pendingBefore <- pendingForSession store sid
+      mAnswered <- deliverNextAnswerResolvedId store sid "2"
+      case mAnswered of
+        Just (qid, delivered, accepted) -> do
+          accepted `shouldBe` True
+          delivered `shouldBe` "develop"
+          -- The returned id is the question that was pending.
+          map pqiId pendingBefore `shouldBe` [qid]
+        Nothing ->
+          expectationFailure "expected the pending ask to be resolved"
+      takeMVar done `shouldReturn` Right "develop"
+
+    it "deliverNextAnswerResolvedId returns Nothing when nothing is pending" $ do
+      store <- newAskReplyStore 0
+      deliverNextAnswerResolvedId store sid "2" `shouldReturn` Nothing
 
   describe "deliverNextAnswerResolvedAny (session-agnostic FIFO + numeric resolution)" $ do
     let opts = [ QuestionOption "main" "default"

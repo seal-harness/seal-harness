@@ -14,8 +14,6 @@ import Seal.Types.Config
 -- etc.) would live here as well.
 data Env = Env
   { envLogLevel :: !Text
-  , envServerHost :: !Text
-  , envServerPort :: !Int
   , envLogger :: !SealLogger
   -- , envHttpManager :: !Manager
   }
@@ -25,7 +23,5 @@ data Env = Env
 mkEnv :: SealLogger -> Config -> IO Env
 mkEnv logger cfg = pure Env
   { envLogLevel = view config_logLevel cfg
-  , envServerHost = view (config_server . serverConfig_host) cfg
-  , envServerPort = view (config_server . serverConfig_port) cfg
   , envLogger = logger
   }

@@ -26,12 +26,14 @@ module Seal.Gateway.Types.Route
   , RepoIdOrErr (..)
   , TabIndexOrErr (..)
   , AskIdOrErr (..)
+  , CronJobIdOrErr (..)
   , sessionIdCapture
   , agentDefIdCapture
   , skillIdCapture
   , repoIdCapture
   , tabIndexCapture
   , askIdCapture
+  , cronJobIdCapture
   , textCapture
   , freeFormBodyCodec
   , respCodec
@@ -144,6 +146,11 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   RouteProviderDelete :: SealRoute '[Text] '[] Bodyless Resp
   RouteProviderDefaultGet :: SealRoute '[] '[] Bodyless Resp
   RouteProviderDefaultPut :: SealRoute '[] '[] (Body Req) Resp
+  -- Channels
+  RouteChannelsList   :: SealRoute '[] '[] Bodyless Resp
+  RouteChannelCreate  :: SealRoute '[] '[] (Body Req) Resp
+  RouteChannelUpdate  :: SealRoute '[Text] '[] (Body Req) Resp
+  RouteChannelDelete  :: SealRoute '[Text] '[] Bodyless Resp
   -- UI
   RouteUiStateGet    :: SealRoute '[] '[] Bodyless Resp
   RouteUiStatePut    :: SealRoute '[] '[] (Body Req) Resp
@@ -151,6 +158,25 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   RouteUiRepos       :: SealRoute '[] '[] (Body Req) Resp
   -- Adopt
   RouteAdopt         :: SealRoute '[] '[] (Body Req) Resp
+  -- Files (machine-level file explorer)
+  RouteFilesList     :: SealRoute '[] '[] Bodyless Resp
+  RouteFilesContent  :: SealRoute '[] '[] Bodyless Resp
+  RouteFilesDownload :: SealRoute '[] '[] Bodyless Resp
+  RouteFilesStat     :: SealRoute '[] '[] Bodyless Resp
+  RouteFilesManifest :: SealRoute '[] '[] Bodyless Resp
+  RouteFilesChunk    :: SealRoute '[] '[] Bodyless Resp
+  -- Setup (first-run wizard). The gate is blocking: these four are the only
+  -- routes the SPA may call before it hands control back to <App/>.
+  RouteSetupState    :: SealRoute '[] '[] Bodyless Resp
+  RouteSetupVault    :: SealRoute '[] '[] (Body Req) Resp
+  RouteSetupVaultReopen :: SealRoute '[] '[] (Body Req) Resp
+  RouteProviderTest  :: SealRoute '[Text] '[] (Body Req) Resp
+  -- Cron
+  RouteCronList      :: SealRoute '[] '[] Bodyless Resp
+  RouteCronCreate    :: SealRoute '[] '[] (Body Req) Resp
+  RouteCronGet       :: SealRoute '[CronJobIdOrErr] '[] Bodyless Resp
+  RouteCronUpdate    :: SealRoute '[CronJobIdOrErr] '[] (Body Req) Resp
+  RouteCronDelete    :: SealRoute '[CronJobIdOrErr] '[] Bodyless Resp
 
 -- | The 'Meta' table — one arm per 'SealRoute' constructor. Uses @./@ for
 -- path building, @end@ for path termination, @capture@ for path captures.
@@ -220,11 +246,30 @@ routeMeta = \case
   RouteProviderDelete -> Meta (match "providers" ./ capture textCapture ./ end) qend bodyless (resp (one respCodec)) M.delete
   RouteProviderDefaultGet -> Meta (match "providers" ./ match "default" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteProviderDefaultPut -> Meta (match "providers" ./ match "default" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
+  RouteChannelsList -> Meta (match "channels" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteChannelCreate -> Meta (match "channels" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteChannelUpdate -> Meta (match "channels" ./ capture textCapture ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
+  RouteChannelDelete -> Meta (match "channels" ./ capture textCapture ./ end) qend bodyless (resp (one respCodec)) M.delete
   RouteUiStateGet -> Meta (match "ui" ./ match "state" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteUiStatePut -> Meta (match "ui" ./ match "state" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
   RouteUiCustomModels -> Meta (match "ui" ./ match "custom-models" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteUiRepos -> Meta (match "ui" ./ match "repos" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
   RouteAdopt -> Meta (match "adopt" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteFilesList -> Meta (match "files" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteFilesContent -> Meta (match "files" ./ match "content" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteFilesDownload -> Meta (match "files" ./ match "download" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteFilesStat -> Meta (match "files" ./ match "stat" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteFilesManifest -> Meta (match "files" ./ match "download" ./ match "manifest" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteFilesChunk -> Meta (match "files" ./ match "download" ./ match "chunk" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteSetupState -> Meta (match "setup" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteSetupVault -> Meta (match "setup" ./ match "vault" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteSetupVaultReopen -> Meta (match "setup" ./ match "vault" ./ match "reopen" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteProviderTest -> Meta (match "providers" ./ capture textCapture ./ match "test" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteCronList -> Meta (match "cron" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteCronCreate -> Meta (match "cron" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteCronGet -> Meta (match "cron" ./ capture cronJobIdCapture ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteCronUpdate -> Meta (match "cron" ./ capture cronJobIdCapture ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.put
+  RouteCronDelete -> Meta (match "cron" ./ capture cronJobIdCapture ./ end) qend bodyless (resp (one respCodec)) M.delete
 
 -- | All routes, listed as 'Constructed' values (existential 'SealRoute').
 -- The order controls literal-vs-capture matching at the FIRST segment only
@@ -288,11 +333,30 @@ allRoutes =
   , Constructed RouteProviderDelete
   , Constructed RouteProviderDefaultGet
   , Constructed RouteProviderDefaultPut
+  , Constructed RouteChannelsList
+  , Constructed RouteChannelCreate
+  , Constructed RouteChannelUpdate
+  , Constructed RouteChannelDelete
   , Constructed RouteUiStateGet
   , Constructed RouteUiStatePut
   , Constructed RouteUiCustomModels
   , Constructed RouteUiRepos
   , Constructed RouteAdopt
+  , Constructed RouteFilesList
+  , Constructed RouteFilesContent
+  , Constructed RouteFilesDownload
+  , Constructed RouteFilesStat
+  , Constructed RouteFilesManifest
+  , Constructed RouteFilesChunk
+  , Constructed RouteSetupState
+  , Constructed RouteSetupVault
+  , Constructed RouteSetupVaultReopen
+  , Constructed RouteProviderTest
+  , Constructed RouteCronList
+  , Constructed RouteCronCreate
+  , Constructed RouteCronGet
+  , Constructed RouteCronUpdate
+  , Constructed RouteCronDelete
   ]
 
 -- | The 'Router' for 'SealRoute', built from 'allRoutes' + 'routeMeta'.
@@ -359,6 +423,15 @@ askIdCapture = CaptureCodec
   , captureCodecDecode = Just . AskIdOrErr . Right
   }
 
+-- | A validated 'CronJobId' capture (or the parse error).
+newtype CronJobIdOrErr = CronJobIdOrErr (Either Text Text)
+
+cronJobIdCapture :: CaptureCodec CronJobIdOrErr
+cronJobIdCapture = CaptureCodec
+  { captureCodecEncode = \(CronJobIdOrErr e) -> fromRight "" e
+  , captureCodecDecode = Just . CronJobIdOrErr . Right
+  }
+
 -- | A plain 'Text' capture (unvalidated — used for provider labels + model
 -- names where the legacy router did no validation).
 textCapture :: CaptureCodec Text
@@ -387,6 +460,8 @@ instance ToParamSchema RepoIdOrErr where
 instance ToParamSchema TabIndexOrErr where
   toParamSchema _ = mempty & type_ ?~ OpenApiTypeSingle OpenApiString
 instance ToParamSchema AskIdOrErr where
+  toParamSchema _ = mempty & type_ ?~ OpenApiTypeSingle OpenApiString
+instance ToParamSchema CronJobIdOrErr where
   toParamSchema _ = mempty & type_ ?~ OpenApiTypeSingle OpenApiString
 
 -- ---------------------------------------------------------------------------

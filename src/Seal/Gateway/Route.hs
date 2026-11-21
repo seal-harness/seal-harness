@@ -23,12 +23,14 @@ module Seal.Gateway.Route
   , RepoIdOrErr (..)
   , TabIndexOrErr (..)
   , AskIdOrErr (..)
+  , CronJobIdOrErr (..)
   , sessionIdCapture
   , agentDefIdCapture
   , skillIdCapture
   , repoIdCapture
   , tabIndexCapture
   , askIdCapture
+  , cronJobIdCapture
   , textCapture
   , freeFormBodyCodec
   , respCodec

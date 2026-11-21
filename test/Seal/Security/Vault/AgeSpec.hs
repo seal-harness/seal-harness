@@ -2,6 +2,7 @@
 module Seal.Security.Vault.AgeSpec (spec) where
 
 import Data.ByteString (ByteString)
+import Data.Text qualified as T
 import Test.Hspec
 
 import Seal.Security.Vault.Age
@@ -36,3 +37,25 @@ spec = describe "Seal.Security.Vault.Age" $ do
   it "failing encryptor surfaces its error on decrypt" $ do
     dec <- veDecrypt (mkFailingEncryptor (VaultBackendError "boom")) "anything"
     dec `shouldBe` Left (VaultBackendError "boom")
+
+  -- Plan WU1 tests 23–25: the argv seam and the validation choke point.
+  it "ageDecryptArgs uses the single-token identity form" $
+    ageDecryptArgs (AgeIdentity "/home/u/.seal/keys/default.identity")
+      `shouldBe` ["--decrypt", "--identity=/home/u/.seal/keys/default.identity"]
+
+  it "ageEncryptArgs uses the single-token recipient form" $
+    ageEncryptArgs (AgeRecipient "age1qqqq")
+      `shouldBe` ["--encrypt", "--recipient=age1qqqq"]
+
+  it "mkAgeEncryptor rejects a malformed recipient" $ do
+    -- Validation happens BEFORE the `age --version` preflight, so this is a
+    -- pure rejection: had a process been spawned with these arguments the
+    -- error would be "age not installed" or age's own stderr, not this.
+    result <- mkAgeEncryptor (AgeRecipient "not-a-recipient") (AgeIdentity "/tmp/x")
+    case result of
+      Left (VaultBackendError msg) ->
+        msg `shouldSatisfy` T.isInfixOf "invalid recipient"
+      Left other ->
+        expectationFailure ("expected a recipient validation error, got " <> show other)
+      Right _ ->
+        expectationFailure "expected Left for a malformed recipient, got Right"

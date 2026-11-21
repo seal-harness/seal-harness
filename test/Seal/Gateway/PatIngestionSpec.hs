@@ -57,6 +57,7 @@ import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.API (ApiDeps (..), apiApp)
+import Seal.Gateway.Setup (stubSetupDeps)
 import Seal.Git.Repo (openConfigRepo)
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.ISA.Opcode (OpResult (..), Opcode, uoRun)
@@ -78,8 +79,10 @@ import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.SourceControl.Registry (RepoRegistryHandle, mkRepoRegistryHandle)
 import Seal.Tabs (newTabsHandle)
 import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
+import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.Tools.Args (textBinArg, textBinName)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
+import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
 import Seal.Tools.Exec.Types (getRemotePath)
 import Seal.Tools.Exec.UIO (runUIOWithEnv)
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
@@ -88,6 +91,7 @@ import Seal.Tools.Ssh.Agent (SshAgentEnv (..), mkFakeSshAgentHandle)
 import Seal.Vault.Commands (VaultRuntime (..))
 import Seal.Vault.Access (unrestrictedVaultAccess)
 import Seal.Web.UiState (newUiStateHandle)
+import Seal.Cron.Store (CronStore (..))
 
 import Katip (Severity (..), Scribe (..), Verbosity (V2), jsonFormat, permitItem)
 
@@ -234,7 +238,7 @@ fakePaths = SealPaths
 fakeMeta :: SessionMeta
 fakeMeta =
   let sid = case mkSessionId "test" of Right s -> s; Left _ -> error "sid"
-  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True mempty
+  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
        (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0) mempty
 
 -- | Build 'ApiDeps' with a REAL 'mkRepoRegistryHandle' (writing to a real
@@ -262,6 +266,7 @@ mkVaultDeps vr tmp = do
         , adAgentDefs       = adb
         , adSkills          = skills
         , adProviders       = pure knownProviders
+        , adOllamaReadiness = noOllamaReadiness
         , adUiState         = uiState
         , adSend            = Nothing
         , adDefaultAgent    = pure Nothing
@@ -270,11 +275,19 @@ mkVaultDeps vr tmp = do
         , adRepoRegistry     = repoRegH
         , adAgentRegistry    = agentRegH
         , adConfigRepo       = openConfigRepo "/tmp/nonexistent-seal-test"
-        , adVault            = vr
+        , adVault            = vr, adCanonicalOrigin = Nothing, adSetup = stubSetupDeps
         , adPaths            = paths
         
         , adWsHealth = pure (StreamHealth "up" 8081)
         , adAbortReg         = testAbortReg
+        , adCronStore = stubCronStore
+        , adFileExplorer = mkFailClosedFileExplorer
+        , adFileExplorerEnabled = False
+, adDownloadPromptBytes = 268435456
+, adDownloadChunkBytes = 4194304
+, adDownloadAllowBlocked = False
+, adHttpManager = Nothing
+, adIconCache = Nothing
         , adSecurityConfig   = defaultSecurityConfig
         , adMkSessionExec    = Nothing
         }
@@ -314,6 +327,19 @@ getExec ref idx = do
 -- Spec
 ----------------------------------------------------------------------
 
+-- | A pure 'CronStore' stub for ApiDeps literals that don't exercise cron.
+stubCronStore :: CronStore
+stubCronStore = CronStore
+  { csCreate    = \_ -> error "cron store stub: csCreate"
+  , csRead      = \_ -> error "cron store stub: csRead"
+  , csList      = \_ -> error "cron store stub: csList"
+  , csSave      = \_ -> error "cron store stub: csSave"
+  , csDelete    = \_ -> error "cron store stub: csDelete"
+  , csRecordRun = \_ _ -> error "cron store stub: csRecordRun"
+  , csListRuns  = \_ _ -> error "cron store stub: csListRuns"
+  , csUpdateRun = \_ _ -> error "cron store stub: csUpdateRun"
+  , csLock = error "cron store stub: csLock"
+  }
 spec :: Spec
 spec = describe "Seal.Gateway.PatIngestion (cross-layer integration)" $ do
 

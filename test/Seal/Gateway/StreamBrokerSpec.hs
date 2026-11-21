@@ -10,9 +10,13 @@ import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Time (getCurrentTime, addUTCTime)
-import Control.Concurrent (threadDelay)
-import Control.Concurrent.STM (TVar, atomically, writeTVar)
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar')
 import Control.Exception (Exception, throwIO)
+import Katip (Severity (..), Scribe (..), permitItem, jsonFormat, Verbosity (V2))
+import Seal.Logging.Global (setGlobalLogger, unsetGlobalLogger)
+import Seal.Logging.Logger (closeSealLogger, newSealLoggerWithScribe)
 import Control.Monad (void)
 import System.Timeout (timeout)
 import Test.Hspec
@@ -30,6 +34,34 @@ data DeadConnection = DeadConnection
   deriving stock (Show)
 
 instance Exception DeadConnection
+
+-- | A send action that throws, simulating a connection that dropped.
+dieOnEvent :: BrokerEvent -> IO ()
+dieOnEvent _ = throwIO DeadConnection
+
+-- | Install a capture scribe as the global logger at the given permit
+-- severity, run an action, then restore the no-op default. The permit is
+-- the whole point: with 'permitItem InfoS' this mirrors the production
+-- logger built from the default config level, so a Debug-severity line
+-- would be dropped and a Warning would survive — which is exactly what
+-- Unit 2b's DoD has to prove.
+withCaptureLoggerAt :: Severity -> IO a -> IO (a, [T.Text])
+withCaptureLoggerAt permit action = do
+  ref <- newIORef []
+  let scribe = Scribe
+        { liPush = \item -> do
+            let rendered = jsonFormat False V2 item
+            modifyIORef' ref (T.pack (show rendered) :)
+        , scribePermitItem = permitItem permit
+        , scribeFinalizer = pure ()
+        }
+  logger <- newSealLoggerWithScribe scribe DebugS
+  setGlobalLogger logger
+  result <- action
+  closeSealLogger logger
+  captured <- readIORef ref
+  unsetGlobalLogger
+  pure (result, captured)
 
 -- | Subscribe with a no-op close action (tests don't need real WS close).
 subscribeTest :: StreamBroker -> SessionId -> (BrokerEvent -> IO ()) -> IO (TVar SessionId)
@@ -189,25 +221,158 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
     count <- subscriberCount broker
     count `shouldBe` 1
 
-  -- ── reconcileStaleThinking ──────────────────────────────────────────
+  -- ── unsubscribe / remove-by-identity (Unit 1) ───────────────────────
+  --
+  -- Nothing ever removed a subscriber from 'sbSubs': 'acceptConn' subscribes
+  -- and, when the peer goes away, simply returns. Dead entries were reaped
+  -- only opportunistically by a later broadcast that tried to send to them —
+  -- cheaply if the send raised, but the full per-send timeout if it blocked.
+  -- Measured on a process that had been up ~22h: 15 connect events and zero
+  -- teardowns. Past 'sbCap' the silent no-op in 'subscribe' means a new tab
+  -- connects, receives nothing, and looks alive while being inert.
+  describe "Seal.Gateway.StreamBroker.unsubscribe" $ do
+    it "removes the subscriber, and a later broadcast does not reach it" $ do
+      broker <- newStreamBroker 10
+      ref <- newIORef ([] :: [BrokerEvent])
+      subRef <- subscribeTest broker (mkSid "a") (\e -> modifyIORef' ref (e :))
+      count <- subscriberCount broker
+      count `shouldBe` 1
+      unsubscribe broker subRef
+      count' <- subscriberCount broker
+      count' `shouldBe` 0
+      broadcast broker (BeEntryRecorded (mkSid "a") (object ["id" .= ("e1" :: T.Text)]))
+      events <- readIORef ref
+      length events `shouldBe` 0
 
+    it "is idempotent (a second call is a no-op)" $ do
+      broker <- newStreamBroker 10
+      subRef <- subscribeTest broker (mkSid "a") (\_ -> pure ())
+      unsubscribe broker subRef
+      unsubscribe broker subRef
+      count <- subscriberCount broker
+      count `shouldBe` 0
+
+    -- The lost-update race. 'broadcast' snapshots the subscriber list at
+    -- :168 and writes the WHOLE list back at :177, inside a guard that only
+    -- fires when some send FAILED. So this test needs a throwing subscriber
+    -- to arm that guard — with every send succeeding, no write happens and
+    -- the test would pass vacuously on the buggy code.
+    --
+    -- Order: B (succeeds) first, then F (throws, arming the guard), then A
+    -- (blocks, giving the main thread a deterministic window). Unsubscribing
+    -- B while A is blocked leaves B in the stale snapshot, so the buggy
+    -- write-back resurrects it.
+    it "does not resurrect a subscriber unsubscribed during a fan-out" $ do
+      broker <- newStreamBroker 10
+      bHits <- newIORef (0 :: Int)
+      subB <- subscribeTest broker (mkSid "a") (\_ -> modifyIORef' bHits (+ 1))
+      void $ subscribeTest broker (mkSid "a") dieOnEvent
+      entered <- newEmptyMVar
+      release <- newEmptyMVar
+      void $ subscribeTest broker (mkSid "a") $ \_ -> do
+        putMVar entered ()
+        takeMVar release
+      let entry = object ["id" .= ("e1" :: T.Text)]
+      void $ forkIO (broadcast broker (BeEntryRecorded (mkSid "a") entry))
+      -- Wait until A's send has been entered: B and F have already run.
+      takeMVar entered
+      unsubscribe broker subB
+      putMVar release ()
+      -- Let the fan-out finish (F's throw + the write-back).
+      threadDelay 200_000
+      count <- subscriberCount broker
+      count `shouldBe` 1  -- only A remains; B must stay gone
+      hitsAfter <- readIORef bHits
+      broadcast broker (BeEntryRecorded (mkSid "a") entry)
+      threadDelay 200_000
+      hitsFinal <- readIORef bHits
+      hitsFinal `shouldBe` hitsAfter  -- no further delivery to B
+
+    -- A concurrently-added subscriber must survive the write-back. This also
+    -- needs the guard armed (F throws), otherwise no write happens and the
+    -- test proves nothing on the buggy code.
+    it "does not drop a subscriber added during a fan-out" $ do
+      broker <- newStreamBroker 10
+      void $ subscribeTest broker (mkSid "a") dieOnEvent
+      entered <- newEmptyMVar
+      release <- newEmptyMVar
+      void $ subscribeTest broker (mkSid "a") $ \_ -> do
+        putMVar entered ()
+        takeMVar release
+      let entry = object ["id" .= ("e1" :: T.Text)]
+      void $ forkIO (broadcast broker (BeEntryRecorded (mkSid "a") entry))
+      takeMVar entered
+      void $ subscribeTest broker (mkSid "a") (\_ -> pure ())
+      putMVar release ()
+      threadDelay 200_000
+      count <- subscriberCount broker
+      count `shouldBe` 2  -- the blocked one + the one added mid-flight
+
+  -- ── broadcast diagnostics (Unit 2b) ─────────────────────────────────
+  --
+  -- A blocked handler used to leave NO trace: 'requestTimingMiddleware'
+  -- logs only inside the 'respond' continuation, so a handler that never
+  -- produced a Response logged nothing at all. The consequence was visible
+  -- in the incident this work came from — a 42 MB log with no POST line for
+  -- a session that HAD been created on disk. These lines are Warning (not
+  -- Debug) so they survive the default Info filter.
+  describe "Seal.Gateway.StreamBroker.broadcast diagnostics" $ do
+    it "logs a Warning when it prunes a failed subscriber" $ do
+      broker <- newStreamBroker 10
+      void $ subscribeTest broker (mkSid "a") dieOnEvent
+      (_, logs) <- withCaptureLoggerAt InfoS $
+        broadcast broker (BeEntryRecorded (mkSid "a") (object ["id" .= ("e1" :: T.Text)]))
+      let joined = T.intercalate "\n" logs
+      joined `shouldSatisfy` T.isInfixOf "pruning"
+      -- Severity check: the line survives a permitItem InfoS scribe, i.e. it
+      -- is an Info-or-above item, not a Debug one.
+      joined `shouldSatisfy` T.isInfixOf "Warning"
+
+    it "stays silent for a fast fan-out with no failures" $ do
+      broker <- newStreamBroker 10
+      ref <- newIORef ([] :: [BrokerEvent])
+      void $ subscribeTest broker (mkSid "a") (\e -> modifyIORef' ref (e :))
+      (_, logs) <- withCaptureLoggerAt InfoS $
+        broadcast broker (BeEntryRecorded (mkSid "a") (object ["id" .= ("e1" :: T.Text)]))
+      let joined = T.intercalate "\n" logs
+      -- A healthy fan-out must not warn. (The subscriber count is 1 and the
+      -- send is instantaneous, so neither the prune branch nor the slow
+      -- branch fires.)
+      joined `shouldNotSatisfy` T.isInfixOf "[broadcast]"
+
+    it "does not leak event content into the diagnostics" $ do
+      broker <- newStreamBroker 10
+      void $ subscribeTest broker (mkSid "a") dieOnEvent
+      let secret = "SUPER-SECRET-PAYLOAD-xyzzy" :: T.Text
+      (_, logs) <- withCaptureLoggerAt InfoS $
+        broadcast broker (BeEntryRecorded (mkSid "a") (object ["id" .= secret]))
+      let joined = T.intercalate "\n" logs
+      joined `shouldSatisfy` T.isInfixOf "pruning"
+      -- Ids and counts only — the event payload must never reach the log.
+      joined `shouldNotSatisfy` T.isInfixOf secret
+
+  -- ── reconcileStaleThinking ──────────────────────────────────────────
+  --
+  -- The stale-thinking sweep must never clear a session that is still
+  -- working: the web sidebar, the chat channels' /watch set, and the /bg
+  -- connection all treat "harness-status: idle" as "the turn is over".
+  -- (Regression: a 34-minute turn was cleared at the 30-minute mark while
+  -- it was still streaming tool calls, so the tab jumped to the top of
+  -- Active Tabs as idle-unread and sat there until the turn really ended.)
   describe "Seal.Gateway.StreamBroker.reconcileStaleThinking" $ do
-    it "clears sessions that have been thinking longer than the threshold" $ do
+    it "clears sessions that have been SILENT longer than the threshold" $ do
       broker <- newStreamBroker 10
       setThinking broker (mkSid "stale") True
-      -- Manually backdate the thinking timestamp so it's older than 1 second.
-      now <- getCurrentTime
-      atomically $ writeTVar (sbThinking broker)
-        (Map.insert (mkSid "stale") (addUTCTime (-120) now) Map.empty)
-      cleared <- reconcileStaleThinking broker 60
+      backdateThinking broker (mkSid "stale") 120
+      cleared <- reconcileStaleThinking broker notBusy 60
       cleared `shouldBe` Set.fromList [mkSid "stale"]
       remaining <- thinkingSessions broker
       Set.null remaining `shouldBe` True
 
-    it "does NOT clear sessions that started thinking recently" $ do
+    it "does NOT clear sessions whose last activity is recent" $ do
       broker <- newStreamBroker 10
       setThinking broker (mkSid "fresh") True
-      cleared <- reconcileStaleThinking broker 3600
+      cleared <- reconcileStaleThinking broker notBusy 3600
       Set.null cleared `shouldBe` True
       remaining <- thinkingSessions broker
       remaining `shouldBe` Set.fromList [mkSid "fresh"]
@@ -217,19 +382,85 @@ spec = describe "Seal.Gateway.StreamBroker" $ do
       ref <- newIORef ([] :: [BrokerEvent])
       void $ subscribeTest broker (mkSid "stale") (\e -> modifyIORef' ref (e :))
       setThinking broker (mkSid "stale") True
-      now <- getCurrentTime
-      atomically $ writeTVar (sbThinking broker)
-        (Map.insert (mkSid "stale") (addUTCTime (-120) now) Map.empty)
-      void $ reconcileStaleThinking broker 60
+      backdateThinking broker (mkSid "stale") 120
+      void $ reconcileStaleThinking broker notBusy 60
       events <- readIORef ref
       -- BeActivity is all-subscriber, so the subscriber focused on "stale"
       -- receives the idle event.
       any isIdleActivity events `shouldBe` True
-      where
-        isIdleActivity (BeActivity _ payload) =
-          case payload of
-            A.Object o -> case KM.lookup "status" o of
-              Just (A.String "idle") -> True
-              _ -> False
-            _ -> False
-        isIdleActivity _ = False
+
+    -- The reported bug: a long turn that keeps producing output must not be
+    -- declared idle just because the turn itself is old. Every
+    -- session-scoped broadcast refreshes the stamp, so the sweep measures
+    -- silence, not turn duration.
+    it "does NOT clear a silent-looking session that just produced activity" $ do
+      broker <- newStreamBroker 10
+      setThinking broker (mkSid "busy") True
+      backdateThinking broker (mkSid "busy") 120
+      -- A tool-call activity: what a running turn emits constantly.
+      broadcast broker (BeActivity (mkSid "busy") (object
+        [ "kind" .= ("tool-call" :: T.Text)
+        , "tool" .= ("BASH" :: T.Text)
+        ]))
+      cleared <- reconcileStaleThinking broker notBusy 60
+      Set.null cleared `shouldBe` True
+      remaining <- thinkingSessions broker
+      remaining `shouldBe` Set.fromList [mkSid "busy"]
+
+    it "counts a recorded transcript entry as activity" $ do
+      broker <- newStreamBroker 10
+      setThinking broker (mkSid "busy") True
+      backdateThinking broker (mkSid "busy") 120
+      broadcast broker (BeEntryRecorded (mkSid "busy") (object ["id" .= ("e1" :: T.Text)]))
+      cleared <- reconcileStaleThinking broker notBusy 60
+      Set.null cleared `shouldBe` True
+
+    -- Second guard: the caller's busy predicate (turn in flight, or
+    -- background children still running). A session parked on a long silent
+    -- sub-agent run is alive, not stale.
+    it "does NOT clear a silent session the caller reports as busy" $ do
+      broker <- newStreamBroker 10
+      setThinking broker (mkSid "parked") True
+      backdateThinking broker (mkSid "parked") 120
+      cleared <- reconcileStaleThinking broker (\_ -> pure True) 60
+      Set.null cleared `shouldBe` True
+      remaining <- thinkingSessions broker
+      remaining `shouldBe` Set.fromList [mkSid "parked"]
+
+    it "restarts the clock of a busy session so a later sweep leaves it alone" $ do
+      broker <- newStreamBroker 10
+      setThinking broker (mkSid "parked") True
+      backdateThinking broker (mkSid "parked") 120
+      void (reconcileStaleThinking broker (\_ -> pure True) 60)
+      cleared <- reconcileStaleThinking broker notBusy 60
+      Set.null cleared `shouldBe` True
+
+    -- An entry frame arriving after the idle broadcast must not resurrect
+    -- the session in the thinking set (there is nothing to keep alive).
+    it "does not re-add a session that already broadcast idle" $ do
+      broker <- newStreamBroker 10
+      setThinking broker (mkSid "done") True
+      setThinking broker (mkSid "done") False
+      broadcast broker (BeEntryRecorded (mkSid "done") (object ["id" .= ("e1" :: T.Text)]))
+      remaining <- thinkingSessions broker
+      Set.null remaining `shouldBe` True
+    where
+      notBusy :: SessionId -> IO Bool
+      notBusy _ = pure False
+
+      -- Backdate a thinking session's last-activity stamp so it looks
+      -- silent to the sweep.
+      backdateThinking :: StreamBroker -> SessionId -> Int -> IO ()
+      backdateThinking broker sid secondsAgo = do
+        now <- getCurrentTime
+        atomically $ modifyTVar' (sbThinking broker)
+          (Map.adjust (const (addUTCTime (negate (fromIntegral secondsAgo)) now)) sid)
+
+      isIdleActivity :: BrokerEvent -> Bool
+      isIdleActivity (BeActivity _ payload) =
+        case payload of
+          A.Object o -> case KM.lookup "status" o of
+            Just (A.String "idle") -> True
+            _                      -> False
+          _ -> False
+      isIdleActivity _ = False

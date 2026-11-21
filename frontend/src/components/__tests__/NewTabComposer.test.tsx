@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import { NewTabComposer } from '../NewTabComposer'
-import { adoptWindow, createTab } from '../../hooks/useApi'
+import { adoptWindow, createTab, setupRepo } from '../../hooks/useApi'
 import type { NewTabSpec } from '../../hooks/useNewTabSpec'
 import type { NewTabResponse } from '../../hooks/useApi'
 import type { DiscoverableWindow, ProviderInfo } from '../../types'
@@ -36,6 +36,7 @@ function makeSpec(overrides: Partial<NewTabSpec> = {}): NewTabSpec {
     model: 'claude-sonnet-4',
     setModel: vi.fn(),
     models: [{ name: 'claude-sonnet-4', contextWindow: 200000 }],
+    modelOptions: ['claude-sonnet-4'],
     modelsLoading: false,
     useCustomModel: false,
     handleModelSelectChange: vi.fn(),
@@ -43,6 +44,8 @@ function makeSpec(overrides: Partial<NewTabSpec> = {}): NewTabSpec {
     repo: '',
     setRepo: vi.fn(),
     repoOptions: [], refreshRepos: () => {},
+    repoBranch: '',
+    setRepoBranch: vi.fn(),
     flavour: 'claude-code',
     setFlavour: vi.fn(),
     customBinary: '',
@@ -131,7 +134,48 @@ describe('NewTabComposer — provider kind', () => {
     expect(screen.getByLabelText('A')).toBeTruthy()
   })
 
-  it('shows all supported providers, marking unconfigured ones as disabled', () => {
+  // Test 42, the second ProviderSelect consumer. This is the other live render
+  // of the SHARED component, so the annotation is pinned here as well as in
+  // CronView — a change to ProviderSelect must not silently lose it in one.
+  it('42: annotates Ollama with its readiness and keeps it selectable', () => {
+    render(
+      <NewTabComposer
+        spec={makeSpec({
+          configuredProviders: [
+            makeProvider({ name: 'anthropic', isDefault: true, configured: true }),
+            makeProvider({ name: 'ollama', isDefault: false, configured: true, readiness: 'not-running' }),
+          ],
+          provider: 'anthropic',
+        })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    const sel = screen.getByLabelText('Provider') as HTMLSelectElement
+    const ollama = Array.from(sel.options).find((o) => o.value === 'ollama')!
+    expect(ollama.textContent).toBe('Ollama (Not Running)')
+    expect(ollama.disabled).toBe(false)
+  })
+
+  it('42b: a ready Ollama carries its model count here too', () => {
+    render(
+      <NewTabComposer
+        spec={makeSpec({
+          configuredProviders: [
+            makeProvider({ name: 'ollama', isDefault: false, configured: true, readiness: 'ready', readiness_models: 4 }),
+          ],
+          provider: 'ollama',
+        })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    const sel = screen.getByLabelText('Provider') as HTMLSelectElement
+    expect(Array.from(sel.options).find((o) => o.value === 'ollama')!.textContent)
+      .toBe('Ollama (Ready · 4 Models)')
+  })
+
+  it('shows only configured providers in the provider dropdown', () => {
     render(
       <NewTabComposer
         spec={makeSpec({
@@ -147,19 +191,11 @@ describe('NewTabComposer — provider kind', () => {
       />,
     )
     const sel = screen.getByLabelText('Provider') as HTMLSelectElement
-    const byValue = Object.fromEntries(Array.from(sel.options).map((o) => [o.value, o]))
-    const anthropic = byValue['anthropic']!
-    const ollama = byValue['ollama']!
-    const openrouter = byValue['openrouter']!
-    expect(anthropic).toBeDefined()
-    expect(ollama).toBeDefined()
-    expect(openrouter).toBeDefined()
-    // The unconfigured one is present but disabled + labelled.
-    expect(openrouter.disabled).toBe(true)
-    expect(openrouter.textContent).toMatch(/not configured/)
-    // Configured ones are selectable.
-    expect(anthropic.disabled).toBe(false)
-    expect(ollama.disabled).toBe(false)
+    const values = Array.from(sel.options).map((o) => o.value)
+    expect(values).toContain('anthropic')
+    expect(values).toContain('ollama')
+    // The unconfigured type is not rendered at all.
+    expect(values).not.toContain('openrouter')
   })
 
   it('submit calls createTab then onSubmit', async () => {
@@ -185,22 +221,28 @@ describe('NewTabComposer — provider kind', () => {
     expect(onSubmit).toHaveBeenCalled()
   })
 
-  it('custom model input renders a combobox populated with customModels', () => {
+  it('model field is a combobox populated with the provider configured models and accepts free text', () => {
+    const setModel = vi.fn()
     render(
       <NewTabComposer
-        spec={makeSpec({ useCustomModel: true, model: '', customModels: ['claude-3-opus', 'gpt-4o'] })}
+        spec={makeSpec({
+          model: '',
+          setModel,
+          modelOptions: ['claude-sonnet-4', 'claude-opus-4-8'],
+        })}
         onSubmit={() => {}}
         onCancel={() => {}}
       />,
     )
-    const input = screen.getByLabelText('Custom Model') as HTMLInputElement
+    const input = screen.getByLabelText('Model') as HTMLInputElement
     expect(input).toBeTruthy()
-    // The custom combobox popup renders on focus with the customModel options.
     fireEvent.focus(input)
-    const list = screen.getByTestId('provider-model-custom-list')
-    expect(list).toBeTruthy()
+    const list = screen.getByTestId('provider-model-list')
     const opts = Array.from(list.querySelectorAll('[role="option"]')).map((o) => o.textContent)
-    expect(opts).toEqual(['claude-3-opus', 'gpt-4o'])
+    expect(opts).toEqual(['claude-sonnet-4', 'claude-opus-4-8'])
+    // A model not in the list is typed straight into the same combobox.
+    fireEvent.change(input, { target: { value: 'my-custom-model' } })
+    expect(setModel).toHaveBeenCalledWith('my-custom-model')
   })
 })
 
@@ -324,19 +366,21 @@ describe('NewTabComposer — attach kind', () => {
   })
 })
 
-describe('NewTabComposer — branchFrom', () => {
-  it('pre-fills the branch_from field and locks kind to provider', () => {
+describe('NewTabComposer — branch mode', () => {
+  it('shows the parent session id and locks kind to provider', () => {
     const setKind = vi.fn()
     render(
       <NewTabComposer
         spec={makeSpec({ kind: 'provider', setKind })}
         onSubmit={() => {}}
         onCancel={() => {}}
-        branchFrom="entry-abc"
+        branchParentSid="20260101-000000-000"
+        branchConvLen={7}
       />,
     )
-    // The branch-from field is shown read-only with the value.
-    expect((screen.getByLabelText('Branch From') as HTMLInputElement).value).toBe('entry-abc')
+    // The branch-from field shows the PARENT SESSION ID, read-only.
+    expect((screen.getByLabelText('Branch From') as HTMLInputElement).value)
+      .toBe('20260101-000000-000')
     // The harness + attach kind pills are disabled.
     const harnessPill = screen.getByRole('radio', { name: 'New Harness' })
     const attachPill = screen.getByRole('radio', { name: 'Existing Harness' })
@@ -346,7 +390,7 @@ describe('NewTabComposer — branchFrom', () => {
     expect(screen.getByRole('radio', { name: 'AI Provider' })).not.toBeDisabled()
   })
 
-  it('calls createTab with branch_from set on submit', async () => {
+  it('calls createTab with the parent sid AND the conversation anchor', async () => {
     const onSubmit = vi.fn()
     const buildBody = vi.fn(() => ({ kind: 'provider', provider: 'anthropic', model: 'claude-sonnet-4' }))
     render(
@@ -354,7 +398,8 @@ describe('NewTabComposer — branchFrom', () => {
         spec={makeSpec({ kind: 'provider', buildBody })}
         onSubmit={onSubmit}
         onCancel={() => {}}
-        branchFrom="entry-abc"
+        branchParentSid="20260101-000000-000"
+        branchConvLen={7}
       />,
     )
     fireEvent.click(screen.getByLabelText('Submit new tab'))
@@ -363,7 +408,8 @@ describe('NewTabComposer — branchFrom', () => {
       kind: 'provider',
       provider: 'anthropic',
       model: 'claude-sonnet-4',
-      branch_from: 'entry-abc',
+      branch_from: '20260101-000000-000',
+      branch_conv_len: 7,
     })
   })
 })
@@ -456,5 +502,69 @@ describe('NewTabComposer — submit spinner', () => {
       expect(screen.getByLabelText('Provider')).toBeTruthy()
       expect(screen.getByLabelText('Submit new tab')).toBeTruthy()
     })
+  })
+})
+
+// ── Repo branch (WU-6) ──────────────────────────────────────────────────────
+
+describe('NewTabComposer — repo branch', () => {
+  it('passes the branch to setupRepo on submit', async () => {
+    const onSubmit = vi.fn()
+    render(
+      <NewTabComposer
+        spec={makeSpec({ repo: 'https://github.com/o/r.git', repoBranch: 'dev' })}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    fireEvent.click(screen.getByLabelText('Submit new tab'))
+    await waitFor(() =>
+      expect(setupRepo).toHaveBeenCalledWith('s2', 'https://github.com/o/r.git', 'dev'),
+    )
+  })
+
+  it('passes undefined (not an empty string) when no branch is entered', async () => {
+    const onSubmit = vi.fn()
+    render(
+      <NewTabComposer
+        spec={makeSpec({ repo: 'https://github.com/o/r.git', repoBranch: '   ' })}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    fireEvent.click(screen.getByLabelText('Submit new tab'))
+    await waitFor(() =>
+      expect(setupRepo).toHaveBeenCalledWith('s2', 'https://github.com/o/r.git', undefined),
+    )
+  })
+
+
+  it('hides the branch field until a repo URL is entered', () => {
+    render(<NewTabComposer spec={makeSpec({ repo: '' })} onSubmit={() => {}} onCancel={() => {}} />)
+    expect(screen.queryByLabelText('Repo Branch')).toBeNull()
+  })
+
+  it('shows the branch field once a repo URL is entered', () => {
+    render(
+      <NewTabComposer
+        spec={makeSpec({ repo: 'https://github.com/o/r.git' })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    expect(screen.getByLabelText('Repo Branch')).toBeTruthy()
+  })
+
+  it('types into the branch field through setRepoBranch', () => {
+    const setRepoBranch = vi.fn()
+    render(
+      <NewTabComposer
+        spec={makeSpec({ repo: 'https://github.com/o/r.git', setRepoBranch })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    fireEvent.change(screen.getByLabelText('Repo Branch'), { target: { value: 'dev' } })
+    expect(setRepoBranch).toHaveBeenCalledWith('dev')
   })
 })

@@ -20,7 +20,7 @@
 --
 --   * batch mode ('tasks' array) with a concurrency cap
 --     (@delegation.max_concurrent_children@);
---   * depth cap (@delegation.max_spawn_depth@, default 1, clamped to [1,3])
+--   * depth cap (@delegation.max_spawn_depth@, default 3, clamped to [1,3])
 --     + @orchestrator_enabled@ kill switch (the role field is accepted but the
 --     wiring layer enforces the effective role when it builds the child's
 --     ISA registry);
@@ -55,6 +55,7 @@ module Seal.Agent.Runtime.Delegation
   , subagentIdText
     -- * Tasks & results
   , ChildTask (..)
+  , RepoSpec (..)
   , ChildResult (..)
   , ChildExitReason (..)
   , ChildStatus (..)
@@ -119,7 +120,7 @@ data DelegationConfig = DelegationConfig
   , dcChildTimeoutSeconds :: Maybe Double
     -- ^ Hard per-child timeout in seconds. Default 600, floor 30.
   , dcMaxSpawnDepth :: Maybe Int
-    -- ^ Max delegation tree depth. Default 1 (flat), clamped to [1,3].
+    -- ^ Max delegation tree depth. Default 3, clamped to [1,3].
   , dcOrchestratorEnabled :: Maybe Bool
     -- ^ Kill switch for the orchestrator role. Default True.
   , dcProvider :: Maybe Text
@@ -247,6 +248,15 @@ showHexI32 n = T.justifyRight 8 '0' (T.pack (go n))
 -- Tasks & results
 -- ---------------------------------------------------------------------------
 
+-- | A repo checkout a top-level (handoff) session materializes in its own
+-- workdir before its first turn: the URL plus the optional branch or tag --
+-- exactly the pair @SETUP_REPO@ takes. 'rsBranch' = 'Nothing' asks for the
+-- remote's default branch.
+data RepoSpec = RepoSpec
+  { rsUrl    :: !Text
+  , rsBranch :: !(Maybe Text)
+  } deriving stock (Eq, Show)
+
 -- | One task to delegate. The def id resolves the provider/model/system/tools
 -- template; the goal is the first user message; the context is optional
 -- background appended to the system prompt.
@@ -268,6 +278,11 @@ data ChildTask = ChildTask
     -- @cache/workdirs/<child-session>@. When 'False' (the default), the
     -- child inherits the parent's workdir (WU-4: repo clones and plan
     -- files visible to children without re-cloning).
+  , ctRepo :: !(Maybe RepoSpec)
+    -- ^ The repo checkout to materialize in the child's own workdir before
+    -- the run. Only read for a **top-level / handoff** spawn
+    -- (@AGENT_MANAGE action=handoff@, which also sets 'ctIsolateWorkdir').
+    -- Plain @AGENT_START@ children always pass 'Nothing'.
   } deriving stock (Eq, Show)
 
 -- | Why a child stopped.

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { AgentDefInfo, AgentDefInput, ToolsAllowList } from '../types'
+import type { AgentDefInfo, AgentDefInput, ProviderReadiness, ToolsAllowList } from '../types'
+import { readinessLabel } from '../lib/readiness'
 import {
   createAgentDef,
   deleteAgentDef,
@@ -9,12 +10,15 @@ import {
   useAgentDefs,
   useConfiguredProviders,
 } from '../hooks/useApi'
+import { type AgentGroup, groupAgents } from '../lib/agentGroups'
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Anthropic',
+  'ollama-cloud': 'Ollama Cloud',
   openai: 'OpenAI',
+  'openai-compatible': 'OpenAI-compatible',
   openrouter: 'OpenRouter',
   ollama: 'Ollama',
 }
@@ -98,45 +102,6 @@ function defToInput(d: AgentDefInfo): AgentDefInput {
 }
 
 // ── Grouping ─────────────────────────────────────────────────────────────
-
-/** The display label for an agent's group.  Ungrouped agents (group === null
- *  or empty string) fall under the default "Agents" heading, matching the
- *  behaviour of the backend's available-agents catalog and the flat on-disk
- *  layout (no subdirectory). Mirrors SkillsView.groupLabel. */
-function groupLabel(group: string | null): string {
-  const g = group?.trim()
-  if (!g) return 'Agents'
-  return g
-}
-
-/** Partition agents into groups in display order.  Ungrouped agents come
- *  first (under "Agents"), then named groups in alphabetical order —
- *  matching the sorting in the backend's prompt catalog. Mirrors
- *  SkillsView.groupSkills. */
-interface AgentGroup {
-  label: string
-  agents: AgentDefInfo[]
-}
-
-function groupAgents(agents: AgentDefInfo[]): AgentGroup[] {
-  const sorted = [...agents].sort((a, b) => {
-    const ga = a.group?.trim() ?? ''
-    const gb = b.group?.trim() ?? ''
-    if (ga !== gb) return ga.localeCompare(gb)
-    return a.id.localeCompare(b.id)
-  })
-  const groups: AgentGroup[] = []
-  for (const a of sorted) {
-    const label = groupLabel(a.group)
-    const last = groups[groups.length - 1]
-    if (last && last.label === label) {
-      last.agents.push(a)
-    } else {
-      groups.push({ label, agents: [a] })
-    }
-  }
-  return groups
-}
 
 // ── Collapsible group section ────────────────────────────────────────────
 
@@ -232,6 +197,17 @@ function AgentGroupSection({
  *  The id is the canonical AgentDefId — [A-Za-z0-9_-]+, non-empty, no
  *  leading dot. The form validates this client-side so the user gets
  *  immediate feedback before the round-trip. */
+/** The parenthesised readiness annotation for a provider option. Empty for
+ *  `pending` (nothing has been observed yet) and for any provider with no
+ *  readiness at all. */
+function optionReadinessSuffix(
+  readiness: ProviderReadiness,
+  usableModels: number | undefined,
+): string {
+  const label = readinessLabel(readiness, usableModels)
+  return label === '' ? '' : ` (${label})`
+}
+
 export function AgentsView() {
   const { agents, loaded, error, refresh } = useAgentDefs()
   const { providers, loaded: providersLoaded } = useConfiguredProviders()
@@ -524,6 +500,13 @@ export function AgentsView() {
                 {providersLoaded && providers.map((p) => (
                   <option key={p.name} value={p.name}>
                     {PROVIDER_LABELS[p.name] ?? p.name}
+                    {/* Test 42: this list is hand-rolled (it never renders
+                        ProviderSelect), so it needs the annotation itself.
+                        Parenthesised to match ` (default)`/` (missing)`, and
+                        the option stays selectable — annotation, not gating. */}
+                    {p.name === 'ollama' && p.readiness !== undefined
+                      ? optionReadinessSuffix(p.readiness, p.readiness_models)
+                      : ''}
                   </option>
                 ))}
                 {/* Allow providers not in the configured list too — the

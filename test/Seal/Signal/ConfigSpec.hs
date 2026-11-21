@@ -43,6 +43,11 @@ spec = do
       scTextChunkLimit defaultSignalConfig `shouldBe` Just defaultSignalChunkLimit
       scAllowFrom defaultSignalConfig `shouldBe` AllowAll
 
+    it "uses a 4000-byte chunk budget" $ do
+      -- Pinned so a future edit cannot quietly shrink it back: this budget is
+      -- what keeps a single edited progress bubble from being split mid-turn.
+      defaultSignalChunkLimit `shouldBe` 4000
+
   describe "Seal.Signal.Config.resolveSignalConfig" $ do
     it "resolves a config-only account" $ do
       case resolveSignalConfig (Just defaultSignalConfig { scAccount = Just "+15551234567" }) Nothing of

@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PatternSynonyms #-}
 module Seal.ISA.DispatchSpec (spec) where
 
 import Data.Default (def)
@@ -32,7 +33,7 @@ import Seal.Channel.Caps
 import Seal.Handles.AskReply
   ( AskReply (..), ApprovalScope (..), askHuman
   , deliverAnswer, newAskReplyStore, pendingForSession, pqiId )
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), ToolResultPart (..))
+import Seal.Providers.Class (ContentBlock (..), Message (..), pattern Message, Role (..), ToolResultPart (..))
 import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub, UntrustedIO)
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)

@@ -59,7 +59,7 @@ import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File (RuntimeConfig (..), defaultRuntimeConfig, loadRuntimeConfig,
-                         saveRuntimeConfig)
+                         updateRuntimeConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Security.Vault qualified as Vault
 import Seal.Signal.Config (SignalConfig (..), defaultSignalChunkLimit)
@@ -373,18 +373,21 @@ writeSignalConfig rt caps phoneNumber = do
             , scAllowFrom      = AllowAll
             }
         }
-  saveRuntimeConfig cfgPath updated
-  ccSend caps $ T.intercalate "\n"
-    [ ""
-    , "Signal configured!"
-    , "  Account: " <> phoneNumber
-    , "  Default channel: signal"
-    , ""
-    , "One more step to secure your setup:"
-    , "  Send any message from Signal to " <> phoneNumber
-    , "  and I'll lock down access to just that sender."
-    ]
-  lockDownAllowFrom rt caps phoneNumber
+  written <- updateRuntimeConfig cfgPath (const updated)
+  case written of
+    Left err -> ccSend caps ("Could not save the Signal config: " <> err)
+    Right () -> do
+      ccSend caps $ T.intercalate "\n"
+        [ ""
+        , "Signal configured!"
+        , "  Account: " <> phoneNumber
+        , "  Default channel: signal"
+        , ""
+        , "One more step to secure your setup:"
+        , "  Send any message from Signal to " <> phoneNumber
+        , "  and I'll lock down access to just that sender."
+        ]
+      lockDownAllowFrom rt caps phoneNumber
 
 -- | Prompt the user to send a Signal message, capture the sender's user id
 -- via @signal-cli receive@, and rewrite the @[signal].allow_from@ to
@@ -421,20 +424,22 @@ lockDownAllowFrom rt caps account = lockAttempt (3 :: Int)
               updated = baseCfg
                 { rcSignal = Just sigCfg { scAllowFrom = AllowOnly (Set.singleton sender) }
                 }
-          saveRuntimeConfig cfgPath updated
-          ccSend caps $ T.intercalate "\n"
-            [ ""
-            , "Locked down! Access is now restricted to: " <> sender
-            , ""
-            , "To start chatting:"
-            , "  1. Restart Seal (or run: seal signal)"
-            , "  2. Open Signal on your phone"
-            , "  3. Send a message to " <> account
-            , ""
-            , "To allow more senders later, edit " <> T.pack cfgPath <> ":"
-            , "  [signal]"
-            , "  allow_from = [\"" <> sender <> "\", \"<other-sender>\"]"
-            ]
+          written <- updateRuntimeConfig cfgPath (const updated)
+          case written of
+            Left err -> ccSend caps ("Could not save the config: " <> err)
+            Right () -> ccSend caps $ T.intercalate "\n"
+              [ ""
+              , "Locked down! Access is now restricted to: " <> sender
+              , ""
+              , "To start chatting:"
+              , "  1. Restart Seal (or run: seal signal)"
+              , "  2. Open Signal on your phone"
+              , "  3. Send a message to " <> account
+              , ""
+              , "To allow more senders later, edit " <> T.pack cfgPath <> ":"
+              , "  [signal]"
+              , "  allow_from = [\"" <> sender <> "\", \"<other-sender>\"]"
+              ]
 
 -- ---------------------------------------------------------------------------
 -- Telegram wizard
@@ -506,24 +511,26 @@ writeTelegramConfig rt caps username = do
             , tcAllowFrom      = AllowAll
             }
         }
-  saveRuntimeConfig cfgPath updated
-  ccSend caps $ T.intercalate "\n"
-    [ ""
-    , "Telegram configured!"
-    , "  Bot: @" <> username
-    , "  Token: stored in vault (key: " <> telegramVaultKey <> ")"
-    , "  DM policy: open (accepts messages from anyone)"
-    , ""
-    , "To start chatting:"
-    , "  1. Restart Seal (or run: seal telegram)"
-    , "  2. Open Telegram and DM @" <> username
-    , ""
-    , "To restrict access later, edit " <> T.pack cfgPath <> ":"
-    , "  [telegram]"
-    , "  allow_from = [\"<your-telegram-user-id>\"]"
-    , ""
-    , "Your Telegram user id will appear in the logs on first message."
-    ]
+  written <- updateRuntimeConfig cfgPath (const updated)
+  case written of
+    Left err -> ccSend caps ("Could not save the Telegram config: " <> err)
+    Right () -> ccSend caps $ T.intercalate "\n"
+      [ ""
+      , "Telegram configured!"
+      , "  Bot: @" <> username
+      , "  Token: stored in vault (key: " <> telegramVaultKey <> ")"
+      , "  DM policy: open (accepts messages from anyone)"
+      , ""
+      , "To start chatting:"
+      , "  1. Restart Seal (or run: seal telegram)"
+      , "  2. Open Telegram and DM @" <> username
+      , ""
+      , "To restrict access later, edit " <> T.pack cfgPath <> ":"
+      , "  [telegram]"
+      , "  allow_from = [\"<your-telegram-user-id>\"]"
+      , ""
+      , "Your Telegram user id will appear in the logs on first message."
+      ]
 
 -- ---------------------------------------------------------------------------
 -- Real SignalCli — shells out to signal-cli

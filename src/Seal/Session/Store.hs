@@ -22,6 +22,7 @@ module Seal.Session.Store
   , updateSessionSystemOverride
   , updateSessionDescription
   , updateSessionRepoUrl
+  , updateSessionRepo
   , updateSessionSealFrontMatter
   , autoBindRepoAgent
   , autoBindRepoAgentWith
@@ -51,12 +52,12 @@ import System.Posix.Files (setFileMode)
 
 import Seal.Agent.Def.Backend (AgentDefBackend (..), workdirAgentDefBackend)
 import Seal.Agent.Def.Types (AgentDef (..), AgentDefId (..), agentDefIdText, mkAgentDefId)
-import Seal.Config.File (RuntimeConfig (..), providerDefaultModel)
+import Seal.Config.File (RuntimeConfig (..))
 import Seal.Config.Paths
   ( SealPaths, agentSessionDir, sessionArchivedMarkerPath
   , sessionMetaPath, sessionsRoot )
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
-import Seal.Providers.Registry (resolveDefaultModel)
+import Seal.Providers.Registry (resolveDefaultModelForName)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Store.Markdown (decodeDoc, fmLookup)
 import Seal.Tools.Exec.WorkdirFs (WorkdirFs)
@@ -96,6 +97,7 @@ newSessionMeta _paths provider model channel mAgent mAllowedSecrets = do
     , smDescription = Nothing
     , smSealFrontMatter = True
     , smRepoUrl = Nothing
+    , smRepoBranch = Nothing
     , smCreatedAt = now, smLastActive = now
     , smAllowedSecrets = mAllowedSecrets }
 
@@ -245,7 +247,7 @@ defaultSessionSelection cfg =
   , fromMaybe fallbackModel (rcDefaultModel cfg) )
   where
     provLabel = fromMaybe "anthropic" (rcDefaultProvider cfg)
-    ModelId fallbackModel = resolveDefaultModel (providerDefaultModel cfg provLabel) provLabel
+    ModelId fallbackModel = resolveDefaultModelForName cfg provLabel
 
 -- | Resolve the default agent for a new session. Returns 'Nothing' if
 -- @default_agent@ is unset, the id fails validation, or the def is not on
@@ -413,9 +415,11 @@ updateSessionDescription paths sid mDesc = do
 -- through the same 'callDispatcher'). 'Nothing' or an empty/whitespace
 -- URL clears the field. Returns 'False' when the session's
 -- @session.json@ cannot be found or parsed; 'True' on a successful write.
--- Only touches 'smRepoUrl' — all other fields are preserved.
-updateSessionRepoUrl :: SealPaths -> SessionId -> Maybe Text -> IO Bool
-updateSessionRepoUrl paths sid mUrl = do
+-- Only touches 'smRepoUrl' and 'smRepoBranch' — all other fields are
+-- preserved. Written together (one read + one atomic save) so the pair can
+-- never disagree: the branch is a property of *that* clone.
+updateSessionRepo :: SealPaths -> SessionId -> Maybe Text -> Maybe Text -> IO Bool
+updateSessionRepo paths sid mUrl mBranch = do
   let mp = sessionMetaPath paths sid
   exists <- doesFileExist mp
   if not exists
@@ -425,15 +429,22 @@ updateSessionRepoUrl paths sid mUrl = do
       case mMeta of
         Nothing  -> pure False
         Just meta -> do
-          let next = meta { smRepoUrl = normalized }
+          let next = meta { smRepoUrl = normalized mUrl
+                          , smRepoBranch = normalized mBranch }
           saveSessionMeta paths next
           pure True
   where
-    normalized = case mUrl of
+    normalized x = case x of
       Just t
         | not (T.null (T.strip t)) -> Just t
         | otherwise                -> Nothing
       Nothing                      -> Nothing
+
+-- | Record only the repo URL (see 'updateSessionRepo'). Kept for callers
+-- that have no branch to record; equivalent to passing 'Nothing' as the
+-- branch.
+updateSessionRepoUrl :: SealPaths -> SessionId -> Maybe Text -> IO Bool
+updateSessionRepoUrl paths sid mUrl = updateSessionRepo paths sid mUrl Nothing
 
 -- | Set (or clear) whether the harness injects its own front matter into
 -- the session's system prompt. 'True' injects the static guidance blocks,

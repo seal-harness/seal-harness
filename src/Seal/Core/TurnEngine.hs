@@ -29,9 +29,8 @@ module Seal.Core.TurnEngine
   ) where
 
 import Control.Exception (bracket, catch)
-import Control.Monad (unless, when)
+import Control.Monad (unless, void, when)
 import Data.Aeson (Value)
-import Data.Aeson.Types qualified as AT
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Set (member, fromList)
@@ -42,7 +41,6 @@ import Data.Text qualified as T
 import Data.Time (UTCTime, getCurrentTime)
 import Network.HTTP.Client (Manager)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
-import System.FilePath ((</>))
 import System.Random (randomRIO)
 
 import Seal.Agent.Def.Backend qualified as Def
@@ -59,7 +57,7 @@ import Seal.Channel.Caps (ChannelCaps)
 import Seal.Command.Provider (ProviderRuntime (..), resolveDefProvider)
 import Seal.Config.File
   ( RuntimeConfig, defaultRetrievalMaxScanBytes, defaultMaxTurns, loadRuntimeConfig
-  , retrievalMaxScanBytes, onDemandSchemas, maxTurnsConfig, rcWeb, rcDelegation, rcDebugSessionTranscript, rcDebugModelResponses, rcMaxModelRetries, rcRetryBaseDelayMs
+  , retrievalMaxScanBytes, onDemandSchemas, maxTurnsConfig, rcWeb, rcDelegation, rcDebugSessionTranscript, rcDebugModelResponses, rcMaxModelRetries, rcRetryBaseDelayMs, defaultMaxModelRetries, defaultModelRetryBaseDelayMs
   , resolvedAutoloadSkill, resolvedAvailableSkills, resolvedAvailableAgents
   , resolvedParallelToolGuidance
   , resolvedToolUseEnforcement, resolvedTaskCompletionGuidance, toolTimeoutConfig
@@ -97,7 +95,7 @@ import Seal.ISA.Dispatch
    recordSkillLoadResult)
 import Seal.ISA.Ops.Agent
   ( AgentStartGate (..), AgentStartWiring (..), AgentWorkerBuilder
-  , agentDefManageOp, agentManageOp, agentDefWriteOp, agentDefReadOp, agentDefListOp, agentDefDeleteOp
+  , agentDefManageOp, agentManageOp, AgentHandoffDeps (..), agentDefWriteOp, agentDefReadOp, agentDefListOp, agentDefDeleteOp
   , agentInstancesOp, agentStartOp, agentStatusOp, agentStopOp
   , agentInterruptOp, gateOpen )
 import Seal.ISA.Ops.Bin (binExecOp)
@@ -108,12 +106,13 @@ import Seal.ISA.Ops.Memory
 import Seal.ISA.Ops.Process (processManageOp)
 import Seal.ISA.Ops.Browser (browserManageOp)
 import Seal.ISA.Ops.Registry (opcodeDescribeOp, opcodeListOp)
-import Seal.ISA.Ops.Repo (setupRepoOp)
+import Seal.ISA.Ops.Repo (parseSetupRepoInput, setupRepoOp)
 import Seal.ISA.Ops.Search (searchFilesOp)
 import Seal.ISA.Ops.Secret (secretManageOp)
 import Seal.ISA.Ops.Shell (shellExecOp)
 import Seal.ISA.Ops.Session (sessionListOp, sessionSearchOp, sessionGetOp, sessionManageOp)
 import Seal.ISA.Ops.Skills
+import Seal.ISA.Ops.Cron (cronManageOp)
 import Seal.ISA.Opcode (Opcode, OpResult (..), localBackend, opName, orIsError)
 import qualified Seal.ISA.Registry as ISA
 import Seal.Logging.Exceptions (withExceptionLogging)
@@ -131,10 +130,10 @@ import Seal.Session.Kind (HarnessFlavour (..))
 import Seal.Session.Lock
   (ReplyRegistry, replyFanout, replySubscriberCount,
    SessionLocks, withSessionLock)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
 import Seal.Session.Store
   ( autoBindRepoAgentWith, formatSessionId, saveSessionMeta
-  , updateSessionRepoUrl )
+  , updateSessionRepo )
 import Seal.Session.Workdir (SessionExec (..), failClosedSessionExec)
 import Seal.Security.Path (WorkspaceRoot)
 import qualified Seal.Security.Policy as Policy
@@ -159,10 +158,10 @@ import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs (..), snapIsDirectoryAt, snapTopDirs )
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Tabs (TabsHandle, ensureTabForSession)
+import Seal.Tools.Args (branchNameText)
 import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
-import Seal.Util.StrictIO (decodeFileStrict)
 import Seal.Vault.Commands (VaultRuntime)
 import Seal.Vault.Access (VaultAccess, vaultAccess, noVaultAccess)
 import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
@@ -270,6 +269,7 @@ buildSessionRegistry
   -> Policy.AutonomyLevel
   -> Maybe WebConfig
   -> AgentStartWiring
+  -> AgentHandoffDeps
   -> HarnessRegistry
   -> TmuxRunner
   -> Maybe Manager
@@ -277,7 +277,7 @@ buildSessionRegistry
   -> Bool
   -> ISA.Registry
 buildSessionRegistry va paths cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
-                     startWiring harnessReg tmuxRunner httpManager caps onDemand =
+                     startWiring handoffDeps harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
     baseOps =
@@ -292,6 +292,7 @@ buildSessionRegistry va paths cloneDeps backends wsRoot sid operatorCeiling auto
       , memoryArchiveOp (bMemory backends) (bEmbedding backends)
       , skillWriteOp (bSkills backends) sid
      , skillManageOp (bSkills backends) sid
+      , cronManageOp (bCronFire backends) (bCronStore backends) sid
       , skillLoadOp (bSkills backends)
       , skillListOp (bSkills backends)
       , skillDeleteOp (bSkills backends)
@@ -305,13 +306,13 @@ buildSessionRegistry va paths cloneDeps backends wsRoot sid operatorCeiling auto
       , agentStatusOp (bRuntime backends)
       , agentStopOp (bRuntime backends)
       , agentInterruptOp (bRuntime backends)
-     , agentManageOp startWiring
+     , agentManageOp startWiring handoffDeps
       , searchFilesOp wsRoot securityPolicy operatorCeiling
       , fileReadOp wsRoot operatorCeiling
       , fileWriteOp wsRoot operatorCeiling
       , filePatchOp wsRoot
       , shellExecOp wsRoot securityPolicy
-      , setupRepoOp cloneDeps wsRoot autonomy
+      , setupRepoOp cloneDeps autonomy
       , binExecOp wsRoot securityPolicy binAllowList
       , processManageOp wsRoot securityPolicy
      , browserManageOp securityPolicy
@@ -734,13 +735,18 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
   turnRepeatTrack <- lookupOrCreateRepeatTrack (tdRepeatReg td) sid
   let onDemand = either (const False) onDemandSchemas eCfg
       startWiring = taStartWiring adapter sessionBackends sid appEnv eCfg operatorCeiling meta'
+      channelLabel = taChannelLabel adapter meta'
+      handoffDeps = AgentHandoffDeps
+        { ahdWorker = buildWorker td sessionBackends sid [sid] appEnv eCfg operatorCeiling channelLabel 0 True
+        , ahdEnsureTab = Just (ensureTabForSession (tdTabsHandle td) KindAi)
+        }
       -- Wrap the adapter's caps so ASK_HUMAN (and the confirmation gate)
       -- broadcast idle → thinking around the blocking ccPrompt call. This
       -- keeps the web frontend's status indicator correct while the turn
       -- is waiting for human input (not stuck on "thinking").
       askAwareCaps = wrapCapsForAskStatus (tdBroker td) sid (taCaps adapter)
       isaReg = buildSessionRegistry turnVA paths cloneDeps sessionBackends wsRoot sid operatorCeiling
-                 (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
+                 (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring handoffDeps
                  (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) askAwareCaps onDemand
   itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
   let onEntry = broadcastNewEntries (tdBroker td) paths sid (modelText model) (smCreatedAt meta')
@@ -918,13 +924,12 @@ mkCloneDepsTurn td va = do
 -- the session directory or @session.json@ is missing or undecodable. The
 -- engine uses this to re-read meta after 'autoBindRepoAgent' may have
 -- rebound 'smAgent'.
+--
+-- Thin re-export of 'readSessionMeta' (the single reader, in the leaf
+-- "Seal.Session.Meta" module) so the engine's many call sites stay
+-- unchanged while the gateway / delegation worker share the same code.
 loadSessionMeta :: SealPaths -> SessionId -> IO (Maybe SessionMeta)
-loadSessionMeta paths sid = do
-  let mp = sessionDir paths sid System.FilePath.</> "session.json"
-  exists <- System.Directory.doesFileExist mp
-  if not exists
-    then pure Nothing
-    else decodeFileStrict mp
+loadSessionMeta = readSessionMeta
 
 -- | Should 'runSessionTurn' auto-tab the session after a turn? 'True' for
 -- normal turns (every channel-originated session is visible in the sidebar).
@@ -1022,14 +1027,14 @@ modelRetriesFromConfig :: Either a RuntimeConfig -> Int
 modelRetriesFromConfig eCfg =
   case eCfg of
     Right cfg | Just n <- rcMaxModelRetries cfg -> n
-    _ -> 3
+    _ -> defaultMaxModelRetries
 
 -- | Extract model_retry_base_delay_ms from config (default 1000).
 retryBaseDelayFromConfig :: Either a RuntimeConfig -> Int
 retryBaseDelayFromConfig eCfg =
   case eCfg of
     Right cfg | Just n <- rcRetryBaseDelayMs cfg -> n
-    _ -> 1000
+    _ -> defaultModelRetryBaseDelayMs
 
 -- | Load a session's channel label (e.g. @"telegram"@, @"web"@, @"cli"@)
 -- from its @session.json@. Returns 'Nothing' when the session directory or
@@ -1107,8 +1112,12 @@ callDispatcher td caps sid channelLabel callOpName val = do
           , bAgentDefs = Def.unionAgentDefBackend workdirAgentDefs (bAgentDefs (tdBaseBackends td))
           }
         startWiring = buildStartWiring td sessionBackends sid appEnv eCfg operatorCeiling channelLabel
+        handoffDeps = AgentHandoffDeps
+          { ahdWorker = buildWorker td sessionBackends sid [sid] appEnv eCfg operatorCeiling channelLabel 0 True
+          , ahdEnsureTab = Just (ensureTabForSession (tdTabsHandle td) KindAi)
+          }
         isaReg = buildSessionRegistry callVA (tdPaths td) cloneDeps sessionBackends wsRoot sid operatorCeiling
-                   (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring
+                   (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring handoffDeps
                    (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) caps onDemand
     itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
     callAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
@@ -1122,13 +1131,16 @@ callDispatcher td caps sid channelLabel callOpName val = do
             unless (orIsError r) $ do
               -- The clone changed the workdir's structure: drop the cached
               -- discovery scan, re-scan fresh, and bind from the fresh defs.
-              -- Persist the cloned repo URL to session.json so the sidebar
-              -- can display it. The URL comes from the opcode's input
-              -- value.
-              let mRepoUrl =
-                    AT.parseMaybe
-                      (AT.withObject "SETUP_REPO input" (AT..: "url")) val
-              _ <- updateSessionRepoUrl paths sid mRepoUrl
+              -- Persist the cloned repo URL *and* the branch (or tag) to
+              -- session.json, so the sidebar can display the repo and a
+              -- later clone — a handoff's pre-turn checkout, say — can
+              -- repeat exactly this checkout. Parsed with the opcode's own
+              -- input parser: what is recorded is exactly what was cloned.
+              case parseSetupRepoInput val of
+                Left _ -> pure ()   -- unreachable: the opcode just ran
+                Right (repoUrl, mBranch) ->
+                  void (updateSessionRepo paths sid
+                          (Just repoUrl) (branchNameText <$> mBranch))
               invalidateWorkdirScan (tdExecCache td) sid
               freshMetaEnv <- metaCacheEnvFor td paths eSecCfg
               (freshDefs, freshSkillsList) <-
@@ -1206,7 +1218,7 @@ buildStartWiring td sessionBackends parentSid appEnv eCfg operatorCeiling channe
     , aswWorker =
         case tdMkWorker td of
           Just stub | 1 >= tdMkWorkerStubDepth td -> stub
-          _ -> buildWorker td sessionBackends parentSid [parentSid] appEnv eCfg operatorCeiling channel 0
+          _ -> buildWorker td sessionBackends parentSid [parentSid] appEnv eCfg operatorCeiling channel 0 False
       -- Top-level turns: the gate is OPEN (operator-authorized spawning —
       -- the depth cap, spawn-pause, and resolver checks govern it).
     , aswGate = gateOpen
@@ -1259,8 +1271,12 @@ buildWorker
      -- ^ This worker's OWN delegation depth (0 = a top-level session's
      -- worker; its children run at depth 1). Threaded so an orchestrator
      -- child's nested AGENT_START wiring gets depth+1 (issue #154 §3.2).
+  -> Bool
+     -- ^ When 'True', the worker creates a top-level session (handoff)
+     -- instead of a child session nested under the parent's @agents\/@
+     -- directory. See 'dwdTopLevel' in "Seal.Agent.Runtime.Delegation.Worker".
   -> AgentWorkerBuilder
-buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeiling channel ownDepth =
+buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeiling channel ownDepth topLevel =
   mkDelegateWorker DelegationWorkerDeps
     { dwdPaths = tdPaths td
     , dwdParentSid = parentSid
@@ -1307,6 +1323,7 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
       -- re-reading its own session transcript is guarded by the child's
       -- own counts.
     , dwdToolTimeout = either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg
+    , dwdTopLevel = topLevel
     }
   where
     -- The parent session's front-matter toggle, read from its session.json
@@ -1330,6 +1347,7 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
       , smDescription = Nothing
       , smSealFrontMatter = True
       , smRepoUrl = Nothing
+      , smRepoBranch = Nothing
       , smCreatedAt = tnow, smLastActive = tnow
       , smAllowedSecrets = mempty }
 
@@ -1388,7 +1406,7 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
         , fileWriteOp childWsRoot operatorCeiling
         , filePatchOp childWsRoot
         , shellExecOp childWsRoot securityPolicy
-        , setupRepoOp childCloneDeps childWsRoot (tdAutonomy td)
+        , setupRepoOp childCloneDeps (tdAutonomy td)
         , binExecOp childWsRoot securityPolicy Nothing
         , processManageOp childWsRoot securityPolicy
         , webFetchOp childWebFetchCfg
@@ -1451,6 +1469,7 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
           | childDepth + 1 >= tdMkWorkerStubDepth td -> stub
         _ -> buildWorker td sessionBackends childSid lineage adapterAppEnv
                           eCfg operatorCeiling adapterChannel (childDepth + 1)
+                          False
   -- §3.2 item 6: the role-aware blocklist applies to every op EXCEPT the
   -- gated nested AGENT_START (which is always present and self-gating at
   -- authorize: leaf/kill-switch rejections carry the dedicated messages

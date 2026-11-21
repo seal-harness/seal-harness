@@ -5,13 +5,24 @@ import type {
   AgentInfo,
   DeployKeyInfo,
   DiscoverableWindow,
+  FileContent,
+  FileListing,
   HarnessInfo,
   ProviderInfo,
   ProviderDetail,
   ProviderInput,
+  ChannelDetail,
+  ChannelInput,
+  ChannelUpdateInput,
+  ChannelMutationResult,
   RepoInfo,
   RepoInput,
   SecretInput,
+  CronJobSummary,
+  CronJobDetail,
+  CronJobInput,
+  CronJobUpdateInput,
+  CronMutationResult,
   SessionInfo,
   SkillInfo,
   SkillInput,
@@ -357,7 +368,9 @@ export function useTranscript(sessionId: string | null) {
  *  whose response is TRANSIENT (never enters the transcript); `"assistant"`
  *  means a normal turn whose reply lands in the transcript. Modelled as an
  *  OPEN enum — the frontend must tolerate future/unknown kinds. */
-export type SendKind = 'slash' | 'assistant' | (string & {})
+/** `answer` = the message was consumed as the reply to a pending ASK_HUMAN
+ *  question; no turn ran, so no transcript entry follows. */
+export type SendKind = 'slash' | 'assistant' | 'answer' | (string & {})
 
 /** Parsed 200 body of POST /api/sessions/:id/send. `session_id` is set only
  *  by slash commands that mint+focus a new session (e.g. /new) so the SPA
@@ -693,18 +706,50 @@ export function useSessionAgents(sessionId: string | null) {
   return { agents }
 }
 
+/** Fired after a provider create/update/delete so the long-lived
+ *  `useConfiguredProviders` consumers (the new-session/new-tab composers)
+ *  re-read the list without a page reload. */
+export const PROVIDERS_CHANGED_EVENT = 'seal:providers-changed'
+
+export function notifyProvidersChanged(): void {
+  window.dispatchEvent(new Event(PROVIDERS_CHANGED_EVENT))
+}
+
 export function useConfiguredProviders() {
   const [providers, setProviders] = useState<ProviderInfo[]>([])
   const [loaded, setLoaded] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
 
   useEffect(() => {
+    let cancelled = false
     fetchJson<ProviderInfo[]>('/api/providers').then((data) => {
+      if (cancelled) return
       if (Array.isArray(data)) setProviders(data)
       setLoaded(true)
     })
-  }, [])
+    return () => { cancelled = true }
+  }, [refreshCount])
 
-  return { providers, loaded }
+  // The composer hook lives at the App level and stays mounted while the user
+  // visits the Providers tab. Re-fetch when a provider mutation lands so the
+  // newly-added provider is selectable on the next session.
+  useEffect(() => {
+    const handler = () => refresh()
+    window.addEventListener(PROVIDERS_CHANGED_EVENT, handler)
+    return () => window.removeEventListener(PROVIDERS_CHANGED_EVENT, handler)
+  }, [refresh])
+
+  // Design D2.5: re-fetch on window focus, for the same reason as
+  // useAllProviders — the dropdowns annotate Ollama's observed readiness, and
+  // that changes while the page sits idle.
+  useEffect(() => {
+    const onFocus = () => refresh()
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [refresh])
+
+  return { providers, loaded, refresh }
 }
 
 /** Live fetch of available models for a provider. The backend proxies to the
@@ -856,7 +901,106 @@ export function useAllProviders() {
     return () => { cancelled = true }
   }, [refreshCount])
 
+  // Design D2.5: re-fetch when the window regains focus. Readiness is observed
+  // state that changes out of band (the operator starts or stops the daemon),
+  // and this endpoint is otherwise only fetched on mount + mutation — so
+  // without this a healthy daemon stays shown as "Not Running" indefinitely.
+  useEffect(() => {
+    const onFocus = () => refresh()
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [refresh])
+
   return { providers, loaded, error, refresh }
+}
+
+// ── Channel CRUD ───────────────────────────────────────────────────────
+
+/** Fetch ALL channels from GET /api/channels. Returns null on any failure. */
+export async function fetchAllChannels(): Promise<ChannelDetail[] | null> {
+  return fetchJson<ChannelDetail[]>('/api/channels')
+}
+
+/** Read the backend's @{"error": "..."}@ body for a channel mutation,
+ *  falling back to the HTTP status. */
+async function channelMutationError(res: Response): Promise<string> {
+  const body = await res.json().catch(() => null)
+  if (body && typeof body.error === 'string' && body.error.length > 0) return body.error
+  return `HTTP ${res.status}`
+}
+
+/** Create a new channel. For Telegram, the `token` is stored in the vault;
+ *  never persisted in config.toml. Returns the created channel detail on
+ *  success, or the backend's error on failure. */
+export async function createChannel(input: ChannelInput): Promise<ChannelMutationResult> {
+  try {
+    const res = await fetch('/api/channels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return { ok: false, error: await channelMutationError(res) }
+    return { ok: true, channel: await res.json() as ChannelDetail }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Update an existing channel's config. The id is taken from the path.
+ *  Returns the updated channel detail on success, or the backend's error
+ *  on failure. */
+export async function updateChannel(id: string, input: ChannelUpdateInput): Promise<ChannelMutationResult> {
+  try {
+    const res = await fetch(`/api/channels/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return { ok: false, error: await channelMutationError(res) }
+    return { ok: true, channel: await res.json() as ChannelDetail }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Delete a channel by id. Returns true when the backend accepted the
+ *  delete (204). Idempotent — a missing id is not an error. */
+export async function deleteChannel(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/channels/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** Mount + refresh list of all channels. Mirrors useAllProviders — fetches
+ *  GET /api/channels on mount and when `refresh()` is called after a
+ *  mutation. NOT polled (channel config changes only via this UI). */
+export function useChannels() {
+  const [channels, setChannels] = useState<ChannelDetail[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    fetchAllChannels().then((data) => {
+      if (cancelled) return
+      if (Array.isArray(data)) {
+        setChannels(data)
+        setError(false)
+      } else {
+        setError(true)
+      }
+      setLoaded(true)
+    })
+    return () => { cancelled = true }
+  }, [refreshCount])
+
+  return { channels, loaded, error, refresh }
 }
 
 // ── Tab mutators ────────────────────────────────────────────────────────
@@ -880,6 +1024,9 @@ export interface CreateTabBody {
   model?: string
   agent?: string
   branch_from?: string
+  /** Conversation length to inherit from `branch_from` (a parent SESSION
+   *  id). Sent only alongside `branch_from`. */
+  branch_conv_len?: number
   harness_id?: string
   allowed_secrets?: string[]
 }
@@ -1118,18 +1265,25 @@ export interface SetupRepoResult {
 
 /** Clone a repo into a session's workdir before the first turn (the "set
  *  up repo" combo box calls this right after creating a bare session).
+ *  `branch` is an optional branch or tag to check out instead of the
+ *  remote's default branch; blank/absent is omitted from the body, so the
+ *  request stays byte-identical to the pre-branch one.
  *  The backend dispatches the SETUP_REPO opcode, so the clone (and any
  *  failure) is recorded in the session transcript — visible in the chat,
  *  not silent. Returns the structured result, or null on a network/parse
  *  failure. */
-export async function setupRepo(sessionId: string, url: string, timeoutMs = 120_000): Promise<SetupRepoResult | null> {
+export async function setupRepo(sessionId: string, url: string, branch?: string, timeoutMs = 120_000): Promise<SetupRepoResult | null> {
   const ctrl = new AbortController()
   const t = setTimeout(() => ctrl.abort(), timeoutMs)
+  // Omit the branch entirely (never `null`) when it is absent or blank —
+  // the gateway then clones the remote's default branch.
+  const trimmedBranch = branch?.trim()
+  const body = trimmedBranch ? { url, branch: trimmedBranch } : { url }
   try {
     const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/setup-repo`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify(body),
       signal: ctrl.signal,
     })
     if (!res.ok) {
@@ -1143,6 +1297,19 @@ export async function setupRepo(sessionId: string, url: string, timeoutMs = 120_
     clearTimeout(t)
   }
 }
+
+/** Fetch the absolute workdir path for a session. The backend computes
+ *  the path from the security config: local mode →
+ *  `<cache>/workdirs/<sid>`; remote mode →
+ *  `<remote-workspace>/workdirs/<sid>`. The frontend uses this for the
+ *  "open session workdir in Files" link in the chat header. Returns the
+ *  path string, or null on any failure (network error, 404, parse
+ *  error). */
+export async function fetchSessionWorkdir(sessionId: string): Promise<string | null> {
+  const res = await fetchJson<{ path: string }>(`/api/sessions/${encodeURIComponent(sessionId)}/workdir`)
+  return res?.path ?? null
+}
+
 // ── Agent CRUD ──────────────────────────────────────────────────────────
 
 /** Fetch all agent defs (the full def, including provider/model/system/
@@ -1579,5 +1746,320 @@ export async function setDefaultAgent(agent: string | null): Promise<boolean> {
     return res.ok
   } catch {
     return false
+  }
+}
+
+// ── Cron CRUD ───────────────────────────────────────────────────────────
+
+/** Fetch all cron jobs (list summary — no next_fire). Returns null on
+ *  any failure. */
+export async function fetchCronJobs(): Promise<CronJobSummary[] | null> {
+  return fetchJson<CronJobSummary[]>('/api/cron')
+}
+
+/** Fetch a single cron job by id (detail — includes next_fire). Returns
+ *  null on any failure (including 404). */
+export async function fetchCronJob(id: string): Promise<CronJobDetail | null> {
+  return fetchJson<CronJobDetail>(`/api/cron/${encodeURIComponent(id)}`)
+}
+
+/** Read the backend's `{"error": "..."}` body for a cron mutation. */
+async function cronMutationError(res: Response): Promise<string> {
+  const body = await res.json().catch(() => null)
+  if (body && typeof body.error === 'string' && body.error.length > 0) return body.error
+  return `HTTP ${res.status}`
+}
+
+/** Create a new cron job. Returns the created job (with next_fire) on
+ *  success, or the backend's error message on failure. */
+export async function createCronJob(input: CronJobInput): Promise<CronMutationResult> {
+  try {
+    const res = await fetch('/api/cron', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return { ok: false, error: await cronMutationError(res) }
+    return { ok: true, job: await res.json() as CronJobDetail }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Update an existing cron job (partial patch). Returns the updated job
+ *  on success, or the backend's error message on failure. */
+export async function updateCronJob(id: string, input: CronJobUpdateInput): Promise<CronMutationResult> {
+  try {
+    const res = await fetch(`/api/cron/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    })
+    if (!res.ok) return { ok: false, error: await cronMutationError(res) }
+    return { ok: true, job: await res.json() as CronJobDetail }
+  } catch {
+    return { ok: false, error: 'network error' }
+  }
+}
+
+/** Delete a cron job by id. Returns true when the backend accepted the
+ *  delete (204 — idempotent). */
+export async function deleteCronJob(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/cron/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** Polled list of cron jobs. Uses the `useHarnesses` interval-poll shape
+ *  (3 s) because cron genuinely changes in the background (the scheduler
+ *  updates last_fire, run_count, and consecutive_failures, and can
+ *  auto-disable a job). The list endpoint does no next-fire computation,
+ *  so each poll is a directory read + JSON encode. */
+export function useCronJobs() {
+  const [jobs, setJobs] = useState<CronJobSummary[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const poll = useCallback(async () => {
+    const data = await fetchCronJobs()
+    if (data) {
+      setJobs(data)
+      setError(false)
+    } else {
+      setError(true)
+    }
+    setLoaded(true)
+  }, [])
+
+  useEffect(() => {
+    poll()
+    const id = setInterval(poll, POLL_INTERVAL)
+    return () => clearInterval(id)
+  }, [poll, refreshCount])
+
+  const refresh = useCallback(() => setRefreshCount((n) => n + 1), [])
+
+  return { jobs, loaded, error, refresh }
+}
+
+// ── File Explorer ───────────────────────────────────────────────────────
+
+/** Fetch a directory listing. Returns the listing on success, or an
+ *  error status code (400/403/404) on failure. Pass null/undefined for
+ *  `path` to resolve the home directory (the backend defaults to $HOME). */
+export async function fetchFileListing(
+  path: string | null | undefined,
+  signal?: AbortSignal,
+): Promise<{ ok: true; listing: FileListing } | { ok: false; status: number }> {
+  try {
+    const url = path
+      ? `/api/files?path=${encodeURIComponent(path)}`
+      : '/api/files'
+    const res = await fetch(url, signal ? { signal } : undefined)
+    if (!res.ok) return { ok: false, status: res.status }
+    const listing = (await res.json()) as FileListing
+    return { ok: true, listing }
+  } catch {
+    return { ok: false, status: 0 }
+  }
+}
+
+/** Fetch a listing AND, in the same round trip, listings for several extra
+ *  directories (the rail's expansion chain). The backend serves the extras
+ *  from one batched remote operation, so N directories cost one SSH round
+ *  trip instead of N.
+ *
+ *  Returns the primary listing plus any rail listings that arrived complete.
+ *  Directories the transport truncated are simply absent from `rail`; the
+ *  caller re-requests those individually. */
+export async function fetchFileListingWithRail(
+  path: string | null | undefined,
+  railPaths: string[],
+  signal?: AbortSignal,
+): Promise<
+  | { ok: true; listing: FileListing; rail: FileListing[] }
+  | { ok: false; status: number }
+> {
+  try {
+    const qs = new URLSearchParams()
+    if (path) qs.set('path', path)
+    for (const p of railPaths) qs.append('paths', p)
+    const url = `/api/files?${qs.toString()}`
+    const res = await fetch(url, signal ? { signal } : undefined)
+    if (!res.ok) return { ok: false, status: res.status }
+    const body = (await res.json()) as FileListing & { rail?: FileListing[] }
+    const { rail, ...listing } = body
+    return { ok: true, listing: listing as FileListing, rail: rail ?? [] }
+  } catch {
+    return { ok: false, status: 0 }
+  }
+}
+
+export async function fetchFileContent(
+  path: string,
+  signal?: AbortSignal,
+): Promise<{ ok: true; content: FileContent } | { ok: false; status: number }> {
+  try {
+    const res = await fetch(
+      `/api/files/content?path=${encodeURIComponent(path)}`,
+      signal ? { signal } : undefined,
+    )
+    if (!res.ok) return { ok: false, status: res.status }
+    const content = (await res.json()) as FileContent
+    return { ok: true, content }
+  } catch {
+    return { ok: false, status: 0 }
+  }
+}
+
+/** Hook: fetch and hold a directory listing. Re-fetches when `path`
+ *  changes or `refresh` is called. Returns `listing`, `loading`, `error`
+ *  (the HTTP status code, or 0 for a network error), and `refresh`. */
+export function useFileListing(path: string | null | undefined) {
+  const [listing, setListing] = useState<FileListing | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<number | null>(null)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+    fetchFileListing(path).then((res) => {
+      if (cancelled) return
+      if (res.ok) {
+        setListing(res.listing)
+        setError(null)
+      } else {
+        setListing(null)
+        setError(res.status)
+      }
+      setLoading(false)
+    })
+    return () => { cancelled = true }
+  }, [path, refreshCount])
+
+  return { listing, loading, error, refresh }
+}
+
+/** Hook: fetch and hold file content. Re-fetches when `path` changes or
+ *  `refresh` is called. Returns `content`, `loading`, `error` (the HTTP
+ *  status code, or 0 for a network error), and `refresh`. */
+export function useFileContent(path: string | null | undefined) {
+  const [content, setContent] = useState<FileContent | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<number | null>(null)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+    if (!path) {
+      setContent(null); setLoading(false); return
+    }
+    fetchFileContent(path).then((res) => {
+      if (cancelled) return
+      if (res.ok) {
+        setContent(res.content)
+        setError(null)
+      } else {
+        setContent(null)
+        setError(res.status)
+      }
+      setLoading(false)
+    })
+    return () => { cancelled = true }
+  }, [path, refreshCount])
+
+  return { content, loading, error, refresh }
+}
+
+/** Download a file via `fetch()` (NOT a plain `<a href>`). Checks the
+ *  `X-Truncated` response header — when true, the file was truncated by
+ *  the server's byte ceiling, so we show a warning. The blob is saved via
+ *  `URL.createObjectURL` + a temporary `<a download>` click. Returns
+ *  `{ truncated: boolean }` so the caller can show a toast. */
+export async function downloadFile(path: string, partialLimit?: number): Promise<{ truncated: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/files/download?path=${encodeURIComponent(path)}`)
+    if (!res.ok) return { truncated: false, error: `HTTP ${res.status}` }
+    const truncated = res.headers.get('X-Truncated') === 'true'
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    // Derive a filename from the last path component.
+    const basename = path.split('/').pop() || 'download'
+    if (truncated) {
+      const savedStr = formatBytes(partialLimit ?? blob.size)
+      const totalStr = formatBytes(blob.size)
+      a.download = `${basename}.${savedStr}-of-${totalStr}.partial`
+    } else {
+      a.download = basename
+    }
+    document.body.appendChild(a)
+    a.click()
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n}B`
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)}KiB`
+  if (n < 1024 * 1024 * 1024) return `${Math.round(n / (1024 * 1024))}MiB`
+  return `${(n / (1024 * 1024 * 1024)).toFixed(1)}GiB`
+}
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+    return { truncated }
+  } catch {
+    return { truncated: false, error: 'network error' }
+  }
+}
+
+/** Fetch file stat (size, mtime) via `GET /api/files/stat?path=<p>`.
+ *  Returns `{ok:true, stat} | {ok:false, status}`. */
+export async function fetchFileStat(path: string): Promise<{ ok: true; stat: import('../types').FileStat } | { ok: false; status: number }> {
+  try {
+    const res = await fetch(`/api/files/stat?path=${encodeURIComponent(path)}`)
+    if (!res.ok) return { ok: false, status: res.status }
+    const stat = await res.json() as import('../types').FileStat
+    return { ok: true, stat }
+  } catch {
+    return { ok: false, status: 0 }
+  }
+}
+
+/** Fetch a download manifest via `GET /api/files/download/manifest?path=<p>`.
+ *  Returns O(1) metadata (no hash list). */
+export async function fetchFileManifest(path: string): Promise<{ ok: true; manifest: import('../types').FileManifest } | { ok: false; status: number }> {
+  try {
+    const res = await fetch(`/api/files/download/manifest?path=${encodeURIComponent(path)}`)
+    if (!res.ok) return { ok: false, status: res.status }
+    const manifest = await res.json() as import('../types').FileManifest
+    return { ok: true, manifest }
+  } catch {
+    return { ok: false, status: 0 }
+  }
+}
+
+/** Fetch a single chunk via `GET /api/files/download/chunk?path=<p>&index=<i>&size=<s>&mtime=<m>`.
+ *  Returns raw bytes + the X-Chunk-SHA256 header. */
+export async function fetchFileChunk(path: string, index: number, size: number, mtime: number | null): Promise<{ ok: true; bytes: ArrayBuffer; sha256: string | null } | { ok: false; status: number }> {
+  try {
+    const mtimeParam = mtime === null ? 'null' : String(mtime)
+    const res = await fetch(`/api/files/download/chunk?path=${encodeURIComponent(path)}&index=${index}&size=${size}&mtime=${mtimeParam}`)
+    if (!res.ok) return { ok: false, status: res.status }
+    const bytes = await res.arrayBuffer()
+    const sha256 = res.headers.get('X-Chunk-SHA256')
+    return { ok: true, bytes, sha256 }
+  } catch {
+    return { ok: false, status: 0 }
   }
 }

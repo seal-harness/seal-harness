@@ -250,11 +250,20 @@ export interface AgentInfo {
 
 export interface ProviderInfo {
   name: string
+  /** Ollama's observed readiness. **Absent** (not null) for every other
+   *  provider and for custom OpenAI-compatible instances. */
+  readiness?: ProviderReadiness
+  /** The usable-model count that accompanies `readiness: 'ready'`. Absent
+   *  otherwise. Lowercase snake_case: this endpoint keeps its own casing. */
+  readiness_models?: number
   /** True for the provider Seal is configured to use (from CLI flag or
    *  config file). At most one entry has it set to true. */
   isDefault?: boolean
   /** The configured default model for this provider, if any. */
   defaultModel?: string
+  /** Operator-configured frequently-used models for this provider. Offered
+   *  as suggestions by the new-tab model combobox. Absent means none. */
+  models?: string[]
   /** Whether this provider has a usable credential (or is keyless, like
    *  local Ollama). The backend's /api/providers sets this for every entry;
    *  absent is treated as configured (back-compat with older test mocks). */
@@ -262,6 +271,18 @@ export interface ProviderInfo {
 }
 
 // ── Provider CRUD (detailed) ───────────────────────────────────────────
+
+/** Ollama's observed readiness (design §D3). One enum, no free text: the
+ *  backend never sends RAM bytes, model names or sizes. */
+export type ProviderReadiness =
+  | 'pending'
+  | 'unknown'
+  | 'not-installed'
+  | 'not-running'
+  | 'no-models'
+  | 'no-fitting-model'
+  | 'ready'
+  | 'cloud'
 
 /** The auth status of a provider, as reported by GET /api/providers/all.
  *  Mirrors the backend's authStatus field. */
@@ -272,20 +293,92 @@ export type ProviderAuthStatus = 'api-key' | 'oauth' | 'keyless' | 'none' | 'vau
  *  config fields, and whether the provider is the default. */
 export interface ProviderDetail {
   name: string
+  /** Ollama's observed readiness. Absent for every other provider. */
+  readiness?: ProviderReadiness
+  /** The usable-model count for `readiness: 'ready'`. camelCase here: this
+   *  endpoint is a 1:1 wire mapping like `authStatus`/`isDefault`. */
+  readinessModels?: number
+  /** The provider implementation ("anthropic", "ollama", "ollama-cloud",
+   *  "openrouter", "openai", "openai-compatible"). For a custom
+   *  OpenAI-compatible instance `name` is the operator-chosen unique name and
+   *  `type` is "openai-compatible". */
+  type?: string
   isDefault: boolean
   defaultModel: string | null
+  /** Operator-configured frequently-used models for this provider. */
+  models: string[]
   baseUrl: string | null
   authStatus: ProviderAuthStatus
+  /** Whether the operator must SUPPLY a base URL / unique name. This is a
+   *  validation question, NOT a visibility one: Ollama's base URL is optional
+   *  yet must still be shown, because it is the only GUI path to a remote
+   *  daemon (design D7). */
+  requiresBaseUrl: boolean
+  requiresName: boolean
 }
 
 /** The body for POST /api/providers and PUT /api/providers/:name. The
- *  api_key is write-only — never returned by the API. */
+ *  api_key is write-only — never returned by the API. `type` is required when
+ *  creating a custom OpenAI-compatible instance (name is its unique id). */
 export interface ProviderInput {
   name?: string
+  type?: string
   api_key?: string
   base_url?: string
   default_model?: string
+  /** Frequently-used models for this provider. Sent as an array; a blank
+   *  entry is ignored by the backend. Pass [] to clear the list. */
+  models?: string[]
 }
+
+// ── Channel CRUD ───────────────────────────────────────────────────────
+
+/** The auth status of a channel, as reported by GET /api/channels.
+ *  Mirrors the backend's authStatus field. */
+export type ChannelAuthStatus = 'configured' | 'missing-credential' | 'vault-locked'
+
+/** The detailed channel info returned by GET /api/channels, showing ALL
+ *  configured channels. camelCase response wire keys match the backend's
+ *  JSON 1:1 (no mapping function needed, like ProviderDetail). */
+export interface ChannelDetail {
+  id: string
+  kind: string
+  label: string | null
+  account: string | null
+  textChunkLimit: number | null
+  allowFrom: string[] | null
+  authStatus: ChannelAuthStatus
+}
+
+/** The body for POST /api/channels. Wire keys are snake_case, matching the
+ *  request body 1:1 (like ProviderInput). `token` is write-only — never
+ *  returned by the API. */
+export interface ChannelInput {
+  id: string
+  kind: string
+  label?: string
+  account?: string
+  token?: string
+  text_chunk_limit?: number
+  allow_from?: string[]
+}
+
+/** The body for PUT /api/channels/:id. All optional — only provided fields
+ *  are updated. `kind` and `id` are immutable. */
+export interface ChannelUpdateInput {
+  label?: string
+  account?: string
+  token?: string
+  text_chunk_limit?: number
+  allow_from?: string[]
+}
+
+/** The outcome of a channel create/update mutation. On success `channel`
+ *  carries the updated detail; on failure `error` carries the backend's
+ *  error message. The token is NEVER echoed back. */
+export type ChannelMutationResult =
+  | { ok: true; channel: ChannelDetail }
+  | { ok: false; error: string }
 
 // ── Agent CRUD (full def) ──────────────────────────────────────────────
 
@@ -450,6 +543,10 @@ export interface TranscriptEntry {
   payload: Record<string, unknown> | string
   harness: string | null
   model: string | null
+  /** The conversation length AFTER this entry's messages — the branch
+   *  anchor, rendered onto the derived `Message`. Null on legacy
+   *  `transcript.jsonl` rows, which carry no trustworthy position. */
+  convLen?: number | null
   /** The originating communications-channel label of this entry (e.g.
    *  "telegram", "web", "cli"), or null when the entry carries no channel
    *  (response entries, CLI TUI turns with no MessageSource, the
@@ -458,6 +555,12 @@ export interface TranscriptEntry {
    *  recordSkillLoadResult. Surfaced so the frontend can attribute user
    *  messages and skill loads to the channel they came from. */
   channel: string | null
+  /** The authenticated sender user id on the originating channel (a Telegram
+   *  user id, or a Signal phone/uuid), or null when the channel carried no
+   *  sender identity (web/CLI, response entries, the conversation-only
+   *  fallback). Stamped into the request entry's erMeta as `userId` by
+   *  runTurn's requestMeta. */
+  userId: string | null
   /** Whether this is a harness-internal entry (e.g. the synthetic
    *  continuation prompt appended after a StopMaxTokens truncation).
    *  When true, the frontend hides the entry from the chat view so the
@@ -476,6 +579,57 @@ export interface TranscriptEntry {
    *  indicating the entry is still being streamed and may be updated further.
    *  Absent (undefined) or false for finalized `entry` events. */
   streaming?: boolean
+}
+
+// ── File Explorer ───────────────────────────────────────────────────────
+
+/** A single entry in a directory listing. Mirrors the backend's
+ *  `FeEntry` JSON (camelCase at the fetch boundary). */
+export interface FileEntry {
+  name: string
+  isDir: boolean
+  isSymlink: boolean
+  size: number | null
+  mtime: string | null
+}
+
+/** The result of `GET /api/files?path=<dir>`. Mirrors the backend's
+ *  `FeListing` JSON. */
+export interface FileListing {
+  path: string
+  entries: FileEntry[]
+  truncated: boolean
+  warning: string | null
+}
+
+/** The result of `GET /api/files/content?path=<file>`. Mirrors the
+ *  backend's `FeContent` JSON. When `isBinary` is true, `content` is a
+ *  placeholder message and should NOT be rendered as file text. */
+export interface FileContent {
+  path: string
+  content: string
+  truncated: boolean
+  linesRead: number
+  isBinary: boolean
+}
+
+/** The result of `GET /api/files/stat?path=<file>`. Mirrors the backend's
+ *  `FileStat` JSON. `mtimeEpoch` is null when mtime is unavailable. */
+export interface FileStat {
+  path: string
+  size: number
+  mtimeEpoch: number | null
+}
+
+/** The result of `GET /api/files/download/manifest?path=<file>`. O(1)
+ *  metadata — no hash list (per design §12). The client computes
+ *  chunkCount from size/chunkSize. */
+export interface FileManifest {
+  path: string
+  size: number
+  mtimeEpoch: number | null
+  chunkSize: number
+  chunkCount: number
 }
 
 // ── Message derivation (UI-internal, from TranscriptEntry) ─────────────
@@ -526,6 +680,14 @@ export interface Message {
    *  on branchable rows (user + assistant); absent on synthesized rows
    *  (e.g. the System prompt row). Used as the branch boundary key. */
   entryId?: string
+  /** The conversation length AFTER this row — the branch anchor. The
+   *  backend copies this many `conversation.jsonl` lines into a branched
+   *  session. Undefined means "no anchor": the row cannot be branched from
+   *  (legacy `transcript.jsonl` rows, and synthesized rows that have no
+   *  conversation position). The branch button is gated on this field
+   *  rather than `entryId`, because `entryId` is a render index while this
+   *  is a real position in the conversation file. */
+  convLen?: number
   agentName: string
   agentStatus: AgentStatus
   timestamp: string
@@ -548,11 +710,86 @@ export interface Message {
    *  the user actually clicks the "View raw JSON" button — not on every
    *  render. A plain string is also accepted (for test fixtures). */
   rawJson?: string | (() => string)
-  /** Marks a TRANSIENT slash-command output bubble (kind:"slash" send
-   *  response). These rows are NOT persisted — they never enter the
+  /** Marks a TRANSIENT output bubble: the response to a `kind:"slash"` send
+   *  (command output) or a `kind:"answer"` send (an `ASK_HUMAN` answer the
+   *  gateway consumed, so no turn runs and no transcript entry follows).
+   *  These rows are NOT persisted — they never enter the
   *  transcript and vanish on reload. Rendered in a muted "command output"
-  *  style with a "command output — not saved" label. Spliced into the
-  *  message list at the position the command occupied in the conversation
-  *  flow, so no reordering happens when new entries arrive later. */
+   *  style with a "command output — not saved" label. Spliced into the
+   *  message list at the position the command occupied in the conversation
+   *  flow, so no reordering happens when new entries arrive later. */
   slashBubble?: boolean
+  /** Overrides the bubble's muted tag when it is set. A slash-command bubble
+   *  keeps the default "command output — not saved"; an `ASK_HUMAN` answer
+   *  confirmation says "sent as the answer — not saved". */
+  slashBubbleLabel?: string
 }
+
+// ── Cron ───────────────────────────────────────────────────────────────
+
+/** A cron job summary from `GET /api/cron` (the list response).
+ *  Omits `next_fire` (which requires a timezone load per job) and
+ *  includes `consecutive_failures` (the signal that a job is failing). */
+export interface CronJobSummary {
+  id: string
+  name: string
+  schedule: string
+  timezone: string | null
+  prompt: string
+  agent_def_id: string | null
+  /** Optional provider override. `null` = use Seal's configured default. */
+  provider: string | null
+  /** Optional model override. `null` = use Seal's configured default. */
+  model: string | null
+  enabled: boolean
+  one_shot: boolean
+  created_at: string
+  updated_at: string
+  last_fire: string | null
+  run_count: number
+  consecutive_failures: number
+}
+
+/** A cron job detail from `GET /api/cron/:id`. Includes `next_fire`. */
+export interface CronJobDetail extends CronJobSummary {
+  next_fire: string | null
+}
+
+/** The input for `POST /api/cron` (create). Dedicated type so the client
+ *  cannot set `created_at`, `run_count`, `consecutive_failures`, or
+ *  `last_fire`. */
+export interface CronJobInput {
+  name: string
+  schedule: string
+  timezone?: string
+  prompt: string
+  agent_def_id?: string
+  /** Optional; omit (or send "") to use Seal's configured default provider. */
+  provider?: string | null
+  /** Optional; omit (or send "") to use Seal's configured default model. */
+  model?: string | null
+  enabled?: boolean
+  one_shot?: boolean
+}
+
+/** The input for `PUT /api/cron/:id` (update). All fields optional —
+ *  only the supplied fields are patched. */
+export interface CronJobUpdateInput {
+  name?: string
+  schedule?: string
+  timezone?: string
+  prompt?: string
+  agent_def_id?: string
+  /** Absent or `null` = leave unchanged; `""` = clear to the configured
+   *  default; a name = set. */
+  provider?: string | null
+  /** Same three-way convention as `provider`. */
+  model?: string | null
+  enabled?: boolean
+  one_shot?: boolean
+}
+
+/** The outcome of a cron create/update mutation. */
+export type CronMutationResult =
+  | { ok: true; job: CronJobDetail }
+  | { ok: false; error: string }

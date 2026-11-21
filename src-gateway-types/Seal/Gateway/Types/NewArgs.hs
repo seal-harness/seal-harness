@@ -5,7 +5,7 @@
 --
 -- Two things live here:
 --
--- * 'NewArgs' and its parser — the @-p@\/@-m@\/@-r@ flags of @\/new@. The
+-- * 'NewArgs' and its parser — the @-p@\/@-m@\/@-r@\/@-b@ flags of @\/new@. The
 --   chat-channel loop parses the same flags as the CLI/web registry, so the
 --   parser must be shared rather than re-implemented (handoff §4 item 9:
 --   "reuse it, do not re-parse by hand").
@@ -23,22 +23,32 @@ import Data.Text (Text)
 import Data.Text qualified as T
 
 -- | Optional arguments for @/new@. All fields are 'Maybe' — 'Nothing' means
--- "use the config default" (for provider/model) or "no repo" (for repo).
+-- "use the config default" (for provider/model), "no repo" (for repo), or
+-- "the remote's default branch" (for branch).
 data NewArgs = NewArgs
   { naProvider :: Maybe Text
   , naModel    :: Maybe Text
   , naRepo     :: Maybe Text
+  , naBranch   :: Maybe Text
+    -- ^ The branch or tag to check out when @-r@ clones a repo. 'Nothing'
+    -- means the remote's default branch.
   } deriving stock (Eq, Show)
 
 -- | The empty 'NewArgs' — no overrides, use all config defaults.
 emptyNewArgs :: NewArgs
-emptyNewArgs = NewArgs { naProvider = Nothing, naModel = Nothing, naRepo = Nothing }
+emptyNewArgs = NewArgs
+  { naProvider = Nothing
+  , naModel    = Nothing
+  , naRepo     = Nothing
+  , naBranch   = Nothing
+  }
 
 -- | Parse the raw argument text from the routing layer into 'NewArgs'.
 -- This is a simple manual parse used by the inbox-channel loop path
 -- ('Seal.Channels.Chat.Loop'), which doesn't go through
--- optparse-applicative. Supports @-p@\/@--provider@, @-m@\/@--model@, and
--- @-r@\/@--repo@ with a single value each. Unknown flags are ignored.
+-- optparse-applicative. Supports @-p@\/@--provider@, @-m@\/@--model@,
+-- @-r@\/@--repo@, and @-b@\/@--branch@ with a single value each. Unknown
+-- flags are ignored.
 parseNewArgs :: Text -> NewArgs
 parseNewArgs raw =
   go (splitArgs raw) emptyNewArgs
@@ -48,6 +58,7 @@ parseNewArgs raw =
       | flag `elem` ["-p", "--provider"] = go rest acc { naProvider = Just val }
       | flag `elem` ["-m", "--model"]    = go rest acc { naModel    = Just val }
       | flag `elem` ["-r", "--repo"]     = go rest acc { naRepo     = Just val }
+      | flag `elem` ["-b", "--branch"]   = go rest acc { naBranch   = Just val }
       | otherwise                        = go (val : rest) acc
     go (_flag : rest) acc = go rest acc
 

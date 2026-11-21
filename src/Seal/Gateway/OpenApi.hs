@@ -37,9 +37,9 @@ import qualified Trasa.Method as M
 import Seal.Gateway.Route
   ( SealRoute (..), allRoutes
   , SessionIdOrErr (..), AgentDefIdOrErr (..), SkillIdOrErr (..)
-  , RepoIdOrErr (..), TabIndexOrErr (..), AskIdOrErr (..)
+  , RepoIdOrErr (..), TabIndexOrErr (..), AskIdOrErr (..), CronJobIdOrErr (..)
   , sessionIdCapture, agentDefIdCapture, skillIdCapture
-  , repoIdCapture, tabIndexCapture, askIdCapture, textCapture
+  , repoIdCapture, tabIndexCapture, askIdCapture, cronJobIdCapture, textCapture
   , freeFormBodyCodec
   )
 
@@ -134,11 +134,30 @@ openApiMeta = \case
   RouteProviderDelete -> api (match "providers" ./ capture oaText ./ end) qend bodyless (resp (one ffBody)) M.delete
   RouteProviderDefaultGet -> api (match "providers" ./ match "default" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteProviderDefaultPut -> api (match "providers" ./ match "default" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put
+  RouteChannelsList -> api (match "channels" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteChannelCreate -> api (match "channels" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteChannelUpdate -> api (match "channels" ./ capture oaText ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put
+  RouteChannelDelete -> api (match "channels" ./ capture oaText ./ end) qend bodyless (resp (one ffBody)) M.delete
   RouteUiStateGet -> api (match "ui" ./ match "state" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteUiStatePut -> api (match "ui" ./ match "state" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put
   RouteUiCustomModels -> api (match "ui" ./ match "custom-models" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
   RouteUiRepos -> api (match "ui" ./ match "repos" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
   RouteAdopt -> api (match "adopt" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteFilesList -> api (match "files" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteFilesContent -> api (match "files" ./ match "content" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteFilesDownload -> api (match "files" ./ match "download" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteFilesStat -> api (match "files" ./ match "stat" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteFilesManifest -> api (match "files" ./ match "download" ./ match "manifest" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteFilesChunk -> api (match "files" ./ match "download" ./ match "chunk" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteSetupState -> api (match "setup" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteSetupVault -> api (match "setup" ./ match "vault" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteSetupVaultReopen -> api (match "setup" ./ match "vault" ./ match "reopen" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteProviderTest -> api (match "providers" ./ capture oaText ./ match "test" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteCronList -> api (match "cron" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteCronCreate -> api (match "cron" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteCronGet -> api (match "cron" ./ capture oaCronJobId ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteCronUpdate -> api (match "cron" ./ capture oaCronJobId ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.put
+  RouteCronDelete -> api (match "cron" ./ capture oaCronJobId ./ end) qend bodyless (resp (one ffBody)) M.delete
 
 -- | Prefix a path with @match "api"@ so the rendered OpenAPI paths include the
 -- @\/api@ prefix the client sees (the gateway strips it before dispatching to
@@ -178,6 +197,9 @@ oaTabIndex = openApiCaptureCodec tabIndexCapture
 
 oaAskId :: OpenApiCaptureCodec AskIdOrErr
 oaAskId = openApiCaptureCodec askIdCapture
+
+oaCronJobId :: OpenApiCaptureCodec CronJobIdOrErr
+oaCronJobId = openApiCaptureCodec cronJobIdCapture
 
 oaText :: OpenApiCaptureCodec Text
 oaText = openApiCaptureCodec textCapture

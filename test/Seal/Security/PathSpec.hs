@@ -202,6 +202,19 @@ spec = describe "Seal.Security.Path" $ do
         r <- mkSafePathAllowAbs (WorkspaceRoot "/nonexistent") (outside </> ".env" </> "secrets")
         r `shouldSatisfy` isBlocked
 
+    -- The blocked-name check runs on the *requested* path. A symlink whose own
+    -- name is innocent but whose target sits inside a blocked directory must be
+    -- rejected too, or `<workdir>/link` reads ~/.seal through an absolute path.
+    it "rejects a symlink that resolves into a blocked location" $
+      withSystemTempDirectory "seal-ws" $ \root ->
+        withSystemTempDirectory "seal-outside" $ \outside -> do
+          createDirectoryIfMissing True (outside </> ".seal")
+          BS.writeFile (outside </> ".seal" </> "credentials.toml") "pk"
+          let link = root </> "innocent.txt"
+          createFileLink (outside </> ".seal" </> "credentials.toml") link
+          r <- mkSafePathAllowAbs (WorkspaceRoot root) link
+          r `shouldSatisfy` isBlocked
+
     it "rejects a missing absolute path with PathDoesNotExist" $
       withSystemTempDirectory "seal-outside" $ \outside -> do
         r <- mkSafePathAllowAbs (WorkspaceRoot "/nonexistent") (outside </> "no-such-file.txt")
@@ -230,6 +243,19 @@ spec = describe "Seal.Security.Path" $ do
         createDirectoryIfMissing True (outside </> ".ssh")
         r <- mkSafePathForWriteAllowAbs (WorkspaceRoot "/nonexistent") (outside </> ".ssh" </> "id_rsa")
         r `shouldSatisfy` isBlocked
+
+    -- Same escape on the write side: canonicalising the parent does not resolve
+    -- a symlink that is the final component, so a write through it would land
+    -- inside the blocklist.
+    it "rejects a symlink that resolves into a blocked location" $
+      withSystemTempDirectory "seal-ws" $ \root ->
+        withSystemTempDirectory "seal-outside" $ \outside -> do
+          createDirectoryIfMissing True (outside </> ".seal")
+          BS.writeFile (outside </> ".seal" </> "security.toml") "x"
+          let link = root </> "innocent.txt"
+          createFileLink (outside </> ".seal" </> "security.toml") link
+          r <- mkSafePathForWriteAllowAbs (WorkspaceRoot root) link
+          r `shouldSatisfy` isBlocked
 
     it "rejects a missing parent in an absolute path" $
       withSystemTempDirectory "seal-outside" $ \outside -> do
