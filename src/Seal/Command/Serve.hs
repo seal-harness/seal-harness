@@ -671,6 +671,10 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
       downloadPromptBytes = fromMaybe 268435456 (gcFileDownloadPromptBytes gwCfg)
       downloadChunkBytes  = fromMaybe 4194304 (gcFileDownloadChunkBytes gwCfg)
       downloadAllowBlocked = fromMaybe False (gcFileDownloadAllowBlocked gwCfg)
+      -- Ceiling for an inline image preview. 32 MiB comfortably covers
+      -- camera and phone photos while bounding gateway memory and the
+      -- per-file remote transport.
+      mediaPreviewBytes = 33554432
   fileExplorer <- case untrustedExecConfigFromSecurity secCfg of
     -- WU-1: split ceilings — viewer reads stay at maxScanBytes (128 KiB),
     -- downloads use a 4 MiB chunk size (full config wiring comes in WU-2).
@@ -731,6 +735,7 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
         , adDownloadPromptBytes = downloadPromptBytes
         , adDownloadChunkBytes  = downloadChunkBytes
         , adDownloadAllowBlocked = downloadAllowBlocked
+        , adMediaPreviewBytes   = mediaPreviewBytes
         , adHttpManager = Just mgr
         , adIconCache = Just iconCache
         , adOllamaReadiness = oprReadiness probes

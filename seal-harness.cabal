@@ -265,6 +265,7 @@ library
          Seal.Gateway.Send
          Seal.Gateway.SessionJson
          Seal.Gateway.ListsSnapshot
+         Seal.Gateway.MediaType
          Seal.Gateway.Broadcast
          Seal.Gateway.Server
          Seal.Gateway.OpenApi
@@ -491,6 +492,7 @@ test-suite tests
        Seal.Gateway.ApiRouteSpec
         Seal.Gateway.ApiSpec
         Seal.Gateway.ApiFilesSpec
+        Seal.Gateway.MediaTypeSpec
         Seal.Gateway.ApiIntegrationSpec
         Seal.Gateway.AgentIntegrationSpec
         Seal.Gateway.BroadcastSpec

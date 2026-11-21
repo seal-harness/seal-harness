@@ -411,6 +411,50 @@ body {
   box-shadow: inset 0 0 0 2px var(--accent-primary);
 }
 
+/* ── Files view: inline image preview ──────────────────────────────────── */
+/*
+ * The image is centred and capped to the pane so a large photo never forces
+ * the whole layout to scroll horizontally. `object-fit: contain` preserves
+ * the aspect ratio; without it a wide panorama would be stretched to the
+ * container's box.
+ */
+.files-media-container {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 16px;
+  overflow: auto;
+}
+
+.files-media-image {
+  max-width: 100%;
+  max-height: calc(100vh - 220px);
+  object-fit: contain;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+}
+
+.files-media-error {
+  padding: 24px;
+  color: var(--text-muted);
+}
+
+/* The viewer's action row (Download + Back), matching the existing content
+ * viewer's header rhythm. */
+.files-viewer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.files-btn-sm {
+  font-size: 12px;
+  padding: 3px 8px;
+}
 /* ── WebSocket connection modal ────────────────────────────────────────── */
 /*
  * A persistent live-stream disconnect. Deliberately NOT a full-screen

@@ -337,6 +337,132 @@ describe('FilesView', () => {
     expect(screen.getByTestId('content-back')).toBeTruthy()
   })
 
+  // ── Inline image preview ────────────────────────────────────────────────
+  //
+  // An allowlisted image is rendered by the browser from the inline
+  // endpoint, NOT fetched as JSON text. The content route is capped at
+  // 128 KiB, so using it would hand back an undecodable fragment.
+  describe('image preview', () => {
+    /** Register `/`, `/home` and the target's parent so the target resolves
+     *  to a FILE entry in its parent listing. */
+    function registerImageTarget(target: string) {
+      const parent = target.slice(0, target.lastIndexOf('/')) || '/'
+      const name = target.slice(target.lastIndexOf('/') + 1)
+      routes.set('/', { body: makeListing({ path: '/', entries: [] }) })
+      routes.set('/home', {
+        body: makeListing({
+          path: '/home',
+          entries: [{ name: 'user', isDir: true, isSymlink: false, size: null, mtime: null }],
+        }),
+      })
+      routes.set(parent, {
+        body: makeListing({
+          path: parent,
+          entries: [{ name, isDir: false, isSymlink: false, size: 1024, mtime: null }],
+        }),
+      })
+    }
+
+    it('renders an <img> for a .png instead of the binary message', async () => {
+      const target = '/home/user/photo.png'
+      setLocation(target)
+      registerImageTarget(target)
+      render(<FilesView />)
+      await waitFor(() => expect(screen.getByTestId('media-image')).toBeTruthy())
+      expect(screen.queryByTestId('binary-file-message')).toBeNull()
+    })
+
+    it('points the <img> at the inline endpoint', async () => {
+      const target = '/home/user/photo.png'
+      setLocation(target)
+      registerImageTarget(target)
+      render(<FilesView />)
+      await waitFor(() => expect(screen.getByTestId('media-image')).toBeTruthy())
+      const img = screen.getByTestId('media-image') as HTMLImageElement
+      expect(img.getAttribute('src')).toBe(
+        `/api/files/download?path=${encodeURIComponent(target)}&inline=1`,
+      )
+    })
+
+    it('never fetches the truncating JSON content route for an image', async () => {
+      const target = '/home/user/photo.png'
+      setLocation(target)
+      registerImageTarget(target)
+      render(<FilesView />)
+      await waitFor(() => expect(screen.getByTestId('media-image')).toBeTruthy())
+      const contentCalls = fetchMock.mock.calls.filter((c) =>
+        String(c[0]).includes('/api/files/content'),
+      )
+      expect(contentCalls).toHaveLength(0)
+    })
+
+    it('previews every allowlisted extension', async () => {
+      for (const ext of ['jpg', 'jpeg', 'gif', 'webp', 'avif', 'bmp', 'ico', 'svg']) {
+        const target = `/home/user/pic.${ext}`
+        setLocation(target)
+        registerImageTarget(target)
+        const { unmount } = render(<FilesView />)
+        await waitFor(() => expect(screen.getByTestId('media-image')).toBeTruthy())
+        unmount()
+      }
+    })
+
+    it('previews .svg in an <img> (script never runs in that context)', async () => {
+      const target = '/home/user/logo.svg'
+      setLocation(target)
+      registerImageTarget(target)
+      render(<FilesView />)
+      await waitFor(() => expect(screen.getByTestId('media-image')).toBeTruthy())
+      const img = screen.getByTestId('media-image') as HTMLImageElement
+      // Still the inline endpoint, which serves the SVG with its hardening CSP.
+      expect(img.getAttribute('src')).toBe(
+        `/api/files/download?path=${encodeURIComponent(target)}&inline=1`,
+      )
+      // Crucially an <img>, never inline SVG markup or an <object>/<iframe>:
+      // those would run the file's script in this origin.
+      expect(document.querySelector('object')).toBeNull()
+      expect(document.querySelector('iframe')).toBeNull()
+    })
+
+    // The preview must never put SVG *markup* into the page. Inlining it, or
+    // using <object>/<embed>/<iframe>, would run the file's script in this
+    // origin — only <img> is a safe render context.
+    it('never inlines SVG markup into the document (XSS)', async () => {
+      const target = '/home/user/evil.svg'
+      setLocation(target)
+      registerImageTarget(target)
+      const { container } = render(<FilesView />)
+      await waitFor(() => expect(screen.getByTestId('media-image')).toBeTruthy())
+
+      expect(container.querySelector('object')).toBeNull()
+      expect(container.querySelector('embed')).toBeNull()
+      expect(container.querySelector('iframe')).toBeNull()
+      // The preview element is an IMG: the browser applies its restricted
+      // image decode path, so the file gets no document and no script engine.
+      expect(screen.getByTestId('media-image').tagName).toBe('IMG')
+    })
+
+    it('shows an error state when the image fails to load', async () => {
+      const target = '/home/user/broken.png'
+      setLocation(target)
+      registerImageTarget(target)
+      render(<FilesView />)
+      await waitFor(() => expect(screen.getByTestId('media-image')).toBeTruthy())
+      fireEvent.error(screen.getByTestId('media-image'))
+      await waitFor(() => expect(screen.getByTestId('media-error')).toBeTruthy())
+      expect(screen.queryByTestId('media-image')).toBeNull()
+    })
+
+    it('exposes download + back affordances', async () => {
+      const target = '/home/user/photo.png'
+      setLocation(target)
+      registerImageTarget(target)
+      render(<FilesView />)
+      await waitFor(() => expect(screen.getByTestId('media-download')).toBeTruthy())
+      expect(screen.getByTestId('media-back')).toBeTruthy()
+    })
+  })
+
   it('viewer download uses fetch, not <a href>', async () => {
     setLocation('/home/user/readme.txt')
     routes.set('/home/user', { body: makeListing() })

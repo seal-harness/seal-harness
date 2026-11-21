@@ -342,7 +342,7 @@ mkDepsFor paths = do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -524,7 +524,7 @@ mkProviderTestDeps tmp cfgRoot vr = do
     , adFileExplorer = mkFailClosedFileExplorer
     , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -2585,7 +2585,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -2672,7 +2672,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -2749,7 +2749,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -2827,7 +2827,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -2930,7 +2930,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -2998,7 +2998,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -3065,7 +3065,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -3113,7 +3113,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -3213,7 +3213,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -3279,7 +3279,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -3344,7 +3344,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -3403,7 +3403,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -3471,7 +3471,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -3744,7 +3744,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -3943,7 +3943,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -4024,7 +4024,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -4080,7 +4080,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adFileExplorer = mkFailClosedFileExplorer
             , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -4274,7 +4274,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adFileExplorer = mkFailClosedFileExplorer
             , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -4611,7 +4611,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -6095,7 +6095,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -6241,7 +6241,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adFileExplorer = mkFailClosedFileExplorer
             , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -6339,7 +6339,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -6457,7 +6457,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -6637,7 +6637,7 @@ spec = describe "Seal.Gateway.API" $ do
             , adFileExplorer = mkFailClosedFileExplorer
             , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -6773,7 +6773,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing
@@ -6911,7 +6911,7 @@ spec = describe "Seal.Gateway.API" $ do
                 , adFileExplorer = mkFailClosedFileExplorer
                 , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
-, adDownloadChunkBytes = 4194304
+, adDownloadChunkBytes = 4194304, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing

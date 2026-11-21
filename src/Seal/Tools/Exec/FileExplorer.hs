@@ -70,6 +70,7 @@ data FileExplorerErr
   | FeIo !Text          -- ^ I/O error (message)
   | FeExec !Text        -- ^ remote SSH exec failure (message)
   | FeTruncated         -- ^ output exceeded the byte ceiling
+  | FeTooLarge          -- ^ file exceeds a caller-supplied byte ceiling (inline preview)
   | FeDisabled          -- ^ file explorer disabled (non-loopback)
   deriving stock (Eq, Show)
 
@@ -665,25 +666,38 @@ remoteStatFile sshCfg runner origPath = do
 -- skip=$index count=1 if="$p" 2>/dev/null@. Uses 'runRemoteStream'
 -- (NOT 'runRemoteBytes') so chunks larger than 50K are not truncated by
 -- the transport cap. The path is 'shellQuote'-d.
+--
+-- The block size is ALWAYS @chunkCap@, never the caller's @len@: @dd@'s
+-- @skip=@ is in blocks of @bs=@, so a short final request must not shrink
+-- @bs@ or the start offset (index * bs) would move. The requested @len@ is
+-- sliced from the block the offset lands in; every caller's offset is a
+-- multiple of @chunkCap@ (the downloader's chunk size).
+--
+-- The stdout handle is drained with 'BS.hGet', not 'BS.hGetSome': a pipe
+-- delivers at most one buffer's worth per read (~64 KiB here), so a single
+-- @hGetSome@ silently drops the rest of a 4 MiB chunk. That corruption
+-- surfaced as partially decoded images (the decoder sees a valid header but
+-- only a fraction of the pixel data).
 remoteReadRange
   :: SshConfig -> RemoteRunner -> Int -> FilePath -> Integer -> Int
   -> IO (Either FileExplorerErr ByteString)
 remoteReadRange sshCfg runner chunkCap origPath offset len = do
   let path = collapsePath origPath
-      chunkSize = min len chunkCap
-      index = offset `div` fromIntegral chunkSize
-      cmdText = remoteReadRangeCmd path chunkSize (fromIntegral index)
+      blockSize = max 1 chunkCap
+      index = offset `div` fromIntegral blockSize
+      want = min len blockSize
+      cmdText = remoteReadRangeCmd path blockSize (fromIntegral index)
   case mkShellCommand cmdText of
     Left _ -> pure (Left (FeExec "invalid command (NUL in path?)"))
     Right _ -> do
       let argv = sshExecArgv sshCfg cmdText
       res <- runRemoteStream runner argv $ \h ->
-               BS.hGetSome h len
+               BS.hGet h blockSize
       case res of
         Left e -> pure (Left (mapRemoteExecError sshCfg e))
         Right bs
           | BS.null bs -> pure (Left (FeIo "read past EOF"))
-          | otherwise -> pure (Right bs)
+          | otherwise -> pure (Right (BS.take want bs))
 
 -- | Resolve the home directory on the remote machine via SSH @echo
 -- $HOME@. The result is cached in an 'IORef' per handle instance.
@@ -776,15 +790,17 @@ remoteReadCmd path ceilingBytes =
 -- | Build the remote stat command. The path is 'shellQuote'-d and
 -- assigned to a shell variable, then @stat -c '%s %Y' -- "$p"@ emits
 -- size and mtime (epoch seconds) on one line. Error sentinels
--- distinguish missing paths from directories. The @stat -f%z -f%m@
--- fallback covers BSD/macOS.
+-- distinguish missing paths from directories. The @stat -f '%z %m'@
+-- fallback covers BSD/macOS, whose @stat@ rejects @-c@ and whose format
+-- language uses @%z@ (size) and @%m@ (mtime). One @-f@ format string
+-- only: @stat -f%z -f%m@ fails with "can't use format 'f' with 'f'".
 remoteStatCmd :: FilePath -> Text
 remoteStatCmd path =
   T.pack $ unwords
     [ "p=" <> shellQuote path <> ";"
     , "if [ ! -e \"$p\" ]; then echo \"" <> T.unpack notFoundMarker <> "\";"
     , "elif [ -d \"$p\" ]; then echo \"" <> T.unpack isDirMarker <> "\";"
-    , "else stat -c '%s %Y' -- \"$p\" 2>/dev/null || stat -f%z -f%m -- \"$p\" 2>/dev/null;"
+    , "else stat -c '%s %Y' -- \"$p\" 2>/dev/null || stat -f '%z %m' -- \"$p\" 2>/dev/null;"
     , "fi"
     ]
 
