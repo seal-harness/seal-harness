@@ -138,6 +138,7 @@ import Seal.Memory.EngramBackend (resolveEmbeddingBackend)
 import Seal.Vault.Backend (parseUnlockMode, resolveEncryptor)
 import Seal.Vault.Provision (defaultProvisionDeps)
 import Seal.Vault.Commands (VaultRuntime (..))
+import Seal.Vault.Access (unrestrictedVaultAccess)
 import Seal.Web.UiState (newUiStateHandle)
 import Seal.Cron.Scheduler (CronScheduler (..), startCronScheduler, defaultTickInterval, defaultMaxConcurrent, applyRunOutcome, checkAutoDisable, reconcileStaleRuns)
 import Seal.Cron.Types (CronJob (..))
@@ -421,7 +422,7 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
                 -- resolution chain is unchanged for every other caller.
                 provider = fromMaybe (fromMaybe cfgProv mProv) (cjProvider job)
                 model = fromMaybe (fromMaybe cfgModel mModel) (cjModel job)
-            meta <- newSession paths provider model "cron" mJobAgent
+            meta <- newSession paths provider model "cron" mJobAgent mempty
             let sid = smId meta
             -- Register the completion handler BEFORE forking the turn: the turn
             -- can finish (or fail) as soon as it starts, and a completion with
@@ -528,7 +529,7 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
   -- only lands on disk when the user sends the first message (the web send
   -- handler writes the transcript to the session dir). This avoids
   -- polluting the sessions list with an empty session on every `seal serve`.
-  sessionMeta <- initSessionMeta paths cfg (bAgentDefs backends)
+  sessionMeta <- initSessionMeta paths cfg (bAgentDefs backends) mempty
   activeRef   <- newIORef sessionMeta
   broker <- newStreamBroker 1024
   -- Build the shared ChannelDeps early so the reply registry + write locks
@@ -808,8 +809,9 @@ mkRepoTestSeam :: VaultRuntime -> RepoRegistryHandle -> AgentRegistryHandle -> S
 mkRepoTestSeam rt repoRegH agentRegH paths = do
   pure RepoTestSeam
     { rtsLsRemote  = \repo -> do
+        va <- unrestrictedVaultAccess rt
         let deps = Clone.CloneDeps
-              { Clone.cdVault = rt
+              { Clone.cdVault = va
               , Clone.cdRepoReg = repoRegH
               , Clone.cdSshAgent = mkRealSshAgentHandle
               , Clone.cdAgentRegistry = agentRegH

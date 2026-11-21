@@ -723,7 +723,8 @@ spec = do
                 , smSealFrontMatter = True
                 , smRepoUrl = Nothing
                 , smRepoBranch = Nothing
-                , smCreatedAt = aTime, smLastActive = aTime }
+                , smCreatedAt = aTime, smLastActive = aTime
+                , smAllowedSecrets = mempty }
           saveSessionMeta paths meta
           pure meta
         statePaths :: FilePath -> SealPaths
@@ -769,7 +770,8 @@ spec = do
             , smSealFrontMatter = True
             , smRepoUrl = Nothing
             , smRepoBranch = Nothing
-            , smCreatedAt = aTime, smLastActive = aTime }
+            , smCreatedAt = aTime, smLastActive = aTime
+            , smAllowedSecrets = mempty }
       saveSessionMeta paths meta
       fs <- mkFs tmp
       autoBindRepoAgent fs paths sid

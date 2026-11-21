@@ -455,6 +455,7 @@ vaultErrorText err = case err of
   VaultNotFound -> "vault file not found"
   VaultAlreadyExists -> "vault already exists"
   VaultKeyNotFound key -> "secret not found: " <> key
+  VaultAccessDenied key -> "secret not available in this session: " <> key
 
 -- ---------------------------------------------------------------------------
 -- Production wiring

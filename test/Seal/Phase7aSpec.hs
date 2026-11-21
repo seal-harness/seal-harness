@@ -67,7 +67,7 @@ fakeMeta :: SessionMeta
 fakeMeta =
   let sid = case mkSessionId "capstone" of Right s -> s; Left _ -> error "sid"
   in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
-       (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+       (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0) mempty
 
 runAppStatus :: Application -> Request -> IO Int
 runAppStatus app req = do

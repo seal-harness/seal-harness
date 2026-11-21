@@ -31,9 +31,10 @@ import Data.CaseInsensitive qualified as CI
 import Data.Either (fromRight, isRight)
 import Data.IORef (readIORef)
 import Data.List (isPrefixOf)
-import Data.Maybe (fromMaybe, isJust, isNothing)
-import Data.Set qualified as Set
 import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe, isJust, isNothing)
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Time (UTCTime, diffUTCTime, getCurrentTime)
 import Data.Vector qualified as V
 
@@ -149,8 +150,9 @@ import Seal.SourceControl.Registry
 import Seal.Security.Vault (VaultHandle (vhDelete, vhGet, vhList, vhPut))
 import Seal.Security.Vault.Age (VaultError (VaultKeyNotFound, VaultLocked))
 import Seal.Security.Crypto (sha256Hash)
-import Seal.Vault.Commands (VaultRuntime (vrHandleRef))
 import Seal.Session.Branch (branchSession)
+import Seal.Vault.Access (unrestrictedVaultAccess)
+import Seal.Vault.Commands (VaultRuntime (vrHandleRef))
 import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection, listArchivedSessions
   , listSessions, newSession, newSessionMeta, resolveDefaultAgent
@@ -1276,6 +1278,27 @@ parseAgentField (A.Object o) =
         eitherToMaybe (Left _)   = Nothing
 parseAgentField _ = Nothing
 
+-- | Parse the optional @allowed_secrets@ field from a request body.
+--
+-- * Absent or @null@ → 'Right mempty' (all secrets allowed, backward compat).
+-- * @[]@ → @'Right' ('Just' Set.empty)@ (no secrets allowed).
+-- * @["a","b"]@ → @'Right' ('Just' (Set.fromList ["a","b"]))@.
+-- * Any entry that is not a string or fails 'isValidSecretName' → 'Left' error
+--   (the caller surfaces a 400).
+parseAllowedSecrets :: A.Value -> Either Text (Set Text)
+parseAllowedSecrets (A.Object o) =
+  case KeyMap.lookup (Key.fromText "allowed_secrets") o of
+    Nothing         -> Right mempty
+    Just A.Null     -> Right mempty
+    Just (A.Array arr) -> do
+      names <- traverse toText (V.toList arr)
+      Right (Set.fromList names)
+    Just _          -> Left "allowed_secrets must be an array"
+  where
+    toText (A.String t) = Right t
+    toText _            = Left "allowed_secrets entries must be strings"
+parseAllowedSecrets _ = Right mempty
+
 -- | Handle POST /api/tabs/new.
 handleTabNew :: ApiDeps -> A.Value -> IO Response
 handleTabNew deps v =
@@ -1284,49 +1307,51 @@ handleTabNew deps v =
     Just "shell"  -> pure (errJson status501 "shell/ssh tabs require Phase 4 untrusted execution")
     Just "ssh"    -> pure (errJson status501 "shell/ssh tabs require Phase 4 untrusted execution")
     Just "attach" -> pure (errJson status501 "attach flow goes through /api/adopt")
-    Just "provider" -> do
-      -- Mint the session id first, then insert the tab, and only persist
-      -- session.json AFTER the tab insert succeeds. If the insert fails
-      -- (full tab list, or a rare I2 collision), no session.json is left
-      -- on disk — otherwise the orphaned session would surface in Recent
-      -- Sessions with no tab to back it. newSessionMeta mints the id
-      -- without touching disk; saveSessionMeta writes the atomically.
-      --
-      -- Branching (see Seal.Session.Branch) rides on THIS arm: three
-      -- cases, distinguished by the two optional branch fields.
-      let paths = srPaths (adSessionRuntime deps)
-          (provider, model) = parseProviderModel v
-          mAgent = parseAgentField v
-          mBranchFrom = parseBranchFrom v
-          mBranchLen  = parseBranchConvLen v
-      case (mBranchFrom, mBranchLen) of
-        -- A client that sends branch_from IS branching. Silently handing
-        -- it an empty session is the exact bug this feature fixes, so a
-        -- missing anchor is a loud error — reachable from a stale cached
-        -- bundle, since a render index like "12" is a valid SessionId.
-        (Just _, Nothing) ->
-          pure (errJson status400
-                 "branch_from requires branch_conv_len (the conversation \
-                 \length to inherit from the parent session)")
-        (Nothing, _) -> plainProviderSession deps paths provider model mAgent
-        (Just parentSid, Just n) -> do
-          parentExists <- doesFileExist (sessionMetaPath paths parentSid)
-          if not parentExists
-            then pure (errJson status404 "session not found")
-            else do
-              meta <- newSessionMeta paths provider model "web" mAgent
-              let sid = smId meta
-              eSeed <- branchSession paths parentSid sid n
-              case eSeed of
-                Left err -> pure (errJson status400 err)
-                Right () -> do
-                  res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
-                  case res of
-                    Left e -> pure (errJson status400 e)
-                    Right _ -> do
-                      saveSessionMeta paths meta
-                      triggerBroadcast deps
-                      pure (tabInsertResponse res (Just sid) "session:provider")
+    Just "provider" -> case parseAllowedSecrets v of
+      Left e -> pure (errJson status400 e)
+      Right mAllowed -> do
+        -- Mint the session id first, then insert the tab, and only persist
+        -- session.json AFTER the tab insert succeeds. If the insert fails
+        -- (full tab list, or a rare I2 collision), no session.json is left
+        -- on disk — otherwise the orphaned session would surface in Recent
+        -- Sessions with no tab to back it. newSessionMeta mints the id
+        -- without touching disk; saveSessionMeta writes the atomically.
+        --
+        -- Branching (see Seal.Session.Branch) rides on THIS arm: three
+        -- cases, distinguished by the two optional branch fields.
+        let paths = srPaths (adSessionRuntime deps)
+            (provider, model) = parseProviderModel v
+            mAgent = parseAgentField v
+            mBranchFrom = parseBranchFrom v
+            mBranchLen  = parseBranchConvLen v
+        case (mBranchFrom, mBranchLen) of
+          -- A client that sends branch_from IS branching. Silently handing
+          -- it an empty session is the exact bug this feature fixes, so a
+          -- missing anchor is a loud error — reachable from a stale cached
+          -- bundle, since a render index like "12" is a valid SessionId.
+          (Just _, Nothing) ->
+            pure (errJson status400
+                   "branch_from requires branch_conv_len (the conversation \
+                   \length to inherit from the parent session)")
+          (Nothing, _) -> plainProviderSession deps paths provider model mAgent mAllowed
+          (Just parentSid, Just n) -> do
+            parentExists <- doesFileExist (sessionMetaPath paths parentSid)
+            if not parentExists
+              then pure (errJson status404 "session not found")
+              else do
+                meta <- newSessionMeta paths provider model "web" mAgent mAllowed
+                let sid = smId meta
+                eSeed <- branchSession paths parentSid sid n
+                case eSeed of
+                  Left err -> pure (errJson status400 err)
+                  Right () -> do
+                    res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
+                    case res of
+                      Left e -> pure (errJson status400 e)
+                      Right _ -> do
+                        saveSessionMeta paths meta
+                        triggerBroadcast deps
+                        pure (tabInsertResponse res (Just sid) "session:provider")
     Just "harness" -> do
       hid <- newHarnessId
       let label = parseHarnessLabel v
@@ -1357,9 +1382,9 @@ handleTabNew deps v =
 -- stay readable. Mints, inserts the tab, then persists — the original
 -- ordering, unchanged.
 plainProviderSession
-  :: ApiDeps -> SealPaths -> Text -> Text -> Maybe AgentDefId -> IO Response
-plainProviderSession deps paths provider model mAgent = do
-  meta <- newSessionMeta paths provider model "web" mAgent
+  :: ApiDeps -> SealPaths -> Text -> Text -> Maybe AgentDefId -> Set Text -> IO Response
+plainProviderSession deps paths provider model mAgent mAllowed = do
+  meta <- newSessionMeta paths provider model "web" mAgent mAllowed
   let sid = smId meta
   res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
   case res of
@@ -1441,22 +1466,24 @@ parseLabelBody body =
 -- anything else @"web"@. Everything else — no tab, one broadcast — is
 -- identical for both.
 handleSessionNew :: ApiDeps -> A.Value -> IO Response
-handleSessionNew deps v = do
-  let paths = srPaths (adSessionRuntime deps)
-      cfgPath = srConfigPath (adSessionRuntime deps)
-  eCfg <- loadRuntimeConfig cfgPath
-  let cfg = fromRight defaultRuntimeConfig eCfg
-  (mDefAgent, mDefProv, mDefModel) <- resolveDefaultAgent (adAgentDefs deps) cfg
-  let (cfgProv, cfgModel) = defaultSessionSelection cfg
-      provider = fromMaybe (fromMaybe cfgProv mDefProv) (lookupBodyStr "provider")
-      model    = fromMaybe (fromMaybe cfgModel mDefModel) (lookupBodyStr "model")
-      mAgent = case lookupBodyStr "agent" of
-        Just t  -> eitherToMaybe (mkAgentDefId t)
-        Nothing -> mDefAgent
-      channel = if lookupBodyBool "headless" then "bg" else fromMaybe "web" (lookupBodyStr "channel")
-  meta <- newSession paths provider model channel mAgent
-  triggerBroadcast deps
-  pure (jsonOk (object [ "session_id" .= sessionIdText (smId meta) ]))
+handleSessionNew deps v = case parseAllowedSecrets v of
+  Left e -> pure (errJson status400 e)
+  Right mAllowed -> do
+    let paths = srPaths (adSessionRuntime deps)
+        cfgPath = srConfigPath (adSessionRuntime deps)
+    eCfg <- loadRuntimeConfig cfgPath
+    let cfg = fromRight defaultRuntimeConfig eCfg
+    (mDefAgent, mDefProv, mDefModel) <- resolveDefaultAgent (adAgentDefs deps) cfg
+    let (cfgProv, cfgModel) = defaultSessionSelection cfg
+        provider = fromMaybe (fromMaybe cfgProv mDefProv) (lookupBodyStr "provider")
+        model    = fromMaybe (fromMaybe cfgModel mDefModel) (lookupBodyStr "model")
+        mAgent = case lookupBodyStr "agent" of
+          Just t  -> eitherToMaybe (mkAgentDefId t)
+          Nothing -> mDefAgent
+        channel = if lookupBodyBool "headless" then "bg" else fromMaybe "web" (lookupBodyStr "channel")
+    meta <- newSession paths provider model channel mAgent mAllowed
+    triggerBroadcast deps
+    pure (jsonOk (object [ "session_id" .= sessionIdText (smId meta) ]))
   where
     objOf (A.Object o) = Just o
     objOf _            = Nothing
@@ -1492,41 +1519,43 @@ handleSessionNew deps v = do
 -- warning and the confirmation line.
 handleSessionRebindNew :: ApiDeps -> Text -> A.Value -> IO Response
 handleSessionRebindNew deps sidTxt body =
-  case mkSessionId sidTxt of
-    Left e  -> pure (errJson status400 ("invalid session id: " <> e))
-    Right oldSid -> do
-      let paths = srPaths (adSessionRuntime deps)
-          mp = sessionMetaPath paths oldSid
-      exists <- doesFileExist mp
-      if not exists
-        then pure (errJson status404 "session not found")
-        else do
-          mOldMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
-          case mOldMeta of
-            Nothing -> pure (errJson status404 "session not found")
-            Just oldMeta -> do
-              eCfg <- loadRuntimeConfig (srConfigPath (adSessionRuntime deps))
-              let cfg = fromRight defaultRuntimeConfig eCfg
-              (mDefAgent, _, _) <- resolveDefaultAgent (adAgentDefs deps) cfg
-              let provider = fromMaybe (smProvider oldMeta) (bodyStr "provider" body)
-                  model    = fromMaybe (smModel oldMeta) (bodyStr "model" body)
-                  channel  = fromMaybe "web" (bodyStr "channel" body)
-              meta <- newSession paths provider model channel mDefAgent
-              let newSid = smId meta
-                  newSidTxt = sessionIdText newSid
-              snap <- snapshotTabs (adTabsHandle deps)
-              case [ t | t <- tlTabs snap, tRef t == BoundSession oldSid ] of
-                []       -> do
-                  triggerBroadcast deps
-                  pure (jsonOk (rebindNewResponse
-                    newSidTxt Nothing False Nothing provider model))
-                (tab : _) -> do
-                  let idx = tabIndexToInt (tIndex tab)
-                  r <- rebindTabH (adTabsHandle deps) (tIndex tab) (BoundSession newSid)
-                  triggerBroadcast deps
-                  pure (jsonOk $ case r of
-                    Left e   -> rebindNewResponse newSidTxt (Just idx) False (Just e) provider model
-                    Right () -> rebindNewResponse newSidTxt (Just idx) True Nothing provider model)
+  case parseAllowedSecrets body of
+    Left e -> pure (errJson status400 e)
+    Right mAllowed -> case mkSessionId sidTxt of
+      Left e  -> pure (errJson status400 ("invalid session id: " <> e))
+      Right oldSid -> do
+        let paths = srPaths (adSessionRuntime deps)
+            mp = sessionMetaPath paths oldSid
+        exists <- doesFileExist mp
+        if not exists
+          then pure (errJson status404 "session not found")
+          else do
+            mOldMeta <- decodeFileStrict mp :: IO (Maybe SessionMeta)
+            case mOldMeta of
+              Nothing -> pure (errJson status404 "session not found")
+              Just oldMeta -> do
+                eCfg <- loadRuntimeConfig (srConfigPath (adSessionRuntime deps))
+                let cfg = fromRight defaultRuntimeConfig eCfg
+                (mDefAgent, _, _) <- resolveDefaultAgent (adAgentDefs deps) cfg
+                let provider = fromMaybe (smProvider oldMeta) (bodyStr "provider" body)
+                    model    = fromMaybe (smModel oldMeta) (bodyStr "model" body)
+                    channel  = fromMaybe "web" (bodyStr "channel" body)
+                meta <- newSession paths provider model channel mDefAgent mAllowed
+                let newSid = smId meta
+                    newSidTxt = sessionIdText newSid
+                snap <- snapshotTabs (adTabsHandle deps)
+                case [ t | t <- tlTabs snap, tRef t == BoundSession oldSid ] of
+                  []       -> do
+                    triggerBroadcast deps
+                    pure (jsonOk (rebindNewResponse
+                      newSidTxt Nothing False Nothing provider model))
+                  (tab : _) -> do
+                    let idx = tabIndexToInt (tIndex tab)
+                    r <- rebindTabH (adTabsHandle deps) (tIndex tab) (BoundSession newSid)
+                    triggerBroadcast deps
+                    pure (jsonOk $ case r of
+                      Left e   -> rebindNewResponse newSidTxt (Just idx) False (Just e) provider model
+                      Right () -> rebindNewResponse newSidTxt (Just idx) True Nothing provider model)
 
 -- | The response body of @POST \/api\/sessions\/:id\/new@. Pure, so the
 -- rebind-failure branch (reachable only via an out-of-range race or a
@@ -1619,8 +1648,9 @@ handleSessionDescription deps sid body =
 -- compile-time-embedded.
 cloneDepsForApiDeps :: ApiDeps -> IO CloneDeps
 cloneDepsForApiDeps deps = do
+  va <- unrestrictedVaultAccess (adVault deps)
   pure CloneDeps
-    { Clone.cdVault = adVault deps
+    { Clone.cdVault = va
     , Clone.cdRepoReg = adRepoRegistry deps
     , Clone.cdSshAgent = mkRealSshAgentHandle
     , Clone.cdAgentRegistry = adAgentRegistry deps
@@ -2518,9 +2548,9 @@ parseCredentialObj co = do
     Nothing           -> Left "credential.vault_key is required"
   mUsername <- case KeyMap.lookup (Key.fromText "username") co of
     Just (A.String t) -> Right (Just t)
-    Just A.Null       -> Right Nothing
+    Just A.Null       -> Right mempty
     Just _            -> Left "credential.username must be a string"
-    Nothing           -> Right Nothing
+    Nothing           -> Right mempty
   parseCredentialKind kind vaultKey mUsername
 
 -- | Fail with @err@ when the predicate is @False@, otherwise pass through.

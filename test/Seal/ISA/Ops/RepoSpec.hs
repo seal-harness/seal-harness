@@ -32,7 +32,7 @@ import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.SourceControl.Repo
   ( RepoCredential (..), SourceRepo (..), VcsKind (..), mkRepoId )
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
-import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
+import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime, fakeVaultAccess)
 import Seal.Tools.Args (BranchName, mkBranchName, mkShellCommand, textShellCommand)
 import Seal.Tools.Exec.UIO (runUIOWithEnv)
 import Seal.Tools.Exec.UIO.Internal (mkTestUIOEnv)
@@ -79,7 +79,7 @@ mkTestCloneDeps keyfilesDir = do
   agentRegH <- mkAgentRegistryHandle keyfilesDir
   let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
   pure CloneDeps
-    { cdVault = vault
+    { cdVault = fakeVaultAccess vault ["K_PASS", "K_PAT", "K_DEPLOY", "K_MU", "TOKEN", "API_KEY", "SECRET", "KEY", "K", "DB_PASS", "ANTHROPIC_API_KEY", "DOOMED"]
     , cdRepoReg = fakeRepoRegistryHandle
     , cdSshAgent = agent
     , cdAgentRegistry = agentRegH
@@ -809,7 +809,7 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
           base <- mkTestCloneDeps (d </> "keys")
           vault <- makeFakeVaultRuntime [("k", "tok")]
           seen <- newIORef []
-          let deps = base { cdRepoReg = registryWith [patRepo], cdVault = vault }
+          let deps = base { cdRepoReg = registryWith [patRepo], cdVault = fakeVaultAccess vault ["k"] }
           withBranchName "dev" $ \dev -> do
             res <- cloneRepoIO deps (recordingUio seen) "https://github.com/o/r" (Just dev)
             res `shouldBe` CloneSwitched "r" "dev"
@@ -828,7 +828,7 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
           base <- mkTestCloneDeps (d </> "keys")
           vault <- makeFakeVaultRuntime [("k", "passphrase")]
           seen <- newIORef []
-          let deps = base { cdRepoReg = registryWith [keyRepo], cdVault = vault }
+          let deps = base { cdRepoReg = registryWith [keyRepo], cdVault = fakeVaultAccess vault ["k"] }
           withBranchName "dev" $ \dev -> do
             res <- cloneRepoIO deps (recordingUio seen) "https://github.com/o/r" (Just dev)
             res `shouldBe` CloneSwitched "r" "dev"

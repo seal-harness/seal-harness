@@ -116,6 +116,7 @@ import qualified Seal.Setup.StateSpec
 import qualified Seal.Gateway.SetupApiSpec
 import qualified Seal.Vault.IdentityPathScopingFailSpec
 import qualified Seal.Vault.CommandsSpec
+import qualified Seal.Vault.AccessSpec
 import qualified Seal.IngestSpec
 import qualified Seal.Channel.CliSpec
 import qualified Seal.Channel.WiringSpec
@@ -349,6 +350,7 @@ specs = do
   Seal.Gateway.SetupApiSpec.spec
   Seal.Vault.IdentityPathScopingFailSpec.spec
   Seal.Vault.CommandsSpec.spec
+  Seal.Vault.AccessSpec.spec
   Seal.IngestSpec.spec
   Seal.Channel.CliSpec.spec
   Seal.Channel.WiringSpec.spec

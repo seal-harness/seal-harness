@@ -29,7 +29,7 @@ import Seal.SourceControl.Repo
   , mkRepoId )
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
-import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
+import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime, fakeVaultAccess)
 import Seal.Tools.Args (textBinArg, textBinName)
 import Seal.Tools.Exec.Types (getRemotePath)
 import Seal.Tools.Exec.UntrustedIO
@@ -135,7 +135,7 @@ ghMkDeployKeyDeps repos keyfilesDir = do
   agentCallsRef <- newIORef []
   let agent = mkFakeSshAgentHandle agentCallsRef (SshAgentEnv "/tmp/fake-sock" "12345")
   pure CloneDeps
-    { cdVault = vault
+    { cdVault = fakeVaultAccess vault ["K_PASS", "K_PAT", "K_DEPLOY", "K_MU", "TOKEN", "API_KEY", "SECRET", "KEY", "K", "DB_PASS", "ANTHROPIC_API_KEY", "DOOMED"]
     , cdRepoReg = ghFakeRepoReg repos
     , cdSshAgent = agent
     , cdAgentRegistry = agentRegH
@@ -151,7 +151,7 @@ ghMkPatDeps repos = do
   agentRegH <- mkAgentRegistryHandle "/tmp/seal-test-agentreg-gh-pat"
   agentCallsRef <- newIORef []
   pure CloneDeps
-    { cdVault = vault
+    { cdVault = fakeVaultAccess vault ["K_PASS", "K_PAT", "K_DEPLOY", "K_MU", "TOKEN", "API_KEY", "SECRET", "KEY", "K", "DB_PASS", "ANTHROPIC_API_KEY", "DOOMED"]
     , cdRepoReg = ghFakeRepoReg repos
     , cdSshAgent = mkFakeSshAgentHandle agentCallsRef (SshAgentEnv "/tmp/fake" "0")
     , cdAgentRegistry = agentRegH
@@ -495,7 +495,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
       agentRegH <- mkAgentRegistryHandle "/tmp/seal-test-agentreg-gh-bytes"
       agentCallsRef <- newIORef []
       let deps = CloneDeps
-            { cdVault = vault
+            { cdVault = fakeVaultAccess vault ["K_PASS", "K_PAT", "K_DEPLOY", "K_MU", "TOKEN", "API_KEY", "SECRET", "KEY", "K", "DB_PASS", "ANTHROPIC_API_KEY", "DOOMED"]
             , cdRepoReg = ghFakeRepoReg [ghPatRepo]
             , cdSshAgent = mkFakeSshAgentHandle agentCallsRef (SshAgentEnv "/tmp/fake" "0")
             , cdAgentRegistry = agentRegH

@@ -1,29 +1,21 @@
 # Active Plan
-<!-- approved: 2026-11-14 -->
-<!-- gate-iterations: 3 -->
+<!-- approved: 2026-10-30T18:15:00Z -->
+<!-- gate-iterations: 2 -->
 <!-- user-approved: true -->
-<!-- status: completed -->
+<!-- status: in-progress -->
 
-Chunked Resumable Download — full implementation plan.
+See: docs/plans/2026-10-30-vault-access-plan.md (full plan)
+Design: docs/plans/2026-10-29-vault-access-design.md (approved by 5-agent design review gate, 3 iterations)
+Issue: #287
 
-Canonical plan (full text, work units, DoD):
-`docs/superpowers/plans/2026-11-14-chunked-resumable-download-plan.md`
+## Work Units (execution order)
+1. WU-1: Create VaultAccess module + type + operations (TDD)
+2. WU-2: SessionMeta smAllowedSecrets :: Set Text + compile-fix
+3. WU-3: secretManageOp with VaultAccess
+4. WU-4: CloneDeps.cdVault :: VaultAccess
+5. WU-5: WebSearchConfig.wscVault :: Maybe VaultAccess
+6. WU-6: TurnDeps per-turn VaultAccess + all callers
+7. WU-7: Gateway API + frontend
+8. WU-8: Final integration + PR update
 
-Design spec:
-`docs/superpowers/specs/2026-11-13-chunked-resumable-download-design.md`
-
-Execution: orchestrated (6 work units).
-
-Operator decisions:
-- Full downloader (Slice 1 + Slice 2)
-- Both local and remote arms
-- No cross-reload resume (in-memory only, no IndexedDB)
-
-| WU | Title | Status | Commit |
-|---|---|---|---|
-| WU-1 | Backend: ceiling split + readBoundedFile fix + FileStat + feReadRange + runRemoteStream | complete | e4d8e50 |
-| WU-2 | Backend: stat + manifest + chunk routes + config + blocked-path | complete | df18a2d |
-| WU-3 | Frontend: confirm dialog + stat + .partial naming + modalStack | complete | 7fe6ed7 |
-| WU-4 | Frontend: chunked download orchestration + progress UI | complete | 8e979a6 |
-| WU-5 | Security: sanitizeHref link block | complete | cdc56ec |
-| WU-6 | Docs + full gate | complete | — |
+WU-1 and WU-2 can be done in parallel (no interdependencies).

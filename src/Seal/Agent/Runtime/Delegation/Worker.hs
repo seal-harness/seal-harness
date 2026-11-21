@@ -416,6 +416,7 @@ writeChildMeta deps childSid = do
     , smRepoBranch = Nothing
     , smCreatedAt = now
     , smLastActive = now
+    , smAllowedSecrets = maybe mempty smAllowedSecrets mParent
     }
 
 -- | Load the calling session's 'SessionMeta' through the shared leaf reader
@@ -540,5 +541,6 @@ writeHandoffMeta deps childSid agentDef taskRepo = do
     , smRepoBranch = repo >>= rsBranch
     , smCreatedAt = now
     , smLastActive = now
+    , smAllowedSecrets = maybe mempty smAllowedSecrets mParent
     }
   pure repo

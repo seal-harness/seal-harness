@@ -43,8 +43,9 @@ import Seal.SourceControl.Clone
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.SourceControl.Repo
   ( RepoCredential (..), SourceRepo (..), VcsKind (..), mkRepoId )
-import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime, makeLockedVaultRuntime)
+import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime, makeLockedVaultRuntime, fakeVaultAccess)
 import Seal.TestHelpers.FakeRegistry (fakeRepoRegistryHandle)
+import Seal.Vault.Access (unrestrictedVaultAccess)
 import Seal.Tools.Exec.UntrustedIO (mergeEnv)
 import Seal.Tools.Ssh.Agent
   ( FakeAgentCall (..), SshAgentEnv (..), mkFakeSshAgentHandle )
@@ -171,10 +172,11 @@ spec = describe "Seal.SourceControl.Clone" $ do
             repo = deployRepo "git@github.com:o/r.git" "K_PASS"
         BS.writeFile keyfilePath encryptedKeyfile
         vault <- makeFakeVaultRuntime [("K_PASS", passphrase)]
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = freshAgentRegistry
@@ -208,10 +210,11 @@ spec = describe "Seal.SourceControl.Clone" $ do
             token = "ghp_SUPERSECRET_TOKEN_12345"
             repo = patRepo "git@github.com:o/r.git" "K_PAT"
         vault <- makeFakeVaultRuntime [("K_PAT", token)]
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = freshAgentRegistry
@@ -242,10 +245,11 @@ spec = describe "Seal.SourceControl.Clone" $ do
             repo = deployRepo "git@github.com:o/r.git" "K_PASS"
         BS.writeFile keyfilePath encryptedKeyfile
         vault <- makeFakeVaultRuntime [("K_PASS", passphrase)]
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = freshAgentRegistry
@@ -284,11 +288,12 @@ spec = describe "Seal.SourceControl.Clone" $ do
             repo = deployRepo "git@github.com:o/r.git" "K_PASS"
         BS.writeFile keyfilePath encryptedKeyfile
         vault <- makeFakeVaultRuntime [("K_PASS", passphrase)]
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         agentRegH <- mkAgentRegistryHandle keyfilesDir
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = agentRegH
@@ -345,11 +350,12 @@ spec = describe "Seal.SourceControl.Clone" $ do
           [ ("K1", "passphrase-1")
           , ("K2", "passphrase-2")
           ]
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         agentRegH <- mkAgentRegistryHandle keyfilesDir
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = agentRegH
@@ -381,11 +387,12 @@ spec = describe "Seal.SourceControl.Clone" $ do
         vault <- makeFakeVaultRuntime
           [ ("K1", "passphrase-1")
           ]
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         agentRegH <- mkAgentRegistryHandle keyfilesDir
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = agentRegH
@@ -414,6 +421,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
         vault <- makeFakeVaultRuntime
           [ ("K1", "passphrase-1")
           ]
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         -- THE FIX: one shared AgentRegistryHandle for both CloneDeps
         -- (mirrors the production fix: one handle threaded through
@@ -421,7 +429,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
         sharedReg <- mkAgentRegistryHandle keyfilesDir
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps1 = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = sharedReg
@@ -430,7 +438,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
               , cdIsRemote = False
               }
             deps2 = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = sharedReg
@@ -460,6 +468,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
         vault <- makeFakeVaultRuntime
           [ ("K1", "passphrase-1")
           ]
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         -- THE BUG: two separate AgentRegistryHandles (simulates the
         -- production bug where each call site creates its own handle
@@ -472,7 +481,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
         reg2 <- mkAgentRegistryHandle keyfilesDir
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps1 = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = reg1
@@ -481,7 +490,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
               , cdIsRemote = False
               }
             deps2 = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = reg2
@@ -522,10 +531,11 @@ spec = describe "Seal.SourceControl.Clone" $ do
             repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K") Nothing Nothing
         BS.writeFile keyfilePath "ciphertext"
         vault <- makeFakeVaultRuntime [("K", passphrase)]
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = freshAgentRegistry
@@ -569,10 +579,11 @@ spec = describe "Seal.SourceControl.Clone" $ do
             rid1 = case mkRepoId "repo-a" of Right i -> i; Left _ -> error "bad id"
             repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredPat "K_PAT") Nothing Nothing
         vault <- makeFakeVaultRuntime [("K_PAT", token)]
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = freshAgentRegistry
@@ -616,10 +627,11 @@ spec = describe "Seal.SourceControl.Clone" $ do
             repo = SourceRepo ridA "git@github.com:o/r.git" VcsGitHub
                     (CredMachineUser "K_MU" username) Nothing Nothing
         vault <- makeFakeVaultRuntime [("K_MU", token)]
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = freshAgentRegistry
@@ -652,9 +664,10 @@ spec = describe "Seal.SourceControl.Clone" $ do
       withSystemTempDirectory "seal-keys" $ \keyfilesDir -> do
         vault <- makeLockedVaultRuntime
         callsRef <- newIORef []
+        let va = fakeVaultAccess vault ["K"]
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = freshAgentRegistry
@@ -672,10 +685,11 @@ spec = describe "Seal.SourceControl.Clone" $ do
           repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredPat "MISSING_KEY") Nothing Nothing
       withSystemTempDirectory "seal-keys" $ \keyfilesDir -> do
         vault <- makeFakeVaultRuntime []
+        let va = fakeVaultAccess vault ["MISSING_KEY"]
         callsRef <- newIORef []
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = freshAgentRegistry
@@ -712,10 +726,11 @@ spec = describe "Seal.SourceControl.Clone" $ do
             repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K") Nothing Nothing
         BS.writeFile keyfilePath "ciphertext"
         vault <- makeFakeVaultRuntime [("K", "passphrase")]
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = freshAgentRegistry
@@ -744,10 +759,11 @@ spec = describe "Seal.SourceControl.Clone" $ do
             repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K") Nothing Nothing
         BS.writeFile keyfilePath "ciphertext"
         vault <- makeFakeVaultRuntime [("K", "passphrase")]
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = freshAgentRegistry
@@ -783,10 +799,11 @@ spec = describe "Seal.SourceControl.Clone" $ do
     it "can be constructed with all fields" $
       withSystemTempDirectory "seal-keys" $ \keyfilesDir -> do
         vault <- makeFakeVaultRuntime []
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = freshAgentRegistry
@@ -859,10 +876,11 @@ spec = describe "Seal.SourceControl.Clone" $ do
             repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K") Nothing Nothing
         BS.writeFile keyfilePath "ciphertext"
         vault <- makeFakeVaultRuntime [("K", "passphrase")]
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = freshAgentRegistry
@@ -889,10 +907,11 @@ spec = describe "Seal.SourceControl.Clone" $ do
             repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K") Nothing Nothing
         BS.writeFile keyfilePath "ciphertext"
         vault <- makeFakeVaultRuntime [("K", "passphrase")]
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = freshAgentRegistry
@@ -923,6 +942,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
             repo = SourceRepo rid1 "git@github.com:o/r.git" VcsGitHub (CredDeployKey "K") Nothing Nothing
         BS.writeFile keyfilePath "ciphertext"
         vault <- makeFakeVaultRuntime [("K", "passphrase")]
+        va <- unrestrictedVaultAccess vault
         callsRef <- newIORef []
         agentRegH <- mkAgentRegistryHandle keyfilesDir
         let agent = mkFakeSshAgentHandle callsRef (SshAgentEnv "/tmp/fake-sock" "12345")
@@ -933,7 +953,7 @@ spec = describe "Seal.SourceControl.Clone" $ do
             -- call). This simulates an IO error in the post-add phase. The
             -- bracket's release must still run sahDeleteAll + sahKill.
             deps = CloneDeps
-              { cdVault = vault
+              { cdVault = va
               , cdRepoReg = fakeRepoRegistryHandle
               , cdSshAgent = agent
               , cdAgentRegistry = agentRegH

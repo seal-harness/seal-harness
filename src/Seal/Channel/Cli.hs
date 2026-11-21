@@ -204,7 +204,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
         let (cfgProv, cfgModel) = defaultSessionSelection cfg
             provider = fromMaybe cfgProv mProv
             model    = fromMaybe cfgModel mModel
-        meta <- newSession paths provider model "bg" mAgent
+        meta <- newSession paths provider model "bg" mAgent mempty
         let bgSid = smId meta
             bgCaps = def
               { ccSend = ccSend caps

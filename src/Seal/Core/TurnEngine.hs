@@ -163,6 +163,7 @@ import Seal.Types.App (runApp)
 import Seal.Types.Config (defaultConfig)
 import Seal.Types.Env (Env, mkEnv)
 import Seal.Vault.Commands (VaultRuntime)
+import Seal.Vault.Access (VaultAccess, vaultAccess, noVaultAccess)
 import Seal.Web.Fetch (webFetchOp, WebFetchConfig (..))
 import Seal.Web.Search (webSearchOp, WebSearchConfig (..), parseProvider)
 
@@ -258,7 +259,7 @@ resolveSystemPrompt agentDefBackend skillBackend autoloadId injectCatalog
 -- Replaces 'Seal.Gateway.Send.buildWebRegistry',
 -- 'Seal.Channel.Cli.cliIsaReg'.
 buildSessionRegistry
-  :: VaultRuntime
+  :: VaultAccess
   -> SealPaths
   -> Clone.CloneDeps
   -> Backends
@@ -275,14 +276,14 @@ buildSessionRegistry
   -> ChannelCaps
   -> Bool
   -> ISA.Registry
-buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
+buildSessionRegistry va paths cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
                      startWiring handoffDeps harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
     baseOps =
       [ showHumanOp caps
       , askHumanOp caps
-      , secretManageOp rt caps
+      , secretManageOp va caps
       , memoryWriteOp (bMemory backends) (bEmbedding backends)
       , memoryReadOp (bMemory backends)
       , memoryManageOp (bMemory backends) (bEmbedding backends)
@@ -348,7 +349,7 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , wscAllowList   = unwrapOpt wcSearchAllowList webCfg []
       , wscAuthKey     = unwrapOptMaybe wcSearchAuthKey webCfg
       , wscMaxResults  = unwrapOpt wcSearchMaxResults webCfg 10
-      , wscVault       = Just rt
+      , wscVault       = Just va
       , wscSearXngUrl  = unwrapOptMaybe wcSearXngUrl webCfg
       }
     webFetchCfg = WebFetchConfig
@@ -683,7 +684,8 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
   eCfg <- loadRuntimeConfig (prConfigPath (tdProvider td))
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-  cloneDeps <- mkCloneDepsTurn td
+      turnVA = vaultAccess (tdVault td) (smAllowedSecrets meta)
+  cloneDeps <- mkCloneDepsTurn td turnVA
   exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
                  (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
                  eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
@@ -743,7 +745,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
       -- keeps the web frontend's status indicator correct while the turn
       -- is waiting for human input (not stuck on "thinking").
       askAwareCaps = wrapCapsForAskStatus (tdBroker td) sid (taCaps adapter)
-      isaReg = buildSessionRegistry (tdVault td) paths cloneDeps sessionBackends wsRoot sid operatorCeiling
+      isaReg = buildSessionRegistry turnVA paths cloneDeps sessionBackends wsRoot sid operatorCeiling
                  (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring handoffDeps
                  (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) askAwareCaps onDemand
   itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
@@ -906,10 +908,10 @@ recordPreamble tHandle model mSystem isaReg = do
 -- | Build 'Clone.CloneDeps' from a 'TurnDeps' (the in-scope vault runtime +
 -- repo registry handle + paths). The ssh-agent is real (production:
 -- 'mkRealSshAgentHandle'); the pinned host keys are compile-time-embedded.
-mkCloneDepsTurn :: TurnDeps -> IO Clone.CloneDeps
-mkCloneDepsTurn td = do
+mkCloneDepsTurn :: TurnDeps -> VaultAccess -> IO Clone.CloneDeps
+mkCloneDepsTurn td va = do
   pure Clone.CloneDeps
-    { Clone.cdVault = tdVault td
+    { Clone.cdVault = va
     , Clone.cdRepoReg = tdRepoReg td
     , Clone.cdSshAgent = mkRealSshAgentHandle
     , Clone.cdAgentRegistry = tdAgentReg td
@@ -1054,7 +1056,7 @@ sessionSkillBackend :: TurnDeps -> SessionId -> IO Skill.SkillBackend
 sessionSkillBackend td sid = do
   let paths = tdPaths td
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
-  cloneDeps <- mkCloneDepsTurn td
+  cloneDeps <- mkCloneDepsTurn td (noVaultAccess (tdVault td))
   exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
                  (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
                  eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
@@ -1091,7 +1093,8 @@ callDispatcher td caps sid channelLabel callOpName val = do
     eCfg <- loadRuntimeConfig (prConfigPath (tdProvider td))
     eSecCfg <- loadSecurityConfig (securityFilePath paths)
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
-    cloneDeps <- mkCloneDepsTurn td
+        callVA = vaultAccess (tdVault td) (maybe mempty smAllowedSecrets mMeta)
+    cloneDeps <- mkCloneDepsTurn td callVA
     exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
                    (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
                    eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
@@ -1113,7 +1116,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
           { ahdWorker = buildWorker td sessionBackends sid [sid] appEnv eCfg operatorCeiling channelLabel 0 True
           , ahdEnsureTab = Just (ensureTabForSession (tdTabsHandle td) KindAi)
           }
-        isaReg = buildSessionRegistry (tdVault td) (tdPaths td) cloneDeps sessionBackends wsRoot sid operatorCeiling
+        isaReg = buildSessionRegistry callVA (tdPaths td) cloneDeps sessionBackends wsRoot sid operatorCeiling
                    (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring handoffDeps
                    (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) caps onDemand
     itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
@@ -1280,7 +1283,9 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
     , dwdParentLineage = parentLineage
     , dwdAppEnv = appEnv
     , dwdMkUIOEnv = \mAnchor childSid -> do
-        childCloneDeps <- mkCloneDepsTurn td
+        mChildMeta <- loadSessionMeta (tdPaths td) childSid
+        let childVA = vaultAccess (tdVault td) (maybe mempty smAllowedSecrets mChildMeta)
+        childCloneDeps <- mkCloneDepsTurn td childVA
         eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
         -- WU-4: when anchoring (mAnchor = Just _), reuse the PARENT's
         -- cached SessionExec (same workdir, same UIOEnv) so the child
@@ -1343,7 +1348,8 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
       , smSealFrontMatter = True
       , smRepoUrl = Nothing
       , smRepoBranch = Nothing
-      , smCreatedAt = tnow, smLastActive = tnow }
+      , smCreatedAt = tnow, smLastActive = tnow
+      , smAllowedSecrets = mempty }
 
 -- | Build a narrowed child registry (issue #154 §3.2/§3.3): the def's
 -- @adTools@ allow-list is ENFORCED (intersection with the base ops), the
@@ -1361,7 +1367,14 @@ buildChildRegistryAdapter
   -> AgentDef -> Int -> Maybe Text -> SessionId -> ChannelCaps -> IO ISA.Registry
 buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapterAppEnv adapterChannel
                           def childDepth mRole childSid childCaps = do
-  childCloneDeps <- mkCloneDepsTurn td
+  -- Load the child's session meta (persisted by writeChildMeta moments
+  -- earlier) to inherit the parent's smAllowedSecrets. This is the
+  -- single source of truth — the child's session.json carries the
+  -- restriction for both live runs and resume.
+  mChildMeta <- loadSessionMeta (tdPaths td) childSid
+  let mAllowedSecrets = maybe mempty smAllowedSecrets mChildMeta
+      childVA = vaultAccess (tdVault td) mAllowedSecrets
+  childCloneDeps <- mkCloneDepsTurn td childVA
   eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
   childExec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
                       (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner mAdopt)
@@ -1374,7 +1387,7 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
       baseOps =
         [ showHumanOp childCaps
         , askHumanOp childCaps
-        , secretManageOp (tdVault td) childCaps
+        , secretManageOp (vaultAccess (tdVault td) mAllowedSecrets) childCaps
         , memoryWriteOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
         , memoryReadOp (bMemory (tdBaseBackends td))
        , memoryManageOp (bMemory (tdBaseBackends td)) (bEmbedding (tdBaseBackends td))
@@ -1414,7 +1427,7 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
         , wscAllowList = unwrapOpt wcSearchAllowList childWebCfg []
         , wscAuthKey = unwrapOptMaybe wcSearchAuthKey childWebCfg
         , wscMaxResults = unwrapOpt wcSearchMaxResults childWebCfg 10
-        , wscVault = Just (tdVault td)
+        , wscVault = Just childVA
         , wscSearXngUrl = unwrapOptMaybe wcSearXngUrl childWebCfg
         }
       -- §3.2 item 3 (design v4): the nested AGENT_START is ALWAYS PRESENT

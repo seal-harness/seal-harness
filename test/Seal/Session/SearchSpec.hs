@@ -62,7 +62,7 @@ spec = describe "Seal.Session.Search" $ do
     it "finds sessions by description match" $ do
       withSystemTempDirectory "seal-search" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         saveSessionMeta paths (meta { smDescription = Just "debug the auth flow" })
         results <- ssbSearch backend paths "auth" False
         length results `shouldBe` 1
@@ -73,7 +73,7 @@ spec = describe "Seal.Session.Search" $ do
     it "finds sessions by first user message" $ do
       withSystemTempDirectory "seal-search" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "How do I fix the database connection pool?"
           , assistantMsg "Let me look into that."
@@ -84,7 +84,7 @@ spec = describe "Seal.Session.Search" $ do
     it "finds sessions by assistant message (full-transcript scan)" $ do
       withSystemTempDirectory "seal-search" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "Can you help me?"
           , assistantMsg "Sure, let me check the AGENT_START opcode for you."
@@ -95,7 +95,7 @@ spec = describe "Seal.Session.Search" $ do
     it "finds sessions by tool call name" $ do
       withSystemTempDirectory "seal-search" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "Run a search"
           , toolUseMsg "SEARCH_FILES"
@@ -106,7 +106,7 @@ spec = describe "Seal.Session.Search" $ do
     it "finds sessions by later user message (not just the first)" $ do
       withSystemTempDirectory "seal-search" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "First message about cats"
           , assistantMsg "Cats are great."
@@ -119,7 +119,7 @@ spec = describe "Seal.Session.Search" $ do
     it "does not match non-existent query" $ do
       withSystemTempDirectory "seal-search" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         saveSessionMeta paths (meta { smDescription = Just "debug the auth flow" })
         results <- ssbSearch backend paths "kubernetes" False
         results `shouldBe` []
@@ -133,7 +133,7 @@ spec = describe "Seal.Session.Search" $ do
     it "case-insensitive match" $ do
       withSystemTempDirectory "seal-search" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "The QuIcK brown fox"
           ]
@@ -143,7 +143,7 @@ spec = describe "Seal.Session.Search" $ do
     it "snippet contains the match context" $ do
       withSystemTempDirectory "seal-search" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "Hello"
           , assistantMsg "The config file is at /etc/app.conf"
@@ -156,7 +156,7 @@ spec = describe "Seal.Session.Search" $ do
     it "respects the archived flag" $ do
       withSystemTempDirectory "seal-search" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         saveSessionMeta paths (meta { smDescription = Just "archived session about auth" })
         -- Create archived marker
         let marker = sessionDir paths (smId meta) </> "archived"
@@ -176,13 +176,13 @@ spec = describe "Seal.Session.Search" $ do
         Nothing -> pendingWith "rg binary not found on PATH"
         Just _ -> withSystemTempDirectory "seal-search" $ \tmp -> do
           let paths = mkPaths tmp
-          meta1 <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+          meta1 <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
           seedConversation paths (smId meta1)
             [ userMsg "Can you help me?"
             , assistantMsg "Sure, let me check the AGENT_START opcode for you."
             ]
           threadDelay 1100000  -- 1.1s — ensure different session ID (ms resolution)
-          meta2 <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+          meta2 <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
           seedConversation paths (smId meta2)
             [ userMsg "Something completely unrelated"
             , assistantMsg "About cats and dogs."
@@ -199,7 +199,7 @@ spec = describe "Seal.Session.Search" $ do
         Nothing -> pendingWith "rg binary not found on PATH"
         Just _ -> withSystemTempDirectory "seal-search" $ \tmp -> do
           let paths = mkPaths tmp
-          meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+          meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
           saveSessionMeta paths (meta { smDescription = Just "debug the auth flow" })
           results <- ssbSearch ripgrepSessionSearchBackend paths "auth" False
           length results `shouldBe` 1
@@ -210,7 +210,7 @@ spec = describe "Seal.Session.Search" $ do
         Nothing -> pendingWith "rg binary not found on PATH"
         Just _ -> withSystemTempDirectory "seal-search" $ \tmp -> do
           let paths = mkPaths tmp
-          meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+          meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
           seedConversation paths (smId meta)
             [ userMsg "Hello world"
             ]
@@ -223,7 +223,7 @@ spec = describe "Seal.Session.Search" $ do
         Nothing -> pendingWith "rg binary not found on PATH"
         Just _ -> withSystemTempDirectory "seal-search" $ \tmp -> do
           let paths = mkPaths tmp
-          meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+          meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
           saveSessionMeta paths (meta { smDescription = Just "archived session about auth" })
           seedConversation paths (smId meta)
             [ userMsg "auth content"
@@ -271,7 +271,7 @@ spec = describe "Seal.Session.Search" $ do
     it "falls back to in-memory when engram binary is not available" $ do
       withSystemTempDirectory "seal-search" $ \tmp -> do
         let paths = mkPaths tmp
-        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing
+        meta <- newSession paths "anthropic" "claude-opus-4" "cli" Nothing mempty
         seedConversation paths (smId meta)
           [ userMsg "The AGENT_START opcode is broken"
           ]

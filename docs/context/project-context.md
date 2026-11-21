@@ -1,20 +1,37 @@
 # Project Context (Maintained by Orchestrator)
 
 ## Tooling
-- Build: `cabal build all` (inside nix dev shell; SIGPIPE pitfall — redirect to file)
-- Test: `cabal test >test.log 2>&1; head -80 test.log`
-- Focused test: `cabal test --test-options='--match "<needle>"'`
-- Lint: `hlint src/ test/` — must report: No hints
+- Language: Haskell (GHC2021, GHC 9.12, -Wall -Werror)
+- Build: cabal (via `make build`)
+- Test: hspec + QuickCheck (via `make test`)
+- Lint: hlint (via `make lint`)
 - Full gate: `make check` (build + test + lint)
-- Frontend: `cd frontend && npm test -- --run` / `npm run build`
+- Frontend: React 18 + TS + Vite + Tailwind, embedded via file-embed
+- Nix flake dev shell (never install GHC/cabal/hlint directly)
+
+## SIGPIPE Pitfall
+Never pipe Haskell binaries through head/tail. Redirect to file, then read.
 
 ## Completed Work Units
-| W1 | Seal.Channels.Config | src/Seal/Channels/Config.hs, test/Seal/Channels/ConfigSpec.hs | ChannelId, ChannelConfig, ResolvedChannel, channelConfigCodec, keyChannelIdBiMap, telegramVaultKeyFor, resolveChannelConfig |
-| W5 | Frontend ChannelsView | frontend/src/components/ChannelsView.tsx, types.ts, useApi.ts | ChannelDetail, ChannelInput, useChannels, createChannel, updateChannel, deleteChannel |
+| WU | Title | Key Files | Status |
+|----|-------|-----------|--------|
 
 ## Established Patterns
-- Providers CRUD: `Map Text ProviderConfig` via `Toml.tableMap` + `keyRepoBiMap`; `normalizeProvidersTable`; `upsertProvider`; `updateRuntimeConfig` (MVar-serialized); camelCase response JSON / snake_case input JSON; `ProvidersView.tsx` list+editor template; `useAllProviders` mount+refresh (not polling)
-- Channel config: `Map ChannelId ChannelConfig` mirrors providers; restricted kind codec (Signal/Telegram only); `telegramVaultKeyFor` maps legacy "telegram" to unsuffixed key
+- SessionMeta: record with tolerant FromJSON (.:? + .!= defaults)
+- Opcode: TrustedOpcode with toAuthorize (pure Value -> Either Text ()) and toRun
+- buildSessionRegistry: per-turn registry construction in TurnEngine
+- buildChildRegistryAdapter: inline registry in delegation worker (NOT via buildSessionRegistry)
+- secretManageOp: VaultRuntime -> ChannelCaps -> Opcode (Trusted)
+- VaultRuntime: global handle, vrHandleRef :: IORef (Maybe VaultHandle)
 
-## Active Services
-See SERVICE-INVENTORY.md (not yet created)
+## Key Files
+- src/Seal/Session/Meta.hs — SessionMeta record + ToJSON/FromJSON
+- src/Seal/ISA/Ops/Secret.hs — SECRET_MANAGE opcode
+- src/Seal/Core/TurnEngine.hs — buildSessionRegistry (~261), buildChildRegistryAdapter (~1341)
+- src/Seal/Session/Store.hs — newSessionMeta/newSession/initSession/initSessionMeta
+- src/Seal/Gateway/API.hs — handleTabNew/handleSessionNew/handleSessionRebindNew
+- src/Seal/Agent/Runtime/Delegation/Worker.hs — writeChildMeta, mkDelegateWorker
+
+## Merge Hotspots
+- seal-harness.cabal — exposed-modules + other-modules
+- test/Main.hs — wire test modules

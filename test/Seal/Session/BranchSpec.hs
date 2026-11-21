@@ -76,6 +76,7 @@ seedParent paths convLines entries = do
     , smRepoBranch = Nothing
     , smCreatedAt = sampleTime
     , smLastActive = sampleTime
+    , smAllowedSecrets = mempty
     }
   BS.writeFile (sessionConversationPath paths parentId) (BS.concat convLines)
   BS.writeFile (sessionEntriesPath paths parentId)
@@ -171,6 +172,7 @@ spec = describe "Seal.Session.Branch" $ do
           , smDescription = Nothing, smSealFrontMatter = True
           , smRepoUrl = Nothing, smRepoBranch = Nothing
           , smCreatedAt = sampleTime, smLastActive = sampleTime
+          , smAllowedSecrets = mempty
           }
         r <- branchSession paths parentId childId 5
         r `shouldBe` Right ()
@@ -187,6 +189,7 @@ spec = describe "Seal.Session.Branch" $ do
           , smDescription = Nothing, smSealFrontMatter = True
           , smRepoUrl = Nothing, smRepoBranch = Nothing
           , smCreatedAt = sampleTime, smLastActive = sampleTime
+          , smAllowedSecrets = mempty
           }
         -- two complete lines plus a partial third with no newline
         BS.writeFile (sessionConversationPath paths parentId)

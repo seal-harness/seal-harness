@@ -69,6 +69,7 @@ data VaultError
   | VaultAlreadyExists
   | VaultKeyNotFound Text
   | VaultBackendError Text
+  | VaultAccessDenied Text
   deriving stock (Eq, Show)
 
 newtype AgeRecipient = AgeRecipient Text deriving stock (Eq, Show)

@@ -1028,6 +1028,7 @@ export interface CreateTabBody {
    *  id). Sent only alongside `branch_from`. */
   branch_conv_len?: number
   harness_id?: string
+  allowed_secrets?: string[]
 }
 
 /** Create a new tab via the unified POST /api/tabs/new endpoint. For
@@ -1062,7 +1063,7 @@ export interface NewBareSessionResponse {
  *  override config defaults when present. Returns the new session id, or
  *  null on failure. */
 export async function createBareSession(
-  body?: { provider?: string; model?: string; agent?: string }
+  body?: { provider?: string; model?: string; agent?: string; allowed_secrets?: string[] }
 ): Promise<NewBareSessionResponse | null> {
   try {
     const res = await fetch('/api/sessions/new', {

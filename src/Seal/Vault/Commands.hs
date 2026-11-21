@@ -132,6 +132,7 @@ vaultErrMsg VaultNotFound         = "vault not found — run /vault setup"
 vaultErrMsg VaultAlreadyExists    = "vault already exists"
 vaultErrMsg (VaultKeyNotFound k)  = "no such secret: " <> k
 vaultErrMsg (VaultBackendError t) = "backend error: " <> t
+vaultErrMsg (VaultAccessDenied k) = "secret not available in this session: " <> k
 
 handleResult :: ChannelCaps -> Either VaultError a -> (a -> IO ()) -> IO ()
 handleResult caps (Left e)  _ = ccSend caps (vaultErrMsg e)

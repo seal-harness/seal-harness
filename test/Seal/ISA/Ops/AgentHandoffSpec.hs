@@ -282,6 +282,7 @@ callerMetaWithRepo mRepo = SessionMeta
   , smRepoBranch = Nothing
   , smCreatedAt = t
   , smLastActive = t
+  , smAllowedSecrets = mempty
   }
   where
     t = read "1970-01-01 00:00:00 UTC"

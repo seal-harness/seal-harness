@@ -444,7 +444,7 @@ mkDepsWithCache cacheRoot fe enabled = do
       meta0 = SessionMeta
         (case mkSessionId "test" of Right s -> s; Left _ -> error "sid")
         "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
-        (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+        (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0) mempty
   activeRef <- newIORef meta0
   let sr = SessionRuntime
         { srPaths = paths, srConfigPath = "/tmp/config.toml"

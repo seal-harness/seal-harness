@@ -283,6 +283,7 @@ library
         Seal.Setup.State
         Seal.Vault.IdentityPath
         Seal.Vault.Commands
+        Seal.Vault.Access
         Seal.Agent.Env
         Seal.Agent.Loop
         Seal.Agent.ContextTruncation
@@ -693,6 +694,7 @@ test-suite tests
         Seal.Gateway.SetupApiSpec
         Seal.Vault.IdentityPathScopingFailSpec
         Seal.Vault.CommandsSpec
+        Seal.Vault.AccessSpec
         Seal.Agent.LoopSpec
         Seal.Agent.ContextTruncationSpec
         Seal.ISA.DispatchSpec

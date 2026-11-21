@@ -61,6 +61,7 @@ import Data.Foldable (toList)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, mapMaybe, maybeToList)
 import Data.Text (Text)
+import Data.Set qualified as Set
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime (..), fromGregorian)
@@ -115,6 +116,7 @@ import Seal.SourceControl.Repo
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
+import Seal.Vault.Access (unrestrictedVaultAccess, vaAllowedSet)
 import Seal.TestHelpers.ScriptProvider (ScriptProvider (..))
 import Seal.Agent.Runtime.Delegation
   ( AgentWorkerBuilder, ChildWorkerOutcome (..)
@@ -463,7 +465,7 @@ buildTestEnv tmp mode mRepo opts = do
   -- Session runtime.
   let meta0 = SessionMeta
         (case mkSessionId "test" of Right s -> s; Left _ -> error "sid") "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
-        (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+        (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0) mempty
   activeRef <- newIORef meta0
   let sr = SessionRuntime
         { srPaths = paths, srConfigPath = configRoot </> "config.toml"
@@ -782,11 +784,16 @@ buildRemoteSecurityConfig tmp user mKeyfilePath =
 -- | Create a provider tab via POST /api/tabs/new. Returns the session id.
 callApiNewTab :: ApiTestEnv -> Text -> Text -> IO Text
 callApiNewTab env provider model = do
+  -- Read all vault keys so test sessions get unrestricted vault access
+  -- (same as before the VaultAccess change). Test-only.
+  va <- unrestrictedVaultAccess (adVault (ateDeps env))
+  let secretKeys = Set.toList (vaAllowedSet va)
   req <- testPost ["api", "tabs", "new"]
     (A.encode (A.object
       [ "kind" .= ("provider" :: Text)
       , "provider" .= provider
       , "model" .= model
+      , "allowed_secrets" .= secretKeys
       ]))
   (st, body) <- runAppBody (ateApp env) req
   if st /= 200

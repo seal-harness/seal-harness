@@ -30,7 +30,7 @@ import Seal.SourceControl.Repo
   ( RepoCredential (..), SourceRepo (..), VcsKind (..), mkRepoId )
 import Seal.SourceControl.Registry (RepoRegistryHandle (..))
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
-import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime)
+import Seal.TestHelpers.FakeVault (makeFakeVaultRuntime, fakeVaultAccess)
 import Seal.Tools.Args (textBinArg, textBinName)
 import Seal.Tools.Exec.Types (getRemotePath)
 import Seal.Tools.Exec.UIO (runUIOWithEnv)
@@ -106,7 +106,7 @@ mkDeployKeyDeps repos isRemote keyfilesDir = do
   agentCallsRef <- newIORef []
   let agent = mkFakeSshAgentHandle agentCallsRef (SshAgentEnv "/tmp/fake-sock" "12345")
   pure CloneDeps
-    { cdVault = vault
+    { cdVault = fakeVaultAccess vault ["K_PASS", "K_PAT", "K_DEPLOY", "K_MU", "TOKEN", "API_KEY", "SECRET", "KEY", "K", "DB_PASS", "ANTHROPIC_API_KEY", "DOOMED"]
     , cdRepoReg = fakeRepoReg repos
     , cdSshAgent = agent
     , cdAgentRegistry = agentRegH
@@ -122,7 +122,7 @@ mkPatDeps repos isRemote = do
   agentRegH <- mkAgentRegistryHandle "/tmp/seal-test-agentreg-pat"
   agentCallsRef <- newIORef []
   pure CloneDeps
-    { cdVault = vault
+    { cdVault = fakeVaultAccess vault ["K_PASS", "K_PAT", "K_DEPLOY", "K_MU", "TOKEN", "API_KEY", "SECRET", "KEY", "K", "DB_PASS", "ANTHROPIC_API_KEY", "DOOMED"]
     , cdRepoReg = fakeRepoReg repos
     , cdSshAgent = mkFakeSshAgentHandle agentCallsRef (SshAgentEnv "/tmp/fake" "0")
     , cdAgentRegistry = agentRegH

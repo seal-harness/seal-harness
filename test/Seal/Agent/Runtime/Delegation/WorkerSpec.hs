@@ -192,7 +192,8 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
               , smSealFrontMatter = True
               , smRepoUrl = Nothing
               , smRepoBranch = Nothing
-              , smCreatedAt = now, smLastActive = now }
+              , smCreatedAt = now, smLastActive = now
+              , smAllowedSecrets = mempty }
         saveSessionMeta paths parentMeta
         anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
         deps <- mkWorkerDepsIO tmp anchorRef =<< newIORef Nothing
@@ -516,6 +517,7 @@ sampleMetaWithRepo mRepo = SessionMeta
   , smRepoBranch = Nothing
   , smCreatedAt = t
   , smLastActive = t
+  , smAllowedSecrets = mempty
   }
   where
     t = read "1970-01-01 00:00:00 UTC"
