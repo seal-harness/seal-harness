@@ -1,0 +1,170 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Extension-allowlisted MIME typing for in-browser image preview.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- The file explorer's download endpoint serves every file as
+<span class="lineno">    5 </span>-- @application\/octet-stream@ with @Content-Disposition: attachment@ and
+<span class="lineno">    6 </span>-- @X-Content-Type-Options: nosniff@. That is deliberate: content from the
+<span class="lineno">    7 </span>-- agent's execution machine must never be rendered in the gateway's own
+<span class="lineno">    8 </span>-- origin, because that origin holds the operator's passkey session.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- Image preview needs the opposite on exactly one endpoint variant: a
+<span class="lineno">   11 </span>-- correct @Content-Type@ and @nosniff@ (so the browser decodes the bytes
+<span class="lineno">   12 </span>-- as the type we declare, not as whatever they sniff). 'inlineMediaTypeFor'
+<span class="lineno">   13 </span>-- is the single gate deciding which files may take that path.
+<span class="lineno">   14 </span>--
+<span class="lineno">   15 </span>-- = Why an allowlist and not @mimeTypeFor@
+<span class="lineno">   16 </span>--
+<span class="lineno">   17 </span>-- A denylist of dangerous types is unbounded; a browser's renderer set is
+<span class="lineno">   18 </span>-- not. Only the handful of raster image formats below may be inlined.
+<span class="lineno">   19 </span>--
+<span class="lineno">   20 </span>-- = SVG: allowed, but only with a hardening CSP
+<span class="lineno">   21 </span>--
+<span class="lineno">   22 </span>-- @image\/svg+xml@ is a scriptable document format, so its inclusion is
+<span class="lineno">   23 </span>-- conditional. Two facts decide the design, both verified in a real browser
+<span class="lineno">   24 </span>-- (see 'svgHardeningCsp'):
+<span class="lineno">   25 </span>--
+<span class="lineno">   26 </span>-- * Inside an @&lt;img&gt;@ the browser decodes the file in a restricted mode —
+<span class="lineno">   27 </span>--   scripts never run and subresources never load. So rendering an SVG
+<span class="lineno">   28 </span>--   preview is safe *as a preview*.
+<span class="lineno">   29 </span>-- * The file stays fetchable at its own URL, and navigating there loads it
+<span class="lineno">   30 </span>--   as a DOCUMENT with scripting enabled, in this gateway's
+<span class="lineno">   31 </span>--   passkey-authenticated origin. A malicious @.svg@ fetched that way runs
+<span class="lineno">   32 </span>--   its script and can act as the operator.
+<span class="lineno">   33 </span>--
+<span class="lineno">   34 </span>-- The second fact is why 'inlineMediaTypeFor' returning an SVG is not
+<span class="lineno">   35 </span>-- enough on its own: the response also carries 'svgHardeningCsp', which
+<span class="lineno">   36 </span>-- neutralises the document-navigation path. A caller that serves SVG
+<span class="lineno">   37 </span>-- without that header has reintroduced the vulnerability.
+<span class="lineno">   38 </span>--
+<span class="lineno">   39 </span>-- = Why the extension, not the file's magic bytes
+<span class="lineno">   40 </span>--
+<span class="lineno">   41 </span>-- Sniffing content would mean reading the file before deciding how to serve
+<span class="lineno">   42 </span>-- it (an extra round trip, and on the remote arm an extra SSH command) and
+<span class="lineno">   43 </span>-- would make the served type depend on bytes the caller controls anyway. The
+<span class="lineno">   44 </span>-- extension is what the request is keyed on, and it is what the human sees
+<span class="lineno">   45 </span>-- in the file listing. A mis-named file yields a broken image — never a
+<span class="lineno">   46 </span>-- content-type escape, because 'nsniff' pins the type to our declaration.
+<span class="lineno">   47 </span>module Seal.Gateway.MediaType
+<span class="lineno">   48 </span>  ( InlineMediaType (..)
+<span class="lineno">   49 </span>  , inlineMediaTypeFor
+<span class="lineno">   50 </span>  , svgHardeningCsp
+<span class="lineno">   51 </span>  ) where
+<span class="lineno">   52 </span>
+<span class="lineno">   53 </span>import Data.Text (Text)
+<span class="lineno">   54 </span>import Data.Text qualified as T
+<span class="lineno">   55 </span>import System.FilePath (takeExtension, takeFileName)
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>-- | An image type cleared for inline rendering, and the @Content-Type@
+<span class="lineno">   58 </span>-- header value it must be served with.
+<span class="lineno">   59 </span>--
+<span class="lineno">   60 </span>-- 'imtNeedsSvgCsp' distinguishes SVG, which is a *document* rather than a
+<span class="lineno">   61 </span>-- bitmap. Only SVG sets it, and the serving code must then attach
+<span class="lineno">   62 </span>-- 'svgHardeningCsp' — that header is what makes the document-navigation
+<span class="lineno">   63 </span>-- path safe. Splitting this out as a field (rather than string-matching
+<span class="lineno">   64 </span>-- @image\/svg+xml@ at the call site) keeps the requirement visible in the
+<span class="lineno">   65 </span>-- type instead of in a comment.
+<span class="lineno">   66 </span>data InlineMediaType = InlineMediaType
+<span class="lineno">   67 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">imtContentType</span></span></span> :: Text
+<span class="lineno">   68 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">imtNeedsSvgCsp</span></span></span> :: Bool
+<span class="lineno">   69 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   70 </span>
+<span class="lineno">   71 </span>-- | A raster image type: rendered as pixels, no document semantics.
+<span class="lineno">   72 </span>rasterType :: Text -&gt; InlineMediaType
+<span class="lineno">   73 </span><span class="decl"><span class="istickedoff">rasterType ct = InlineMediaType { imtContentType = ct, imtNeedsSvgCsp = False }</span></span>
+<span class="lineno">   74 </span>
+<span class="lineno">   75 </span>-- | The @Content-Type@ to serve @path@ with inline, or 'Nothing' when the
+<span class="lineno">   76 </span>-- extension is not on the allowlist (the caller then keeps the hardened
+<span class="lineno">   77 </span>-- @octet-stream@ + @attachment@ behaviour).
+<span class="lineno">   78 </span>--
+<span class="lineno">   79 </span>-- Matching is case-insensitive: @PHOTO.JPG@ and @photo.jpg@ are the same
+<span class="lineno">   80 </span>-- format, and a camera that writes upper-case extensions must not silently
+<span class="lineno">   81 </span>-- lose preview.
+<span class="lineno">   82 </span>inlineMediaTypeFor :: FilePath -&gt; Maybe InlineMediaType
+<span class="lineno">   83 </span><span class="decl"><span class="istickedoff">inlineMediaTypeFor path</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">-- A file whose whole name is the suffix (`.png`) is a hidden dotfile, not</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">-- an image: `takeExtension &quot;/home/u/.png&quot;` yields @&quot;.png&quot;@, so without</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">-- this guard the stem would be empty and a dotfile would be typed as an</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">-- image purely because of its name.</span>
+<span class="lineno">   88 </span><span class="spaces">  </span><span class="istickedoff">| T.null stem = Nothing</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case T.toLower ext of</span>
+<span class="lineno">   90 </span><span class="spaces">      </span><span class="istickedoff">&quot;.png&quot;  -&gt; Just (rasterType &quot;image/png&quot;)</span>
+<span class="lineno">   91 </span><span class="spaces">      </span><span class="istickedoff">&quot;.jpg&quot;  -&gt; Just (rasterType &quot;image/jpeg&quot;)</span>
+<span class="lineno">   92 </span><span class="spaces">      </span><span class="istickedoff">&quot;.jpeg&quot; -&gt; Just (rasterType &quot;image/jpeg&quot;)</span>
+<span class="lineno">   93 </span><span class="spaces">      </span><span class="istickedoff">&quot;.gif&quot;  -&gt; Just (rasterType &quot;image/gif&quot;)</span>
+<span class="lineno">   94 </span><span class="spaces">      </span><span class="istickedoff">&quot;.webp&quot; -&gt; Just (rasterType &quot;image/webp&quot;)</span>
+<span class="lineno">   95 </span><span class="spaces">      </span><span class="istickedoff">&quot;.avif&quot; -&gt; Just (rasterType &quot;image/avif&quot;)</span>
+<span class="lineno">   96 </span><span class="spaces">      </span><span class="istickedoff">&quot;.bmp&quot;  -&gt; Just (rasterType &quot;image/bmp&quot;)</span>
+<span class="lineno">   97 </span><span class="spaces">      </span><span class="istickedoff">&quot;.ico&quot;  -&gt; Just (rasterType &quot;image/x-icon&quot;)</span>
+<span class="lineno">   98 </span><span class="spaces">      </span><span class="istickedoff">-- SVG is a document, not a bitmap. Allowed here because the response</span>
+<span class="lineno">   99 </span><span class="spaces">      </span><span class="istickedoff">-- also carries 'svgHardeningCsp'; the '&lt;img&gt;' render context alone is</span>
+<span class="lineno">  100 </span><span class="spaces">      </span><span class="istickedoff">-- not sufficient (the file is reachable as a document too).</span>
+<span class="lineno">  101 </span><span class="spaces">      </span><span class="istickedoff">&quot;.svg&quot;  -&gt; Just InlineMediaType</span>
+<span class="lineno">  102 </span><span class="spaces">        </span><span class="istickedoff">{ imtContentType = &quot;image/svg+xml&quot;</span>
+<span class="lineno">  103 </span><span class="spaces">        </span><span class="istickedoff">, imtNeedsSvgCsp = True</span>
+<span class="lineno">  104 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">  105 </span><span class="spaces">      </span><span class="istickedoff">_       -&gt; Nothing</span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  107 </span><span class="spaces">    </span><span class="istickedoff">name = T.pack (takeFileName path)</span>
+<span class="lineno">  108 </span><span class="spaces">    </span><span class="istickedoff">ext  = T.pack (takeExtension path)</span>
+<span class="lineno">  109 </span><span class="spaces">    </span><span class="istickedoff">stem = T.take (T.length name - T.length ext) name</span></span>
+<span class="lineno">  110 </span>
+<span class="lineno">  111 </span>-- | The @Content-Security-Policy@ that makes serving an SVG inline safe.
+<span class="lineno">  112 </span>--
+<span class="lineno">  113 </span>-- Every directive is load-bearing, and the combination was chosen by
+<span class="lineno">  114 </span>-- measurement rather than by copying a snippet:
+<span class="lineno">  115 </span>--
+<span class="lineno">  116 </span>-- * @sandbox@ — no tokens. Strips scripting and gives the document an
+<span class="lineno">  117 </span>--   opaque origin, so even if a payload slipped through it cannot read
+<span class="lineno">  118 </span>--   cookies, storage, or make same-origin requests.
+<span class="lineno">  119 </span>-- * @default-src 'none'@ / @script-src 'none'@ / @object-src 'none'@ —
+<span class="lineno">  120 </span>--   defence in depth against script, @javascript:@ URLs, and
+<span class="lineno">  121 </span>--   @&lt;object&gt;@/@&lt;embed&gt;@ re-embedding.
+<span class="lineno">  122 </span>-- * @style-src 'unsafe-inline'@ — REQUIRED for fidelity, not a concession.
+<span class="lineno">  123 </span>--   @default-src 'none'@ alone drops an SVG's own @&lt;style&gt;@ block, and
+<span class="lineno">  124 </span>--   design tools routinely style by class rather than by presentation
+<span class="lineno">  125 </span>--   attribute. Measured: without this, a styled SVG renders with default
+<span class="lineno">  126 </span>--   BLACK fills (47k pixels changed). With it, byte-identical to no-CSP.
+<span class="lineno">  127 </span>--   Inline *styles* are not a script vector; @style-src@ is unrelated to
+<span class="lineno">  128 </span>--   execution.
+<span class="lineno">  129 </span>-- * @img-src data:@ — permits only inline (data-URI) images inside the
+<span class="lineno">  130 </span>--   SVG, so a drawing can embed a raster without phoning home.
+<span class="lineno">  131 </span>-- * @base-uri@ / @form-action 'none'@ — close the remaining document
+<span class="lineno">  132 </span>--   behaviours (link rewriting, form submission).
+<span class="lineno">  133 </span>--
+<span class="lineno">  134 </span>-- 'sandbox' cannot be delivered via @&lt;meta http-equiv&gt;@, so this must be a
+<span class="lineno">  135 </span>-- real response header.
+<span class="lineno">  136 </span>svgHardeningCsp :: Text
+<span class="lineno">  137 </span><span class="decl"><span class="istickedoff">svgHardeningCsp = T.intercalate &quot;; &quot;</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;sandbox&quot;</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">, &quot;default-src 'none'&quot;</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">, &quot;script-src 'none'&quot;</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">, &quot;object-src 'none'&quot;</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">, &quot;base-uri 'none'&quot;</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">, &quot;form-action 'none'&quot;</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">, &quot;style-src 'unsafe-inline'&quot;</span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="istickedoff">, &quot;img-src data:&quot;</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">  147 </span>
+
+</pre>
+</body>
+</html>

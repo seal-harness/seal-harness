@@ -1,0 +1,105 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The @[gateway]@ config section: port, bind host, static dir, allowed
+<span class="lineno">    3 </span>-- origins. The server binds loopback by default; a non-loopback host emits
+<span class="lineno">    4 </span>-- a runtime warning (the full slash-command surface is reachable by
+<span class="lineno">    5 </span>-- anything that can reach the address).
+<span class="lineno">    6 </span>module Seal.Gateway.Config
+<span class="lineno">    7 </span>  ( GatewayConfig (..)
+<span class="lineno">    8 </span>  , PartialGatewayConfig (..)
+<span class="lineno">    9 </span>  , defaultGatewayConfig
+<span class="lineno">   10 </span>  , gatewayConfigCodec
+<span class="lineno">   11 </span>  , withGatewayDefaults
+<span class="lineno">   12 </span>  ) where
+<span class="lineno">   13 </span>
+<span class="lineno">   14 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   15 </span>import Data.Text (Text)
+<span class="lineno">   16 </span>import Toml ((.=))
+<span class="lineno">   17 </span>import Toml qualified
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>-- | The gateway config section.
+<span class="lineno">   20 </span>data GatewayConfig = GatewayConfig
+<span class="lineno">   21 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">gcPort</span></span></span>           :: Int        -- ^ default 8080 (REST + static)
+<span class="lineno">   22 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">gcWsPort</span></span></span>         :: Int        -- ^ default 8081 (WS stream)
+<span class="lineno">   23 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">gcHost</span></span></span>           :: Text       -- ^ default &quot;127.0.0.1&quot;
+<span class="lineno">   24 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">gcStaticDir</span></span></span>      :: Maybe Text  -- ^ the frontend dist dir (Nothing = no static serving)
+<span class="lineno">   25 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">gcAllowedOrigins</span></span></span> :: [Text]     -- ^ the WS Origin allowlist (default localhost:8080)
+<span class="lineno">   26 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>-- | The compiled-in default. Loopback + port 8080 + the local origin.
+<span class="lineno">   29 </span>defaultGatewayConfig :: GatewayConfig
+<span class="lineno">   30 </span><span class="decl"><span class="istickedoff">defaultGatewayConfig = GatewayConfig</span>
+<span class="lineno">   31 </span><span class="spaces">  </span><span class="istickedoff">{ gcPort = 8080</span>
+<span class="lineno">   32 </span><span class="spaces">  </span><span class="istickedoff">, gcWsPort = 8081</span>
+<span class="lineno">   33 </span><span class="spaces">  </span><span class="istickedoff">, gcHost = &quot;127.0.0.1&quot;</span>
+<span class="lineno">   34 </span><span class="spaces">  </span><span class="istickedoff">, gcStaticDir = Nothing</span>
+<span class="lineno">   35 </span><span class="spaces">  </span><span class="istickedoff">, gcAllowedOrigins = [&quot;http://localhost:8080&quot;]</span>
+<span class="lineno">   36 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   37 </span>
+<span class="lineno">   38 </span>-- | Bidirectional tomland codec for the @[gateway]@ section. Every field is
+<span class="lineno">   39 </span>-- optional: a missing key decodes as 'Nothing', then 'withGatewayDefaults'
+<span class="lineno">   40 </span>-- (called by 'Seal.Command.Serve.runServeMain') fills in the
+<span class="lineno">   41 </span>-- 'defaultGatewayConfig' values. This lets a user set just @host@ or just
+<span class="lineno">   42 </span>-- @port@ without specifying the rest.
+<span class="lineno">   43 </span>gatewayConfigCodec :: Toml.TomlCodec PartialGatewayConfig
+<span class="lineno">   44 </span><span class="decl"><span class="istickedoff">gatewayConfigCodec = PartialGatewayConfig</span>
+<span class="lineno">   45 </span><span class="spaces">  </span><span class="istickedoff">&lt;$&gt; Toml.dimap (fmap fromIntegral) (fmap fromIntegral) (Toml.dioptional (Toml.integer &quot;port&quot;)) .= pgcPort</span>
+<span class="lineno">   46 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dimap (fmap fromIntegral) (fmap fromIntegral) (Toml.dioptional (Toml.integer &quot;ws_port&quot;)) .= pgcWsPort</span>
+<span class="lineno">   47 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;host&quot;) .= pgcHost</span>
+<span class="lineno">   48 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;static_dir&quot;) .= pgcStaticDir</span>
+<span class="lineno">   49 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; originsCodec .= pgcAllowedOrigins</span></span>
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>-- | A partial gateway config where every field is optional. 'withGatewayDefaults'
+<span class="lineno">   52 </span>-- merges it with 'defaultGatewayConfig' to produce a complete 'GatewayConfig'.
+<span class="lineno">   53 </span>data PartialGatewayConfig = PartialGatewayConfig
+<span class="lineno">   54 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">pgcPort</span></span></span>           :: Maybe Int
+<span class="lineno">   55 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pgcWsPort</span></span></span>         :: Maybe Int
+<span class="lineno">   56 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pgcHost</span></span></span>           :: Maybe Text
+<span class="lineno">   57 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pgcStaticDir</span></span></span>      :: Maybe Text
+<span class="lineno">   58 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">pgcAllowedOrigins</span></span></span> :: [Text]
+<span class="lineno">   59 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   60 </span>
+<span class="lineno">   61 </span>-- | Merge a partial gateway config with the compiled-in defaults, producing
+<span class="lineno">   62 </span>-- a complete 'GatewayConfig'. Each 'Nothing' field falls back to
+<span class="lineno">   63 </span>-- 'defaultGatewayConfig'; an empty 'pgcAllowedOrigins' also falls back (so
+<span class="lineno">   64 </span>-- omitting @allowed_origins@ keeps the safe loopback default rather than
+<span class="lineno">   65 </span>-- opening to all origins).
+<span class="lineno">   66 </span>withGatewayDefaults :: PartialGatewayConfig -&gt; GatewayConfig
+<span class="lineno">   67 </span><span class="decl"><span class="istickedoff">withGatewayDefaults p = GatewayConfig</span>
+<span class="lineno">   68 </span><span class="spaces">  </span><span class="istickedoff">{ gcPort           = fromMaybe <span class="nottickedoff">(gcPort defaultGatewayConfig)</span> (pgcPort p)</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">, gcWsPort         = fromMaybe (gcWsPort defaultGatewayConfig) (pgcWsPort p)</span>
+<span class="lineno">   70 </span><span class="spaces">  </span><span class="istickedoff">, gcHost           = fromMaybe <span class="nottickedoff">(gcHost defaultGatewayConfig)</span> (pgcHost p)</span>
+<span class="lineno">   71 </span><span class="spaces">  </span><span class="istickedoff">, gcStaticDir      = pgcStaticDir p  -- Nothing = no static serving (the default)</span>
+<span class="lineno">   72 </span><span class="spaces">  </span><span class="istickedoff">, gcAllowedOrigins = if null (pgcAllowedOrigins p)</span>
+<span class="lineno">   73 </span><span class="spaces">                         </span><span class="istickedoff">then gcAllowedOrigins defaultGatewayConfig</span>
+<span class="lineno">   74 </span><span class="spaces">                         </span><span class="istickedoff">else pgcAllowedOrigins p</span>
+<span class="lineno">   75 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   76 </span>
+<span class="lineno">   77 </span>-- | Codec for the @allowed_origins@ array (a TOML array of strings).
+<span class="lineno">   78 </span>originsCodec :: Toml.TomlCodec [Text]
+<span class="lineno">   79 </span><span class="decl"><span class="istickedoff">originsCodec = Toml.dimap Just maybeToList (Toml.dioptional (Toml.arrayOf Toml._Text &quot;allowed_origins&quot;))</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   81 </span><span class="spaces">    </span><span class="istickedoff">maybeToList Nothing   = <span class="nottickedoff">[]</span></span>
+<span class="lineno">   82 </span><span class="spaces">    </span><span class="istickedoff">maybeToList (Just xs) = xs</span></span>
+
+</pre>
+</body>
+</html>

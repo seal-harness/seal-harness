@@ -1,0 +1,234 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>-- | Strict, resource-safe file-reading helpers built on @conduit@ + @resourcet@.
+<span class="lineno">    2 </span>--
+<span class="lineno">    3 </span>-- The lazy 'Data.ByteString.Lazy.readFile' / 'Data.Text.IO.readFile' helpers
+<span class="lineno">    4 </span>-- keep the file handle open until the lazy structure is fully consumed, which
+<span class="lineno">    5 </span>-- is GC-dependent. The 'Seal.Gateway.ListsSnapshot.buildListsSnapshot' hot
+<span class="lineno">    6 </span>-- path reads hundreds of small files per request (111 sessions × multiple
+<span class="lineno">    7 </span>-- files each) and the lazy handles pile up faster than the GC reclaims them,
+<span class="lineno">    8 </span>-- hitting the OS soft FD limit ('EMFILE' / @resource exhausted (Too many
+<span class="lineno">    9 </span>-- open files)@).
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- @conduit@'s 'sourceFile' opens the handle inside a 'ResourceT' scope, so the
+<span class="lineno">   12 </span>-- handle is released as soon as 'runConduitRes' returns — regardless of when
+<span class="lineno">   13 </span>-- (or whether) the resulting lazy 'ByteString' is forced. The bytes are
+<span class="lineno">   14 </span>-- materialized eagerly by 'sinkLazy' before the 'ResourceT' closes the handle,
+<span class="lineno">   15 </span>-- so the decode sees the full file with the fd already released.
+<span class="lineno">   16 </span>--
+<span class="lineno">   17 </span>-- Also provides 'streamFirstMatch' for early-termination line streaming —
+<span class="lineno">   18 </span>-- reads a file line-by-line via conduit and returns the first line where a
+<span class="lineno">   19 </span>-- predicate returns 'Just', without materializing the entire file. Used by
+<span class="lineno">   20 </span>-- 'firstUserMessageSnippetFast' to avoid reading multi-MB conversation files
+<span class="lineno">   21 </span>-- when only the first user message is needed.
+<span class="lineno">   22 </span>module Seal.Util.StrictIO
+<span class="lineno">   23 </span>  ( readFileStrict
+<span class="lineno">   24 </span>  , readFileTextStrict
+<span class="lineno">   25 </span>  , streamFirstMatch
+<span class="lineno">   26 </span>  , streamDecodeLines
+<span class="lineno">   27 </span>  , streamDecodeAfter
+<span class="lineno">   28 </span>  , decodeFileStrict
+<span class="lineno">   29 </span>  ) where
+<span class="lineno">   30 </span>
+<span class="lineno">   31 </span>import Conduit ( await, runConduitRes, sinkLazy, sourceFile, (.|) )
+<span class="lineno">   32 </span>import Data.Aeson (FromJSON, decode)
+<span class="lineno">   33 </span>import Data.ByteString (ByteString)
+<span class="lineno">   34 </span>import Data.ByteString qualified as BS
+<span class="lineno">   35 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   36 </span>import Data.Text (Text)
+<span class="lineno">   37 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>-- | Read a file strictly into a lazy 'ByteString', closing the underlying
+<span class="lineno">   40 </span>-- handle before the helper returns. The handle is acquired and released by
+<span class="lineno">   41 </span>-- the 'ResourceT' scope of 'runConduitRes'; the bytes are materialized by
+<span class="lineno">   42 </span>-- 'sinkLazy' before the scope exits. Callers 'doesFileExist'-guard the path
+<span class="lineno">   43 </span>-- first (the lazy variants they replace did the same).
+<span class="lineno">   44 </span>readFileStrict :: FilePath -&gt; IO BL.ByteString
+<span class="lineno">   45 </span><span class="decl"><span class="istickedoff">readFileStrict path = runConduitRes (sourceFile path .| sinkLazy)</span></span>
+<span class="lineno">   46 </span>
+<span class="lineno">   47 </span>-- | Read a file strictly as 'Text' by reading bytes strictly then decoding.
+<span class="lineno">   48 </span>-- The handle is closed before the decode runs.
+<span class="lineno">   49 </span>readFileTextStrict :: FilePath -&gt; IO Text
+<span class="lineno">   50 </span><span class="decl"><span class="istickedoff">readFileTextStrict path = TE.decodeUtf8 . BL.toStrict &lt;$&gt; readFileStrict path</span></span>
+<span class="lineno">   51 </span>
+<span class="lineno">   52 </span>-- | Stream lines from a file, applying a predicate to each line. Returns
+<span class="lineno">   53 </span>-- the first line where the predicate returns 'Just a', stopping the stream
+<span class="lineno">   54 </span>-- early. The file handle is released as soon as the match is found (or the
+<span class="lineno">   55 </span>-- file is exhausted) by conduit's 'ResourceT' scope. Each line is a strict
+<span class="lineno">   56 </span>-- 'ByteString' without the trailing newline.
+<span class="lineno">   57 </span>--
+<span class="lineno">   58 </span>-- This avoids materializing the entire file when only an early line is
+<span class="lineno">   59 </span>-- needed — e.g. @conversation.jsonl@ files averaging 2.7 MB where the
+<span class="lineno">   60 </span>-- first user message is typically in the first few lines. The line
+<span class="lineno">   61 </span>-- splitting is done in-stream (accumulating chunks until a newline is
+<span class="lineno">   62 </span>-- found) so no intermediate @conduit-extra@ dependency is needed.
+<span class="lineno">   63 </span>streamFirstMatch :: (ByteString -&gt; Maybe a) -&gt; FilePath -&gt; IO (Maybe a)
+<span class="lineno">   64 </span><span class="decl"><span class="istickedoff">streamFirstMatch test path = runConduitRes</span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="istickedoff">(sourceFile path .| lineLoop BS.empty)</span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   67 </span><span class="spaces">    </span><span class="istickedoff">-- | Accumulate chunks until a newline (0x0A) is found, then apply the</span>
+<span class="lineno">   68 </span><span class="spaces">    </span><span class="istickedoff">-- predicate to the complete line. Stops early on the first match.</span>
+<span class="lineno">   69 </span><span class="spaces">    </span><span class="istickedoff">lineLoop acc = do</span>
+<span class="lineno">   70 </span><span class="spaces">      </span><span class="istickedoff">mChunk &lt;- await</span>
+<span class="lineno">   71 </span><span class="spaces">      </span><span class="istickedoff">case mChunk of</span>
+<span class="lineno">   72 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; processRemaining acc</span>
+<span class="lineno">   73 </span><span class="spaces">        </span><span class="istickedoff">Just chunk -&gt; do</span>
+<span class="lineno">   74 </span><span class="spaces">          </span><span class="istickedoff">let combined = acc &lt;&gt; chunk</span>
+<span class="lineno">   75 </span><span class="spaces">          </span><span class="istickedoff">case BS.elemIndex 10 combined of</span>
+<span class="lineno">   76 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">lineLoop combined</span></span>
+<span class="lineno">   77 </span><span class="spaces">            </span><span class="istickedoff">Just idx -&gt;</span>
+<span class="lineno">   78 </span><span class="spaces">              </span><span class="istickedoff">let line = BS.take idx combined</span>
+<span class="lineno">   79 </span><span class="spaces">                  </span><span class="istickedoff">rest = BS.drop (idx + 1) combined</span>
+<span class="lineno">   80 </span><span class="spaces">              </span><span class="istickedoff">in case test line of</span>
+<span class="lineno">   81 </span><span class="spaces">                </span><span class="istickedoff">Just a  -&gt; pure (Just a)</span>
+<span class="lineno">   82 </span><span class="spaces">                </span><span class="istickedoff">Nothing -&gt; lineLoop rest</span>
+<span class="lineno">   83 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">   84 </span><span class="spaces">    </span><span class="istickedoff">-- | Process remaining lines in the accumulator after EOF. The</span>
+<span class="lineno">   85 </span><span class="spaces">    </span><span class="istickedoff">-- accumulator may contain multiple newline-separated lines if the</span>
+<span class="lineno">   86 </span><span class="spaces">    </span><span class="istickedoff">-- source yielded a large chunk on the last await.</span>
+<span class="lineno">   87 </span><span class="spaces">    </span><span class="istickedoff">processRemaining bs</span>
+<span class="lineno">   88 </span><span class="spaces">      </span><span class="istickedoff">| BS.null bs = pure Nothing</span>
+<span class="lineno">   89 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case BS.elemIndex 10 bs of</span>
+<span class="lineno">   90 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">case test bs of</span></span>
+<span class="lineno">   91 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Just a  -&gt; pure (Just a)</span></span>
+<span class="lineno">   92 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt; pure Nothing</span></span>
+<span class="lineno">   93 </span><span class="spaces">          </span><span class="istickedoff">Just idx -&gt;</span>
+<span class="lineno">   94 </span><span class="spaces">            </span><span class="istickedoff">let line = BS.take idx bs</span>
+<span class="lineno">   95 </span><span class="spaces">                </span><span class="istickedoff">rest = BS.drop (idx + 1) bs</span>
+<span class="lineno">   96 </span><span class="spaces">            </span><span class="istickedoff">in case test line of</span>
+<span class="lineno">   97 </span><span class="spaces">              </span><span class="istickedoff">Just a  -&gt; pure (Just a)</span>
+<span class="lineno">   98 </span><span class="spaces">              </span><span class="istickedoff">Nothing -&gt; processRemaining rest</span></span>
+<span class="lineno">   99 </span>
+<span class="lineno">  100 </span>-- | Read and decode a JSON file strictly. The handle is closed before the
+<span class="lineno">  101 </span>-- decode runs. Returns 'Nothing' on a decode failure (the caller is
+<span class="lineno">  102 </span>-- expected to 'doesFileExist'-guard the path first).
+<span class="lineno">  103 </span>decodeFileStrict :: FromJSON a =&gt; FilePath -&gt; IO (Maybe a)
+<span class="lineno">  104 </span><span class="decl"><span class="istickedoff">decodeFileStrict path = decode &lt;$&gt; readFileStrict path</span></span>
+<span class="lineno">  105 </span>-- | Stream a file line-by-line via conduit, decoding each non-empty line as
+<span class="lineno">  106 </span>-- JSON. Unlike 'readFileTextStrict' which materializes the entire file as a
+<span class="lineno">  107 </span>-- single contiguous 'Text' (potentially hundreds of MB for large transcripts),
+<span class="lineno">  108 </span>-- this reads and decodes one line at a time. The file handle is released by
+<span class="lineno">  109 </span>-- the 'ResourceT' scope when the stream completes.
+<span class="lineno">  110 </span>--
+<span class="lineno">  111 </span>-- Empty lines (blank lines between entries) are skipped. Unparseable lines
+<span class="lineno">  112 </span>-- are silently dropped (matching the @mapMaybe A.decode@ pattern used by the
+<span class="lineno">  113 </span>-- existing 'readTranscriptEntriesTimed').
+<span class="lineno">  114 </span>streamDecodeLines :: FromJSON a =&gt; FilePath -&gt; IO [a]
+<span class="lineno">  115 </span><span class="decl"><span class="istickedoff">streamDecodeLines path = runConduitRes</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="istickedoff">(sourceFile path .| lineDecodeLoop BS.empty)</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  118 </span><span class="spaces">    </span><span class="istickedoff">lineDecodeLoop acc = do</span>
+<span class="lineno">  119 </span><span class="spaces">      </span><span class="istickedoff">mChunk &lt;- await</span>
+<span class="lineno">  120 </span><span class="spaces">      </span><span class="istickedoff">case mChunk of</span>
+<span class="lineno">  121 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; processRemaining acc</span>
+<span class="lineno">  122 </span><span class="spaces">        </span><span class="istickedoff">Just chunk -&gt; splitLines (acc &lt;&gt; chunk)</span>
+<span class="lineno">  123 </span><span class="spaces">    </span><span class="istickedoff">-- | Split and decode all complete lines in the buffer, then await more.</span>
+<span class="lineno">  124 </span><span class="spaces">    </span><span class="istickedoff">-- When no newline is found in the buffer, await the next chunk. This</span>
+<span class="lineno">  125 </span><span class="spaces">    </span><span class="istickedoff">-- handles the case where a single chunk contains multiple lines (the</span>
+<span class="lineno">  126 </span><span class="spaces">    </span><span class="istickedoff">-- common case when @sourceFile@ delivers a large chunk).</span>
+<span class="lineno">  127 </span><span class="spaces">    </span><span class="istickedoff">splitLines bs =</span>
+<span class="lineno">  128 </span><span class="spaces">      </span><span class="istickedoff">case BS.elemIndex 10 bs of</span>
+<span class="lineno">  129 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; lineDecodeLoop bs</span>
+<span class="lineno">  130 </span><span class="spaces">        </span><span class="istickedoff">Just idx -&gt;</span>
+<span class="lineno">  131 </span><span class="spaces">          </span><span class="istickedoff">let line = BS.take idx bs</span>
+<span class="lineno">  132 </span><span class="spaces">              </span><span class="istickedoff">rest = BS.drop (idx + 1) bs</span>
+<span class="lineno">  133 </span><span class="spaces">          </span><span class="istickedoff">in decodeLine line (splitLines rest)</span>
+<span class="lineno">  134 </span><span class="spaces">    </span><span class="istickedoff">processRemaining bs</span>
+<span class="lineno">  135 </span><span class="spaces">      </span><span class="istickedoff">| BS.null bs = pure []</span>
+<span class="lineno">  136 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = decodeLine bs (pure [])</span>
+<span class="lineno">  137 </span><span class="spaces">    </span><span class="istickedoff">decodeLine line cont =</span>
+<span class="lineno">  138 </span><span class="spaces">      </span><span class="istickedoff">if BS.null line</span>
+<span class="lineno">  139 </span><span class="spaces">        </span><span class="istickedoff">then cont</span>
+<span class="lineno">  140 </span><span class="spaces">        </span><span class="istickedoff">else case decode (BL.fromStrict line) of</span>
+<span class="lineno">  141 </span><span class="spaces">               </span><span class="istickedoff">Just a  -&gt; fmap (a :) cont</span>
+<span class="lineno">  142 </span><span class="spaces">               </span><span class="istickedoff">Nothing -&gt; cont</span></span>
+<span class="lineno">  143 </span>
+<span class="lineno">  144 </span>-- | Stream a file line-by-line, skipping the first @skipCount@ non-empty
+<span class="lineno">  145 </span>-- lines, then decoding the remaining lines as JSON. This avoids both (a)
+<span class="lineno">  146 </span>-- materializing the entire file as a single 'Text' and (b) decoding lines
+<span class="lineno">  147 </span>-- that will be discarded. Used by 'readTranscriptEntriesTimed' when a
+<span class="lineno">  148 </span>-- 'ReadLastN' limit is set: the first @startConvLen@ conversation lines are
+<span class="lineno">  149 </span>-- skipped without decoding, and only the tail is decoded.
+<span class="lineno">  150 </span>--
+<span class="lineno">  151 </span>-- Empty lines are not counted toward @skipCount@ (matching the
+<span class="lineno">  152 </span>-- @filter (not . T.null) (T.lines raw)@ semantics of the existing code).
+<span class="lineno">  153 </span>streamDecodeAfter :: FromJSON a =&gt; Int -&gt; FilePath -&gt; IO [a]
+<span class="lineno">  154 </span><span class="decl"><span class="istickedoff">streamDecodeAfter skipCount path = runConduitRes</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">(sourceFile path .| skipThenDecode BS.empty skipCount)</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  157 </span><span class="spaces">    </span><span class="istickedoff">skipThenDecode acc skip</span>
+<span class="lineno">  158 </span><span class="spaces">      </span><span class="istickedoff">| skip &lt;= 0 = decodeLoop acc</span>
+<span class="lineno">  159 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = do</span>
+<span class="lineno">  160 </span><span class="spaces">          </span><span class="istickedoff">mChunk &lt;- await</span>
+<span class="lineno">  161 </span><span class="spaces">          </span><span class="istickedoff">case mChunk of</span>
+<span class="lineno">  162 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; processRemainingSkip acc skip</span>
+<span class="lineno">  163 </span><span class="spaces">            </span><span class="istickedoff">Just chunk -&gt; splitSkip (acc &lt;&gt; chunk) skip</span>
+<span class="lineno">  164 </span><span class="spaces">    </span><span class="istickedoff">-- | Split lines in the buffer, skipping non-empty ones until skip is</span>
+<span class="lineno">  165 </span><span class="spaces">    </span><span class="istickedoff">-- exhausted, then switching to decode mode. Handles multi-line chunks.</span>
+<span class="lineno">  166 </span><span class="spaces">    </span><span class="istickedoff">splitSkip bs skip</span>
+<span class="lineno">  167 </span><span class="spaces">      </span><span class="istickedoff">| skip &lt;= 0 = splitDecode bs</span>
+<span class="lineno">  168 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> =</span>
+<span class="lineno">  169 </span><span class="spaces">          </span><span class="istickedoff">case BS.elemIndex 10 bs of</span>
+<span class="lineno">  170 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; skipThenDecode bs skip</span>
+<span class="lineno">  171 </span><span class="spaces">            </span><span class="istickedoff">Just idx -&gt;</span>
+<span class="lineno">  172 </span><span class="spaces">              </span><span class="istickedoff">let line = BS.take idx bs</span>
+<span class="lineno">  173 </span><span class="spaces">                  </span><span class="istickedoff">rest = BS.drop (idx + 1) bs</span>
+<span class="lineno">  174 </span><span class="spaces">              </span><span class="istickedoff">in if <span class="tickonlyfalse">BS.null line</span></span>
+<span class="lineno">  175 </span><span class="spaces">                   </span><span class="istickedoff">then <span class="nottickedoff">splitSkip rest skip</span></span>
+<span class="lineno">  176 </span><span class="spaces">                   </span><span class="istickedoff">else splitSkip rest (skip - 1)</span>
+<span class="lineno">  177 </span><span class="spaces">    </span><span class="istickedoff">processRemainingSkip bs skip</span>
+<span class="lineno">  178 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">skip &lt;= 0</span> = <span class="nottickedoff">processRemainingDecode bs</span></span>
+<span class="lineno">  179 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">BS.null bs</span> = pure []</span>
+<span class="lineno">  180 </span><span class="spaces">      </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span> =</span>
+<span class="lineno">  181 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">case BS.elemIndex 10 bs of</span></span>
+<span class="lineno">  182 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt; pure []  -- remaining bytes are one last skipped line</span></span>
+<span class="lineno">  183 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Just idx -&gt;</span></span>
+<span class="lineno">  184 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">let line = BS.take idx bs</span></span>
+<span class="lineno">  185 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">rest = BS.drop (idx + 1) bs</span></span>
+<span class="lineno">  186 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">in if BS.null line</span></span>
+<span class="lineno">  187 </span><span class="spaces">                   </span><span class="istickedoff"><span class="nottickedoff">then processRemainingSkip rest skip</span></span>
+<span class="lineno">  188 </span><span class="spaces">                   </span><span class="istickedoff"><span class="nottickedoff">else processRemainingSkip rest (skip - 1)</span></span>
+<span class="lineno">  189 </span><span class="spaces">    </span><span class="istickedoff">-- Decoding phase (skip exhausted): same as streamDecodeLines' loop.</span>
+<span class="lineno">  190 </span><span class="spaces">    </span><span class="istickedoff">decodeLoop acc = do</span>
+<span class="lineno">  191 </span><span class="spaces">      </span><span class="istickedoff">mChunk &lt;- await</span>
+<span class="lineno">  192 </span><span class="spaces">      </span><span class="istickedoff">case mChunk of</span>
+<span class="lineno">  193 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; processRemainingDecode acc</span>
+<span class="lineno">  194 </span><span class="spaces">        </span><span class="istickedoff">Just chunk -&gt; splitDecode (acc &lt;&gt; chunk)</span>
+<span class="lineno">  195 </span><span class="spaces">    </span><span class="istickedoff">-- | Split and decode all complete lines in the buffer, then await more.</span>
+<span class="lineno">  196 </span><span class="spaces">    </span><span class="istickedoff">splitDecode bs =</span>
+<span class="lineno">  197 </span><span class="spaces">      </span><span class="istickedoff">case BS.elemIndex 10 bs of</span>
+<span class="lineno">  198 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; decodeLoop bs</span>
+<span class="lineno">  199 </span><span class="spaces">        </span><span class="istickedoff">Just idx -&gt;</span>
+<span class="lineno">  200 </span><span class="spaces">          </span><span class="istickedoff">let line = BS.take idx bs</span>
+<span class="lineno">  201 </span><span class="spaces">              </span><span class="istickedoff">rest = BS.drop (idx + 1) bs</span>
+<span class="lineno">  202 </span><span class="spaces">          </span><span class="istickedoff">in decodeLine line (splitDecode rest)</span>
+<span class="lineno">  203 </span><span class="spaces">    </span><span class="istickedoff">processRemainingDecode bs</span>
+<span class="lineno">  204 </span><span class="spaces">      </span><span class="istickedoff">| BS.null bs = pure []</span>
+<span class="lineno">  205 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = decodeLine bs (pure [])</span>
+<span class="lineno">  206 </span><span class="spaces">    </span><span class="istickedoff">decodeLine line cont =</span>
+<span class="lineno">  207 </span><span class="spaces">      </span><span class="istickedoff">if BS.null line</span>
+<span class="lineno">  208 </span><span class="spaces">        </span><span class="istickedoff">then cont</span>
+<span class="lineno">  209 </span><span class="spaces">        </span><span class="istickedoff">else case decode (BL.fromStrict line) of</span>
+<span class="lineno">  210 </span><span class="spaces">               </span><span class="istickedoff">Just a  -&gt; fmap (a :) cont</span>
+<span class="lineno">  211 </span><span class="spaces">               </span><span class="istickedoff">Nothing -&gt; cont</span></span>
+
+</pre>
+</body>
+</html>

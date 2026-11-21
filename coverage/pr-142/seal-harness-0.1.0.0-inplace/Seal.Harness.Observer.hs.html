@@ -1,0 +1,86 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The per-flavour harness observer: classify a captured screen + the
+<span class="lineno">    3 </span>-- tmux marker map into a 'Liveness'. Pure (the capture is IO, the
+<span class="lineno">    4 </span>-- classification is pure). Only the Claude Code screen-capture heuristic
+<span class="lineno">    5 </span>-- lands in 6a; a codex/generic observer is a follow-up.
+<span class="lineno">    6 </span>module Seal.Harness.Observer
+<span class="lineno">    7 </span>  ( observeClaudeCode
+<span class="lineno">    8 </span>  , livenessToActivity
+<span class="lineno">    9 </span>  ) where
+<span class="lineno">   10 </span>
+<span class="lineno">   11 </span>import Data.Map.Strict (Map)
+<span class="lineno">   12 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   13 </span>import Data.Text (Text)
+<span class="lineno">   14 </span>import Data.Text qualified as T
+<span class="lineno">   15 </span>
+<span class="lineno">   16 </span>import Seal.Harness.Registry (Liveness (..))
+<span class="lineno">   17 </span>
+<span class="lineno">   18 </span>-- | Classify a captured Claude Code screen + the marker map into a
+<span class="lineno">   19 </span>-- 'Liveness'. Heuristic:
+<span class="lineno">   20 </span>--
+<span class="lineno">   21 </span>-- * 'LvExited' when the @seal_id marker is gone AND the pane is dead
+<span class="lineno">   22 </span>--   (the @pane_dead@ marker is present).
+<span class="lineno">   23 </span>-- * 'LvOrphaned' when the pane exists but the @seal_id marker is gone
+<span class="lineno">   24 </span>--   (someone renamed the window out from under us, or the harness crashed
+<span class="lineno">   25 </span>--   and the pane is in a stale state).
+<span class="lineno">   26 </span>-- * 'LvThinking' when the screen shows a spinner / &quot;Thinking…&quot; / &quot;Working…&quot;.
+<span class="lineno">   27 </span>-- * 'LvAwaitingInput' when the screen shows the Claude Code prompt (@&gt; @
+<span class="lineno">   28 </span>--   at the bottom + no spinner) or a yes/no confirmation.
+<span class="lineno">   29 </span>-- * 'LvIdle' otherwise (at the main prompt but not awaiting input).
+<span class="lineno">   30 </span>observeClaudeCode :: Text -&gt; Map Text Text -&gt; Liveness
+<span class="lineno">   31 </span><span class="decl"><span class="istickedoff">observeClaudeCode screen markers</span>
+<span class="lineno">   32 </span><span class="spaces">  </span><span class="istickedoff">| not hasSealId &amp;&amp; paneDead        = LvExited</span>
+<span class="lineno">   33 </span><span class="spaces">  </span><span class="istickedoff">| not hasSealId                    = LvOrphaned</span>
+<span class="lineno">   34 </span><span class="spaces">  </span><span class="istickedoff">| T.isInfixOf &quot;Thinking&quot; stripped  = LvThinking</span>
+<span class="lineno">   35 </span><span class="spaces">  </span><span class="istickedoff">| T.isInfixOf &quot;Working&quot; stripped   = LvThinking</span>
+<span class="lineno">   36 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">isAwaiting screen</span>                 = LvAwaitingInput</span>
+<span class="lineno">   37 </span><span class="spaces">  </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span>                        = <span class="nottickedoff">LvIdle</span></span>
+<span class="lineno">   38 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   39 </span><span class="spaces">    </span><span class="istickedoff">hasSealId = Map.member &quot;seal_id&quot; markers</span>
+<span class="lineno">   40 </span><span class="spaces">    </span><span class="istickedoff">paneDead  = Map.lookup &quot;pane_dead&quot; markers == Just &quot;1&quot;</span>
+<span class="lineno">   41 </span><span class="spaces">    </span><span class="istickedoff">stripped  = T.strip screen</span>
+<span class="lineno">   42 </span><span class="spaces">    </span><span class="istickedoff">isAwaiting s =</span>
+<span class="lineno">   43 </span><span class="spaces">      </span><span class="istickedoff">let ll = T.strip (lastLine s)</span>
+<span class="lineno">   44 </span><span class="spaces">      </span><span class="istickedoff">in ll == &quot;&gt;&quot; || ll == &quot;&gt;&quot;</span>
+<span class="lineno">   45 </span><span class="spaces">         </span><span class="istickedoff">|| T.isInfixOf &quot;? (y/n)&quot; s</span>
+<span class="lineno">   46 </span><span class="spaces">         </span><span class="istickedoff">|| <span class="nottickedoff">T.isInfixOf &quot;? Yes/No&quot; s</span></span>
+<span class="lineno">   47 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">|| T.isInfixOf &quot;Press Enter&quot; s</span></span></span>
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>-- | The last non-empty line of a captured screen.
+<span class="lineno">   50 </span>lastLine :: Text -&gt; Text
+<span class="lineno">   51 </span><span class="decl"><span class="istickedoff">lastLine s = case filter (not . T.null) (T.lines s) of</span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">[]  -&gt; <span class="nottickedoff">&quot;&quot;</span></span>
+<span class="lineno">   53 </span><span class="spaces">  </span><span class="istickedoff">xs  -&gt; last xs</span></span>
+<span class="lineno">   54 </span>
+<span class="lineno">   55 </span>-- | Map a 'Liveness' to the activity-stream tag the frontend (Phase 7)
+<span class="lineno">   56 </span>-- consumes.
+<span class="lineno">   57 </span>livenessToActivity :: Liveness -&gt; Text
+<span class="lineno">   58 </span><span class="decl"><span class="nottickedoff">livenessToActivity = \case</span>
+<span class="lineno">   59 </span><span class="spaces">  </span><span class="nottickedoff">LvIdle          -&gt; &quot;idle&quot;</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="nottickedoff">LvThinking      -&gt; &quot;thinking&quot;</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="nottickedoff">LvAwaitingInput -&gt; &quot;awaiting_input&quot;</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="nottickedoff">LvExited        -&gt; &quot;exited&quot;</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="nottickedoff">LvOrphaned      -&gt; &quot;orphaned&quot;</span></span>
+
+</pre>
+</body>
+</html>

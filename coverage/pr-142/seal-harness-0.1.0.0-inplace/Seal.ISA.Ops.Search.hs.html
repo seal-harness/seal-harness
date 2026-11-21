@@ -1,0 +1,130 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | SEARCH_FILES (Untrusted): search workspace files for a pattern. Runs
+<span class="lineno">    3 </span>-- @rg -n -- &lt;pattern&gt; &lt;path&gt;@ via the 'UntrustedIO' capability (fixed
+<span class="lineno">    4 </span>-- argv, no shell interpreter — the validated 'SearchPattern' newtype
+<span class="lineno">    5 </span>-- guards against option injection). 'SafePath'-confined. Bounded result
+<span class="lineno">    6 </span>-- count (operator-configured ceiling; the model can narrow via
+<span class="lineno">    7 </span>-- @max_results@). This module never imports 'System.Process'.
+<span class="lineno">    8 </span>module Seal.ISA.Ops.Search
+<span class="lineno">    9 </span>  ( searchFilesOp
+<span class="lineno">   10 </span>  ) where
+<span class="lineno">   11 </span>
+<span class="lineno">   12 </span>import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
+<span class="lineno">   13 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   14 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   15 </span>import Data.Text (Text)
+<span class="lineno">   16 </span>import Data.Text qualified as T
+<span class="lineno">   17 </span>
+<span class="lineno">   18 </span>import Seal.Core.Types (OpName (..))
+<span class="lineno">   19 </span>import Seal.ISA.Opcode
+<span class="lineno">   20 </span>import Seal.Providers.Class (ToolResultPart (..))
+<span class="lineno">   21 </span>import Seal.Security.Path (WorkspaceRoot (..))
+<span class="lineno">   22 </span>import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
+<span class="lineno">   23 </span>import Seal.Tools.Args (mkSearchPattern)
+<span class="lineno">   24 </span>import Seal.Tools.Exec.UIO (renderUntrustedErr, uioSearchFiles)
+<span class="lineno">   25 </span>import Seal.Tools.Exec.Types (mkRemotePath)
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>-- | SEARCH_FILES opcode. Input: @{ pattern: Text, path?: Text, max_results?:
+<span class="lineno">   28 </span>-- Int }@. The pattern must not start with @-@ (option injection). The
+<span class="lineno">   29 </span>-- @path@ defaults to @.@ (the workspace root). The result count is bounded
+<span class="lineno">   30 </span>-- by the operator-configured @maxResults@ ceiling; the model's
+<span class="lineno">   31 </span>-- @max_results@ request can only narrow it.
+<span class="lineno">   32 </span>searchFilesOp :: WorkspaceRoot -&gt; SecurityPolicy -&gt; Int -&gt; Opcode
+<span class="lineno">   33 </span><span class="decl"><span class="istickedoff">searchFilesOp _wsRoot policy maxResults = UntrustedOpcode</span>
+<span class="lineno">   34 </span><span class="spaces">  </span><span class="istickedoff">{ uoName = OpName &quot;SEARCH_FILES&quot;</span>
+<span class="lineno">   35 </span><span class="spaces">  </span><span class="istickedoff">, uoDesc = &quot;Search workspace files for a pattern (rg, SafePath-confined, bounded).&quot;</span>
+<span class="lineno">   36 </span><span class="spaces">  </span><span class="istickedoff">, uoInSchema = searchFilesSchema</span>
+<span class="lineno">   37 </span><span class="spaces">  </span><span class="istickedoff">, uoOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">   38 </span><span class="spaces">  </span><span class="istickedoff">, uoAuthorize = \v -&gt;</span>
+<span class="lineno">   39 </span><span class="spaces">      </span><span class="istickedoff">case patternField v of</span>
+<span class="lineno">   40 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; Left &quot;SEARCH_FILES requires {pattern:string}&quot;</span>
+<span class="lineno">   41 </span><span class="spaces">        </span><span class="istickedoff">Just p</span>
+<span class="lineno">   42 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlyfalse">T.null p</span> -&gt; <span class="nottickedoff">Left &quot;SEARCH_FILES: pattern is empty&quot;</span></span>
+<span class="lineno">   43 </span><span class="spaces">          </span><span class="istickedoff">| T.head p == '-' -&gt; Left &quot;SEARCH_FILES: pattern must not start with '-' (option injection)&quot;</span>
+<span class="lineno">   44 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; case spAutonomy policy of</span>
+<span class="lineno">   45 </span><span class="spaces">              </span><span class="istickedoff">Deny -&gt; Left &quot;SEARCH_FILES denied by autonomy policy&quot;</span>
+<span class="lineno">   46 </span><span class="spaces">              </span><span class="istickedoff">_   -&gt; Right ()</span>
+<span class="lineno">   47 </span><span class="spaces">  </span><span class="istickedoff">, uoRun = \v -&gt; do</span>
+<span class="lineno">   48 </span><span class="spaces">      </span><span class="istickedoff">let pat    = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (patternField v)</span>
+<span class="lineno">   49 </span><span class="spaces">          </span><span class="istickedoff">pth    = fromMaybe <span class="nottickedoff">&quot;.&quot;</span> (pathField v)</span>
+<span class="lineno">   50 </span><span class="spaces">          </span><span class="istickedoff">limit  = clampResults maxResults (resultsField v)</span>
+<span class="lineno">   51 </span><span class="spaces">      </span><span class="istickedoff">case mkSearchPattern pat of</span>
+<span class="lineno">   52 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (OpResult [TrpText (&quot;SEARCH_FILES: &quot; &lt;&gt; err)] True</span></span>
+<span class="lineno">   53 </span><span class="spaces">                           </span><span class="istickedoff"><span class="nottickedoff">(object [&quot;pattern&quot; .= pat, &quot;path&quot; .= pth]))</span></span>
+<span class="lineno">   54 </span><span class="spaces">        </span><span class="istickedoff">Right pat' -&gt; do</span>
+<span class="lineno">   55 </span><span class="spaces">          </span><span class="istickedoff">let <span class="nottickedoff">mPath = case mkRemotePath pth of</span></span>
+<span class="lineno">   56 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">Right rp -&gt; Just rp</span></span>
+<span class="lineno">   57 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">Left _   -&gt; Nothing</span></span>
+<span class="lineno">   58 </span><span class="spaces">          </span><span class="istickedoff">res &lt;- uioSearchFiles <span class="nottickedoff">pat'</span> <span class="nottickedoff">mPath</span> <span class="nottickedoff">limit</span></span>
+<span class="lineno">   59 </span><span class="spaces">          </span><span class="istickedoff">case res of</span>
+<span class="lineno">   60 </span><span class="spaces">            </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (OpResult [TrpText (renderUntrustedErr err)] True</span></span>
+<span class="lineno">   61 </span><span class="spaces">                              </span><span class="istickedoff"><span class="nottickedoff">(object [&quot;pattern&quot; .= pat, &quot;path&quot; .= pth]))</span></span>
+<span class="lineno">   62 </span><span class="spaces">            </span><span class="istickedoff">Right out -&gt; do</span>
+<span class="lineno">   63 </span><span class="spaces">              </span><span class="istickedoff">let ls = take limit (T.lines out)</span>
+<span class="lineno">   64 </span><span class="spaces">                  </span><span class="istickedoff">count = length ls</span>
+<span class="lineno">   65 </span><span class="spaces">              </span><span class="istickedoff">pure (OpResult [TrpText (T.intercalate &quot;\n&quot; ls)] False</span>
+<span class="lineno">   66 </span><span class="spaces">                     </span><span class="istickedoff">(object [&quot;pattern&quot; .= pat, &quot;path&quot; .= pth, &quot;result_count&quot; .= count]))</span>
+<span class="lineno">   67 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   68 </span>
+<span class="lineno">   69 </span>searchFilesSchema :: Value
+<span class="lineno">   70 </span><span class="decl"><span class="istickedoff">searchFilesSchema =</span>
+<span class="lineno">   71 </span><span class="spaces">  </span><span class="istickedoff">object</span>
+<span class="lineno">   72 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">   73 </span><span class="spaces">    </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">   74 </span><span class="spaces">        </span><span class="istickedoff">[ &quot;pattern&quot; .= object</span>
+<span class="lineno">   75 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">   76 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;The search pattern (must not start with '-').&quot; :: Text)</span>
+<span class="lineno">   77 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">   78 </span><span class="spaces">        </span><span class="istickedoff">, &quot;path&quot; .= object</span>
+<span class="lineno">   79 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">   80 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Optional workspace-relative path (defaults to '.').&quot; :: Text)</span>
+<span class="lineno">   81 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">   82 </span><span class="spaces">        </span><span class="istickedoff">, &quot;max_results&quot; .= object</span>
+<span class="lineno">   83 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;integer&quot; :: Text)</span>
+<span class="lineno">   84 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Max results to return (clamped to the operator ceiling).&quot; :: Text)</span>
+<span class="lineno">   85 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">   86 </span><span class="spaces">        </span><span class="istickedoff">]</span>
+<span class="lineno">   87 </span><span class="spaces">    </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;pattern&quot;] :: [Text])</span>
+<span class="lineno">   88 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">   89 </span>
+<span class="lineno">   90 </span>patternField :: Value -&gt; Maybe Text
+<span class="lineno">   91 </span><span class="decl"><span class="istickedoff">patternField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;pattern&quot;))</span></span>
+<span class="lineno">   92 </span>
+<span class="lineno">   93 </span>pathField :: Value -&gt; Maybe Text
+<span class="lineno">   94 </span><span class="decl"><span class="istickedoff">pathField v = case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;path&quot;)) v :: Maybe (Maybe Text) of</span>
+<span class="lineno">   95 </span><span class="spaces">  </span><span class="istickedoff">Just (Just t) -&gt; Just t</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">_             -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>resultsField :: Value -&gt; Maybe Int
+<span class="lineno">   99 </span><span class="decl"><span class="istickedoff">resultsField v = case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;max_results&quot;)) v :: Maybe (Maybe Int) of</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">Just (Just n) | <span class="nottickedoff">n &gt;= 0</span> -&gt; <span class="nottickedoff">Just n</span></span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="istickedoff">_                      -&gt; Nothing</span></span>
+<span class="lineno">  102 </span>
+<span class="lineno">  103 </span>clampResults :: Int -&gt; Maybe Int -&gt; Int
+<span class="lineno">  104 </span><span class="decl"><span class="istickedoff">clampResults ceiling' mReq =</span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="istickedoff">case mReq of</span>
+<span class="lineno">  106 </span><span class="spaces">    </span><span class="istickedoff">Nothing  -&gt; ceiling'</span>
+<span class="lineno">  107 </span><span class="spaces">    </span><span class="istickedoff">Just req -&gt; <span class="nottickedoff">max 1 (min ceiling' req)</span></span></span>
+
+</pre>
+</body>
+</html>

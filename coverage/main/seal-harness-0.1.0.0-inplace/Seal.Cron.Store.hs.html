@@ -1,0 +1,258 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The cron store backend. Disk is canonical: jobs live as JSON files
+<span class="lineno">    3 </span>-- under @config\/cron\/jobs\/\&lt;id\&gt;.json@ and run history as append-only
+<span class="lineno">    4 </span>-- JSONL at @config\/cron\/runs\/\&lt;id\&gt;.jsonl@ (rotated to last 100).
+<span class="lineno">    5 </span>module Seal.Cron.Store
+<span class="lineno">    6 </span>  ( CronStore (..)
+<span class="lineno">    7 </span>  , fileCronStore
+<span class="lineno">    8 </span>  , memoryCronStore
+<span class="lineno">    9 </span>  ) where
+<span class="lineno">   10 </span>
+<span class="lineno">   11 </span>import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+<span class="lineno">   12 </span>import Data.Aeson (eitherDecode, encode)
+<span class="lineno">   13 </span>import Data.IORef
+<span class="lineno">   14 </span>import Data.List (isSuffixOf, sortOn)
+<span class="lineno">   15 </span>import Data.Map.Strict (Map)
+<span class="lineno">   16 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   17 </span>import Data.Either (rights)
+<span class="lineno">   18 </span>import Data.Maybe (catMaybes, fromMaybe)
+<span class="lineno">   19 </span>import Control.Monad (when)
+<span class="lineno">   20 </span>import Data.Text qualified as T
+<span class="lineno">   21 </span>import Data.Text.IO qualified as TIO
+<span class="lineno">   22 </span>import Data.Text.Lazy.Encoding qualified as TLE
+<span class="lineno">   23 </span>import Data.Text.Lazy qualified as TL
+<span class="lineno">   24 </span>import System.Directory
+<span class="lineno">   25 </span>  ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
+<span class="lineno">   26 </span>  , listDirectory, removeFile, renameFile )
+<span class="lineno">   27 </span>import System.FilePath (takeDirectory, (&lt;/&gt;), (&lt;.&gt;))
+<span class="lineno">   28 </span>import System.Posix.Files (setFileMode)
+<span class="lineno">   29 </span>
+<span class="lineno">   30 </span>import Seal.Cron.Types
+<span class="lineno">   31 </span>  ( CronJob (..), CronJobId (..), CronRun (..)
+<span class="lineno">   32 </span>  , cronJobIdText )
+<span class="lineno">   33 </span>import Seal.Git.Repo (ConfigRepo, gitCommitAll)
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>data CronStore = CronStore
+<span class="lineno">   36 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">csCreate</span></span></span>    :: CronJob -&gt; IO ()
+<span class="lineno">   37 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">csRead</span></span></span>      :: CronJobId -&gt; IO (Maybe CronJob)
+<span class="lineno">   38 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">csList</span></span></span>      :: Bool -&gt; IO [CronJob]
+<span class="lineno">   39 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">csSave</span></span></span>      :: CronJob -&gt; IO ()
+<span class="lineno">   40 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">csDelete</span></span></span>    :: CronJobId -&gt; IO ()
+<span class="lineno">   41 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">csRecordRun</span></span></span> :: CronJobId -&gt; CronRun -&gt; IO ()
+<span class="lineno">   42 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">csListRuns</span></span></span>  :: CronJobId -&gt; Int -&gt; IO [CronRun]
+<span class="lineno">   43 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">csUpdateRun</span></span></span> :: CronJobId -&gt; (CronRun -&gt; CronRun) -&gt; IO ()
+<span class="lineno">   44 </span>    -- ^ Apply a pure transformation to every run row of a job. Keyed on the job,
+<span class="lineno">   45 </span>    -- not the session: a row exists from the moment a fire starts (before it
+<span class="lineno">   46 </span>    -- has a session id), and reconciliation must repair a whole history, not
+<span class="lineno">   47 </span>    -- just its newest row. Both callers pass a terminal-respecting
+<span class="lineno">   48 </span>    -- transformation, so mapping all rows is idempotent. A job with no runs is
+<span class="lineno">   49 </span>    -- a no-op.
+<span class="lineno">   50 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">csLock</span></span></span>      :: MVar ()
+<span class="lineno">   51 </span>    -- ^ Serializes every mutation. The file backend does whole-file
+<span class="lineno">   52 </span>    -- read-modify-write on both jobs (one file) and runs (one JSONL), so two
+<span class="lineno">   53 </span>    -- writers (the scheduler tick and a turn-completion callback) would
+<span class="lineno">   54 </span>    -- otherwise lose updates — and a lost update is exactly what re-wedges a
+<span class="lineno">   55 </span>    -- job. 'seal serve' is single-process per SEAL_HOME, so an in-process lock
+<span class="lineno">   56 </span>    -- is sufficient.
+<span class="lineno">   57 </span>  }
+<span class="lineno">   58 </span>
+<span class="lineno">   59 </span>fileCronStore :: FilePath -&gt; ConfigRepo -&gt; IO CronStore
+<span class="lineno">   60 </span><span class="decl"><span class="istickedoff">fileCronStore dir repo = do</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">let jobsDir = dir &lt;/&gt; &quot;jobs&quot;</span>
+<span class="lineno">   62 </span><span class="spaces">      </span><span class="istickedoff">runsDir = dir &lt;/&gt; &quot;runs&quot;</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True jobsDir</span>
+<span class="lineno">   64 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True runsDir</span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="istickedoff">lock &lt;- newMVar <span class="nottickedoff">()</span></span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">pure CronStore</span>
+<span class="lineno">   67 </span><span class="spaces">    </span><span class="istickedoff">{ csCreate    = \j -&gt; withMVar lock (\_ -&gt; writeJobFile jobsDir repo j)</span>
+<span class="lineno">   68 </span><span class="spaces">    </span><span class="istickedoff">, csRead      = readJobFile jobsDir</span>
+<span class="lineno">   69 </span><span class="spaces">    </span><span class="istickedoff">, csList      = listJobs jobsDir</span>
+<span class="lineno">   70 </span><span class="spaces">    </span><span class="istickedoff">, csSave      = <span class="nottickedoff">\j -&gt; withMVar lock (\_ -&gt; writeJobFile jobsDir repo j)</span></span>
+<span class="lineno">   71 </span><span class="spaces">    </span><span class="istickedoff">, csDelete    = \jid -&gt; withMVar lock (\_ -&gt; deleteJobFile jobsDir repo jid)</span>
+<span class="lineno">   72 </span><span class="spaces">    </span><span class="istickedoff">, csRecordRun = \jid run -&gt; withMVar lock (\_ -&gt; recordRun runsDir repo jid run)</span>
+<span class="lineno">   73 </span><span class="spaces">    </span><span class="istickedoff">, csListRuns  = listRuns runsDir</span>
+<span class="lineno">   74 </span><span class="spaces">    </span><span class="istickedoff">, csUpdateRun = <span class="nottickedoff">\jid f -&gt; withMVar lock (\_ -&gt; updateRunFile runsDir repo jid f)</span></span>
+<span class="lineno">   75 </span><span class="spaces">    </span><span class="istickedoff">, csLock      = <span class="nottickedoff">lock</span></span>
+<span class="lineno">   76 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">   77 </span>
+<span class="lineno">   78 </span>writeJobFile :: FilePath -&gt; ConfigRepo -&gt; CronJob -&gt; IO ()
+<span class="lineno">   79 </span><span class="decl"><span class="istickedoff">writeJobFile jobsDir repo job = do</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">let path = jobFilePath jobsDir (cjId job)</span>
+<span class="lineno">   81 </span><span class="spaces">      </span><span class="istickedoff">tmp  = path &lt;.&gt; &quot;tmp&quot;</span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True (takeDirectory path)</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">TIO.writeFile tmp (TL.toStrict (TLE.decodeUtf8 (encode job)))</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">setFileMode tmp 0o600</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">renameFile tmp path</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">let rel = &quot;cron/jobs&quot; &lt;/&gt; T.unpack (cronJobIdText (cjId job)) &lt;.&gt; &quot;json&quot;</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">_ &lt;- gitCommitAll repo rel (&quot;seal: CRON write &quot; &lt;&gt; cronJobIdText (cjId job))</span>
+<span class="lineno">   88 </span><span class="spaces">  </span><span class="istickedoff">pure <span class="nottickedoff">()</span></span></span>
+<span class="lineno">   89 </span>
+<span class="lineno">   90 </span>readJobFile :: FilePath -&gt; CronJobId -&gt; IO (Maybe CronJob)
+<span class="lineno">   91 </span><span class="decl"><span class="istickedoff">readJobFile jobsDir jid = do</span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="istickedoff">let path = jobFilePath jobsDir jid</span>
+<span class="lineno">   93 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">   95 </span><span class="spaces">    </span><span class="istickedoff">then pure Nothing</span>
+<span class="lineno">   96 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">   97 </span><span class="spaces">      </span><span class="istickedoff">content &lt;- TIO.readFile path</span>
+<span class="lineno">   98 </span><span class="spaces">      </span><span class="istickedoff">case eitherDecode (TLE.encodeUtf8 (TL.fromStrict content)) of</span>
+<span class="lineno">   99 </span><span class="spaces">        </span><span class="istickedoff">Left _    -&gt; <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">  100 </span><span class="spaces">        </span><span class="istickedoff">Right job -&gt; pure (Just job)</span></span>
+<span class="lineno">  101 </span>
+<span class="lineno">  102 </span>listJobs :: FilePath -&gt; Bool -&gt; IO [CronJob]
+<span class="lineno">  103 </span><span class="decl"><span class="istickedoff">listJobs jobsDir enabledOnly = do</span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesDirectoryExist jobsDir</span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">not exists</span></span>
+<span class="lineno">  106 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">pure []</span></span>
+<span class="lineno">  107 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  108 </span><span class="spaces">      </span><span class="istickedoff">entries &lt;- listDirectory jobsDir</span>
+<span class="lineno">  109 </span><span class="spaces">      </span><span class="istickedoff">let jsonFiles = filter (isSuffixOf &quot;.json&quot;) entries</span>
+<span class="lineno">  110 </span><span class="spaces">      </span><span class="istickedoff">jobs &lt;- mapM (readJobByName jobsDir) jsonFiles</span>
+<span class="lineno">  111 </span><span class="spaces">      </span><span class="istickedoff">let allJobs = catMaybes jobs</span>
+<span class="lineno">  112 </span><span class="spaces">          </span><span class="istickedoff">filtered = if <span class="tickonlyfalse">enabledOnly</span></span>
+<span class="lineno">  113 </span><span class="spaces">                       </span><span class="istickedoff">then <span class="nottickedoff">filter cjEnabled allJobs</span></span>
+<span class="lineno">  114 </span><span class="spaces">                       </span><span class="istickedoff">else allJobs</span>
+<span class="lineno">  115 </span><span class="spaces">      </span><span class="istickedoff">pure (sortOn (cronJobIdText . cjId) filtered)</span></span>
+<span class="lineno">  116 </span>
+<span class="lineno">  117 </span>deleteJobFile :: FilePath -&gt; ConfigRepo -&gt; CronJobId -&gt; IO ()
+<span class="lineno">  118 </span><span class="decl"><span class="istickedoff">deleteJobFile jobsDir repo jid = do</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">let path = jobFilePath jobsDir jid</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">when exists $ do</span>
+<span class="lineno">  122 </span><span class="spaces">    </span><span class="istickedoff">removeFile path</span>
+<span class="lineno">  123 </span><span class="spaces">    </span><span class="istickedoff">let rel = &quot;cron/jobs&quot; &lt;/&gt; T.unpack (cronJobIdText jid) &lt;.&gt; &quot;json&quot;</span>
+<span class="lineno">  124 </span><span class="spaces">    </span><span class="istickedoff">_ &lt;- gitCommitAll repo rel (&quot;seal: CRON delete &quot; &lt;&gt; cronJobIdText jid)</span>
+<span class="lineno">  125 </span><span class="spaces">    </span><span class="istickedoff">pure <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  126 </span>
+<span class="lineno">  127 </span>recordRun :: FilePath -&gt; ConfigRepo -&gt; CronJobId -&gt; CronRun -&gt; IO ()
+<span class="lineno">  128 </span><span class="decl"><span class="istickedoff">recordRun runsDir repo jid run = do</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="istickedoff">let path = runFilePath runsDir jid</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True (takeDirectory path)</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">existing &lt;- readRunFile path</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">let updated = take 100 (run : existing)</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="istickedoff">writeRunFile path updated</span>
+<span class="lineno">  134 </span><span class="spaces">  </span><span class="istickedoff">let rel = &quot;cron/runs&quot; &lt;/&gt; T.unpack (cronJobIdText jid) &lt;.&gt; &quot;jsonl&quot;</span>
+<span class="lineno">  135 </span><span class="spaces">  </span><span class="istickedoff">_ &lt;- gitCommitAll repo rel (&quot;seal: CRON run record &quot; &lt;&gt; cronJobIdText jid)</span>
+<span class="lineno">  136 </span><span class="spaces">  </span><span class="istickedoff">pure <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  137 </span>
+<span class="lineno">  138 </span>-- | Apply a transformation to every run row of a job (order preserved, 100-run
+<span class="lineno">  139 </span>-- cap preserved). Both callers pass a transformation that respects terminal
+<span class="lineno">  140 </span>-- rows, so mapping the whole history is idempotent and is what lets startup
+<span class="lineno">  141 </span>-- reconciliation repair every row a previous process wedged — not just the
+<span class="lineno">  142 </span>-- newest. When nothing changes the file is not rewritten and no commit is made,
+<span class="lineno">  143 </span>-- so the common case costs one read.
+<span class="lineno">  144 </span>updateRunFile :: FilePath -&gt; ConfigRepo -&gt; CronJobId -&gt; (CronRun -&gt; CronRun) -&gt; IO ()
+<span class="lineno">  145 </span><span class="decl"><span class="nottickedoff">updateRunFile runsDir repo jid f = do</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="nottickedoff">let path = runFilePath runsDir jid</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="nottickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="nottickedoff">when exists $ do</span>
+<span class="lineno">  149 </span><span class="spaces">    </span><span class="nottickedoff">existing &lt;- readRunFile path</span>
+<span class="lineno">  150 </span><span class="spaces">    </span><span class="nottickedoff">let updated = map f existing</span>
+<span class="lineno">  151 </span><span class="spaces">    </span><span class="nottickedoff">if updated == existing</span>
+<span class="lineno">  152 </span><span class="spaces">      </span><span class="nottickedoff">then pure ()</span>
+<span class="lineno">  153 </span><span class="spaces">      </span><span class="nottickedoff">else do</span>
+<span class="lineno">  154 </span><span class="spaces">        </span><span class="nottickedoff">writeRunFile path updated</span>
+<span class="lineno">  155 </span><span class="spaces">        </span><span class="nottickedoff">let rel = &quot;cron/runs&quot; &lt;/&gt; T.unpack (cronJobIdText jid) &lt;.&gt; &quot;jsonl&quot;</span>
+<span class="lineno">  156 </span><span class="spaces">        </span><span class="nottickedoff">_ &lt;- gitCommitAll repo rel (&quot;seal: CRON run update &quot; &lt;&gt; cronJobIdText jid)</span>
+<span class="lineno">  157 </span><span class="spaces">        </span><span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  158 </span>
+<span class="lineno">  159 </span>listRuns :: FilePath -&gt; CronJobId -&gt; Int -&gt; IO [CronRun]
+<span class="lineno">  160 </span><span class="decl"><span class="istickedoff">listRuns runsDir jid limit = do</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="istickedoff">let path = runFilePath runsDir jid</span>
+<span class="lineno">  162 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  163 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">not exists</span></span>
+<span class="lineno">  164 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">pure []</span></span>
+<span class="lineno">  165 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  166 </span><span class="spaces">      </span><span class="istickedoff">runs &lt;- readRunFile path</span>
+<span class="lineno">  167 </span><span class="spaces">      </span><span class="istickedoff">pure (take limit runs)</span></span>
+<span class="lineno">  168 </span>
+<span class="lineno">  169 </span>jobFilePath :: FilePath -&gt; CronJobId -&gt; FilePath
+<span class="lineno">  170 </span><span class="decl"><span class="istickedoff">jobFilePath jobsDir jid = jobsDir &lt;/&gt; T.unpack (cronJobIdText jid) &lt;.&gt; &quot;json&quot;</span></span>
+<span class="lineno">  171 </span>
+<span class="lineno">  172 </span>runFilePath :: FilePath -&gt; CronJobId -&gt; FilePath
+<span class="lineno">  173 </span><span class="decl"><span class="istickedoff">runFilePath runsDir jid = runsDir &lt;/&gt; T.unpack (cronJobIdText jid) &lt;.&gt; &quot;jsonl&quot;</span></span>
+<span class="lineno">  174 </span>
+<span class="lineno">  175 </span>readRunFile :: FilePath -&gt; IO [CronRun]
+<span class="lineno">  176 </span><span class="decl"><span class="istickedoff">readRunFile path = do</span>
+<span class="lineno">  177 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  178 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  179 </span><span class="spaces">    </span><span class="istickedoff">then pure []</span>
+<span class="lineno">  180 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  181 </span><span class="spaces">      </span><span class="istickedoff">content &lt;- TIO.readFile path</span>
+<span class="lineno">  182 </span><span class="spaces">      </span><span class="istickedoff">let lines' = filter (not . T.null) (T.lines content)</span>
+<span class="lineno">  183 </span><span class="spaces">          </span><span class="istickedoff">decoded = [ eitherDecode (TLE.encodeUtf8 (TL.fromStrict line))</span>
+<span class="lineno">  184 </span><span class="spaces">                    </span><span class="istickedoff">| line &lt;- lines' ]</span>
+<span class="lineno">  185 </span><span class="spaces">      </span><span class="istickedoff">pure (rights decoded)</span></span>
+<span class="lineno">  186 </span>
+<span class="lineno">  187 </span>writeRunFile :: FilePath -&gt; [CronRun] -&gt; IO ()
+<span class="lineno">  188 </span><span class="decl"><span class="istickedoff">writeRunFile path runs = do</span>
+<span class="lineno">  189 </span><span class="spaces">  </span><span class="istickedoff">let tmp = path &lt;.&gt; &quot;tmp&quot;</span>
+<span class="lineno">  190 </span><span class="spaces">      </span><span class="istickedoff">content = T.intercalate &quot;\n&quot;</span>
+<span class="lineno">  191 </span><span class="spaces">                  </span><span class="istickedoff">[ TL.toStrict (TLE.decodeUtf8 (encode run))</span>
+<span class="lineno">  192 </span><span class="spaces">                  </span><span class="istickedoff">| run &lt;- runs ]</span>
+<span class="lineno">  193 </span><span class="spaces">  </span><span class="istickedoff">TIO.writeFile tmp content</span>
+<span class="lineno">  194 </span><span class="spaces">  </span><span class="istickedoff">setFileMode tmp 0o600</span>
+<span class="lineno">  195 </span><span class="spaces">  </span><span class="istickedoff">renameFile tmp path</span></span>
+<span class="lineno">  196 </span>
+<span class="lineno">  197 </span>readJobByName :: FilePath -&gt; FilePath -&gt; IO (Maybe CronJob)
+<span class="lineno">  198 </span><span class="decl"><span class="istickedoff">readJobByName jobsDir name = do</span>
+<span class="lineno">  199 </span><span class="spaces">  </span><span class="istickedoff">let path = jobsDir &lt;/&gt; name</span>
+<span class="lineno">  200 </span><span class="spaces">  </span><span class="istickedoff">content &lt;- TIO.readFile path</span>
+<span class="lineno">  201 </span><span class="spaces">  </span><span class="istickedoff">case eitherDecode (TLE.encodeUtf8 (TL.fromStrict content)) of</span>
+<span class="lineno">  202 </span><span class="spaces">    </span><span class="istickedoff">Left _    -&gt; <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">  203 </span><span class="spaces">    </span><span class="istickedoff">Right job -&gt; pure (Just job)</span></span>
+<span class="lineno">  204 </span>
+<span class="lineno">  205 </span>memoryCronStore :: IO CronStore
+<span class="lineno">  206 </span><span class="decl"><span class="istickedoff">memoryCronStore = do</span>
+<span class="lineno">  207 </span><span class="spaces">  </span><span class="istickedoff">jobsRef &lt;- newIORef (Map.empty :: Map CronJobId CronJob)</span>
+<span class="lineno">  208 </span><span class="spaces">  </span><span class="istickedoff">runsRef &lt;- newIORef (Map.empty :: Map CronJobId [CronRun])</span>
+<span class="lineno">  209 </span><span class="spaces">  </span><span class="istickedoff">lock &lt;- newMVar <span class="nottickedoff">()</span></span>
+<span class="lineno">  210 </span><span class="spaces">  </span><span class="istickedoff">pure CronStore</span>
+<span class="lineno">  211 </span><span class="spaces">    </span><span class="istickedoff">{ csCreate = \job -&gt; modifyIORef' jobsRef (Map.insert (cjId job) job)</span>
+<span class="lineno">  212 </span><span class="spaces">    </span><span class="istickedoff">, csRead   = \jid -&gt; do</span>
+<span class="lineno">  213 </span><span class="spaces">        </span><span class="istickedoff">m &lt;- readIORef jobsRef</span>
+<span class="lineno">  214 </span><span class="spaces">        </span><span class="istickedoff">pure (Map.lookup jid m)</span>
+<span class="lineno">  215 </span><span class="spaces">    </span><span class="istickedoff">, csList   = \enabledOnly -&gt; do</span>
+<span class="lineno">  216 </span><span class="spaces">        </span><span class="istickedoff">m &lt;- readIORef jobsRef</span>
+<span class="lineno">  217 </span><span class="spaces">        </span><span class="istickedoff">let allJobs = Map.elems m</span>
+<span class="lineno">  218 </span><span class="spaces">            </span><span class="istickedoff">filtered = if enabledOnly</span>
+<span class="lineno">  219 </span><span class="spaces">                         </span><span class="istickedoff">then filter cjEnabled allJobs</span>
+<span class="lineno">  220 </span><span class="spaces">                         </span><span class="istickedoff">else allJobs</span>
+<span class="lineno">  221 </span><span class="spaces">        </span><span class="istickedoff">pure (sortOn (cronJobIdText . cjId) filtered)</span>
+<span class="lineno">  222 </span><span class="spaces">    </span><span class="istickedoff">, csSave   = \job -&gt; modifyIORef' jobsRef (Map.insert (cjId job) job)</span>
+<span class="lineno">  223 </span><span class="spaces">    </span><span class="istickedoff">, csDelete = modifyIORef' jobsRef . Map.delete</span>
+<span class="lineno">  224 </span><span class="spaces">    </span><span class="istickedoff">, csRecordRun = \jid run -&gt; withMVar lock (\_ -&gt; modifyIORef' runsRef</span>
+<span class="lineno">  225 </span><span class="spaces">        </span><span class="istickedoff">(Map.insertWith (\_new old -&gt; take 100 (run : old)) jid [run]))</span>
+<span class="lineno">  226 </span><span class="spaces">    </span><span class="istickedoff">, csListRuns = \jid limit -&gt; do</span>
+<span class="lineno">  227 </span><span class="spaces">        </span><span class="istickedoff">m &lt;- readIORef runsRef</span>
+<span class="lineno">  228 </span><span class="spaces">        </span><span class="istickedoff">pure (take limit (fromMaybe [] (Map.lookup jid m)))</span>
+<span class="lineno">  229 </span><span class="spaces">    </span><span class="istickedoff">, csUpdateRun = \jid f -&gt; withMVar lock (\_ -&gt; do</span>
+<span class="lineno">  230 </span><span class="spaces">        </span><span class="istickedoff">m &lt;- readIORef runsRef</span>
+<span class="lineno">  231 </span><span class="spaces">        </span><span class="istickedoff">case Map.lookup jid m of</span>
+<span class="lineno">  232 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  233 </span><span class="spaces">          </span><span class="istickedoff">Just rs  -&gt; modifyIORef' runsRef (Map.insert jid (map f rs)))</span>
+<span class="lineno">  234 </span><span class="spaces">    </span><span class="istickedoff">, csLock = <span class="nottickedoff">lock</span></span>
+<span class="lineno">  235 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+
+</pre>
+</body>
+</html>

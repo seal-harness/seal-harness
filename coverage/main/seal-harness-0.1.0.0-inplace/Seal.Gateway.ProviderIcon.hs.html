@@ -1,0 +1,268 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Provider favicon resolution: fetch the root page of an OpenAI-compatible
+<span class="lineno">    3 </span>-- provider's base URL, find the first @&lt;link rel=&quot;icon&quot;&gt;@ (or
+<span class="lineno">    4 </span>-- @apple-touch-icon@) tag, resolve the @href@ to an absolute URL, and fetch
+<span class="lineno">    5 </span>-- the icon image bytes.
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- This is a backend proxy: the frontend's @&lt;img src=&quot;/api/providers/:name/icon&quot;&gt;@
+<span class="lineno">    8 </span>-- hits this module through the REST API, which fetches the provider's website
+<span class="lineno">    9 </span>-- server-side. This avoids CORS (the browser cannot read cross-origin HTML)
+<span class="lineno">   10 </span>-- and network-reachability issues (the backend can reach private endpoints).
+<span class="lineno">   11 </span>--
+<span class="lineno">   12 </span>-- Results are cached in-memory per root URL with a TTL so repeated renders
+<span class="lineno">   13 </span>-- do not refetch.
+<span class="lineno">   14 </span>module Seal.Gateway.ProviderIcon
+<span class="lineno">   15 </span>  ( resolveProviderIconBytes
+<span class="lineno">   16 </span>  , IconResult (..)
+<span class="lineno">   17 </span>  , IconCache
+<span class="lineno">   18 </span>  , newIconCache
+<span class="lineno">   19 </span>  , cachedIcon
+<span class="lineno">   20 </span>  , storeIcon
+<span class="lineno">   21 </span>  , deriveRootUrl
+<span class="lineno">   22 </span>  , extractIconHref
+<span class="lineno">   23 </span>  , resolveIconUrl
+<span class="lineno">   24 </span>  ) where
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>import Control.Exception (try, SomeException)
+<span class="lineno">   27 </span>import Data.ByteString (ByteString)
+<span class="lineno">   28 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   29 </span>import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+<span class="lineno">   30 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   31 </span>import Data.Text (Text)
+<span class="lineno">   32 </span>import Data.Text qualified as T
+<span class="lineno">   33 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   34 </span>import Data.Text.Encoding.Error qualified as TEE
+<span class="lineno">   35 </span>import Data.Time (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
+<span class="lineno">   36 </span>import Network.HTTP.Client
+<span class="lineno">   37 </span>  ( Manager, Response, httpLbs, parseRequest
+<span class="lineno">   38 </span>  , responseBody, responseHeaders, responseStatus, responseTimeout, responseTimeoutMicro )
+<span class="lineno">   39 </span>import Network.HTTP.Types (statusCode, hContentType)
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>-- | The result of resolving a provider icon.
+<span class="lineno">   42 </span>data IconResult
+<span class="lineno">   43 </span>  = IconFound ByteString Text
+<span class="lineno">   44 </span>    -- ^ The icon image bytes and its content-type (e.g. &quot;image/png&quot;).
+<span class="lineno">   45 </span>  | IconNotFound
+<span class="lineno">   46 </span>    -- ^ No icon link found on the root page, or the page could not be fetched.
+<span class="lineno">   47 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>)
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>-- | An in-memory cache of resolved icons, keyed by root URL.
+<span class="lineno">   50 </span>newtype IconCache = IconCache
+<span class="lineno">   51 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">icEntries</span></span></span> :: IORef (Map.Map Text (IconResult, UTCTime))
+<span class="lineno">   52 </span>  }
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>-- | Create a new empty icon cache.
+<span class="lineno">   55 </span>newIconCache :: IO IconCache
+<span class="lineno">   56 </span><span class="decl"><span class="istickedoff">newIconCache = IconCache &lt;$&gt; newIORef Map.empty</span></span>
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>-- | Cache TTL in seconds. A provider's favicon changes rarely; 10 minutes
+<span class="lineno">   59 </span>-- keeps the badge responsive to operator config changes without refetching
+<span class="lineno">   60 </span>-- on every page load.
+<span class="lineno">   61 </span>iconCacheTtlSeconds :: NominalDiffTime
+<span class="lineno">   62 </span><span class="decl"><span class="istickedoff">iconCacheTtlSeconds = 600</span></span>
+<span class="lineno">   63 </span>
+<span class="lineno">   64 </span>-- | Look up a cached icon entry. Returns 'Nothing' when the cache has no
+<span class="lineno">   65 </span>-- entry or the entry has expired.
+<span class="lineno">   66 </span>cachedIcon :: IconCache -&gt; Text -&gt; IO (Maybe IconResult)
+<span class="lineno">   67 </span><span class="decl"><span class="istickedoff">cachedIcon cache rootUrl = do</span>
+<span class="lineno">   68 </span><span class="spaces">  </span><span class="istickedoff">entries &lt;- readIORef (icEntries cache)</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">case Map.lookup rootUrl entries of</span>
+<span class="lineno">   70 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure Nothing</span>
+<span class="lineno">   71 </span><span class="spaces">    </span><span class="istickedoff">Just (result, cachedAt) -&gt; do</span>
+<span class="lineno">   72 </span><span class="spaces">      </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">   73 </span><span class="spaces">      </span><span class="istickedoff">if <span class="tickonlyfalse">diffUTCTime now cachedAt &gt; iconCacheTtlSeconds</span></span>
+<span class="lineno">   74 </span><span class="spaces">        </span><span class="istickedoff">then <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">   75 </span><span class="spaces">        </span><span class="istickedoff">else pure (Just result)</span></span>
+<span class="lineno">   76 </span>
+<span class="lineno">   77 </span>-- | Store an icon result in the cache.
+<span class="lineno">   78 </span>storeIcon :: IconCache -&gt; Text -&gt; IconResult -&gt; IO ()
+<span class="lineno">   79 </span><span class="decl"><span class="istickedoff">storeIcon cache rootUrl result = do</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">   81 </span><span class="spaces">  </span><span class="istickedoff">modifyIORef' (icEntries cache) (Map.insert rootUrl (result, now))</span></span>
+<span class="lineno">   82 </span>
+<span class="lineno">   83 </span>-- | Resolve a provider's favicon: fetch the root page, extract the icon
+<span class="lineno">   84 </span>-- @&lt;link&gt;@ href, resolve it to an absolute URL, fetch the image bytes, and
+<span class="lineno">   85 </span>-- return them with the content-type. Uses the cache to avoid refetching.
+<span class="lineno">   86 </span>resolveProviderIconBytes :: IconCache -&gt; Manager -&gt; Text -&gt; IO IconResult
+<span class="lineno">   87 </span><span class="decl"><span class="nottickedoff">resolveProviderIconBytes cache mgr baseUrl = do</span>
+<span class="lineno">   88 </span><span class="spaces">  </span><span class="nottickedoff">let rootUrl = deriveRootUrl baseUrl</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="nottickedoff">case rootUrl of</span>
+<span class="lineno">   90 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure IconNotFound</span>
+<span class="lineno">   91 </span><span class="spaces">    </span><span class="nottickedoff">Just root -&gt; do</span>
+<span class="lineno">   92 </span><span class="spaces">      </span><span class="nottickedoff">mCached &lt;- cachedIcon cache root</span>
+<span class="lineno">   93 </span><span class="spaces">      </span><span class="nottickedoff">case mCached of</span>
+<span class="lineno">   94 </span><span class="spaces">        </span><span class="nottickedoff">Just result -&gt; pure result</span>
+<span class="lineno">   95 </span><span class="spaces">        </span><span class="nottickedoff">Nothing -&gt; do</span>
+<span class="lineno">   96 </span><span class="spaces">          </span><span class="nottickedoff">result &lt;- fetchProviderIcon mgr root</span>
+<span class="lineno">   97 </span><span class="spaces">          </span><span class="nottickedoff">storeIcon cache root result</span>
+<span class="lineno">   98 </span><span class="spaces">          </span><span class="nottickedoff">pure result</span></span>
+<span class="lineno">   99 </span>
+<span class="lineno">  100 </span>-- | Derive the root page URL (origin only) from a provider base URL.
+<span class="lineno">  101 </span>-- Strips @/v1@ and any trailing path. Returns 'Nothing' when the input is
+<span class="lineno">  102 </span>-- empty or not a parseable URL.
+<span class="lineno">  103 </span>--
+<span class="lineno">  104 </span>--   &quot;https://api.openai.com/v1&quot;      → &quot;https://api.openai.com&quot;
+<span class="lineno">  105 </span>--   &quot;http://localhost:8000/v1/&quot;      → &quot;http://localhost:8000&quot;
+<span class="lineno">  106 </span>--   &quot;https://api.example.com/api/v2&quot; → &quot;https://api.example.com&quot;
+<span class="lineno">  107 </span>deriveRootUrl :: Text -&gt; Maybe Text
+<span class="lineno">  108 </span><span class="decl"><span class="istickedoff">deriveRootUrl baseUrl = do</span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="istickedoff">let trimmed = T.strip baseUrl</span>
+<span class="lineno">  110 </span><span class="spaces">  </span><span class="istickedoff">if T.null trimmed then Nothing</span>
+<span class="lineno">  111 </span><span class="spaces">  </span><span class="istickedoff">else case T.breakOn &quot;://&quot; trimmed of</span>
+<span class="lineno">  112 </span><span class="spaces">    </span><span class="istickedoff">(scheme, rest) | not (T.null rest) -&gt;</span>
+<span class="lineno">  113 </span><span class="spaces">      </span><span class="istickedoff">let hostPart = T.takeWhile (\c -&gt; c /= '/' &amp;&amp; c /= '?') (T.drop 3 rest)</span>
+<span class="lineno">  114 </span><span class="spaces">      </span><span class="istickedoff">in if <span class="tickonlyfalse">T.null hostPart</span> then <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  115 </span><span class="spaces">         </span><span class="istickedoff">else Just (scheme &lt;&gt; &quot;://&quot; &lt;&gt; hostPart)</span>
+<span class="lineno">  116 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; Nothing</span></span>
+<span class="lineno">  117 </span>
+<span class="lineno">  118 </span>-- | Extract the first icon @&lt;link&gt;@ tag's @href@ value from an HTML string.
+<span class="lineno">  119 </span>-- Searches for @rel=&quot;icon&quot;@, @rel=&quot;shortcut icon&quot;@, and
+<span class="lineno">  120 </span>-- @rel=&quot;apple-touch-icon&quot;@ (case-insensitive), in that preference order.
+<span class="lineno">  121 </span>-- Returns 'Nothing' when no icon link is found.
+<span class="lineno">  122 </span>extractIconHref :: ByteString -&gt; Maybe Text
+<span class="lineno">  123 </span><span class="decl"><span class="istickedoff">extractIconHref html =</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">case findMatchingLinks &quot;icon&quot; of</span>
+<span class="lineno">  125 </span><span class="spaces">    </span><span class="istickedoff">Just href -&gt; Just href</span>
+<span class="lineno">  126 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; case findMatchingLinks &quot;shortcut icon&quot; of</span>
+<span class="lineno">  127 </span><span class="spaces">      </span><span class="istickedoff">Just href -&gt; Just href</span>
+<span class="lineno">  128 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; findMatchingLinks &quot;apple-touch-icon&quot;</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  130 </span><span class="spaces">    </span><span class="istickedoff">-- The full HTML as lowercase Text for case-insensitive scanning.</span>
+<span class="lineno">  131 </span><span class="spaces">    </span><span class="istickedoff">htmlText = TE.decodeUtf8With <span class="nottickedoff">TEE.lenientDecode</span> html</span>
+<span class="lineno">  132 </span><span class="spaces">    </span><span class="istickedoff">htmlLower = T.toLower htmlText</span>
+<span class="lineno">  133 </span><span class="spaces">    </span><span class="istickedoff">-- Find all &lt;link ...&gt; tags whose rel attribute matches the pattern,</span>
+<span class="lineno">  134 </span><span class="spaces">    </span><span class="istickedoff">-- and return the href of the first one.</span>
+<span class="lineno">  135 </span><span class="spaces">    </span><span class="istickedoff">findMatchingLinks :: Text -&gt; Maybe Text</span>
+<span class="lineno">  136 </span><span class="spaces">    </span><span class="istickedoff">findMatchingLinks relPattern = findLinkTagWithRel htmlText htmlLower relPattern 0</span></span>
+<span class="lineno">  137 </span>
+<span class="lineno">  138 </span>-- | Scan the HTML text for @&lt;link&gt;@ tags, checking each one's @rel@
+<span class="lineno">  139 </span>-- attribute (case-insensitive via the lowercase copy) against the pattern.
+<span class="lineno">  140 </span>-- Returns the @href@ value of the first match.
+<span class="lineno">  141 </span>findLinkTagWithRel :: Text -&gt; Text -&gt; Text -&gt; Int -&gt; Maybe Text
+<span class="lineno">  142 </span><span class="decl"><span class="istickedoff">findLinkTagWithRel orig lower relPattern start =</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">case T.breakOn &quot;&lt;link&quot; (T.drop start lower) of</span>
+<span class="lineno">  144 </span><span class="spaces">    </span><span class="istickedoff">(_, &quot;&quot;) -&gt; Nothing  -- no more &lt;link tags</span>
+<span class="lineno">  145 </span><span class="spaces">    </span><span class="istickedoff">(pre, tagStart) -&gt;</span>
+<span class="lineno">  146 </span><span class="spaces">      </span><span class="istickedoff">let afterLink = T.drop 5 tagStart  -- skip &quot;&lt;link&quot;</span>
+<span class="lineno">  147 </span><span class="spaces">      </span><span class="istickedoff">in case T.breakOn &quot;&gt;&quot; afterLink of</span>
+<span class="lineno">  148 </span><span class="spaces">        </span><span class="istickedoff">(tagContent, _) -&gt;</span>
+<span class="lineno">  149 </span><span class="spaces">          </span><span class="istickedoff">let tagLower = tagContent</span>
+<span class="lineno">  150 </span><span class="spaces">              </span><span class="istickedoff">tagOrig = T.take (T.length tagContent) (T.drop (T.length pre + 5) orig)</span>
+<span class="lineno">  151 </span><span class="spaces">          </span><span class="istickedoff">in if containsRel relPattern tagLower</span>
+<span class="lineno">  152 </span><span class="spaces">               </span><span class="istickedoff">then extractHrefValue tagOrig</span>
+<span class="lineno">  153 </span><span class="spaces">               </span><span class="istickedoff">else findLinkTagWithRel <span class="nottickedoff">orig</span> lower <span class="nottickedoff">relPattern</span> (T.length pre + 5 + T.length tagContent + 1)</span></span>
+<span class="lineno">  154 </span>
+<span class="lineno">  155 </span>-- | Check whether a tag's content contains @rel=&quot;...icon...&quot;@ (already
+<span class="lineno">  156 </span>-- lowercased). We check for @rel@ followed by @=@ and the pattern.
+<span class="lineno">  157 </span>containsRel :: Text -&gt; Text -&gt; Bool
+<span class="lineno">  158 </span><span class="decl"><span class="istickedoff">containsRel relPattern tagContent =</span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="istickedoff">case T.breakOn &quot;rel&quot; tagContent of</span>
+<span class="lineno">  160 </span><span class="spaces">    </span><span class="istickedoff">(_, &quot;&quot;) -&gt; <span class="nottickedoff">False</span></span>
+<span class="lineno">  161 </span><span class="spaces">    </span><span class="istickedoff">(_, afterRel) -&gt;</span>
+<span class="lineno">  162 </span><span class="spaces">      </span><span class="istickedoff">let afterRelWord = T.dropWhile (\c -&gt; c == ' ' || c == '\t' || c == '\n') (T.drop 3 afterRel)</span>
+<span class="lineno">  163 </span><span class="spaces">      </span><span class="istickedoff">in case T.uncons afterRelWord of</span>
+<span class="lineno">  164 </span><span class="spaces">           </span><span class="istickedoff">Just ('=', afterEq) -&gt;</span>
+<span class="lineno">  165 </span><span class="spaces">             </span><span class="istickedoff">let afterEq' = T.dropWhile (\c -&gt; c == ' ' || c == '\t' || c == '\n') afterEq</span>
+<span class="lineno">  166 </span><span class="spaces">             </span><span class="istickedoff">in case T.uncons afterEq' of</span>
+<span class="lineno">  167 </span><span class="spaces">                  </span><span class="istickedoff">Just ('&quot;', afterQuote) -&gt;</span>
+<span class="lineno">  168 </span><span class="spaces">                    </span><span class="istickedoff">relPattern `T.isPrefixOf` T.toLower (T.takeWhile (/= '&quot;') afterQuote)</span>
+<span class="lineno">  169 </span><span class="spaces">                  </span><span class="istickedoff">Just ('\'', afterQuote) -&gt;</span>
+<span class="lineno">  170 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">relPattern `T.isPrefixOf` T.toLower (T.takeWhile (/= '\'') afterQuote)</span></span>
+<span class="lineno">  171 </span><span class="spaces">                  </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">relPattern `T.isPrefixOf` T.dropWhile (\c -&gt; c == ' ' || c == '\t') afterEq'</span></span>
+<span class="lineno">  172 </span><span class="spaces">           </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">False</span></span></span>
+<span class="lineno">  173 </span>
+<span class="lineno">  174 </span>-- | Extract the @href@ value from a tag's attribute string.
+<span class="lineno">  175 </span>-- Looks for @href=&quot;...&quot;@ or @href='...'@.
+<span class="lineno">  176 </span>extractHrefValue :: Text -&gt; Maybe Text
+<span class="lineno">  177 </span><span class="decl"><span class="istickedoff">extractHrefValue tag =</span>
+<span class="lineno">  178 </span><span class="spaces">  </span><span class="istickedoff">case T.breakOn &quot;href&quot; (T.toLower tag) of</span>
+<span class="lineno">  179 </span><span class="spaces">    </span><span class="istickedoff">(_, &quot;&quot;) -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  180 </span><span class="spaces">    </span><span class="istickedoff">(_, afterHref) -&gt;</span>
+<span class="lineno">  181 </span><span class="spaces">      </span><span class="istickedoff">let afterHrefWord = T.dropWhile (\c -&gt; c == ' ' || c == '\t' || c == '\n') (T.drop 4 afterHref)</span>
+<span class="lineno">  182 </span><span class="spaces">      </span><span class="istickedoff">in case T.uncons afterHrefWord of</span>
+<span class="lineno">  183 </span><span class="spaces">           </span><span class="istickedoff">Just ('=', afterEq) -&gt;</span>
+<span class="lineno">  184 </span><span class="spaces">             </span><span class="istickedoff">let afterEq' = T.dropWhile (\c -&gt; c == ' ' || c == '\t' || c == '\n') afterEq</span>
+<span class="lineno">  185 </span><span class="spaces">             </span><span class="istickedoff">in case T.uncons afterEq' of</span>
+<span class="lineno">  186 </span><span class="spaces">                  </span><span class="istickedoff">Just ('&quot;', afterQuote) -&gt; Just (T.takeWhile (/= '&quot;') afterQuote)</span>
+<span class="lineno">  187 </span><span class="spaces">                  </span><span class="istickedoff">Just ('\'', afterQuote) -&gt; <span class="nottickedoff">Just (T.takeWhile (/= '\'') afterQuote)</span></span>
+<span class="lineno">  188 </span><span class="spaces">                  </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Just (T.takeWhile (\c -&gt; c /= ' ' &amp;&amp; c /= '&gt;' &amp;&amp; c /= '\t' &amp;&amp; c /= '\n') afterEq')</span></span>
+<span class="lineno">  189 </span><span class="spaces">           </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  190 </span>
+<span class="lineno">  191 </span>-- | Resolve an icon @href@ (which may be absolute, protocol-relative, or
+<span class="lineno">  192 </span>-- root-relative) to an absolute URL using the provider's root URL as the
+<span class="lineno">  193 </span>-- base. Returns 'Nothing' when the href is empty.
+<span class="lineno">  194 </span>resolveIconUrl :: Text -&gt; Text -&gt; Maybe Text
+<span class="lineno">  195 </span><span class="decl"><span class="istickedoff">resolveIconUrl rootUrl href = do</span>
+<span class="lineno">  196 </span><span class="spaces">  </span><span class="istickedoff">let h = T.strip href</span>
+<span class="lineno">  197 </span><span class="spaces">  </span><span class="istickedoff">if T.null h then Nothing</span>
+<span class="lineno">  198 </span><span class="spaces">  </span><span class="istickedoff">else if &quot;//&quot; `T.isPrefixOf` h then</span>
+<span class="lineno">  199 </span><span class="spaces">    </span><span class="istickedoff">case T.breakOn &quot;://&quot; rootUrl of</span>
+<span class="lineno">  200 </span><span class="spaces">      </span><span class="istickedoff">(scheme, _) | <span class="tickonlytrue">not (T.null scheme)</span> -&gt; Just (scheme &lt;&gt; &quot;:&quot; &lt;&gt; h)</span>
+<span class="lineno">  201 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  202 </span><span class="spaces">  </span><span class="istickedoff">else if &quot;://&quot; `T.isInfixOf` h then Just h</span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="istickedoff">else if &quot;/&quot; `T.isPrefixOf` h then Just (rootUrl &lt;&gt; h)</span>
+<span class="lineno">  204 </span><span class="spaces">  </span><span class="istickedoff">else Just (rootUrl &lt;&gt; &quot;/&quot; &lt;&gt; h)</span></span>
+<span class="lineno">  205 </span>
+<span class="lineno">  206 </span>-- | Fetch the provider's root page, extract the icon, fetch the image bytes.
+<span class="lineno">  207 </span>fetchProviderIcon :: Manager -&gt; Text -&gt; IO IconResult
+<span class="lineno">  208 </span><span class="decl"><span class="nottickedoff">fetchProviderIcon mgr rootUrl = do</span>
+<span class="lineno">  209 </span><span class="spaces">  </span><span class="nottickedoff">eHtml &lt;- tryFetch mgr rootUrl</span>
+<span class="lineno">  210 </span><span class="spaces">  </span><span class="nottickedoff">case eHtml of</span>
+<span class="lineno">  211 </span><span class="spaces">    </span><span class="nottickedoff">Left _ -&gt; pure IconNotFound</span>
+<span class="lineno">  212 </span><span class="spaces">    </span><span class="nottickedoff">Right resp -&gt;</span>
+<span class="lineno">  213 </span><span class="spaces">      </span><span class="nottickedoff">let code = statusCode (responseStatus resp)</span>
+<span class="lineno">  214 </span><span class="spaces">      </span><span class="nottickedoff">in if code &lt; 200 || code &gt; 299</span>
+<span class="lineno">  215 </span><span class="spaces">           </span><span class="nottickedoff">then pure IconNotFound</span>
+<span class="lineno">  216 </span><span class="spaces">           </span><span class="nottickedoff">else case extractIconHref (BL.toStrict (responseBody resp)) of</span>
+<span class="lineno">  217 </span><span class="spaces">             </span><span class="nottickedoff">Nothing -&gt; pure IconNotFound</span>
+<span class="lineno">  218 </span><span class="spaces">             </span><span class="nottickedoff">Just href -&gt; case resolveIconUrl rootUrl href of</span>
+<span class="lineno">  219 </span><span class="spaces">               </span><span class="nottickedoff">Nothing -&gt; pure IconNotFound</span>
+<span class="lineno">  220 </span><span class="spaces">               </span><span class="nottickedoff">Just iconUrl -&gt; do</span>
+<span class="lineno">  221 </span><span class="spaces">                 </span><span class="nottickedoff">eIcon &lt;- tryFetch mgr iconUrl</span>
+<span class="lineno">  222 </span><span class="spaces">                 </span><span class="nottickedoff">case eIcon of</span>
+<span class="lineno">  223 </span><span class="spaces">                   </span><span class="nottickedoff">Left _ -&gt; pure IconNotFound</span>
+<span class="lineno">  224 </span><span class="spaces">                   </span><span class="nottickedoff">Right iconResp -&gt;</span>
+<span class="lineno">  225 </span><span class="spaces">                     </span><span class="nottickedoff">let icCode = statusCode (responseStatus iconResp)</span>
+<span class="lineno">  226 </span><span class="spaces">                     </span><span class="nottickedoff">in if icCode &lt; 200 || icCode &gt; 299</span>
+<span class="lineno">  227 </span><span class="spaces">                          </span><span class="nottickedoff">then pure IconNotFound</span>
+<span class="lineno">  228 </span><span class="spaces">                          </span><span class="nottickedoff">else</span>
+<span class="lineno">  229 </span><span class="spaces">                            </span><span class="nottickedoff">let ct = contentTypeFromResponse iconResp</span>
+<span class="lineno">  230 </span><span class="spaces">                            </span><span class="nottickedoff">in pure (IconFound (BL.toStrict (responseBody iconResp)) ct)</span></span>
+<span class="lineno">  231 </span>
+<span class="lineno">  232 </span>-- | Fetch a URL and return the response, or Left on any error.
+<span class="lineno">  233 </span>tryFetch :: Manager -&gt; Text -&gt; IO (Either SomeException (Response BL.ByteString))
+<span class="lineno">  234 </span><span class="decl"><span class="nottickedoff">tryFetch mgr url = try (do</span>
+<span class="lineno">  235 </span><span class="spaces">  </span><span class="nottickedoff">req &lt;- parseRequest (T.unpack url)</span>
+<span class="lineno">  236 </span><span class="spaces">  </span><span class="nottickedoff">let req' = req { responseTimeout = responseTimeoutMicro 5000000 }</span>
+<span class="lineno">  237 </span><span class="spaces">  </span><span class="nottickedoff">httpLbs req' mgr)</span></span>
+<span class="lineno">  238 </span>
+<span class="lineno">  239 </span>-- | Extract the Content-Type header value from a response, defaulting to
+<span class="lineno">  240 </span>-- &quot;image/png&quot; when absent (most favicons are PNG or ICO).
+<span class="lineno">  241 </span>contentTypeFromResponse :: Response BL.ByteString -&gt; Text
+<span class="lineno">  242 </span><span class="decl"><span class="nottickedoff">contentTypeFromResponse resp =</span>
+<span class="lineno">  243 </span><span class="spaces">  </span><span class="nottickedoff">case lookup hContentType (responseHeaders resp) of</span>
+<span class="lineno">  244 </span><span class="spaces">    </span><span class="nottickedoff">Just ct -&gt; TE.decodeUtf8With TEE.lenientDecode ct</span>
+<span class="lineno">  245 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; &quot;image/png&quot;</span></span>
+
+</pre>
+</body>
+</html>

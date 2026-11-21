@@ -1,0 +1,85 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>-- | The widened channel capability record — the target the Signal channel
+<span class="lineno">    2 </span>-- (Phase 2b) and the web gateway (Phase 7) implement. Coexists with the
+<span class="lineno">    3 </span>-- existing 'Seal.Channel.Caps.ChannelCaps' (kept for the CLI TUI, which is
+<span class="lineno">    4 </span>-- not unified into this handle in Phase 2a). House style: no type class;
+<span class="lineno">    5 </span>-- callers receive the handle and call fields directly.
+<span class="lineno">    6 </span>module Seal.Handles.Channel
+<span class="lineno">    7 </span>  ( ChannelHandle (..)
+<span class="lineno">    8 </span>  , Deferral (..)
+<span class="lineno">    9 </span>  ) where
+<span class="lineno">   10 </span>
+<span class="lineno">   11 </span>import Data.Text (Text)
+<span class="lineno">   12 </span>
+<span class="lineno">   13 </span>import Seal.Core.MessageSource (MessageSource)
+<span class="lineno">   14 </span>
+<span class="lineno">   15 </span>-- | A structured deferral for interactive ops on request/response channels
+<span class="lineno">   16 </span>-- (Signal, the future unified CLI). The web channel is async-only and never
+<span class="lineno">   17 </span>-- returns 'Deferred' — it returns 'AsyncQueued'. Kept simple in 2a: the
+<span class="lineno">   18 </span>-- payload is just a marker the caller can match; 2b fills in the real shape
+<span class="lineno">   19 </span>-- (a continuation id + a timeout) when a real consumer demands it.
+<span class="lineno">   20 </span>data Deferral = Deferred | AsyncQueued
+<span class="lineno">   21 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   22 </span>
+<span class="lineno">   23 </span>-- | The widened channel capability record. Every field is an IO action so the
+<span class="lineno">   24 </span>-- type is uniform between real and fake variants.
+<span class="lineno">   25 </span>data ChannelHandle = ChannelHandle
+<span class="lineno">   26 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">chLabel</span></span></span>       :: Text
+<span class="lineno">   27 </span>  -- ^ The channel's label (e.g. @&quot;telegram&quot;@, @&quot;signal&quot;@, @&quot;cli&quot;@, @&quot;web&quot;@).
+<span class="lineno">   28 </span>  -- Used by the reply registry to dedup subscribers: at most one handle per
+<span class="lineno">   29 </span>  -- channel kind is kept per session, so re-subscribing the same channel
+<span class="lineno">   30 </span>  -- replaces the old handle but a different channel's handle is preserved.
+<span class="lineno">   31 </span>  -- The web frontend is NOT in the registry (it receives entries via the WS
+<span class="lineno">   32 </span>  -- broker), so only append-only chat channels appear here.
+<span class="lineno">   33 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">chSend</span></span></span>        :: Text -&gt; IO ()
+<span class="lineno">   34 </span>  -- ^ Emit one line to the user.
+<span class="lineno">   35 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">chSendError</span></span></span>   :: Text -&gt; IO ()
+<span class="lineno">   36 </span>  -- ^ Emit an error line (may be formatted differently on some channels).
+<span class="lineno">   37 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">chSendChunk</span></span></span>   :: Text -&gt; IO ()
+<span class="lineno">   38 </span>  -- ^ Emit one streaming chunk (for tool output / long replies). Channels
+<span class="lineno">   39 </span>  -- that do not stream may batch and call 'chSend' once.
+<span class="lineno">   40 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">chPrompt</span></span></span>      :: Text -&gt; IO (Either Deferral Text)
+<span class="lineno">   41 </span>  -- ^ Visible prompt; returns 'Right' the typed line on interactive channels,
+<span class="lineno">   42 </span>  -- 'Left Deferred' on channels that cannot answer inline (the caller must
+<span class="lineno">   43 </span>  -- wait for a follow-on message), 'Left AsyncQueued' on async channels.
+<span class="lineno">   44 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">chPromptSecret</span></span></span> :: Text -&gt; IO (Either Deferral Text)
+<span class="lineno">   45 </span>  -- ^ Hidden (no-echo) prompt; same return shape as 'chPrompt'.
+<span class="lineno">   46 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">chStreaming</span></span></span>   :: Bool
+<span class="lineno">   47 </span>  -- ^ Whether this channel benefits from streaming (web: yes; Signal: yes,
+<span class="lineno">   48 </span>  -- chunked; CLI TUI: yes, line-by-line).
+<span class="lineno">   49 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">chReadSecret</span></span></span>  :: IO (Maybe Text)
+<span class="lineno">   50 </span>  -- ^ Pull a secret the channel itself holds (e.g. a pairing token).
+<span class="lineno">   51 </span>  -- 'Nothing' on channels with no channel-held secret. NOT a vault accessor
+<span class="lineno">   52 </span>  -- — the vault is reached via the vault handle, not the channel.
+<span class="lineno">   53 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">chReceive</span></span></span>     :: IO (Maybe MessageSource, Text)
+<span class="lineno">   54 </span>  -- ^ Pull the next inbound message from the channel's inbox, with its
+<span class="lineno">   55 </span>  -- authenticated 'MessageSource'. Returns @(Nothing, &quot;&quot;)@ when the inbox
+<span class="lineno">   56 </span>  -- is empty (the caller may block or poll depending on the channel).
+<span class="lineno">   57 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">chLastChatId</span></span></span>  :: IO (Maybe Text)
+<span class="lineno">   58 </span>  -- ^ The last chat id the channel addressed a reply to (for transports
+<span class="lineno">   59 </span>  -- that need it, e.g. Telegram's @tgSendWithKeyboard@ which addresses a
+<span class="lineno">   60 </span>  -- chat by id). @Nothing@ for channels that address by user id (Signal)
+<span class="lineno">   61 </span>  -- or have no chat-id concept (CLI, web, fakes).
+<span class="lineno">   62 </span>  }
+
+</pre>
+</body>
+</html>

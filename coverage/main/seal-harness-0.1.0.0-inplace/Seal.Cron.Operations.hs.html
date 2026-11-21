@@ -1,0 +1,315 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Shared cron job operations used by both the 'CRON_MANAGE' opcode and
+<span class="lineno">    3 </span>-- the gateway REST API. This module is the single implementation of
+<span class="lineno">    4 </span>-- create / update / enable / delete so the two surfaces cannot drift —
+<span class="lineno">    5 </span>-- a validation rule added here applies to both paths.
+<span class="lineno">    6 </span>module Seal.Cron.Operations
+<span class="lineno">    7 </span>  ( createJob
+<span class="lineno">    8 </span>  , updateJob
+<span class="lineno">    9 </span>  , setJobEnabled
+<span class="lineno">   10 </span>  , deleteJob
+<span class="lineno">   11 </span>  , dedupSlug
+<span class="lineno">   12 </span>  , CronUpdate (..)
+<span class="lineno">   13 </span>  ) where
+<span class="lineno">   14 </span>
+<span class="lineno">   15 </span>import Control.Applicative ((&lt;|&gt;))
+<span class="lineno">   16 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   17 </span>import Data.Text (Text)
+<span class="lineno">   18 </span>import Data.Text qualified as T
+<span class="lineno">   19 </span>import Data.Time (UTCTime, getCurrentTime)
+<span class="lineno">   20 </span>
+<span class="lineno">   21 </span>import Seal.Agent.Def.Types (mkAgentDefId)
+<span class="lineno">   22 </span>import Seal.Providers.Registry (isProviderName)
+<span class="lineno">   23 </span>import Seal.Cron.Types
+<span class="lineno">   24 </span>import Seal.Cron.Store
+<span class="lineno">   25 </span>
+<span class="lineno">   26 </span>-- | The partial-update record for 'updateJob'. 'Nothing' means &quot;leave
+<span class="lineno">   27 </span>-- this field unchanged&quot;. For 'cuTimezone' and 'cuAgentDefId', 'Nothing'
+<span class="lineno">   28 </span>-- means unchanged (NOT &quot;clear the field&quot;).
+<span class="lineno">   29 </span>data CronUpdate = CronUpdate
+<span class="lineno">   30 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">cuName</span></span></span>       :: Maybe Text
+<span class="lineno">   31 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cuSchedule</span></span></span>   :: Maybe Text
+<span class="lineno">   32 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cuTimezone</span></span></span>   :: Maybe Text
+<span class="lineno">   33 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cuPrompt</span></span></span>     :: Maybe Text
+<span class="lineno">   34 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cuAgentDefId</span></span></span> :: Maybe Text
+<span class="lineno">   35 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cuProvider</span></span></span>   :: Maybe Text
+<span class="lineno">   36 </span>    -- ^ 'Nothing' = leave unchanged; 'Just &quot;&quot;' = clear (fall back to the
+<span class="lineno">   37 </span>    -- configured default); 'Just name' = set. Validated with 'isProviderName'
+<span class="lineno">   38 </span>    -- exactly as on create, so an update cannot smuggle in a value that
+<span class="lineno">   39 </span>    -- 'createJob' would reject.
+<span class="lineno">   40 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cuModel</span></span></span>      :: Maybe Text
+<span class="lineno">   41 </span>    -- ^ Same three-way convention as 'cuProvider'.
+<span class="lineno">   42 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cuEnabled</span></span></span>    :: Maybe Bool
+<span class="lineno">   43 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cuOneShot</span></span></span>    :: Maybe Bool
+<span class="lineno">   44 </span>  }
+<span class="lineno">   45 </span>
+<span class="lineno">   46 </span>-- | Create a new cron job. Slugifies the name, dedups against existing
+<span class="lineno">   47 </span>-- ids, validates all fields, and defaults @enabled@ to 'False'.
+<span class="lineno">   48 </span>-- Returns 'Left' with a human-readable error on validation failure.
+<span class="lineno">   49 </span>createJob
+<span class="lineno">   50 </span>  :: CronStore
+<span class="lineno">   51 </span>  -&gt; Text          -- ^ name (1–100 chars)
+<span class="lineno">   52 </span>  -&gt; Text          -- ^ schedule (5-field cron expression)
+<span class="lineno">   53 </span>  -&gt; Maybe Text    -- ^ timezone (IANA identifier, validated against tzdb)
+<span class="lineno">   54 </span>  -&gt; Text          -- ^ prompt (1–4000 chars)
+<span class="lineno">   55 </span>  -&gt; Maybe Text    -- ^ agent_def_id (validated with 'mkAgentDefId')
+<span class="lineno">   56 </span>  -&gt; Maybe Text    -- ^ provider (validated with 'isProviderName'; @&quot;&quot;@ = absent)
+<span class="lineno">   57 </span>  -&gt; Maybe Text    -- ^ model (@&quot;&quot;@ = absent)
+<span class="lineno">   58 </span>  -&gt; Bool          -- ^ enabled
+<span class="lineno">   59 </span>  -&gt; Bool          -- ^ one_shot
+<span class="lineno">   60 </span>  -&gt; IO (Either Text CronJob)
+<span class="lineno">   61 </span><span class="decl"><span class="istickedoff">createJob store name schedStr mTzStr prompt mAgentDefId mProvider mModel enabled oneShot</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">| T.null name || T.length name &gt; 100 =</span>
+<span class="lineno">   63 </span><span class="spaces">      </span><span class="istickedoff">pure (Left <span class="nottickedoff">&quot;name must be 1-100 characters&quot;</span>)</span>
+<span class="lineno">   64 </span><span class="spaces">  </span><span class="istickedoff">| T.null prompt || T.length prompt &gt; 4000 =</span>
+<span class="lineno">   65 </span><span class="spaces">      </span><span class="istickedoff">pure (Left <span class="nottickedoff">&quot;prompt must be 1-4000 characters&quot;</span>)</span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">-- A '/'-leading prompt is routed by the gateway to the slash-command path,</span>
+<span class="lineno">   67 </span><span class="spaces">  </span><span class="istickedoff">-- which never starts a plain turn — so a scheduled run could never report</span>
+<span class="lineno">   68 </span><span class="spaces">  </span><span class="istickedoff">-- completion and would look permanently in-flight. Reject it at the write</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">-- boundary, where the operator gets an immediate, actionable error, instead</span>
+<span class="lineno">   70 </span><span class="spaces">  </span><span class="istickedoff">-- of failing invisibly five times at fire time.</span>
+<span class="lineno">   71 </span><span class="spaces">  </span><span class="istickedoff">| &quot;/&quot; `T.isPrefixOf` T.stripStart prompt =</span>
+<span class="lineno">   72 </span><span class="spaces">      </span><span class="istickedoff">pure (Left <span class="nottickedoff">&quot;prompt must not start with '/'&quot;</span>)</span>
+<span class="lineno">   73 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> =</span>
+<span class="lineno">   74 </span><span class="spaces">      </span><span class="istickedoff">case mkCronExpr schedStr of</span>
+<span class="lineno">   75 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; pure (Left <span class="nottickedoff">e</span>)</span>
+<span class="lineno">   76 </span><span class="spaces">        </span><span class="istickedoff">Right expr -&gt; do</span>
+<span class="lineno">   77 </span><span class="spaces">          </span><span class="istickedoff">mValidTz &lt;- validateTimezone mTzStr</span>
+<span class="lineno">   78 </span><span class="spaces">          </span><span class="istickedoff">case mValidTz of</span>
+<span class="lineno">   79 </span><span class="spaces">            </span><span class="istickedoff">Left e -&gt; pure (Left <span class="nottickedoff">e</span>)</span>
+<span class="lineno">   80 </span><span class="spaces">            </span><span class="istickedoff">Right mTz -&gt;</span>
+<span class="lineno">   81 </span><span class="spaces">              </span><span class="istickedoff">case validateAgentDefId mAgentDefId of</span>
+<span class="lineno">   82 </span><span class="spaces">                </span><span class="istickedoff">Left e -&gt; pure (Left <span class="nottickedoff">e</span>)</span>
+<span class="lineno">   83 </span><span class="spaces">                </span><span class="istickedoff">Right mValidAid -&gt;</span>
+<span class="lineno">   84 </span><span class="spaces">                  </span><span class="istickedoff">case validateProvider mProvider of</span>
+<span class="lineno">   85 </span><span class="spaces">                    </span><span class="istickedoff">Left e -&gt; pure (Left <span class="nottickedoff">e</span>)</span>
+<span class="lineno">   86 </span><span class="spaces">                    </span><span class="istickedoff">Right mValidProv -&gt; do</span>
+<span class="lineno">   87 </span><span class="spaces">                      </span><span class="istickedoff">allJobs &lt;- csList store False</span>
+<span class="lineno">   88 </span><span class="spaces">                      </span><span class="istickedoff">if length allJobs &gt;= 100</span>
+<span class="lineno">   89 </span><span class="spaces">                        </span><span class="istickedoff">then pure (Left <span class="nottickedoff">&quot;maximum job count (100) reached&quot;</span>)</span>
+<span class="lineno">   90 </span><span class="spaces">                        </span><span class="istickedoff">else do</span>
+<span class="lineno">   91 </span><span class="spaces">                          </span><span class="istickedoff">let baseSlug = slugify name</span>
+<span class="lineno">   92 </span><span class="spaces">                          </span><span class="istickedoff">existingIds &lt;- map (cronJobIdText . cjId) &lt;$&gt; csList store False</span>
+<span class="lineno">   93 </span><span class="spaces">                          </span><span class="istickedoff">let slug = dedupSlug baseSlug existingIds</span>
+<span class="lineno">   94 </span><span class="spaces">                          </span><span class="istickedoff">case mkCronJobId slug of</span>
+<span class="lineno">   95 </span><span class="spaces">                            </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (Left e)</span></span>
+<span class="lineno">   96 </span><span class="spaces">                            </span><span class="istickedoff">Right jid -&gt; do</span>
+<span class="lineno">   97 </span><span class="spaces">                              </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">   98 </span><span class="spaces">                              </span><span class="istickedoff">let job = CronJob</span>
+<span class="lineno">   99 </span><span class="spaces">                                    </span><span class="istickedoff">{ cjId = jid, cjName = name</span>
+<span class="lineno">  100 </span><span class="spaces">                                    </span><span class="istickedoff">, cjSchedule = expr, cjTimezone = mTz</span>
+<span class="lineno">  101 </span><span class="spaces">                                    </span><span class="istickedoff">, cjPrompt = prompt</span>
+<span class="lineno">  102 </span><span class="spaces">                                    </span><span class="istickedoff">, cjAgentDefId = mValidAid</span>
+<span class="lineno">  103 </span><span class="spaces">                                    </span><span class="istickedoff">, cjProvider = mValidProv</span>
+<span class="lineno">  104 </span><span class="spaces">                                    </span><span class="istickedoff">, cjModel = validateModel mModel</span>
+<span class="lineno">  105 </span><span class="spaces">                                    </span><span class="istickedoff">, cjEnabled = enabled</span>
+<span class="lineno">  106 </span><span class="spaces">                                    </span><span class="istickedoff">, cjOneShot = oneShot</span>
+<span class="lineno">  107 </span><span class="spaces">                                    </span><span class="istickedoff">, cjCreatedAt = now, cjUpdatedAt = now</span>
+<span class="lineno">  108 </span><span class="spaces">                                    </span><span class="istickedoff">, cjLastFire = Nothing</span>
+<span class="lineno">  109 </span><span class="spaces">                                    </span><span class="istickedoff">, cjRunCount = 0</span>
+<span class="lineno">  110 </span><span class="spaces">                                    </span><span class="istickedoff">, cjConsecutiveFailures = 0 }</span>
+<span class="lineno">  111 </span><span class="spaces">                              </span><span class="istickedoff">csCreate store job</span>
+<span class="lineno">  112 </span><span class="spaces">                              </span><span class="istickedoff">pure (Right job)</span></span>
+<span class="lineno">  113 </span>
+<span class="lineno">  114 </span>-- | Update an existing cron job, patching only the supplied fields.
+<span class="lineno">  115 </span>-- Applies the same validation as 'createJob' to each supplied field.
+<span class="lineno">  116 </span>-- Returns 'Left' if the job doesn't exist or a field is invalid.
+<span class="lineno">  117 </span>updateJob
+<span class="lineno">  118 </span>  :: CronStore
+<span class="lineno">  119 </span>  -&gt; CronJobId
+<span class="lineno">  120 </span>  -&gt; CronUpdate
+<span class="lineno">  121 </span>  -&gt; IO (Either Text CronJob)
+<span class="lineno">  122 </span><span class="decl"><span class="istickedoff">updateJob store jid upd = do</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">mJob &lt;- csRead store jid</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">case mJob of</span>
+<span class="lineno">  125 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure (Left <span class="nottickedoff">(&quot;cron job not found: &quot; &lt;&gt; cronJobIdText jid)</span>)</span>
+<span class="lineno">  126 </span><span class="spaces">    </span><span class="istickedoff">Just job -&gt; updateJobValidated store job upd</span></span>
+<span class="lineno">  127 </span>
+<span class="lineno">  128 </span>-- | Internal: validate all supplied fields and persist the update.
+<span class="lineno">  129 </span>updateJobValidated :: CronStore -&gt; CronJob -&gt; CronUpdate -&gt; IO (Either Text CronJob)
+<span class="lineno">  130 </span><span class="decl"><span class="istickedoff">updateJobValidated store job upd</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">-- Validate name</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">| Just name &lt;- cuName upd</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="istickedoff">, T.null name || T.length name &gt; 100 =</span>
+<span class="lineno">  134 </span><span class="spaces">      </span><span class="istickedoff">pure (Left <span class="nottickedoff">&quot;name must be 1-100 characters&quot;</span>)</span>
+<span class="lineno">  135 </span><span class="spaces">  </span><span class="istickedoff">-- Validate prompt</span>
+<span class="lineno">  136 </span><span class="spaces">  </span><span class="istickedoff">| Just prompt &lt;- cuPrompt upd</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="istickedoff">, T.null prompt || T.length prompt &gt; 4000 =</span>
+<span class="lineno">  138 </span><span class="spaces">      </span><span class="istickedoff">pure (Left <span class="nottickedoff">&quot;prompt must be 1-4000 characters&quot;</span>)</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">| Just prompt &lt;- cuPrompt upd</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">, &quot;/&quot; `T.isPrefixOf` T.stripStart prompt =</span>
+<span class="lineno">  141 </span><span class="spaces">      </span><span class="istickedoff">pure (Left <span class="nottickedoff">&quot;prompt must not start with '/'&quot;</span>)</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = do</span>
+<span class="lineno">  143 </span><span class="spaces">      </span><span class="istickedoff">-- Validate schedule</span>
+<span class="lineno">  144 </span><span class="spaces">      </span><span class="istickedoff">case cuSchedule upd of</span>
+<span class="lineno">  145 </span><span class="spaces">        </span><span class="istickedoff">Just schedStr -&gt;</span>
+<span class="lineno">  146 </span><span class="spaces">          </span><span class="istickedoff">case mkCronExpr schedStr of</span>
+<span class="lineno">  147 </span><span class="spaces">            </span><span class="istickedoff">Left e -&gt; pure (Left <span class="nottickedoff">e</span>)</span>
+<span class="lineno">  148 </span><span class="spaces">            </span><span class="istickedoff">Right _ -&gt; continueAfterSchedule</span>
+<span class="lineno">  149 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; continueAfterSchedule</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  151 </span><span class="spaces">    </span><span class="istickedoff">continueAfterSchedule = do</span>
+<span class="lineno">  152 </span><span class="spaces">      </span><span class="istickedoff">mValidTz &lt;- validateTimezone (cuTimezone upd)</span>
+<span class="lineno">  153 </span><span class="spaces">      </span><span class="istickedoff">case mValidTz of</span>
+<span class="lineno">  154 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; pure (Left <span class="nottickedoff">e</span>)</span>
+<span class="lineno">  155 </span><span class="spaces">        </span><span class="istickedoff">Right mTz -&gt;</span>
+<span class="lineno">  156 </span><span class="spaces">          </span><span class="istickedoff">case validateAgentDefId (cuAgentDefId upd) of</span>
+<span class="lineno">  157 </span><span class="spaces">            </span><span class="istickedoff">Left e -&gt; pure (Left <span class="nottickedoff">e</span>)</span>
+<span class="lineno">  158 </span><span class="spaces">            </span><span class="istickedoff">Right mValidAid -&gt;</span>
+<span class="lineno">  159 </span><span class="spaces">              </span><span class="istickedoff">case validateProvider (cuProvider upd) of</span>
+<span class="lineno">  160 </span><span class="spaces">                </span><span class="istickedoff">Left e -&gt; pure (Left <span class="nottickedoff">e</span>)</span>
+<span class="lineno">  161 </span><span class="spaces">                </span><span class="istickedoff">Right mValidProv -&gt; do</span>
+<span class="lineno">  162 </span><span class="spaces">                  </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  163 </span><span class="spaces">                  </span><span class="istickedoff">let updatedJob =</span>
+<span class="lineno">  164 </span><span class="spaces">                        </span><span class="istickedoff">applyUpdate job upd mTz mValidAid mValidProv now</span>
+<span class="lineno">  165 </span><span class="spaces">                  </span><span class="istickedoff">csSave store updatedJob</span>
+<span class="lineno">  166 </span><span class="spaces">                  </span><span class="istickedoff">pure (Right updatedJob)</span></span>
+<span class="lineno">  167 </span>
+<span class="lineno">  168 </span>-- | Merge a validated 'CronUpdate' into an existing job. Pure, so the
+<span class="lineno">  169 </span>-- three-way &quot;leave alone / clear / set&quot; rule is readable in one place.
+<span class="lineno">  170 </span>--
+<span class="lineno">  171 </span>-- Provider and model follow the same convention: 'Nothing' means the client
+<span class="lineno">  172 </span>-- did not supply the field (an absent key and an explicit JSON @null@ both
+<span class="lineno">  173 </span>-- decode to 'Nothing'), @Just &quot;&quot;@ means the operator emptied the form field
+<span class="lineno">  174 </span>-- and wants the job back on Seal's configured default, and @Just x@ sets it.
+<span class="lineno">  175 </span>applyUpdate
+<span class="lineno">  176 </span>  :: CronJob
+<span class="lineno">  177 </span>  -&gt; CronUpdate
+<span class="lineno">  178 </span>  -&gt; Maybe CronTimeZone   -- ^ validated timezone ('Nothing' = unchanged)
+<span class="lineno">  179 </span>  -&gt; Maybe Text           -- ^ validated agent def id ('Nothing' = unchanged)
+<span class="lineno">  180 </span>  -&gt; Maybe Text           -- ^ validated provider ('Nothing' = absent/empty)
+<span class="lineno">  181 </span>  -&gt; UTCTime
+<span class="lineno">  182 </span>  -&gt; CronJob
+<span class="lineno">  183 </span><span class="decl"><span class="istickedoff">applyUpdate job upd mTz mValidAid mValidProv now = job</span>
+<span class="lineno">  184 </span><span class="spaces">  </span><span class="istickedoff">{ cjName     = fromMaybe (cjName job) (cuName upd)</span>
+<span class="lineno">  185 </span><span class="spaces">  </span><span class="istickedoff">, cjSchedule = case cuSchedule upd of</span>
+<span class="lineno">  186 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; cjSchedule job</span>
+<span class="lineno">  187 </span><span class="spaces">      </span><span class="istickedoff">Just sc -&gt;</span>
+<span class="lineno">  188 </span><span class="spaces">        </span><span class="istickedoff">case mkCronExpr sc of</span>
+<span class="lineno">  189 </span><span class="spaces">          </span><span class="istickedoff">Right e -&gt; e</span>
+<span class="lineno">  190 </span><span class="spaces">          </span><span class="istickedoff">Left _  -&gt; <span class="nottickedoff">cjSchedule job</span></span>
+<span class="lineno">  191 </span><span class="spaces">  </span><span class="istickedoff">, cjTimezone = mTz &lt;|&gt; cjTimezone job</span>
+<span class="lineno">  192 </span><span class="spaces">  </span><span class="istickedoff">, cjPrompt   = fromMaybe (cjPrompt job) (cuPrompt upd)</span>
+<span class="lineno">  193 </span><span class="spaces">  </span><span class="istickedoff">, cjAgentDefId = mValidAid &lt;|&gt; cjAgentDefId job</span>
+<span class="lineno">  194 </span><span class="spaces">  </span><span class="istickedoff">, cjProvider = applyTriState (cjProvider job) (cuProvider upd) mValidProv</span>
+<span class="lineno">  195 </span><span class="spaces">  </span><span class="istickedoff">, cjModel    = applyTriState (cjModel job) (cuModel upd)</span>
+<span class="lineno">  196 </span><span class="spaces">                   </span><span class="istickedoff">(validateModel (cuModel upd))</span>
+<span class="lineno">  197 </span><span class="spaces">  </span><span class="istickedoff">, cjEnabled  = fromMaybe (cjEnabled job) (cuEnabled upd)</span>
+<span class="lineno">  198 </span><span class="spaces">  </span><span class="istickedoff">, cjOneShot  = fromMaybe (cjOneShot job) (cuOneShot upd)</span>
+<span class="lineno">  199 </span><span class="spaces">  </span><span class="istickedoff">, cjUpdatedAt = now</span>
+<span class="lineno">  200 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  201 </span>
+<span class="lineno">  202 </span>-- | Resolve one tri-state field. @supplied@ is the raw client value, needed to
+<span class="lineno">  203 </span>-- tell &quot;key absent&quot; from &quot;@Just \&quot;\&quot;@&quot; (both would otherwise collapse to
+<span class="lineno">  204 </span>-- 'Nothing'); @validated@ is the smart-constructed value produced by the
+<span class="lineno">  205 </span>-- validator that already ran on this same field — it is 'Nothing' when nothing
+<span class="lineno">  206 </span>-- usable was supplied.
+<span class="lineno">  207 </span>applyTriState :: Maybe Text -&gt; Maybe Text -&gt; Maybe Text -&gt; Maybe Text
+<span class="lineno">  208 </span><span class="decl"><span class="istickedoff">applyTriState current supplied validated =</span>
+<span class="lineno">  209 </span><span class="spaces">  </span><span class="istickedoff">case supplied of</span>
+<span class="lineno">  210 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; current</span>
+<span class="lineno">  211 </span><span class="spaces">    </span><span class="istickedoff">Just raw</span>
+<span class="lineno">  212 </span><span class="spaces">      </span><span class="istickedoff">| T.null raw -&gt; Nothing</span>
+<span class="lineno">  213 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>  -&gt; validated</span></span>
+<span class="lineno">  214 </span>
+<span class="lineno">  215 </span>-- | Enable or disable a job. Idempotent — setting enabled to its current
+<span class="lineno">  216 </span>-- value is a no-op that still returns 'Right'. Returns 'Left' if the job
+<span class="lineno">  217 </span>-- doesn't exist.
+<span class="lineno">  218 </span>setJobEnabled :: CronStore -&gt; CronJobId -&gt; Bool -&gt; IO (Either Text CronJob)
+<span class="lineno">  219 </span><span class="decl"><span class="istickedoff">setJobEnabled store jid newEnabled = do</span>
+<span class="lineno">  220 </span><span class="spaces">  </span><span class="istickedoff">mJob &lt;- csRead store jid</span>
+<span class="lineno">  221 </span><span class="spaces">  </span><span class="istickedoff">case mJob of</span>
+<span class="lineno">  222 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure (Left <span class="nottickedoff">(&quot;cron job not found: &quot; &lt;&gt; cronJobIdText jid)</span>)</span>
+<span class="lineno">  223 </span><span class="spaces">    </span><span class="istickedoff">Just job -&gt; do</span>
+<span class="lineno">  224 </span><span class="spaces">      </span><span class="istickedoff">now &lt;- getCurrentTime</span>
+<span class="lineno">  225 </span><span class="spaces">      </span><span class="istickedoff">let updatedJob = job { cjEnabled = newEnabled, cjUpdatedAt = now }</span>
+<span class="lineno">  226 </span><span class="spaces">      </span><span class="istickedoff">csSave store updatedJob</span>
+<span class="lineno">  227 </span><span class="spaces">      </span><span class="istickedoff">pure (Right updatedJob)</span></span>
+<span class="lineno">  228 </span>
+<span class="lineno">  229 </span>-- | Delete a job. Idempotent — deleting a non-existent job returns
+<span class="lineno">  230 </span>-- 'Right ()'. Never fails.
+<span class="lineno">  231 </span>deleteJob :: CronStore -&gt; CronJobId -&gt; IO (Either Text ())
+<span class="lineno">  232 </span><span class="decl"><span class="istickedoff">deleteJob store jid = do</span>
+<span class="lineno">  233 </span><span class="spaces">  </span><span class="istickedoff">csDelete store jid</span>
+<span class="lineno">  234 </span><span class="spaces">  </span><span class="istickedoff">pure (Right ())</span></span>
+<span class="lineno">  235 </span>
+<span class="lineno">  236 </span>-- | Ensure a slug does not collide with existing ids by appending a
+<span class="lineno">  237 </span>-- numeric suffix. Owned here so both the opcode and the web path dedup
+<span class="lineno">  238 </span>-- identically.
+<span class="lineno">  239 </span>dedupSlug :: Text -&gt; [Text] -&gt; Text
+<span class="lineno">  240 </span><span class="decl"><span class="istickedoff">dedupSlug base existingIds</span>
+<span class="lineno">  241 </span><span class="spaces">  </span><span class="istickedoff">| base `notElem` existingIds = base</span>
+<span class="lineno">  242 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = go (2 :: Int)</span>
+<span class="lineno">  243 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  244 </span><span class="spaces">    </span><span class="istickedoff">go :: Int -&gt; Text</span>
+<span class="lineno">  245 </span><span class="spaces">    </span><span class="istickedoff">go n = let c = base &lt;&gt; &quot;-&quot; &lt;&gt; T.pack (show n)</span>
+<span class="lineno">  246 </span><span class="spaces">           </span><span class="istickedoff">in if <span class="tickonlytrue">c `notElem` existingIds</span> then c else <span class="nottickedoff">go (n + 1)</span></span></span>
+<span class="lineno">  247 </span>
+<span class="lineno">  248 </span>-- | Validate a timezone string: format check via 'mkCronTimeZone',
+<span class="lineno">  249 </span>-- then existence check via 'validateCronTimeZone'. 'Nothing' input
+<span class="lineno">  250 </span>-- means &quot;no timezone supplied&quot; and yields 'Right Nothing'.
+<span class="lineno">  251 </span>validateTimezone :: Maybe Text -&gt; IO (Either Text (Maybe CronTimeZone))
+<span class="lineno">  252 </span><span class="decl"><span class="istickedoff">validateTimezone Nothing = pure (Right Nothing)</span>
+<span class="lineno">  253 </span><span class="spaces"></span><span class="istickedoff">validateTimezone (Just tzStr) = case mkCronTimeZone tzStr of</span>
+<span class="lineno">  254 </span><span class="spaces">  </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (Left e)</span></span>
+<span class="lineno">  255 </span><span class="spaces">  </span><span class="istickedoff">Right tz -&gt; do</span>
+<span class="lineno">  256 </span><span class="spaces">    </span><span class="istickedoff">eValid &lt;- validateCronTimeZone tz</span>
+<span class="lineno">  257 </span><span class="spaces">    </span><span class="istickedoff">pure $ case eValid of</span>
+<span class="lineno">  258 </span><span class="spaces">      </span><span class="istickedoff">Left e -&gt; Left <span class="nottickedoff">e</span></span>
+<span class="lineno">  259 </span><span class="spaces">      </span><span class="istickedoff">Right _ -&gt; Right (Just <span class="nottickedoff">tz</span>)</span></span>
+<span class="lineno">  260 </span>
+<span class="lineno">  261 </span>-- | Validate an agent_def_id string with 'mkAgentDefId'. 'Nothing' input
+<span class="lineno">  262 </span>-- means &quot;no agent_def_id supplied&quot; and yields 'Right Nothing'.
+<span class="lineno">  263 </span>validateAgentDefId :: Maybe Text -&gt; Either Text (Maybe Text)
+<span class="lineno">  264 </span><span class="decl"><span class="istickedoff">validateAgentDefId Nothing = Right Nothing</span>
+<span class="lineno">  265 </span><span class="spaces"></span><span class="istickedoff">validateAgentDefId (Just aidStr) = case mkAgentDefId aidStr of</span>
+<span class="lineno">  266 </span><span class="spaces">  </span><span class="istickedoff">Left e -&gt; Left <span class="nottickedoff">e</span></span>
+<span class="lineno">  267 </span><span class="spaces">  </span><span class="istickedoff">Right _ -&gt; <span class="nottickedoff">Right (Just aidStr)</span></span></span>
+<span class="lineno">  268 </span>
+<span class="lineno">  269 </span>-- | Validate an optional provider name. @Nothing@ and @Just &quot;&quot;@ both mean
+<span class="lineno">  270 </span>-- &quot;no provider supplied&quot; and yield 'Right Nothing' — an emptied form field is
+<span class="lineno">  271 </span>-- an absent choice, not a provider named the empty string.
+<span class="lineno">  272 </span>--
+<span class="lineno">  273 </span>-- The check is '&lt;Seal.Providers.Registry.isProviderName&gt;': a built-in provider
+<span class="lineno">  274 </span>-- label, or a syntactically valid custom instance name. A syntactically valid
+<span class="lineno">  275 </span>-- but *unconfigured* name cannot be rejected here — this module is shared by
+<span class="lineno">  276 </span>-- the opcode and the web gateway and holds no config handle. Such a name
+<span class="lineno">  277 </span>-- surfaces as @\&quot;unknown provider in session: …\&quot;@ inside the spawned session's
+<span class="lineno">  278 </span>-- transcript at fire time; see the design note in
+<span class="lineno">  279 </span>-- @docs/plans/2026-11-15-cron-provider-model-plan.md@ (D2).
+<span class="lineno">  280 </span>validateProvider :: Maybe Text -&gt; Either Text (Maybe Text)
+<span class="lineno">  281 </span><span class="decl"><span class="istickedoff">validateProvider Nothing = Right Nothing</span>
+<span class="lineno">  282 </span><span class="spaces"></span><span class="istickedoff">validateProvider (Just provStr)</span>
+<span class="lineno">  283 </span><span class="spaces">  </span><span class="istickedoff">| T.null provStr = Right Nothing</span>
+<span class="lineno">  284 </span><span class="spaces">  </span><span class="istickedoff">| isProviderName provStr = Right (Just provStr)</span>
+<span class="lineno">  285 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Left <span class="nottickedoff">(&quot;invalid provider name: &quot; &lt;&gt; provStr)</span></span></span>
+<span class="lineno">  286 </span>
+<span class="lineno">  287 </span>-- | Validate an optional model id. @Nothing@ and @Just &quot;&quot;@ both mean &quot;no model
+<span class="lineno">  288 </span>-- supplied&quot;. Model ids are opaque to the harness (every provider names its own),
+<span class="lineno">  289 </span>-- so the only rule is that an emptied field is an absent choice.
+<span class="lineno">  290 </span>validateModel :: Maybe Text -&gt; Maybe Text
+<span class="lineno">  291 </span><span class="decl"><span class="istickedoff">validateModel Nothing = Nothing</span>
+<span class="lineno">  292 </span><span class="spaces"></span><span class="istickedoff">validateModel (Just m) = if T.null m then Nothing else Just m</span></span>
+
+</pre>
+</body>
+</html>

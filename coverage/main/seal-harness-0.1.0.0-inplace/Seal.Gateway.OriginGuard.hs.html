@@ -1,0 +1,233 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The mutation guard's verdict: may this request mutate state?
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- The gateway's REST API is reachable from any page in the operator's browser.
+<span class="lineno">    5 </span>-- Passkey sessions do not fix that on their own: a cookie is sent on a
+<span class="lineno">    6 </span>-- cross-origin request, so a hostile page can drive @POST@/@PUT@/@DELETE@
+<span class="lineno">    7 </span>-- against the gateway (CSRF). The passkey layer decides *network* identity; this
+<span class="lineno">    8 </span>-- module decides whether the *request origin* is the gateway's own.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- The canonical origin is resolved once at boot by 'Seal.Config.BootPlan' and is
+<span class="lineno">   11 </span>-- the same value WebAuthn verifies @clientDataJSON.origin@ against. The
+<span class="lineno">   12 </span>-- WebSocket allowlist is derived separately, from @[gateway] host@ + @port@, and
+<span class="lineno">   13 </span>-- is exact: a browser opened at @http:\/\/127.0.0.1:&lt;port&gt;@ can use the REST API
+<span class="lineno">   14 </span>-- here but not the live stream. Open the URL the boot banner prints.
+<span class="lineno">   15 </span>--
+<span class="lineno">   16 </span>-- Pure on purpose: the whole verdict (including the loopback-alias cases that
+<span class="lineno">   17 </span>-- keep @vite dev@ and the e2e harness working) is testable without a socket.
+<span class="lineno">   18 </span>--
+<span class="lineno">   19 </span>-- == Residual threats (stated, not claimed away)
+<span class="lineno">   20 </span>--
+<span class="lineno">   21 </span>-- * Holders of the per-run service token and clients in an explicitly waived
+<span class="lineno">   22 </span>--   @mode = &quot;none&quot;@ install are authorised to mutate; the guard only stops a
+<span class="lineno">   23 </span>--   *browser page from another origin*.
+<span class="lineno">   24 </span>-- * A same-UID local process is admitted: it sends no @Origin@, and it could
+<span class="lineno">   25 </span>--   already write @~\/.seal\/security.toml@ directly. See
+<span class="lineno">   26 </span>--   &quot;Seal.Gateway.Setup&quot;'s module header for the same statement about setup.
+<span class="lineno">   27 </span>-- * @mode = &quot;none&quot;@ on a wildcard bind resolves no canonical origin, so the
+<span class="lineno">   28 </span>--   verdict is @Allowed@ for everything. That is the operator's written
+<span class="lineno">   29 </span>--   waiver, not an oversight.
+<span class="lineno">   30 </span>module Seal.Gateway.OriginGuard
+<span class="lineno">   31 </span>  ( GuardHeaders (..)
+<span class="lineno">   32 </span>  , GuardVerdict (..)
+<span class="lineno">   33 </span>  , sameOriginVerdict
+<span class="lineno">   34 </span>  , guardHeadersFrom
+<span class="lineno">   35 </span>  ) where
+<span class="lineno">   36 </span>
+<span class="lineno">   37 </span>import Data.Char (isDigit)
+<span class="lineno">   38 </span>import Data.Text (Text)
+<span class="lineno">   39 </span>import Data.Text qualified as T
+<span class="lineno">   40 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   41 </span>import Network.HTTP.Types (HeaderName, hOrigin)
+<span class="lineno">   42 </span>import Network.Wai (Request, requestHeaders)
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>-- | The only two headers the verdict needs.
+<span class="lineno">   45 </span>data GuardHeaders = GuardHeaders
+<span class="lineno">   46 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">ghOrigin</span></span></span>       :: !(Maybe Text)
+<span class="lineno">   47 </span>    -- ^ @Origin@. Absent for curl/HTTP clients and for same-origin GETs.
+<span class="lineno">   48 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ghSecFetchSite</span></span></span> :: !(Maybe Text)
+<span class="lineno">   49 </span>    -- ^ @Sec-Fetch-Site@. Browsers send it on every request; @cross-site@ on a
+<span class="lineno">   50 </span>    -- cross-origin one.
+<span class="lineno">   51 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   52 </span>
+<span class="lineno">   53 </span>-- | The verdict. A rejection carries a short reason for the log and the 403
+<span class="lineno">   54 </span>-- body (never request content beyond the fact that it did not match).
+<span class="lineno">   55 </span>data GuardVerdict = Allowed | Rejected !Text
+<span class="lineno">   56 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>-- | @Sec-Fetch-Site@ has no constant in @http-types@; header names are
+<span class="lineno">   59 </span>-- case-insensitive and @HeaderName@ is @IsString@ over the lowercased form.
+<span class="lineno">   60 </span>hSecFetchSite :: HeaderName
+<span class="lineno">   61 </span><span class="decl"><span class="istickedoff">hSecFetchSite = &quot;sec-fetch-site&quot;</span></span>
+<span class="lineno">   62 </span>
+<span class="lineno">   63 </span>-- | Decide whether a request may mutate state.
+<span class="lineno">   64 </span>--
+<span class="lineno">   65 </span>-- @Nothing@ is the boot plan's explicit &quot;no origin could be resolved&quot; (a
+<span class="lineno">   66 </span>-- wildcard bind with @mode = none@): the operator waived access control and
+<span class="lineno">   67 </span>-- there is no canonical origin to compare against, so everything is allowed.
+<span class="lineno">   68 </span>--
+<span class="lineno">   69 </span>-- A loopback canonical origin accepts any loopback alias on any port. That is
+<span class="lineno">   70 </span>-- load-bearing: the boot plan canonicalises a loopback bind to
+<span class="lineno">   71 </span>-- @http:\/\/localhost:\&lt;port\&gt;@, while the SPA is reached at
+<span class="lineno">   72 </span>-- @http:\/\/127.0.0.1:\&lt;port\&gt;@ (the e2e harness) or
+<span class="lineno">   73 </span>-- @http:\/\/localhost:5173@ (the vite dev proxy). Only code already running on
+<span class="lineno">   74 </span>-- the host can serve from a loopback name.
+<span class="lineno">   75 </span>sameOriginVerdict :: Maybe Text -&gt; GuardHeaders -&gt; GuardVerdict
+<span class="lineno">   76 </span><span class="decl"><span class="istickedoff">sameOriginVerdict Nothing _headers = Allowed</span>
+<span class="lineno">   77 </span><span class="spaces"></span><span class="istickedoff">sameOriginVerdict (Just canonical) headers =</span>
+<span class="lineno">   78 </span><span class="spaces">  </span><span class="istickedoff">case ghOrigin headers of</span>
+<span class="lineno">   79 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; allowWithoutOrigin</span>
+<span class="lineno">   80 </span><span class="spaces">    </span><span class="istickedoff">Just raw</span>
+<span class="lineno">   81 </span><span class="spaces">      </span><span class="istickedoff">| T.toLower (T.strip raw) == &quot;null&quot; -&gt;</span>
+<span class="lineno">   82 </span><span class="spaces">          </span><span class="istickedoff">Rejected &quot;Origin: null is not an acceptable origin&quot;</span>
+<span class="lineno">   83 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; case (parseOrigin canonical, parseOrigin raw) of</span>
+<span class="lineno">   84 </span><span class="spaces">          </span><span class="istickedoff">(Just canon, Just origin)</span>
+<span class="lineno">   85 </span><span class="spaces">            </span><span class="istickedoff">| identicalOrigin canon origin -&gt; Allowed</span>
+<span class="lineno">   86 </span><span class="spaces">            </span><span class="istickedoff">| poScheme canon == poScheme origin</span>
+<span class="lineno">   87 </span><span class="spaces">            </span><span class="istickedoff">, isLoopbackHost (poHost canon)</span>
+<span class="lineno">   88 </span><span class="spaces">            </span><span class="istickedoff">, isLoopbackHost (poHost origin) -&gt; Allowed</span>
+<span class="lineno">   89 </span><span class="spaces">            </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt;</span>
+<span class="lineno">   90 </span><span class="spaces">                </span><span class="istickedoff">Rejected (&quot;origin does not match the gateway origin (&quot; &lt;&gt; raw &lt;&gt; &quot;)&quot;)</span>
+<span class="lineno">   91 </span><span class="spaces">          </span><span class="istickedoff">_ -&gt; Rejected &quot;Origin header is not a well-formed http(s) origin&quot;</span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   93 </span><span class="spaces">    </span><span class="istickedoff">-- A browser cannot issue a cross-site request without telling us so. Absent</span>
+<span class="lineno">   94 </span><span class="spaces">    </span><span class="istickedoff">-- metadata means a non-browser client (curl, the chat channels, tests).</span>
+<span class="lineno">   95 </span><span class="spaces">    </span><span class="istickedoff">allowWithoutOrigin = case ghSecFetchSite headers of</span>
+<span class="lineno">   96 </span><span class="spaces">      </span><span class="istickedoff">Just site</span>
+<span class="lineno">   97 </span><span class="spaces">        </span><span class="istickedoff">| T.toLower (T.strip site) `elem` [&quot;cross-site&quot;, &quot;same-site&quot;] -&gt;</span>
+<span class="lineno">   98 </span><span class="spaces">            </span><span class="istickedoff">Rejected &quot;cross-site fetch metadata without Origin&quot;</span>
+<span class="lineno">   99 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; Allowed</span></span>
+<span class="lineno">  100 </span>
+<span class="lineno">  101 </span>-- | Extract the two headers from a WAI request. Lenient UTF-8 decoding matches
+<span class="lineno">  102 </span>-- the rest of the gateway: a malformed header simply fails to match.
+<span class="lineno">  103 </span>guardHeadersFrom :: Request -&gt; GuardHeaders
+<span class="lineno">  104 </span><span class="decl"><span class="istickedoff">guardHeadersFrom req = GuardHeaders</span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="istickedoff">{ ghOrigin       = lookupText hOrigin</span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="istickedoff">, ghSecFetchSite = lookupText hSecFetchSite</span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  109 </span><span class="spaces">    </span><span class="istickedoff">lookupText :: HeaderName -&gt; Maybe Text</span>
+<span class="lineno">  110 </span><span class="spaces">    </span><span class="istickedoff">lookupText name = TE.decodeUtf8Lenient &lt;$&gt; lookup name (requestHeaders req)</span></span>
+<span class="lineno">  111 </span>
+<span class="lineno">  112 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  113 </span>-- Origin parsing
+<span class="lineno">  114 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  115 </span>
+<span class="lineno">  116 </span>-- | A parsed origin: scheme, host (lowercased, brackets kept for IPv6) and the
+<span class="lineno">  117 </span>-- effective port (explicit, else the scheme default). Nothing else is carried —
+<span class="lineno">  118 </span>-- an origin with a path, query or fragment is not an origin.
+<span class="lineno">  119 </span>data ParsedOrigin = ParsedOrigin
+<span class="lineno">  120 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">poScheme</span></span></span> :: !Text
+<span class="lineno">  121 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">poHost</span></span></span>   :: !Text
+<span class="lineno">  122 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">poPort</span></span></span>   :: !Int
+<span class="lineno">  123 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  124 </span>
+<span class="lineno">  125 </span>parseOrigin :: Text -&gt; Maybe ParsedOrigin
+<span class="lineno">  126 </span><span class="decl"><span class="istickedoff">parseOrigin raw = do</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="istickedoff">let stripped = T.strip raw</span>
+<span class="lineno">  128 </span><span class="spaces">      </span><span class="istickedoff">-- Browsers never send a trailing slash, but some tools do; tolerate one.</span>
+<span class="lineno">  129 </span><span class="spaces">      </span><span class="istickedoff">cleaned = if &quot;/&quot; `T.isSuffixOf` stripped then T.dropEnd 1 stripped else stripped</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">(scheme, afterScheme) &lt;- splitScheme cleaned</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">host &lt;- splitHost afterScheme</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">port &lt;- splitPort scheme afterScheme</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="istickedoff">pure (ParsedOrigin (T.toLower scheme) host port)</span></span>
+<span class="lineno">  134 </span>
+<span class="lineno">  135 </span>splitScheme :: Text -&gt; Maybe (Text, Text)
+<span class="lineno">  136 </span><span class="decl"><span class="istickedoff">splitScheme t =</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="istickedoff">case T.breakOn &quot;://&quot; t of</span>
+<span class="lineno">  138 </span><span class="spaces">    </span><span class="istickedoff">(scheme, rest)</span>
+<span class="lineno">  139 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">T.null rest</span>                -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  140 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">T.null scheme</span>             -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  141 </span><span class="spaces">      </span><span class="istickedoff">| T.toLower scheme `notElem` [&quot;http&quot;, &quot;https&quot;] -&gt; Nothing</span>
+<span class="lineno">  142 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>                 -&gt; Just (scheme, T.drop 3 rest)</span></span>
+<span class="lineno">  143 </span>
+<span class="lineno">  144 </span>-- | The host part of an authority, with a validation that nothing hostile
+<span class="lineno">  145 </span>-- follows it. A path/query/fragment anywhere in the authority is rejected.
+<span class="lineno">  146 </span>splitHost :: Text -&gt; Maybe Text
+<span class="lineno">  147 </span><span class="decl"><span class="istickedoff">splitHost authority</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">T.null authority</span> = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="istickedoff">| T.any (`elem` (&quot;/?#&quot; :: String)) authority = Nothing</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="istickedoff">| &quot;[&quot; `T.isPrefixOf` authority =</span>
+<span class="lineno">  151 </span><span class="spaces">      </span><span class="istickedoff">case T.breakOn &quot;]&quot; authority of</span>
+<span class="lineno">  152 </span><span class="spaces">        </span><span class="istickedoff">(h, rest)</span>
+<span class="lineno">  153 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlyfalse">T.null rest</span> -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  154 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>   -&gt;</span>
+<span class="lineno">  155 </span><span class="spaces">              </span><span class="istickedoff">let after = T.drop 1 rest</span>
+<span class="lineno">  156 </span><span class="spaces">              </span><span class="istickedoff">in if <span class="tickonlytrue">T.null after || validPortSuffix after</span></span>
+<span class="lineno">  157 </span><span class="spaces">                   </span><span class="istickedoff">then Just (T.toLower h &lt;&gt; &quot;]&quot;)</span>
+<span class="lineno">  158 </span><span class="spaces">                   </span><span class="istickedoff">else <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> =</span>
+<span class="lineno">  160 </span><span class="spaces">      </span><span class="istickedoff">case T.breakOn &quot;:&quot; authority of</span>
+<span class="lineno">  161 </span><span class="spaces">        </span><span class="istickedoff">(h, rest)</span>
+<span class="lineno">  162 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlyfalse">T.null h</span> -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  163 </span><span class="spaces">          </span><span class="istickedoff">| T.null rest -&gt; Just (T.toLower h)</span>
+<span class="lineno">  164 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">validPortSuffix rest</span> -&gt; Just (T.toLower h)</span>
+<span class="lineno">  165 </span><span class="spaces">          </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span> -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  166 </span>
+<span class="lineno">  167 </span>splitPort :: Text -&gt; Text -&gt; Maybe Int
+<span class="lineno">  168 </span><span class="decl"><span class="istickedoff">splitPort scheme authority</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="istickedoff">| &quot;[&quot; `T.isPrefixOf` authority =</span>
+<span class="lineno">  170 </span><span class="spaces">      </span><span class="istickedoff">case T.breakOn &quot;]&quot; authority of</span>
+<span class="lineno">  171 </span><span class="spaces">        </span><span class="istickedoff">(_, rest) -&gt; portFrom (T.drop 1 rest) <span class="nottickedoff">(defaultPort scheme)</span></span>
+<span class="lineno">  172 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> =</span>
+<span class="lineno">  173 </span><span class="spaces">      </span><span class="istickedoff">case T.breakOn &quot;:&quot; authority of</span>
+<span class="lineno">  174 </span><span class="spaces">        </span><span class="istickedoff">(_, rest) -&gt; portFrom rest (defaultPort scheme)</span></span>
+<span class="lineno">  175 </span>
+<span class="lineno">  176 </span>portFrom :: Text -&gt; Int -&gt; Maybe Int
+<span class="lineno">  177 </span><span class="decl"><span class="istickedoff">portFrom rest fallback</span>
+<span class="lineno">  178 </span><span class="spaces">  </span><span class="istickedoff">| T.null rest = Just fallback</span>
+<span class="lineno">  179 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">validPortSuffix rest</span> =</span>
+<span class="lineno">  180 </span><span class="spaces">      </span><span class="istickedoff">case reads (T.unpack (T.drop 1 rest)) of</span>
+<span class="lineno">  181 </span><span class="spaces">        </span><span class="istickedoff">[(n, &quot;&quot;)] -&gt; Just n</span>
+<span class="lineno">  182 </span><span class="spaces">        </span><span class="istickedoff">_         -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  183 </span><span class="spaces">  </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span> = <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  184 </span>
+<span class="lineno">  185 </span>validPortSuffix :: Text -&gt; Bool
+<span class="lineno">  186 </span><span class="decl"><span class="istickedoff">validPortSuffix t =</span>
+<span class="lineno">  187 </span><span class="spaces">  </span><span class="istickedoff">case T.uncons t of</span>
+<span class="lineno">  188 </span><span class="spaces">    </span><span class="istickedoff">Just (':', digits) -&gt; not (T.null digits) &amp;&amp; T.all isDigit digits &amp;&amp; T.length digits &lt;= 5</span>
+<span class="lineno">  189 </span><span class="spaces">    </span><span class="istickedoff">_                  -&gt; <span class="nottickedoff">False</span></span></span>
+<span class="lineno">  190 </span>
+<span class="lineno">  191 </span>defaultPort :: Text -&gt; Int
+<span class="lineno">  192 </span><span class="decl"><span class="istickedoff">defaultPort scheme = if <span class="tickonlytrue">T.toLower scheme == &quot;https&quot;</span> then 443 else <span class="nottickedoff">80</span></span></span>
+<span class="lineno">  193 </span>
+<span class="lineno">  194 </span>identicalOrigin :: ParsedOrigin -&gt; ParsedOrigin -&gt; Bool
+<span class="lineno">  195 </span><span class="decl"><span class="istickedoff">identicalOrigin a b =</span>
+<span class="lineno">  196 </span><span class="spaces">  </span><span class="istickedoff">poScheme a == poScheme b &amp;&amp; poHost a == poHost b &amp;&amp; poPort a == poPort b</span></span>
+<span class="lineno">  197 </span>
+<span class="lineno">  198 </span>-- | @localhost@, any @127.0.0.0\/8@ address, and IPv6 @::1@ (with or without
+<span class="lineno">  199 </span>-- brackets). Everything else — including @localhost.evil.com@ and @10.x@ — is
+<span class="lineno">  200 </span>-- not loopback.
+<span class="lineno">  201 </span>isLoopbackHost :: Text -&gt; Bool
+<span class="lineno">  202 </span><span class="decl"><span class="istickedoff">isLoopbackHost host</span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="istickedoff">| h == &quot;localhost&quot; = True</span>
+<span class="lineno">  204 </span><span class="spaces">  </span><span class="istickedoff">| h == &quot;[::1]&quot; || h == &quot;::1&quot; = True</span>
+<span class="lineno">  205 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case T.splitOn &quot;.&quot; h of</span>
+<span class="lineno">  206 </span><span class="spaces">      </span><span class="istickedoff">[a, b, c, d] -&gt; a == &quot;127&quot; &amp;&amp; all numeric [b, c, d]</span>
+<span class="lineno">  207 </span><span class="spaces">      </span><span class="istickedoff">_            -&gt; False</span>
+<span class="lineno">  208 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  209 </span><span class="spaces">    </span><span class="istickedoff">h = T.toLower host</span>
+<span class="lineno">  210 </span><span class="spaces">    </span><span class="istickedoff">numeric part = not (T.null part) &amp;&amp; T.all isDigit part</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,388 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The CRON_MANAGE opcode: action-based interface for managing cron jobs.
+<span class="lineno">    3 </span>-- Audited trust level — cron job definitions are persistent, cross-session
+<span class="lineno">    4 </span>-- state.
+<span class="lineno">    5 </span>module Seal.ISA.Ops.Cron
+<span class="lineno">    6 </span>  ( cronManageOp
+<span class="lineno">    7 </span>  , CronFireDelegate
+<span class="lineno">    8 </span>  ) where
+<span class="lineno">    9 </span>
+<span class="lineno">   10 </span>import Control.Monad.IO.Class (liftIO)
+<span class="lineno">   11 </span>import Data.Aeson
+<span class="lineno">   12 </span>  ( Value, object, withObject, (.:), (.:?), (.=) )
+<span class="lineno">   13 </span>import Data.Aeson.Key (fromText)
+<span class="lineno">   14 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   15 </span>import Data.Maybe (fromMaybe, isJust)
+<span class="lineno">   16 </span>import Data.Text (Text)
+<span class="lineno">   17 </span>import Data.Text qualified as T
+<span class="lineno">   18 </span>import Data.Time (UTCTime, getCurrentTime)
+<span class="lineno">   19 </span>
+<span class="lineno">   20 </span>import Seal.Core.Types (OpName (..), SessionId, TrustLevel (..), sessionIdText)
+<span class="lineno">   21 </span>import Seal.Types.App (App)
+<span class="lineno">   22 </span>import Seal.ISA.Opcode
+<span class="lineno">   23 </span>import Seal.Providers.Class (ToolResultPart (..))
+<span class="lineno">   24 </span>import Seal.Cron.Operations (createJob, updateJob, setJobEnabled, deleteJob, CronUpdate (..))
+<span class="lineno">   25 </span>import Seal.Cron.Types
+<span class="lineno">   26 </span>import Seal.Cron.Store
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>type CronFireDelegate = CronJob -&gt; IO (Either Text SessionId)
+<span class="lineno">   29 </span>
+<span class="lineno">   30 </span>data CronAction
+<span class="lineno">   31 </span>  = CaCreate | CaRead | CaList | CaUpdate | CaDelete | CaTrigger | CaEnable | CaDisable
+<span class="lineno">   32 </span>
+<span class="lineno">   33 </span>parseCronAction :: Value -&gt; Either Text CronAction
+<span class="lineno">   34 </span><span class="decl"><span class="istickedoff">parseCronAction v =</span>
+<span class="lineno">   35 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;action&quot;)) v of</span>
+<span class="lineno">   36 </span><span class="spaces">    </span><span class="istickedoff">Just t -&gt; case t :: Text of</span>
+<span class="lineno">   37 </span><span class="spaces">      </span><span class="istickedoff">&quot;create&quot;  -&gt; Right CaCreate</span>
+<span class="lineno">   38 </span><span class="spaces">      </span><span class="istickedoff">&quot;read&quot;    -&gt; Right CaRead</span>
+<span class="lineno">   39 </span><span class="spaces">      </span><span class="istickedoff">&quot;list&quot;    -&gt; Right CaList</span>
+<span class="lineno">   40 </span><span class="spaces">      </span><span class="istickedoff">&quot;update&quot;  -&gt; Right CaUpdate</span>
+<span class="lineno">   41 </span><span class="spaces">      </span><span class="istickedoff">&quot;delete&quot;  -&gt; Right CaDelete</span>
+<span class="lineno">   42 </span><span class="spaces">      </span><span class="istickedoff">&quot;trigger&quot; -&gt; Right CaTrigger</span>
+<span class="lineno">   43 </span><span class="spaces">      </span><span class="istickedoff">&quot;enable&quot;  -&gt; Right CaEnable</span>
+<span class="lineno">   44 </span><span class="spaces">      </span><span class="istickedoff">&quot;disable&quot; -&gt; Right CaDisable</span>
+<span class="lineno">   45 </span><span class="spaces">      </span><span class="istickedoff">other     -&gt; <span class="nottickedoff">Left (&quot;unknown cron action: &quot; &lt;&gt; other)</span></span>
+<span class="lineno">   46 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">Left &quot;missing or invalid action field&quot;</span></span></span>
+<span class="lineno">   47 </span>
+<span class="lineno">   48 </span>idField :: Value -&gt; Maybe Text
+<span class="lineno">   49 </span><span class="decl"><span class="istickedoff">idField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;id&quot;))</span></span>
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>nameField :: Value -&gt; Maybe Text
+<span class="lineno">   52 </span><span class="decl"><span class="istickedoff">nameField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;name&quot;))</span></span>
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>scheduleField :: Value -&gt; Maybe Text
+<span class="lineno">   55 </span><span class="decl"><span class="istickedoff">scheduleField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;schedule&quot;))</span></span>
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>timezoneField :: Value -&gt; Maybe Text
+<span class="lineno">   58 </span><span class="decl"><span class="istickedoff">timezoneField v = joinMaybe (parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;timezone&quot;)) v)</span></span>
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>promptField :: Value -&gt; Maybe Text
+<span class="lineno">   61 </span><span class="decl"><span class="istickedoff">promptField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;prompt&quot;))</span></span>
+<span class="lineno">   62 </span>
+<span class="lineno">   63 </span>agentDefIdField :: Value -&gt; Maybe Text
+<span class="lineno">   64 </span><span class="decl"><span class="istickedoff">agentDefIdField v = joinMaybe (parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;agent_def_id&quot;)) v)</span></span>
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>providerField :: Value -&gt; Maybe Text
+<span class="lineno">   67 </span><span class="decl"><span class="istickedoff">providerField v = joinMaybe (parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;provider&quot;)) v)</span></span>
+<span class="lineno">   68 </span>
+<span class="lineno">   69 </span>modelField :: Value -&gt; Maybe Text
+<span class="lineno">   70 </span><span class="decl"><span class="istickedoff">modelField v = joinMaybe (parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;model&quot;)) v)</span></span>
+<span class="lineno">   71 </span>
+<span class="lineno">   72 </span>enabledField :: Value -&gt; Bool
+<span class="lineno">   73 </span><span class="decl"><span class="istickedoff">enabledField v = fromMaybe False (joinMaybe (parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;enabled&quot;)) v))</span></span>
+<span class="lineno">   74 </span>
+<span class="lineno">   75 </span>oneShotField :: Value -&gt; Bool
+<span class="lineno">   76 </span><span class="decl"><span class="istickedoff">oneShotField v = fromMaybe False (joinMaybe (parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;one_shot&quot;)) v))</span></span>
+<span class="lineno">   77 </span>
+<span class="lineno">   78 </span>enabledOnlyField :: Value -&gt; Bool
+<span class="lineno">   79 </span><span class="decl"><span class="nottickedoff">enabledOnlyField v = fromMaybe False (joinMaybe (parseMaybe (withObject &quot;in&quot; (.:? &quot;enabled_only&quot;)) v))</span></span>
+<span class="lineno">   80 </span>
+<span class="lineno">   81 </span>enabledField' :: Value -&gt; Maybe Bool
+<span class="lineno">   82 </span><span class="decl"><span class="istickedoff">enabledField' v = joinMaybe (parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;enabled&quot;)) v)</span></span>
+<span class="lineno">   83 </span>
+<span class="lineno">   84 </span>oneShotField' :: Value -&gt; Maybe Bool
+<span class="lineno">   85 </span><span class="decl"><span class="istickedoff">oneShotField' v = joinMaybe (parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;one_shot&quot;)) v)</span></span>
+<span class="lineno">   86 </span>
+<span class="lineno">   87 </span>joinMaybe :: Maybe (Maybe a) -&gt; Maybe a
+<span class="lineno">   88 </span><span class="decl"><span class="istickedoff">joinMaybe = (&gt;&gt;= id)</span></span>
+<span class="lineno">   89 </span>
+<span class="lineno">   90 </span>handleCreate :: CronStore -&gt; Value -&gt; App OpResult
+<span class="lineno">   91 </span><span class="decl"><span class="istickedoff">handleCreate store v = do</span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="istickedoff">case (nameField v, scheduleField v, promptField v) of</span>
+<span class="lineno">   93 </span><span class="spaces">    </span><span class="istickedoff">(Nothing, _, _) -&gt; <span class="nottickedoff">pure (errResult &quot;create requires {name:string}&quot;)</span></span>
+<span class="lineno">   94 </span><span class="spaces">    </span><span class="istickedoff">(_, Nothing, _) -&gt; pure (errResult <span class="nottickedoff">&quot;create requires {schedule:string}&quot;</span>)</span>
+<span class="lineno">   95 </span><span class="spaces">    </span><span class="istickedoff">(_, _, Nothing) -&gt; <span class="nottickedoff">pure (errResult &quot;create requires {prompt:string}&quot;)</span></span>
+<span class="lineno">   96 </span><span class="spaces">    </span><span class="istickedoff">(Just name, Just sched, Just prompt) -&gt; do</span>
+<span class="lineno">   97 </span><span class="spaces">      </span><span class="istickedoff">let mTzStr = timezoneField v</span>
+<span class="lineno">   98 </span><span class="spaces">          </span><span class="istickedoff">mAgentDefId = agentDefIdField v</span>
+<span class="lineno">   99 </span><span class="spaces">          </span><span class="istickedoff">enabled = enabledField v</span>
+<span class="lineno">  100 </span><span class="spaces">          </span><span class="istickedoff">oneShot = oneShotField v</span>
+<span class="lineno">  101 </span><span class="spaces">          </span><span class="istickedoff">mProv = providerField v</span>
+<span class="lineno">  102 </span><span class="spaces">          </span><span class="istickedoff">mModel = modelField v</span>
+<span class="lineno">  103 </span><span class="spaces">      </span><span class="istickedoff">eJob &lt;- liftIO (createJob store name sched mTzStr prompt mAgentDefId mProv mModel enabled oneShot)</span>
+<span class="lineno">  104 </span><span class="spaces">      </span><span class="istickedoff">case eJob of</span>
+<span class="lineno">  105 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; pure (errResult <span class="nottickedoff">e</span>)</span>
+<span class="lineno">  106 </span><span class="spaces">        </span><span class="istickedoff">Right job -&gt; do</span>
+<span class="lineno">  107 </span><span class="spaces">          </span><span class="istickedoff">now &lt;- liftIO getCurrentTime</span>
+<span class="lineno">  108 </span><span class="spaces">          </span><span class="istickedoff">mNextFire &lt;- liftIO (computeNextFire (cjSchedule job) (cjTimezone job) now)</span>
+<span class="lineno">  109 </span><span class="spaces">          </span><span class="istickedoff">let slug = cronJobIdText (cjId job)</span>
+<span class="lineno">  110 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult</span>
+<span class="lineno">  111 </span><span class="spaces">            </span><span class="istickedoff">[ TrpText (&quot;created job '&quot; &lt;&gt; name &lt;&gt; &quot;' (id: &quot; &lt;&gt; slug</span>
+<span class="lineno">  112 </span><span class="spaces">                       </span><span class="istickedoff">&lt;&gt; &quot;), next fire: &quot; &lt;&gt; tshowUTC mNextFire) ]</span>
+<span class="lineno">  113 </span><span class="spaces">            </span><span class="istickedoff">False</span>
+<span class="lineno">  114 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">(object [ &quot;action&quot; .= (&quot;create&quot; :: Text), &quot;id&quot; .= slug</span></span>
+<span class="lineno">  115 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, &quot;name&quot; .= name, &quot;schedule&quot; .= sched</span></span>
+<span class="lineno">  116 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, &quot;enabled&quot; .= enabled, &quot;one_shot&quot; .= oneShot</span></span>
+<span class="lineno">  117 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, &quot;next_fire&quot; .= mNextFire ])</span>)</span></span>
+<span class="lineno">  118 </span>
+<span class="lineno">  119 </span>handleRead :: CronStore -&gt; Value -&gt; App OpResult
+<span class="lineno">  120 </span><span class="decl"><span class="istickedoff">handleRead store v = do</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">case idField v &gt;&gt;= either <span class="nottickedoff">(const Nothing)</span> Just . mkCronJobId of</span>
+<span class="lineno">  122 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (errResult &quot;read requires {id:string}&quot;)</span></span>
+<span class="lineno">  123 </span><span class="spaces">    </span><span class="istickedoff">Just jid -&gt; do</span>
+<span class="lineno">  124 </span><span class="spaces">      </span><span class="istickedoff">mJob &lt;- liftIO (csRead store jid)</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="istickedoff">case mJob of</span>
+<span class="lineno">  126 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; pure (OpResult</span>
+<span class="lineno">  127 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[ TrpText (&quot;cron job not found: &quot; &lt;&gt; cronJobIdText jid) ]</span> True</span>
+<span class="lineno">  128 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(object [ &quot;action&quot; .= (&quot;read&quot; :: Text), &quot;id&quot; .= cronJobIdText jid, &quot;found&quot; .= False ])</span>)</span>
+<span class="lineno">  129 </span><span class="spaces">        </span><span class="istickedoff">Just job -&gt; pure (OpResult</span>
+<span class="lineno">  130 </span><span class="spaces">          </span><span class="istickedoff">[ TrpText (renderJob job) ] False</span>
+<span class="lineno">  131 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(object [ &quot;action&quot; .= (&quot;read&quot; :: Text), &quot;id&quot; .= cronJobIdText jid, &quot;found&quot; .= True</span></span>
+<span class="lineno">  132 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, &quot;name&quot; .= cjName job, &quot;schedule&quot; .= cronExprText (cjSchedule job)</span></span>
+<span class="lineno">  133 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, &quot;enabled&quot; .= cjEnabled job, &quot;one_shot&quot; .= cjOneShot job ])</span>)</span></span>
+<span class="lineno">  134 </span>
+<span class="lineno">  135 </span>handleList :: CronStore -&gt; Value -&gt; App OpResult
+<span class="lineno">  136 </span><span class="decl"><span class="istickedoff">handleList store v = do</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="istickedoff">let <span class="nottickedoff">enabledOnly = enabledOnlyField v</span></span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="istickedoff">jobs &lt;- liftIO (csList store <span class="nottickedoff">enabledOnly</span>)</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">let <span class="nottickedoff">rendered = case jobs of</span></span>
+<span class="lineno">  140 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">[] -&gt; &quot;(no cron jobs defined)&quot;</span></span>
+<span class="lineno">  141 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">_ -&gt; T.intercalate &quot;\n&quot;</span></span>
+<span class="lineno">  142 </span><span class="spaces">               </span><span class="istickedoff"><span class="nottickedoff">[ cronJobIdText (cjId j)</span></span>
+<span class="lineno">  143 </span><span class="spaces">                 </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot; [&quot; &lt;&gt; (if cjEnabled j then &quot;enabled&quot; else &quot;disabled&quot; :: Text) &lt;&gt; &quot;]: &quot;</span></span>
+<span class="lineno">  144 </span><span class="spaces">                 </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; cjName j &lt;&gt; &quot; — &quot; &lt;&gt; cronExprText (cjSchedule j)</span></span>
+<span class="lineno">  145 </span><span class="spaces">               </span><span class="istickedoff"><span class="nottickedoff">| j &lt;- jobs ]</span></span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">pure (OpResult <span class="nottickedoff">[TrpText rendered]</span> False</span>
+<span class="lineno">  147 </span><span class="spaces">         </span><span class="istickedoff"><span class="nottickedoff">(object [ &quot;action&quot; .= (&quot;list&quot; :: Text), &quot;count&quot; .= length jobs</span></span>
+<span class="lineno">  148 </span><span class="spaces">                 </span><span class="istickedoff"><span class="nottickedoff">, &quot;ids&quot; .= map (cronJobIdText . cjId) jobs</span></span>
+<span class="lineno">  149 </span><span class="spaces">                 </span><span class="istickedoff"><span class="nottickedoff">, &quot;enabled_count&quot; .= length (filter cjEnabled jobs) ])</span>)</span></span>
+<span class="lineno">  150 </span>
+<span class="lineno">  151 </span>handleUpdate :: CronStore -&gt; Value -&gt; App OpResult
+<span class="lineno">  152 </span><span class="decl"><span class="istickedoff">handleUpdate store v = do</span>
+<span class="lineno">  153 </span><span class="spaces">  </span><span class="istickedoff">case idField v &gt;&gt;= either <span class="nottickedoff">(const Nothing)</span> Just . mkCronJobId of</span>
+<span class="lineno">  154 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (errResult &quot;update requires {id:string}&quot;)</span></span>
+<span class="lineno">  155 </span><span class="spaces">    </span><span class="istickedoff">Just jid -&gt; do</span>
+<span class="lineno">  156 </span><span class="spaces">      </span><span class="istickedoff">eUpdated &lt;- liftIO (updateJob store jid (CronUpdate</span>
+<span class="lineno">  157 </span><span class="spaces">        </span><span class="istickedoff">{ cuName = nameField v</span>
+<span class="lineno">  158 </span><span class="spaces">        </span><span class="istickedoff">, cuSchedule = scheduleField v</span>
+<span class="lineno">  159 </span><span class="spaces">        </span><span class="istickedoff">, cuTimezone = timezoneField v</span>
+<span class="lineno">  160 </span><span class="spaces">        </span><span class="istickedoff">, cuPrompt = promptField v</span>
+<span class="lineno">  161 </span><span class="spaces">        </span><span class="istickedoff">, cuAgentDefId = agentDefIdField v</span>
+<span class="lineno">  162 </span><span class="spaces">        </span><span class="istickedoff">, cuProvider = providerField v</span>
+<span class="lineno">  163 </span><span class="spaces">        </span><span class="istickedoff">, cuModel = modelField v</span>
+<span class="lineno">  164 </span><span class="spaces">        </span><span class="istickedoff">, cuEnabled = enabledField' v</span>
+<span class="lineno">  165 </span><span class="spaces">        </span><span class="istickedoff">, cuOneShot = oneShotField' v</span>
+<span class="lineno">  166 </span><span class="spaces">        </span><span class="istickedoff">}))</span>
+<span class="lineno">  167 </span><span class="spaces">      </span><span class="istickedoff">case eUpdated of</span>
+<span class="lineno">  168 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; pure (errResult <span class="nottickedoff">e</span>)</span>
+<span class="lineno">  169 </span><span class="spaces">        </span><span class="istickedoff">Right updatedJob -&gt; do</span>
+<span class="lineno">  170 </span><span class="spaces">          </span><span class="istickedoff">now &lt;- liftIO getCurrentTime</span>
+<span class="lineno">  171 </span><span class="spaces">          </span><span class="istickedoff">mNextFire &lt;- liftIO (computeNextFire <span class="nottickedoff">(cjSchedule updatedJob)</span> (cjTimezone updatedJob) <span class="nottickedoff">now</span>)</span>
+<span class="lineno">  172 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult</span>
+<span class="lineno">  173 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">[ TrpText (&quot;updated job '&quot; &lt;&gt; cronJobIdText jid &lt;&gt; &quot;'&quot;) ]</span> False</span>
+<span class="lineno">  174 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">(object [ &quot;action&quot; .= (&quot;update&quot; :: Text), &quot;id&quot; .= cronJobIdText jid</span></span>
+<span class="lineno">  175 </span><span class="spaces">                    </span><span class="istickedoff"><span class="nottickedoff">, &quot;next_fire&quot; .= mNextFire ])</span>)</span></span>
+<span class="lineno">  176 </span>
+<span class="lineno">  177 </span>handleDelete :: CronStore -&gt; Value -&gt; App OpResult
+<span class="lineno">  178 </span><span class="decl"><span class="istickedoff">handleDelete store v = do</span>
+<span class="lineno">  179 </span><span class="spaces">  </span><span class="istickedoff">case idField v &gt;&gt;= either <span class="nottickedoff">(const Nothing)</span> Just . mkCronJobId of</span>
+<span class="lineno">  180 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (errResult &quot;delete requires {id:string}&quot;)</span></span>
+<span class="lineno">  181 </span><span class="spaces">    </span><span class="istickedoff">Just jid -&gt; do</span>
+<span class="lineno">  182 </span><span class="spaces">      </span><span class="istickedoff">mJob &lt;- liftIO (csRead store <span class="nottickedoff">jid</span>)</span>
+<span class="lineno">  183 </span><span class="spaces">      </span><span class="istickedoff">_ &lt;- liftIO (deleteJob store jid)</span>
+<span class="lineno">  184 </span><span class="spaces">      </span><span class="istickedoff">let <span class="nottickedoff">existed = isJust mJob</span></span>
+<span class="lineno">  185 </span><span class="spaces">      </span><span class="istickedoff">pure (OpResult</span>
+<span class="lineno">  186 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">[ TrpText (if existed then &quot;deleted&quot; else &quot;deleted (was not present)&quot;) ]</span> False</span>
+<span class="lineno">  187 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">(object [ &quot;action&quot; .= (&quot;delete&quot; :: Text), &quot;id&quot; .= cronJobIdText jid, &quot;existed&quot; .= existed ])</span>)</span></span>
+<span class="lineno">  188 </span>
+<span class="lineno">  189 </span>handleTrigger :: Maybe CronFireDelegate -&gt; CronStore -&gt; Value -&gt; App OpResult
+<span class="lineno">  190 </span><span class="decl"><span class="istickedoff">handleTrigger mFireDelegate store v = do</span>
+<span class="lineno">  191 </span><span class="spaces">  </span><span class="istickedoff">case idField v &gt;&gt;= either <span class="nottickedoff">(const Nothing)</span> Just . mkCronJobId of</span>
+<span class="lineno">  192 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (errResult &quot;trigger requires {id:string}&quot;)</span></span>
+<span class="lineno">  193 </span><span class="spaces">    </span><span class="istickedoff">Just jid -&gt; do</span>
+<span class="lineno">  194 </span><span class="spaces">      </span><span class="istickedoff">mJob &lt;- liftIO (csRead store jid)</span>
+<span class="lineno">  195 </span><span class="spaces">      </span><span class="istickedoff">case mJob of</span>
+<span class="lineno">  196 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (OpResult</span></span>
+<span class="lineno">  197 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[ TrpText (&quot;cron job not found: &quot; &lt;&gt; cronJobIdText jid) ] True</span></span>
+<span class="lineno">  198 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(object [ &quot;action&quot; .= (&quot;trigger&quot; :: Text), &quot;id&quot; .= cronJobIdText jid, &quot;found&quot; .= False ]))</span></span>
+<span class="lineno">  199 </span><span class="spaces">        </span><span class="istickedoff">Just job -&gt; case mFireDelegate of</span>
+<span class="lineno">  200 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; pure (errResult <span class="nottickedoff">&quot;trigger not available (no fire delegate configured)&quot;</span>)</span>
+<span class="lineno">  201 </span><span class="spaces">          </span><span class="istickedoff">Just fire -&gt; do</span>
+<span class="lineno">  202 </span><span class="spaces">            </span><span class="istickedoff">eResult &lt;- liftIO (fire <span class="nottickedoff">job</span>)</span>
+<span class="lineno">  203 </span><span class="spaces">            </span><span class="istickedoff">case eResult of</span>
+<span class="lineno">  204 </span><span class="spaces">              </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (errResult (&quot;trigger failed: &quot; &lt;&gt; err))</span></span>
+<span class="lineno">  205 </span><span class="spaces">              </span><span class="istickedoff">Right sid -&gt; pure (OpResult</span>
+<span class="lineno">  206 </span><span class="spaces">                </span><span class="istickedoff">[ TrpText (&quot;triggered job '&quot; &lt;&gt; cronJobIdText jid</span>
+<span class="lineno">  207 </span><span class="spaces">                           </span><span class="istickedoff">&lt;&gt; &quot;', session: &quot; &lt;&gt; sessionIdText sid) ] False</span>
+<span class="lineno">  208 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">(object [ &quot;action&quot; .= (&quot;trigger&quot; :: Text), &quot;id&quot; .= cronJobIdText jid</span></span>
+<span class="lineno">  209 </span><span class="spaces">                        </span><span class="istickedoff"><span class="nottickedoff">, &quot;session_id&quot; .= sessionIdText sid ])</span>)</span></span>
+<span class="lineno">  210 </span>
+<span class="lineno">  211 </span>handleEnable :: CronStore -&gt; Value -&gt; App OpResult
+<span class="lineno">  212 </span><span class="decl"><span class="istickedoff">handleEnable store v = do</span>
+<span class="lineno">  213 </span><span class="spaces">  </span><span class="istickedoff">case idField v &gt;&gt;= either <span class="nottickedoff">(const Nothing)</span> Just . mkCronJobId of</span>
+<span class="lineno">  214 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (errResult &quot;enable requires {id:string}&quot;)</span></span>
+<span class="lineno">  215 </span><span class="spaces">    </span><span class="istickedoff">Just jid -&gt; do</span>
+<span class="lineno">  216 </span><span class="spaces">      </span><span class="istickedoff">eJob &lt;- liftIO (setJobEnabled store jid True)</span>
+<span class="lineno">  217 </span><span class="spaces">      </span><span class="istickedoff">case eJob of</span>
+<span class="lineno">  218 </span><span class="spaces">        </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">pure (OpResult</span></span>
+<span class="lineno">  219 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[ TrpText (&quot;cron job not found: &quot; &lt;&gt; cronJobIdText jid) ] True</span></span>
+<span class="lineno">  220 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(object [ &quot;action&quot; .= (&quot;enable&quot; :: Text), &quot;id&quot; .= cronJobIdText jid, &quot;found&quot; .= False ]))</span></span>
+<span class="lineno">  221 </span><span class="spaces">        </span><span class="istickedoff">Right job -&gt; do</span>
+<span class="lineno">  222 </span><span class="spaces">          </span><span class="istickedoff">now &lt;- liftIO getCurrentTime</span>
+<span class="lineno">  223 </span><span class="spaces">          </span><span class="istickedoff">mNextFire &lt;- liftIO (computeNextFire <span class="nottickedoff">(cjSchedule job)</span> (cjTimezone job) <span class="nottickedoff">now</span>)</span>
+<span class="lineno">  224 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult</span>
+<span class="lineno">  225 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">[ TrpText (&quot;enabled job '&quot; &lt;&gt; cronJobIdText jid &lt;&gt; &quot;', next fire: &quot; &lt;&gt; tshowUTC mNextFire) ]</span> False</span>
+<span class="lineno">  226 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">(object [ &quot;action&quot; .= (&quot;enable&quot; :: Text), &quot;id&quot; .= cronJobIdText jid, &quot;next_fire&quot; .= mNextFire ])</span>)</span></span>
+<span class="lineno">  227 </span>
+<span class="lineno">  228 </span>handleDisable :: CronStore -&gt; Value -&gt; App OpResult
+<span class="lineno">  229 </span><span class="decl"><span class="istickedoff">handleDisable store v = do</span>
+<span class="lineno">  230 </span><span class="spaces">  </span><span class="istickedoff">case idField v &gt;&gt;= either <span class="nottickedoff">(const Nothing)</span> Just . mkCronJobId of</span>
+<span class="lineno">  231 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (errResult &quot;disable requires {id:string}&quot;)</span></span>
+<span class="lineno">  232 </span><span class="spaces">    </span><span class="istickedoff">Just jid -&gt; do</span>
+<span class="lineno">  233 </span><span class="spaces">      </span><span class="istickedoff">eJob &lt;- liftIO (setJobEnabled store jid False)</span>
+<span class="lineno">  234 </span><span class="spaces">      </span><span class="istickedoff">case eJob of</span>
+<span class="lineno">  235 </span><span class="spaces">        </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">pure (OpResult</span></span>
+<span class="lineno">  236 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[ TrpText (&quot;cron job not found: &quot; &lt;&gt; cronJobIdText jid) ] True</span></span>
+<span class="lineno">  237 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(object [ &quot;action&quot; .= (&quot;disable&quot; :: Text), &quot;id&quot; .= cronJobIdText jid, &quot;found&quot; .= False ]))</span></span>
+<span class="lineno">  238 </span><span class="spaces">        </span><span class="istickedoff">Right _job -&gt; do</span>
+<span class="lineno">  239 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult</span>
+<span class="lineno">  240 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">[ TrpText (&quot;disabled job '&quot; &lt;&gt; cronJobIdText jid &lt;&gt; &quot;'&quot;) ]</span> False</span>
+<span class="lineno">  241 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">(object [ &quot;action&quot; .= (&quot;disable&quot; :: Text), &quot;id&quot; .= cronJobIdText jid ])</span>)</span></span>
+<span class="lineno">  242 </span>
+<span class="lineno">  243 </span>authorizeCronManage :: Value -&gt; Either Text ()
+<span class="lineno">  244 </span><span class="decl"><span class="istickedoff">authorizeCronManage v =</span>
+<span class="lineno">  245 </span><span class="spaces">  </span><span class="istickedoff">case parseCronAction v of</span>
+<span class="lineno">  246 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">Left e</span></span>
+<span class="lineno">  247 </span><span class="spaces">    </span><span class="istickedoff">Right action -&gt; case action of</span>
+<span class="lineno">  248 </span><span class="spaces">      </span><span class="istickedoff">CaCreate -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  249 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">case (nameField v, scheduleField v, promptField v) of</span></span>
+<span class="lineno">  250 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">(Just name, Just sched, Just _prompt) -&gt; do</span></span>
+<span class="lineno">  251 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">whenB (T.null name || T.length name &gt; 100) (Left &quot;name must be 1-100 characters&quot;)</span></span>
+<span class="lineno">  252 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">case mkCronExpr sched of</span></span>
+<span class="lineno">  253 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">Left e -&gt; Left e</span></span>
+<span class="lineno">  254 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">Right _ -&gt; case timezoneField v of</span></span>
+<span class="lineno">  255 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">Just tzText -&gt; const (Right ()) =&lt;&lt; mkCronTimeZone tzText</span></span>
+<span class="lineno">  256 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt; Right ()</span></span>
+<span class="lineno">  257 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">_ -&gt; Left &quot;create requires {name, schedule, prompt}&quot;</span></span>
+<span class="lineno">  258 </span><span class="spaces">      </span><span class="istickedoff">CaRead    -&gt; <span class="nottickedoff">checkId v &quot;read&quot;</span></span>
+<span class="lineno">  259 </span><span class="spaces">      </span><span class="istickedoff">CaList    -&gt; <span class="nottickedoff">Right ()</span></span>
+<span class="lineno">  260 </span><span class="spaces">      </span><span class="istickedoff">CaUpdate  -&gt; do</span>
+<span class="lineno">  261 </span><span class="spaces">        </span><span class="istickedoff">_ &lt;- checkId v <span class="nottickedoff">&quot;update&quot;</span></span>
+<span class="lineno">  262 </span><span class="spaces">        </span><span class="istickedoff">let hasField = any isJust [ nameField v, scheduleField v, timezoneField v</span>
+<span class="lineno">  263 </span><span class="spaces">                                  </span><span class="istickedoff">, promptField v, providerField v, modelField v ]</span>
+<span class="lineno">  264 </span><span class="spaces">                      </span><span class="istickedoff">|| isJust (enabledField' v) || isJust (oneShotField' v)</span>
+<span class="lineno">  265 </span><span class="spaces">        </span><span class="istickedoff">if hasField then Right () else Left <span class="nottickedoff">&quot;update requires at least one field to update&quot;</span></span>
+<span class="lineno">  266 </span><span class="spaces">      </span><span class="istickedoff">CaDelete  -&gt; <span class="nottickedoff">checkId v &quot;delete&quot;</span></span>
+<span class="lineno">  267 </span><span class="spaces">      </span><span class="istickedoff">CaTrigger -&gt; <span class="nottickedoff">checkId v &quot;trigger&quot;</span></span>
+<span class="lineno">  268 </span><span class="spaces">      </span><span class="istickedoff">CaEnable  -&gt; <span class="nottickedoff">checkId v &quot;enable&quot;</span></span>
+<span class="lineno">  269 </span><span class="spaces">      </span><span class="istickedoff">CaDisable -&gt; <span class="nottickedoff">checkId v &quot;disable&quot;</span></span></span>
+<span class="lineno">  270 </span>
+<span class="lineno">  271 </span>checkId :: Value -&gt; Text -&gt; Either Text ()
+<span class="lineno">  272 </span><span class="decl"><span class="istickedoff">checkId v actionName =</span>
+<span class="lineno">  273 </span><span class="spaces">  </span><span class="istickedoff">case idField v of</span>
+<span class="lineno">  274 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">Left (actionName &lt;&gt; &quot; requires {id:string}&quot;)</span></span>
+<span class="lineno">  275 </span><span class="spaces">    </span><span class="istickedoff">Just t -&gt; const (Right <span class="nottickedoff">()</span>) =&lt;&lt; mkCronJobId t</span></span>
+<span class="lineno">  276 </span>
+<span class="lineno">  277 </span>cronManageOp :: Maybe CronFireDelegate -&gt; CronStore -&gt; SessionId -&gt; Opcode
+<span class="lineno">  278 </span><span class="decl"><span class="istickedoff">cronManageOp mFireDelegate store _session = TrustedOpcode</span>
+<span class="lineno">  279 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;CRON_MANAGE&quot;</span>
+<span class="lineno">  280 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = <span class="nottickedoff">Audited</span></span>
+<span class="lineno">  281 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Manage cron jobs. Use action to select: create (new job), read (by id), list (all jobs), update (modify by id), delete (by id, idempotent), trigger (fire immediately), enable (enable job), disable (pause job).&quot;</span>
+<span class="lineno">  282 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = object</span>
+<span class="lineno">  283 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  284 </span><span class="spaces">      </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">  285 </span><span class="spaces">          </span><span class="istickedoff">[ fromText &quot;action&quot; .= object</span>
+<span class="lineno">  286 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  287 </span><span class="spaces">              </span><span class="istickedoff">, &quot;enum&quot; .= ([&quot;create&quot;,&quot;read&quot;,&quot;list&quot;,&quot;update&quot;,&quot;delete&quot;,&quot;trigger&quot;,&quot;enable&quot;,&quot;disable&quot;] :: [Text])</span>
+<span class="lineno">  288 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Operation to perform.&quot; :: Text) ]</span>
+<span class="lineno">  289 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;id&quot; .= object</span>
+<span class="lineno">  290 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  291 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Cron job id ([a-z0-9-]+) (read, update, delete, trigger, enable, disable).&quot; :: Text) ]</span>
+<span class="lineno">  292 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;name&quot; .= object</span>
+<span class="lineno">  293 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  294 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Human-readable job name, max 100 chars (create, update).&quot; :: Text) ]</span>
+<span class="lineno">  295 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;schedule&quot; .= object</span>
+<span class="lineno">  296 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  297 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;5-field cron expression, e.g. \&quot;0 9 * * 1-5\&quot; (create, update).&quot; :: Text) ]</span>
+<span class="lineno">  298 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;timezone&quot; .= object</span>
+<span class="lineno">  299 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  300 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;IANA timezone, e.g. \&quot;America/New_York\&quot; (create, update).&quot; :: Text) ]</span>
+<span class="lineno">  301 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;prompt&quot; .= object</span>
+<span class="lineno">  302 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  303 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Prompt to run on each fire, max 4000 chars (create, update).&quot; :: Text) ]</span>
+<span class="lineno">  304 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;agent_def_id&quot; .= object</span>
+<span class="lineno">  305 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  306 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Agent def id to use (create, update). Default: default agent.&quot; :: Text) ]</span>
+<span class="lineno">  307 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;provider&quot; .= object</span>
+<span class="lineno">  308 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  309 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Provider override for this job (create, update). Omit or send \&quot;\&quot; to use Seal's configured default provider.&quot; :: Text) ]</span>
+<span class="lineno">  310 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;model&quot; .= object</span>
+<span class="lineno">  311 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  312 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Model override for this job (create, update). Omit or send \&quot;\&quot; to use Seal's configured default model.&quot; :: Text) ]</span>
+<span class="lineno">  313 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;enabled&quot; .= object</span>
+<span class="lineno">  314 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;boolean&quot; :: Text)</span>
+<span class="lineno">  315 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Initial enabled state (create, update). Default: false on create.&quot; :: Text) ]</span>
+<span class="lineno">  316 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;one_shot&quot; .= object</span>
+<span class="lineno">  317 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;boolean&quot; :: Text)</span>
+<span class="lineno">  318 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;If true, auto-disable after first run (create, update). Default: false.&quot; :: Text) ]</span>
+<span class="lineno">  319 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;enabled_only&quot; .= object</span>
+<span class="lineno">  320 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;boolean&quot; :: Text)</span>
+<span class="lineno">  321 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;List only enabled jobs (list). Default: false.&quot; :: Text) ]</span>
+<span class="lineno">  322 </span><span class="spaces">          </span><span class="istickedoff">]</span>
+<span class="lineno">  323 </span><span class="spaces">      </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;action&quot;] :: [Text])</span>
+<span class="lineno">  324 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  325 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  326 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = authorizeCronManage</span>
+<span class="lineno">  327 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = <span class="nottickedoff">False</span></span>
+<span class="lineno">  328 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt;</span>
+<span class="lineno">  329 </span><span class="spaces">      </span><span class="istickedoff">case parseCronAction v of</span>
+<span class="lineno">  330 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (errResult e)</span></span>
+<span class="lineno">  331 </span><span class="spaces">        </span><span class="istickedoff">Right action -&gt; case action of</span>
+<span class="lineno">  332 </span><span class="spaces">          </span><span class="istickedoff">CaCreate  -&gt; handleCreate store v</span>
+<span class="lineno">  333 </span><span class="spaces">          </span><span class="istickedoff">CaRead    -&gt; handleRead store v</span>
+<span class="lineno">  334 </span><span class="spaces">          </span><span class="istickedoff">CaList    -&gt; handleList store <span class="nottickedoff">v</span></span>
+<span class="lineno">  335 </span><span class="spaces">          </span><span class="istickedoff">CaUpdate  -&gt; handleUpdate store v</span>
+<span class="lineno">  336 </span><span class="spaces">          </span><span class="istickedoff">CaDelete  -&gt; handleDelete store v</span>
+<span class="lineno">  337 </span><span class="spaces">          </span><span class="istickedoff">CaTrigger -&gt; handleTrigger mFireDelegate store v</span>
+<span class="lineno">  338 </span><span class="spaces">          </span><span class="istickedoff">CaEnable  -&gt; handleEnable store v</span>
+<span class="lineno">  339 </span><span class="spaces">          </span><span class="istickedoff">CaDisable -&gt; handleDisable store v</span>
+<span class="lineno">  340 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  341 </span>
+<span class="lineno">  342 </span>errResult :: Text -&gt; OpResult
+<span class="lineno">  343 </span><span class="decl"><span class="istickedoff">errResult msg = OpResult <span class="nottickedoff">[TrpText msg]</span> True <span class="nottickedoff">(object [])</span></span></span>
+<span class="lineno">  344 </span>
+<span class="lineno">  345 </span>renderJob :: CronJob -&gt; Text
+<span class="lineno">  346 </span><span class="decl"><span class="istickedoff">renderJob j = T.intercalate &quot;\n&quot;</span>
+<span class="lineno">  347 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;id: &quot; &lt;&gt; cronJobIdText (cjId j)</span>
+<span class="lineno">  348 </span><span class="spaces">  </span><span class="istickedoff">, &quot;name: &quot; &lt;&gt; cjName j</span>
+<span class="lineno">  349 </span><span class="spaces">  </span><span class="istickedoff">, &quot;schedule: &quot; &lt;&gt; cronExprText (cjSchedule j)</span>
+<span class="lineno">  350 </span><span class="spaces">  </span><span class="istickedoff">, &quot;timezone: &quot; &lt;&gt; maybe &quot;(host local)&quot; <span class="nottickedoff">cronTimeZoneText</span> (cjTimezone j)</span>
+<span class="lineno">  351 </span><span class="spaces">  </span><span class="istickedoff">, &quot;provider: &quot; &lt;&gt; fromMaybe &quot;(configured default)&quot; (cjProvider j)</span>
+<span class="lineno">  352 </span><span class="spaces">  </span><span class="istickedoff">, &quot;model: &quot; &lt;&gt; fromMaybe &quot;(configured default)&quot; (cjModel j)</span>
+<span class="lineno">  353 </span><span class="spaces">  </span><span class="istickedoff">, &quot;prompt: &quot; &lt;&gt; cjPrompt j</span>
+<span class="lineno">  354 </span><span class="spaces">  </span><span class="istickedoff">, &quot;enabled: &quot; &lt;&gt; (if <span class="tickonlyfalse">cjEnabled j</span> then <span class="nottickedoff">&quot;true&quot;</span> else &quot;false&quot; :: Text)</span>
+<span class="lineno">  355 </span><span class="spaces">  </span><span class="istickedoff">, &quot;one_shot: &quot; &lt;&gt; (if <span class="tickonlyfalse">cjOneShot j</span> then <span class="nottickedoff">&quot;true&quot;</span> else &quot;false&quot; :: Text)</span>
+<span class="lineno">  356 </span><span class="spaces">  </span><span class="istickedoff">, &quot;run_count: &quot; &lt;&gt; T.pack (show (cjRunCount j))</span>
+<span class="lineno">  357 </span><span class="spaces">  </span><span class="istickedoff">, &quot;consecutive_failures: &quot; &lt;&gt; T.pack (show (cjConsecutiveFailures j))</span>
+<span class="lineno">  358 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">  359 </span>
+<span class="lineno">  360 </span>tshowUTC :: Maybe UTCTime -&gt; Text
+<span class="lineno">  361 </span><span class="decl"><span class="istickedoff">tshowUTC = maybe <span class="nottickedoff">&quot;unknown&quot;</span> (T.pack . show)</span></span>
+<span class="lineno">  362 </span>
+<span class="lineno">  363 </span>whenB :: Bool -&gt; Either Text () -&gt; Either Text ()
+<span class="lineno">  364 </span><span class="decl"><span class="nottickedoff">whenB True e = e</span>
+<span class="lineno">  365 </span><span class="spaces"></span><span class="nottickedoff">whenB False _ = Right ()</span></span>
+
+</pre>
+</body>
+</html>

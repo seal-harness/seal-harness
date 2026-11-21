@@ -1,0 +1,143 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Shutdown logging for @seal serve@.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- Ctrl-C is the normal way to stop the server, and it is also the moment when
+<span class="lineno">    5 </span>-- every in-process sub-agent dies: children run as forked threads in this
+<span class="lineno">    6 </span>-- process ('Seal.Agent.Runtime.Registry'), so terminating the server
+<span class="lineno">    7 </span>-- terminates them. Nothing marks that in the log today, which makes
+<span class="lineno">    8 </span>-- &quot;my sub-agents died and never came back&quot; hard to correlate with &quot;I stopped
+<span class="lineno">    9 </span>-- the server&quot;. This module closes that gap:
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- * On 'UserInterrupt' (what the GHC RTS raises on the main thread for SIGINT)
+<span class="lineno">   12 </span>--   it logs a shutdown marker plus an inventory of the live sub-agents — id,
+<span class="lineno">   13 </span>--   parent session, child session, depth, status — and then exits with
+<span class="lineno">   14 </span>--   'shutdownExitCode' (130, the conventional @128 + SIGINT@).
+<span class="lineno">   15 </span>-- * Every other async exception is re-raised untouched: this handler must
+<span class="lineno">   16 </span>--   never swallow 'ThreadKilled' or a timeout.
+<span class="lineno">   17 </span>--
+<span class="lineno">   18 </span>-- No POSIX signal handler is installed. The RTS already converts SIGINT into
+<span class="lineno">   19 </span>-- 'UserInterrupt' and restores the default SIGINT disposition first, so a
+<span class="lineno">   20 </span>-- second Ctrl-C still hard-kills a wedged process. Installing our own handler
+<span class="lineno">   21 </span>-- would take that escape hatch away.
+<span class="lineno">   22 </span>module Seal.Command.Shutdown
+<span class="lineno">   23 </span>  ( handleServeInterrupt
+<span class="lineno">   24 </span>  , isLiveSubagent
+<span class="lineno">   25 </span>  , renderLiveSubagents
+<span class="lineno">   26 </span>  , shutdownExitCode
+<span class="lineno">   27 </span>  ) where
+<span class="lineno">   28 </span>
+<span class="lineno">   29 </span>import Control.Exception (AsyncException (..), throwIO)
+<span class="lineno">   30 </span>import Data.IORef (IORef, readIORef)
+<span class="lineno">   31 </span>import Data.Text (Text)
+<span class="lineno">   32 </span>import Data.Text qualified as T
+<span class="lineno">   33 </span>import System.Exit (ExitCode (..), exitWith)
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>import Katip (Severity (..), ls)
+<span class="lineno">   36 </span>
+<span class="lineno">   37 </span>import Seal.Agent.Runtime.Delegation (subagentIdText)
+<span class="lineno">   38 </span>import Seal.Agent.Runtime.Registry
+<span class="lineno">   39 </span>  ( AgentInstance (..), AgentRuntime, AgentStatus (..), listAgents )
+<span class="lineno">   40 </span>import Seal.Core.Types (sessionIdText)
+<span class="lineno">   41 </span>import Seal.Logging.Logger (SealLogger, logIO)
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>-- | What a SIGINT-killed server exits with: 128 + 2 (SIGINT). Scripts and
+<span class="lineno">   44 </span>-- @make serve@ then see an interrupted server rather than a clean exit 0.
+<span class="lineno">   45 </span>shutdownExitCode :: ExitCode
+<span class="lineno">   46 </span><span class="decl"><span class="istickedoff">shutdownExitCode = ExitFailure 130</span></span>
+<span class="lineno">   47 </span>
+<span class="lineno">   48 </span>-- | Handle an async exception raised on the @seal serve@ main thread.
+<span class="lineno">   49 </span>--
+<span class="lineno">   50 </span>-- 'UserInterrupt' (Ctrl-C) logs the shutdown marker + the live sub-agent
+<span class="lineno">   51 </span>-- inventory and exits with 'shutdownExitCode'. The inventory comes from the
+<span class="lineno">   52 </span>-- @IORef@ the serve wiring fills in once 'Seal.Core.Backends.newBackends' has
+<span class="lineno">   53 </span>-- run; 'Nothing' means the interrupt landed during startup, before there was
+<span class="lineno">   54 </span>-- a runtime to report on.
+<span class="lineno">   55 </span>--
+<span class="lineno">   56 </span>-- Any other async exception is re-raised as-is.
+<span class="lineno">   57 </span>handleServeInterrupt :: SealLogger -&gt; IORef (Maybe AgentRuntime) -&gt; AsyncException -&gt; IO ()
+<span class="lineno">   58 </span><span class="decl"><span class="istickedoff">handleServeInterrupt logger runtimeRef = \case</span>
+<span class="lineno">   59 </span><span class="spaces">  </span><span class="istickedoff">UserInterrupt -&gt; do</span>
+<span class="lineno">   60 </span><span class="spaces">    </span><span class="istickedoff">logShutdown logger runtimeRef</span>
+<span class="lineno">   61 </span><span class="spaces">    </span><span class="istickedoff">exitWith shutdownExitCode</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">other -&gt; throwIO other</span></span>
+<span class="lineno">   63 </span>
+<span class="lineno">   64 </span>-- | Emit the shutdown marker followed by one line per live sub-agent.
+<span class="lineno">   65 </span>logShutdown :: SealLogger -&gt; IORef (Maybe AgentRuntime) -&gt; IO ()
+<span class="lineno">   66 </span><span class="decl"><span class="istickedoff">logShutdown logger runtimeRef = do</span>
+<span class="lineno">   67 </span><span class="spaces">  </span><span class="istickedoff">mRuntime &lt;- readIORef runtimeRef</span>
+<span class="lineno">   68 </span><span class="spaces">  </span><span class="istickedoff">case mRuntime of</span>
+<span class="lineno">   69 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt;</span>
+<span class="lineno">   70 </span><span class="spaces">      </span><span class="istickedoff">logIO logger InfoS</span>
+<span class="lineno">   71 </span><span class="spaces">        </span><span class="istickedoff">&quot;SIGINT received (Ctrl-C); shutting down during startup\</span>
+<span class="lineno">   72 </span><span class="spaces">        </span><span class="istickedoff">\ (the sub-agent runtime was not created yet)&quot;</span>
+<span class="lineno">   73 </span><span class="spaces">    </span><span class="istickedoff">Just runtime -&gt; do</span>
+<span class="lineno">   74 </span><span class="spaces">      </span><span class="istickedoff">instances &lt;- listAgents runtime</span>
+<span class="lineno">   75 </span><span class="spaces">      </span><span class="istickedoff">let live = filter isLiveSubagent instances</span>
+<span class="lineno">   76 </span><span class="spaces">      </span><span class="istickedoff">logIO logger InfoS (ls (headline (length live)))</span>
+<span class="lineno">   77 </span><span class="spaces">      </span><span class="istickedoff">mapM_ (logIO logger InfoS . ls) (renderLiveSubagents live)</span>
+<span class="lineno">   78 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   79 </span><span class="spaces">    </span><span class="istickedoff">-- Plain ASCII on purpose: 'Seal.Logging.Logger.logIO' renders messages</span>
+<span class="lineno">   80 </span><span class="spaces">    </span><span class="istickedoff">-- through 'show', so a non-ASCII glyph shows up escaped (@\\8212@ for an</span>
+<span class="lineno">   81 </span><span class="spaces">    </span><span class="istickedoff">-- em dash) in seal.log.</span>
+<span class="lineno">   82 </span><span class="spaces">    </span><span class="istickedoff">headline :: Int -&gt; Text</span>
+<span class="lineno">   83 </span><span class="spaces">    </span><span class="istickedoff">headline 0 = &quot;SIGINT received (Ctrl-C); shutting down: no live sub-agents&quot;</span>
+<span class="lineno">   84 </span><span class="spaces">    </span><span class="istickedoff">headline 1 =</span>
+<span class="lineno">   85 </span><span class="spaces">      </span><span class="istickedoff">&quot;SIGINT received (Ctrl-C); shutting down: 1 live sub-agent\</span>
+<span class="lineno">   86 </span><span class="spaces">      </span><span class="istickedoff">\ will be killed with this process&quot;</span>
+<span class="lineno">   87 </span><span class="spaces">    </span><span class="istickedoff">headline n =</span>
+<span class="lineno">   88 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">&quot;SIGINT received (Ctrl-C); shutting down: &quot; &lt;&gt; T.pack (show n)</span></span>
+<span class="lineno">   89 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot; live sub-agents will be killed with this process&quot;</span></span></span>
+<span class="lineno">   90 </span>
+<span class="lineno">   91 </span>-- | A sub-agent whose worker thread is still alive in this process, and so
+<span class="lineno">   92 </span>-- dies with it. 'Starting' and 'Running' are the statuses that carry a live
+<span class="lineno">   93 </span>-- forked worker; the rest ('Stopped', 'Crashed', 'Interrupted') linger in the
+<span class="lineno">   94 </span>-- registry as history.
+<span class="lineno">   95 </span>isLiveSubagent :: AgentInstance -&gt; Bool
+<span class="lineno">   96 </span><span class="decl"><span class="istickedoff">isLiveSubagent inst = case aiStatus inst of</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">Starting -&gt; <span class="nottickedoff">True</span></span>
+<span class="lineno">   98 </span><span class="spaces">  </span><span class="istickedoff">Running  -&gt; True</span>
+<span class="lineno">   99 </span><span class="spaces">  </span><span class="istickedoff">_        -&gt; <span class="nottickedoff">False</span></span></span>
+<span class="lineno">  100 </span>
+<span class="lineno">  101 </span>-- | Render one line per live sub-agent: id, parent session, child session,
+<span class="lineno">  102 </span>-- depth, status. Non-live entries are dropped. The id already embeds the
+<span class="lineno">  103 </span>-- agent def id (see 'Seal.Agent.Runtime.Delegation.mkSubagentId'), so the def
+<span class="lineno">  104 </span>-- is not repeated here.
+<span class="lineno">  105 </span>renderLiveSubagents :: [AgentInstance] -&gt; [Text]
+<span class="lineno">  106 </span><span class="decl"><span class="istickedoff">renderLiveSubagents = map render . filter isLiveSubagent</span>
+<span class="lineno">  107 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  108 </span><span class="spaces">    </span><span class="istickedoff">render inst =</span>
+<span class="lineno">  109 </span><span class="spaces">      </span><span class="istickedoff">&quot;  sub-agent &quot; &lt;&gt; subagentIdText (aiSubagentId inst)</span>
+<span class="lineno">  110 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot; parent=&quot; &lt;&gt; sessionIdText (aiParentSession inst)</span>
+<span class="lineno">  111 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot; child=&quot; &lt;&gt; sessionIdText (aiSession inst)</span>
+<span class="lineno">  112 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot; depth=&quot; &lt;&gt; T.pack (show (aiDepth inst))</span>
+<span class="lineno">  113 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot; status=&quot; &lt;&gt; statusText (aiStatus inst)</span>
+<span class="lineno">  114 </span><span class="spaces">    </span><span class="istickedoff">statusText = \case</span>
+<span class="lineno">  115 </span><span class="spaces">      </span><span class="istickedoff">Starting    -&gt; <span class="nottickedoff">&quot;starting&quot;</span></span>
+<span class="lineno">  116 </span><span class="spaces">      </span><span class="istickedoff">Running     -&gt; &quot;running&quot;</span>
+<span class="lineno">  117 </span><span class="spaces">      </span><span class="istickedoff">Idle        -&gt; <span class="nottickedoff">&quot;idle&quot;</span></span>
+<span class="lineno">  118 </span><span class="spaces">      </span><span class="istickedoff">Stopped     -&gt; <span class="nottickedoff">&quot;stopped&quot;</span></span>
+<span class="lineno">  119 </span><span class="spaces">      </span><span class="istickedoff">Interrupted -&gt; <span class="nottickedoff">&quot;interrupted&quot;</span></span>
+<span class="lineno">  120 </span><span class="spaces">      </span><span class="istickedoff">Crashed err -&gt; <span class="nottickedoff">&quot;crashed: &quot; &lt;&gt; err</span></span></span>
+
+</pre>
+</body>
+</html>

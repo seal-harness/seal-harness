@@ -1,0 +1,484 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The Memory opcode group. The consolidated entry point is
+<span class="lineno">    3 </span>-- 'memoryManageOp' (\&quot;MEMORY_MANAGE\&quot;), which dispatches on an @action@
+<span class="lineno">    4 </span>-- field to one of five handlers: @write@, @read@, @list@, @search@,
+<span class="lineno">    5 </span>-- @archive@.
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- The legacy opcodes ('memoryWriteOp', 'memoryReadOp', 'memoryListOp',
+<span class="lineno">    8 </span>-- 'memorySearchOp', 'memoryArchiveOp') remain as thin shims that delegate
+<span class="lineno">    9 </span>-- to the same handlers with a pre-set action. This preserves backward
+<span class="lineno">   10 </span>-- compatibility during the transition period — existing call sites, tests,
+<span class="lineno">   11 </span>-- and downstream consumers continue to work unchanged.
+<span class="lineno">   12 </span>--
+<span class="lineno">   13 </span>-- All memory opcodes are 'Trusted' — the dispatcher writes the session
+<span class="lineno">   14 </span>-- transcript; the opcodes operate on the file-based memory store
+<span class="lineno">   15 </span>-- ('Seal.Memory.Store') and the embedding backend ('Seal.Memory.Embedding').
+<span class="lineno">   16 </span>--
+<span class="lineno">   17 </span>-- The memory system is write-once: the @write@ action fails if the path
+<span class="lineno">   18 </span>-- already exists in @active\/@. To update a fact, archive the old memory
+<span class="lineno">   19 </span>-- (@archive@ action) then write the new one. Files are never deleted —
+<span class="lineno">   20 </span>-- archive is a move from @active\/@ to @archived\/@ with a timestamp
+<span class="lineno">   21 </span>-- prefix.
+<span class="lineno">   22 </span>--
+<span class="lineno">   23 </span>-- The @read@ action falls back to @archived\/@ if the file isn't in
+<span class="lineno">   24 </span>-- @active\/@, returning the content with an @archived: true@ flag.
+<span class="lineno">   25 </span>--
+<span class="lineno">   26 </span>-- The @search@ action delegates to the 'EmbeddingBackend'. The null
+<span class="lineno">   27 </span>-- backend returns empty results (not an error), with a substring fallback.
+<span class="lineno">   28 </span>module Seal.ISA.Ops.Memory
+<span class="lineno">   29 </span>  ( -- * Consolidated opcode
+<span class="lineno">   30 </span>    memoryManageOp
+<span class="lineno">   31 </span>    -- * Legacy shims (delegate to the same handlers)
+<span class="lineno">   32 </span>  , memoryWriteOp
+<span class="lineno">   33 </span>  , memoryReadOp
+<span class="lineno">   34 </span>  , memoryListOp
+<span class="lineno">   35 </span>  , memorySearchOp
+<span class="lineno">   36 </span>  , memoryArchiveOp
+<span class="lineno">   37 </span>  ) where
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>import Control.Monad.IO.Class (liftIO)
+<span class="lineno">   40 </span>import Data.Aeson
+<span class="lineno">   41 </span>  ( Value (..), object, withObject, (.:), (.:?), (.=) )
+<span class="lineno">   42 </span>import Data.Aeson.Key (fromText)
+<span class="lineno">   43 </span>import Seal.Types.App (App)
+<span class="lineno">   44 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   45 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   46 </span>import Data.Text (Text)
+<span class="lineno">   47 </span>import Data.Text qualified as T
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>import Seal.Core.Types (OpName (..), TrustLevel (..))
+<span class="lineno">   50 </span>import Seal.ISA.Opcode
+<span class="lineno">   51 </span>import Seal.Memory.Embedding (EmbeddingBackend (..), SearchResult (..))
+<span class="lineno">   52 </span>import Seal.Memory.Path (MemoryPath, mkMemoryPath, memoryPathText)
+<span class="lineno">   53 </span>import Seal.Memory.Store (MemoryStore (..))
+<span class="lineno">   54 </span>import Seal.Providers.Class (ToolResultPart (..))
+<span class="lineno">   55 </span>
+<span class="lineno">   56 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   57 </span>-- Action enum
+<span class="lineno">   58 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>data MemoryAction
+<span class="lineno">   61 </span>  = MemWrite
+<span class="lineno">   62 </span>  | MemRead
+<span class="lineno">   63 </span>  | MemList
+<span class="lineno">   64 </span>  | MemSearch
+<span class="lineno">   65 </span>  | MemArchive
+<span class="lineno">   66 </span>
+<span class="lineno">   67 </span>parseMemoryAction :: Value -&gt; Either Text MemoryAction
+<span class="lineno">   68 </span><span class="decl"><span class="istickedoff">parseMemoryAction v =</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;action&quot;)) v of</span>
+<span class="lineno">   70 </span><span class="spaces">    </span><span class="istickedoff">Just t -&gt; case t :: Text of</span>
+<span class="lineno">   71 </span><span class="spaces">      </span><span class="istickedoff">&quot;write&quot;   -&gt; Right MemWrite</span>
+<span class="lineno">   72 </span><span class="spaces">      </span><span class="istickedoff">&quot;read&quot;    -&gt; Right MemRead</span>
+<span class="lineno">   73 </span><span class="spaces">      </span><span class="istickedoff">&quot;list&quot;    -&gt; Right MemList</span>
+<span class="lineno">   74 </span><span class="spaces">      </span><span class="istickedoff">&quot;search&quot;  -&gt; Right MemSearch</span>
+<span class="lineno">   75 </span><span class="spaces">      </span><span class="istickedoff">&quot;archive&quot; -&gt; Right MemArchive</span>
+<span class="lineno">   76 </span><span class="spaces">      </span><span class="istickedoff">other     -&gt; Left (&quot;unknown memory action: &quot; &lt;&gt; other)</span>
+<span class="lineno">   77 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">Left &quot;missing or invalid action field&quot;</span></span></span>
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   80 </span>-- Field extractors
+<span class="lineno">   81 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   82 </span>
+<span class="lineno">   83 </span>-- | Extract the @path@ string field from a JSON object.
+<span class="lineno">   84 </span>pathField :: Value -&gt; Maybe Text
+<span class="lineno">   85 </span><span class="decl"><span class="istickedoff">pathField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;path&quot;))</span></span>
+<span class="lineno">   86 </span>
+<span class="lineno">   87 </span>-- | Extract the @content@ string field (defaults to empty when absent).
+<span class="lineno">   88 </span>contentField :: Value -&gt; Text
+<span class="lineno">   89 </span><span class="decl"><span class="istickedoff">contentField v = fromMaybe &quot;&quot; (parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;content&quot;)) v)</span></span>
+<span class="lineno">   90 </span>
+<span class="lineno">   91 </span>-- | Extract the optional @prefix@ string field for LIST.
+<span class="lineno">   92 </span>prefixField :: Value -&gt; Text
+<span class="lineno">   93 </span><span class="decl"><span class="istickedoff">prefixField v =</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;prefix&quot;)) v :: Maybe (Maybe Text) of</span>
+<span class="lineno">   95 </span><span class="spaces">    </span><span class="istickedoff">Just (Just t) -&gt; t</span>
+<span class="lineno">   96 </span><span class="spaces">    </span><span class="istickedoff">_             -&gt; <span class="nottickedoff">&quot;&quot;</span></span></span>
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>-- | Extract the optional @include_archived@ bool field (defaults to False).
+<span class="lineno">   99 </span>includeArchivedField :: Value -&gt; Bool
+<span class="lineno">  100 </span><span class="decl"><span class="istickedoff">includeArchivedField v =</span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;include_archived&quot;)) v :: Maybe (Maybe Bool) of</span>
+<span class="lineno">  102 </span><span class="spaces">    </span><span class="istickedoff">Just (Just b) -&gt; <span class="nottickedoff">b</span></span>
+<span class="lineno">  103 </span><span class="spaces">    </span><span class="istickedoff">_             -&gt; False</span></span>
+<span class="lineno">  104 </span>
+<span class="lineno">  105 </span>-- | Extract the optional @query@ string field for SEARCH.
+<span class="lineno">  106 </span>queryField :: Value -&gt; Maybe Text
+<span class="lineno">  107 </span><span class="decl"><span class="istickedoff">queryField v =</span>
+<span class="lineno">  108 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;query&quot;)) v :: Maybe (Maybe Text) of</span>
+<span class="lineno">  109 </span><span class="spaces">    </span><span class="istickedoff">Just (Just q) -&gt; Just q</span>
+<span class="lineno">  110 </span><span class="spaces">    </span><span class="istickedoff">_             -&gt; Nothing</span></span>
+<span class="lineno">  111 </span>
+<span class="lineno">  112 </span>-- | Extract the optional @limit@ integer field for SEARCH (defaults to 10).
+<span class="lineno">  113 </span>limitField :: Value -&gt; Int
+<span class="lineno">  114 </span><span class="decl"><span class="nottickedoff">limitField v =</span>
+<span class="lineno">  115 </span><span class="spaces">  </span><span class="nottickedoff">case parseMaybe (withObject &quot;in&quot; (.:? &quot;limit&quot;)) v :: Maybe (Maybe Int) of</span>
+<span class="lineno">  116 </span><span class="spaces">    </span><span class="nottickedoff">Just (Just n) | n &gt; 0 -&gt; n</span>
+<span class="lineno">  117 </span><span class="spaces">    </span><span class="nottickedoff">_                     -&gt; 10</span></span>
+<span class="lineno">  118 </span>
+<span class="lineno">  119 </span>-- | Validate and parse the path field into a 'MemoryPath'.
+<span class="lineno">  120 </span>parsePath :: Value -&gt; Either Text MemoryPath
+<span class="lineno">  121 </span><span class="decl"><span class="istickedoff">parsePath v =</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">case pathField v of</span>
+<span class="lineno">  123 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; Left &quot;missing path field&quot;</span>
+<span class="lineno">  124 </span><span class="spaces">    </span><span class="istickedoff">Just t  -&gt; mkMemoryPath t</span></span>
+<span class="lineno">  125 </span>
+<span class="lineno">  126 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  127 </span>-- Handlers (shared between MEMORY_MANAGE and legacy shims)
+<span class="lineno">  128 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  129 </span>
+<span class="lineno">  130 </span>handleWrite :: MemoryStore -&gt; EmbeddingBackend -&gt; Value -&gt; App OpResult
+<span class="lineno">  131 </span><span class="decl"><span class="istickedoff">handleWrite store embedding v =</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">case parsePath v of</span>
+<span class="lineno">  133 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; pure (OpResult <span class="nottickedoff">[TrpText (&quot;invalid path: &quot; &lt;&gt; e)]</span> True <span class="nottickedoff">(object [])</span>)</span>
+<span class="lineno">  134 </span><span class="spaces">    </span><span class="istickedoff">Right mp -&gt; do</span>
+<span class="lineno">  135 </span><span class="spaces">      </span><span class="istickedoff">let content = contentField v</span>
+<span class="lineno">  136 </span><span class="spaces">      </span><span class="istickedoff">result &lt;- liftIO (msWrite store mp content)</span>
+<span class="lineno">  137 </span><span class="spaces">      </span><span class="istickedoff">case result of</span>
+<span class="lineno">  138 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; pure (OpResult <span class="nottickedoff">[TrpText e]</span> True <span class="nottickedoff">(object [&quot;path&quot; .= memoryPathText mp])</span>)</span>
+<span class="lineno">  139 </span><span class="spaces">        </span><span class="istickedoff">Right _ -&gt; do</span>
+<span class="lineno">  140 </span><span class="spaces">          </span><span class="istickedoff">liftIO (ebIndex embedding <span class="nottickedoff">(T.unpack (memoryPathText mp))</span> <span class="nottickedoff">content</span>)</span>
+<span class="lineno">  141 </span><span class="spaces">          </span><span class="istickedoff">let recorded = object</span>
+<span class="lineno">  142 </span><span class="spaces">                </span><span class="istickedoff">[ &quot;path&quot; .= memoryPathText mp</span>
+<span class="lineno">  143 </span><span class="spaces">                </span><span class="istickedoff">, &quot;content&quot; .= content</span>
+<span class="lineno">  144 </span><span class="spaces">                </span><span class="istickedoff">]</span>
+<span class="lineno">  145 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult [TrpText &quot;stored&quot;] False recorded)</span></span>
+<span class="lineno">  146 </span>
+<span class="lineno">  147 </span>handleRead :: MemoryStore -&gt; Value -&gt; App OpResult
+<span class="lineno">  148 </span><span class="decl"><span class="istickedoff">handleRead store v =</span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="istickedoff">case parsePath v of</span>
+<span class="lineno">  150 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (OpResult [TrpText (&quot;invalid path: &quot; &lt;&gt; e)] True (object []))</span></span>
+<span class="lineno">  151 </span><span class="spaces">    </span><span class="istickedoff">Right mp -&gt; do</span>
+<span class="lineno">  152 </span><span class="spaces">      </span><span class="istickedoff">result &lt;- liftIO (msRead store mp)</span>
+<span class="lineno">  153 </span><span class="spaces">      </span><span class="istickedoff">case result of</span>
+<span class="lineno">  154 </span><span class="spaces">        </span><span class="istickedoff">Left _e -&gt; do</span>
+<span class="lineno">  155 </span><span class="spaces">          </span><span class="istickedoff">let <span class="nottickedoff">recorded = object</span></span>
+<span class="lineno">  156 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">[ &quot;path&quot; .= memoryPathText mp</span></span>
+<span class="lineno">  157 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">, &quot;exists&quot; .= False</span></span>
+<span class="lineno">  158 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  159 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult [TrpText (&quot;not found: &quot; &lt;&gt; memoryPathText mp)] False <span class="nottickedoff">recorded</span>)</span>
+<span class="lineno">  160 </span><span class="spaces">        </span><span class="istickedoff">Right (content, isArchived) -&gt; do</span>
+<span class="lineno">  161 </span><span class="spaces">          </span><span class="istickedoff">let <span class="nottickedoff">recorded = object</span></span>
+<span class="lineno">  162 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">[ &quot;path&quot; .= memoryPathText mp</span></span>
+<span class="lineno">  163 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">, &quot;content&quot; .= content</span></span>
+<span class="lineno">  164 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">, &quot;exists&quot; .= True</span></span>
+<span class="lineno">  165 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">, &quot;archived&quot; .= isArchived</span></span>
+<span class="lineno">  166 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  167 </span><span class="spaces">              </span><span class="istickedoff">msg = if isArchived</span>
+<span class="lineno">  168 </span><span class="spaces">                      </span><span class="istickedoff">then &quot;archived: &quot; &lt;&gt; content</span>
+<span class="lineno">  169 </span><span class="spaces">                      </span><span class="istickedoff">else content</span>
+<span class="lineno">  170 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult [TrpText msg] False <span class="nottickedoff">recorded</span>)</span></span>
+<span class="lineno">  171 </span>
+<span class="lineno">  172 </span>handleList :: MemoryStore -&gt; Value -&gt; App OpResult
+<span class="lineno">  173 </span><span class="decl"><span class="istickedoff">handleList store v = do</span>
+<span class="lineno">  174 </span><span class="spaces">  </span><span class="istickedoff">let prefix = prefixField v</span>
+<span class="lineno">  175 </span><span class="spaces">      </span><span class="istickedoff">includeArchived = includeArchivedField v</span>
+<span class="lineno">  176 </span><span class="spaces">  </span><span class="istickedoff">entries &lt;- liftIO (msList store prefix includeArchived)</span>
+<span class="lineno">  177 </span><span class="spaces">  </span><span class="istickedoff">let rendered = T.intercalate &quot;\n&quot; (map memoryPathText entries)</span>
+<span class="lineno">  178 </span><span class="spaces">        </span><span class="istickedoff">&lt;&gt; &quot;\n---\n&quot; &lt;&gt; T.pack (show (length entries)) &lt;&gt; &quot; entries&quot;</span>
+<span class="lineno">  179 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">recorded = object</span></span>
+<span class="lineno">  180 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">[ &quot;prefix&quot; .= prefix</span></span>
+<span class="lineno">  181 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, &quot;include_archived&quot; .= includeArchived</span></span>
+<span class="lineno">  182 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, &quot;count&quot; .= length entries</span></span>
+<span class="lineno">  183 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  184 </span><span class="spaces">  </span><span class="istickedoff">pure (OpResult [TrpText rendered] False <span class="nottickedoff">recorded</span>)</span></span>
+<span class="lineno">  185 </span>
+<span class="lineno">  186 </span>handleSearch :: EmbeddingBackend -&gt; MemoryStore -&gt; Value -&gt; App OpResult
+<span class="lineno">  187 </span><span class="decl"><span class="istickedoff">handleSearch embedding store v =</span>
+<span class="lineno">  188 </span><span class="spaces">  </span><span class="istickedoff">case queryField v of</span>
+<span class="lineno">  189 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (OpResult [TrpText &quot;missing query&quot;] True (object []))</span></span>
+<span class="lineno">  190 </span><span class="spaces">    </span><span class="istickedoff">Just query -&gt; do</span>
+<span class="lineno">  191 </span><span class="spaces">      </span><span class="istickedoff">let <span class="nottickedoff">limit = limitField v</span></span>
+<span class="lineno">  192 </span><span class="spaces">          </span><span class="istickedoff">includeArchived = includeArchivedField v</span>
+<span class="lineno">  193 </span><span class="spaces">      </span><span class="istickedoff">results &lt;- liftIO (ebSearch embedding <span class="nottickedoff">query</span> <span class="nottickedoff">limit</span>)</span>
+<span class="lineno">  194 </span><span class="spaces">      </span><span class="istickedoff">substringResults &lt;-</span>
+<span class="lineno">  195 </span><span class="spaces">        </span><span class="istickedoff">if <span class="tickonlytrue">null results</span></span>
+<span class="lineno">  196 </span><span class="spaces">          </span><span class="istickedoff">then liftIO (msSearch store query includeArchived)</span>
+<span class="lineno">  197 </span><span class="spaces">          </span><span class="istickedoff">else <span class="nottickedoff">pure []</span></span>
+<span class="lineno">  198 </span><span class="spaces">      </span><span class="istickedoff">let totalResults = length results + length substringResults</span>
+<span class="lineno">  199 </span><span class="spaces">          </span><span class="istickedoff">allResults = map <span class="nottickedoff">renderEmbeddingResult</span> results</span>
+<span class="lineno">  200 </span><span class="spaces">                    </span><span class="istickedoff">&lt;&gt; map renderSubstringResult substringResults</span>
+<span class="lineno">  201 </span><span class="spaces">          </span><span class="istickedoff">rendered = if null allResults</span>
+<span class="lineno">  202 </span><span class="spaces">                       </span><span class="istickedoff">then &quot;No results.&quot;</span>
+<span class="lineno">  203 </span><span class="spaces">                       </span><span class="istickedoff">else T.intercalate <span class="nottickedoff">&quot;\n&quot;</span> allResults</span>
+<span class="lineno">  204 </span><span class="spaces">                   </span><span class="istickedoff">&lt;&gt; &quot;\n---\n&quot; &lt;&gt; T.pack (show totalResults) &lt;&gt; &quot; results&quot;</span>
+<span class="lineno">  205 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">recorded = object</span></span>
+<span class="lineno">  206 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">[ &quot;query&quot; .= query</span></span>
+<span class="lineno">  207 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, &quot;limit&quot; .= limit</span></span>
+<span class="lineno">  208 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, &quot;total_matches&quot; .= totalResults</span></span>
+<span class="lineno">  209 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  210 </span><span class="spaces">      </span><span class="istickedoff">pure (OpResult [TrpText rendered] False <span class="nottickedoff">recorded</span>)</span>
+<span class="lineno">  211 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  212 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">renderEmbeddingResult sr =</span></span>
+<span class="lineno">  213 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">srPath sr &lt;&gt; &quot; (score: &quot; &lt;&gt; T.pack (show (srScore sr)) &lt;&gt; &quot;):\n&quot;</span></span>
+<span class="lineno">  214 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; srContent sr</span></span>
+<span class="lineno">  215 </span><span class="spaces">    </span><span class="istickedoff">renderSubstringResult (mp, content) =</span>
+<span class="lineno">  216 </span><span class="spaces">      </span><span class="istickedoff">memoryPathText mp &lt;&gt; &quot;:\n&quot; &lt;&gt; content</span></span>
+<span class="lineno">  217 </span>
+<span class="lineno">  218 </span>handleArchive :: MemoryStore -&gt; EmbeddingBackend -&gt; Value -&gt; App OpResult
+<span class="lineno">  219 </span><span class="decl"><span class="istickedoff">handleArchive store embedding v =</span>
+<span class="lineno">  220 </span><span class="spaces">  </span><span class="istickedoff">case parsePath v of</span>
+<span class="lineno">  221 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (OpResult [TrpText (&quot;invalid path: &quot; &lt;&gt; e)] True (object []))</span></span>
+<span class="lineno">  222 </span><span class="spaces">    </span><span class="istickedoff">Right mp -&gt; do</span>
+<span class="lineno">  223 </span><span class="spaces">      </span><span class="istickedoff">result &lt;- liftIO (msArchive store mp)</span>
+<span class="lineno">  224 </span><span class="spaces">      </span><span class="istickedoff">case result of</span>
+<span class="lineno">  225 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; pure (OpResult <span class="nottickedoff">[TrpText e]</span> True <span class="nottickedoff">(object [&quot;path&quot; .= memoryPathText mp])</span>)</span>
+<span class="lineno">  226 </span><span class="spaces">        </span><span class="istickedoff">Right archivedPath -&gt; do</span>
+<span class="lineno">  227 </span><span class="spaces">          </span><span class="istickedoff">liftIO (ebUnindex embedding <span class="nottickedoff">(T.unpack (memoryPathText mp))</span>)</span>
+<span class="lineno">  228 </span><span class="spaces">          </span><span class="istickedoff">let <span class="nottickedoff">recorded = object</span></span>
+<span class="lineno">  229 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">[ &quot;path&quot; .= memoryPathText mp</span></span>
+<span class="lineno">  230 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">, &quot;archived_path&quot; .= memoryPathText archivedPath</span></span>
+<span class="lineno">  231 </span><span class="spaces">                </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  232 </span><span class="spaces">          </span><span class="istickedoff">pure (OpResult [TrpText (&quot;archived: &quot; &lt;&gt; memoryPathText archivedPath)] False <span class="nottickedoff">recorded</span>)</span></span>
+<span class="lineno">  233 </span>
+<span class="lineno">  234 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  235 </span>-- Authorize gate helpers
+<span class="lineno">  236 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  237 </span>
+<span class="lineno">  238 </span>authorizeWrite :: Value -&gt; Either Text ()
+<span class="lineno">  239 </span><span class="decl"><span class="istickedoff">authorizeWrite v =</span>
+<span class="lineno">  240 </span><span class="spaces">  </span><span class="istickedoff">case parsePath v of</span>
+<span class="lineno">  241 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; Left e</span>
+<span class="lineno">  242 </span><span class="spaces">    </span><span class="istickedoff">Right _ -&gt; case pathField v of</span>
+<span class="lineno">  243 </span><span class="spaces">      </span><span class="istickedoff">Just _ -&gt; case contentField v of</span>
+<span class="lineno">  244 </span><span class="spaces">        </span><span class="istickedoff">&quot;&quot; -&gt; Left &quot;write requires non-empty content&quot;</span>
+<span class="lineno">  245 </span><span class="spaces">        </span><span class="istickedoff">_  -&gt; Right ()</span>
+<span class="lineno">  246 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">Left &quot;write requires path&quot;</span></span></span>
+<span class="lineno">  247 </span>
+<span class="lineno">  248 </span>authorizeRead :: Value -&gt; Either Text ()
+<span class="lineno">  249 </span><span class="decl"><span class="istickedoff">authorizeRead = either Left (const (Right ())) . parsePath</span></span>
+<span class="lineno">  250 </span>
+<span class="lineno">  251 </span>authorizeSearch :: Value -&gt; Either Text ()
+<span class="lineno">  252 </span><span class="decl"><span class="istickedoff">authorizeSearch v =</span>
+<span class="lineno">  253 </span><span class="spaces">  </span><span class="istickedoff">case queryField v of</span>
+<span class="lineno">  254 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; Left &quot;search requires query&quot;</span>
+<span class="lineno">  255 </span><span class="spaces">    </span><span class="istickedoff">Just _  -&gt; <span class="nottickedoff">Right ()</span></span></span>
+<span class="lineno">  256 </span>
+<span class="lineno">  257 </span>authorizeArchive :: Value -&gt; Either Text ()
+<span class="lineno">  258 </span><span class="decl"><span class="istickedoff">authorizeArchive = either Left (const (Right ())) . parsePath</span></span>
+<span class="lineno">  259 </span>
+<span class="lineno">  260 </span>-- | Authorize gate for MEMORY_MANAGE — dispatches per-action validation.
+<span class="lineno">  261 </span>authorizeManage :: Value -&gt; Either Text ()
+<span class="lineno">  262 </span><span class="decl"><span class="istickedoff">authorizeManage v =</span>
+<span class="lineno">  263 </span><span class="spaces">  </span><span class="istickedoff">case parseMemoryAction v of</span>
+<span class="lineno">  264 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt; Left e</span>
+<span class="lineno">  265 </span><span class="spaces">    </span><span class="istickedoff">Right action -&gt; case action of</span>
+<span class="lineno">  266 </span><span class="spaces">      </span><span class="istickedoff">MemWrite   -&gt; authorizeWrite v</span>
+<span class="lineno">  267 </span><span class="spaces">      </span><span class="istickedoff">MemRead    -&gt; authorizeRead v</span>
+<span class="lineno">  268 </span><span class="spaces">      </span><span class="istickedoff">MemList    -&gt; Right ()</span>
+<span class="lineno">  269 </span><span class="spaces">      </span><span class="istickedoff">MemSearch  -&gt; authorizeSearch v</span>
+<span class="lineno">  270 </span><span class="spaces">      </span><span class="istickedoff">MemArchive -&gt; authorizeArchive v</span></span>
+<span class="lineno">  271 </span>
+<span class="lineno">  272 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  273 </span>-- Consolidated opcode: MEMORY_MANAGE
+<span class="lineno">  274 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  275 </span>
+<span class="lineno">  276 </span>-- | MEMORY_MANAGE: action-based entry point for all memory operations.
+<span class="lineno">  277 </span>-- The @action@ field discriminates between @write@, @read@, @list@,
+<span class="lineno">  278 </span>-- @search@, and @archive@. Per-action required-field validation happens
+<span class="lineno">  279 </span>-- in the authorize gate.
+<span class="lineno">  280 </span>memoryManageOp :: MemoryStore -&gt; EmbeddingBackend -&gt; Opcode
+<span class="lineno">  281 </span><span class="decl"><span class="istickedoff">memoryManageOp store embedding = TrustedOpcode</span>
+<span class="lineno">  282 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;MEMORY_MANAGE&quot;</span>
+<span class="lineno">  283 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = <span class="nottickedoff">Trusted</span></span>
+<span class="lineno">  284 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Manage memory files. Use action to select: write (create, write-once), read (by path, falls back to archived/), list (by prefix), search (semantic), archive (move to archived/).&quot;</span>
+<span class="lineno">  285 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = object</span>
+<span class="lineno">  286 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  287 </span><span class="spaces">      </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">  288 </span><span class="spaces">          </span><span class="istickedoff">[ fromText &quot;action&quot; .= object</span>
+<span class="lineno">  289 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  290 </span><span class="spaces">              </span><span class="istickedoff">, &quot;enum&quot; .= ([&quot;write&quot;, &quot;read&quot;, &quot;list&quot;, &quot;search&quot;, &quot;archive&quot;] :: [Text])</span>
+<span class="lineno">  291 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Operation to perform.&quot; :: Text)</span>
+<span class="lineno">  292 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  293 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;path&quot; .= object</span>
+<span class="lineno">  294 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  295 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Memory path relative to active/ (write, read, archive).&quot; :: Text)</span>
+<span class="lineno">  296 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  297 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;content&quot; .= object</span>
+<span class="lineno">  298 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  299 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Memory content, plain text (write only).&quot; :: Text)</span>
+<span class="lineno">  300 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  301 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;prefix&quot; .= object</span>
+<span class="lineno">  302 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  303 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Directory prefix to filter by (list only).&quot; :: Text)</span>
+<span class="lineno">  304 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  305 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;query&quot; .= object</span>
+<span class="lineno">  306 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  307 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Search query (search only).&quot; :: Text)</span>
+<span class="lineno">  308 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  309 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;limit&quot; .= object</span>
+<span class="lineno">  310 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;integer&quot; :: Text)</span>
+<span class="lineno">  311 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Max search results (default: 10).&quot; :: Text)</span>
+<span class="lineno">  312 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  313 </span><span class="spaces">          </span><span class="istickedoff">, fromText &quot;include_archived&quot; .= object</span>
+<span class="lineno">  314 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;boolean&quot; :: Text)</span>
+<span class="lineno">  315 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Include archived memories (list, search; default: false).&quot; :: Text)</span>
+<span class="lineno">  316 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">  317 </span><span class="spaces">          </span><span class="istickedoff">]</span>
+<span class="lineno">  318 </span><span class="spaces">      </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;action&quot;] :: [Text])</span>
+<span class="lineno">  319 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  320 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  321 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = authorizeManage</span>
+<span class="lineno">  322 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = <span class="nottickedoff">False</span></span>
+<span class="lineno">  323 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt;</span>
+<span class="lineno">  324 </span><span class="spaces">      </span><span class="istickedoff">case parseMemoryAction v of</span>
+<span class="lineno">  325 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (OpResult [TrpText e] True (object []))</span></span>
+<span class="lineno">  326 </span><span class="spaces">        </span><span class="istickedoff">Right action -&gt; case action of</span>
+<span class="lineno">  327 </span><span class="spaces">          </span><span class="istickedoff">MemWrite   -&gt; handleWrite store embedding v</span>
+<span class="lineno">  328 </span><span class="spaces">          </span><span class="istickedoff">MemRead    -&gt; handleRead store v</span>
+<span class="lineno">  329 </span><span class="spaces">          </span><span class="istickedoff">MemList    -&gt; handleList store v</span>
+<span class="lineno">  330 </span><span class="spaces">          </span><span class="istickedoff">MemSearch  -&gt; handleSearch embedding store v</span>
+<span class="lineno">  331 </span><span class="spaces">          </span><span class="istickedoff">MemArchive -&gt; handleArchive store embedding v</span>
+<span class="lineno">  332 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  333 </span>
+<span class="lineno">  334 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  335 </span>-- Legacy shims (backward compatibility)
+<span class="lineno">  336 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  337 </span>
+<span class="lineno">  338 </span>-- | MEMORY_WRITE (legacy shim): delegates to the write handler.
+<span class="lineno">  339 </span>memoryWriteOp :: MemoryStore -&gt; EmbeddingBackend -&gt; Opcode
+<span class="lineno">  340 </span><span class="decl"><span class="istickedoff">memoryWriteOp store embedding = TrustedOpcode</span>
+<span class="lineno">  341 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;MEMORY_WRITE&quot;</span>
+<span class="lineno">  342 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  343 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = <span class="nottickedoff">&quot;Write a new memory file at the given path under active/. Fails if the file already exists (write-once). (Legacy — prefer MEMORY_MANAGE with action=\&quot;write\&quot;.)&quot;</span></span>
+<span class="lineno">  344 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = <span class="nottickedoff">object</span></span>
+<span class="lineno">  345 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span></span>
+<span class="lineno">  346 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;properties&quot; .= object</span></span>
+<span class="lineno">  347 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[ fromText &quot;path&quot; .= object</span></span>
+<span class="lineno">  348 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span></span>
+<span class="lineno">  349 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;Memory path relative to active/ (e.g. \&quot;projects/architecture\&quot;).&quot; :: Text)</span></span>
+<span class="lineno">  350 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  351 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">, fromText &quot;content&quot; .= object</span></span>
+<span class="lineno">  352 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span></span>
+<span class="lineno">  353 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;The memory content (plain text).&quot; :: Text)</span></span>
+<span class="lineno">  354 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  355 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  356 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;required&quot; .= ([&quot;path&quot;, &quot;content&quot;] :: [Text])</span></span>
+<span class="lineno">  357 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  358 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  359 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = authorizeWrite</span>
+<span class="lineno">  360 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = False</span>
+<span class="lineno">  361 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; handleWrite store embedding v</span>
+<span class="lineno">  362 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  363 </span>
+<span class="lineno">  364 </span>-- | MEMORY_READ (legacy shim): delegates to the read handler.
+<span class="lineno">  365 </span>memoryReadOp :: MemoryStore -&gt; Opcode
+<span class="lineno">  366 </span><span class="decl"><span class="istickedoff">memoryReadOp store = TrustedOpcode</span>
+<span class="lineno">  367 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;MEMORY_READ&quot;</span>
+<span class="lineno">  368 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  369 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = <span class="nottickedoff">&quot;Read a memory file by path. Falls back to archived/ if not in active/. (Legacy — prefer MEMORY_MANAGE with action=\&quot;read\&quot;.)&quot;</span></span>
+<span class="lineno">  370 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = <span class="nottickedoff">object</span></span>
+<span class="lineno">  371 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span></span>
+<span class="lineno">  372 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;properties&quot; .= object</span></span>
+<span class="lineno">  373 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[ fromText &quot;path&quot; .= object</span></span>
+<span class="lineno">  374 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span></span>
+<span class="lineno">  375 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;Memory path relative to active/.&quot; :: Text)</span></span>
+<span class="lineno">  376 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  377 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  378 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;required&quot; .= ([&quot;path&quot;] :: [Text])</span></span>
+<span class="lineno">  379 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  380 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  381 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = authorizeRead</span>
+<span class="lineno">  382 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = False</span>
+<span class="lineno">  383 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; handleRead store v</span>
+<span class="lineno">  384 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  385 </span>
+<span class="lineno">  386 </span>-- | MEMORY_LIST (legacy shim): delegates to the list handler.
+<span class="lineno">  387 </span>memoryListOp :: MemoryStore -&gt; Opcode
+<span class="lineno">  388 </span><span class="decl"><span class="istickedoff">memoryListOp store = TrustedOpcode</span>
+<span class="lineno">  389 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;MEMORY_LIST&quot;</span>
+<span class="lineno">  390 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = <span class="nottickedoff">Trusted</span></span>
+<span class="lineno">  391 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = <span class="nottickedoff">&quot;List memory file paths matching a prefix. Set include_archived to also list archived memories. (Legacy — prefer MEMORY_MANAGE with action=\&quot;list\&quot;.)&quot;</span></span>
+<span class="lineno">  392 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = <span class="nottickedoff">object</span></span>
+<span class="lineno">  393 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span></span>
+<span class="lineno">  394 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;properties&quot; .= object</span></span>
+<span class="lineno">  395 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[ fromText &quot;prefix&quot; .= object</span></span>
+<span class="lineno">  396 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span></span>
+<span class="lineno">  397 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;Directory prefix to filter by (e.g. \&quot;projects/\&quot;).&quot; :: Text)</span></span>
+<span class="lineno">  398 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  399 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">, fromText &quot;include_archived&quot; .= object</span></span>
+<span class="lineno">  400 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;boolean&quot; :: Text)</span></span>
+<span class="lineno">  401 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;Include archived memories (default: false).&quot; :: Text)</span></span>
+<span class="lineno">  402 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  403 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  404 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  405 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  406 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = <span class="nottickedoff">const (Right ())</span></span>
+<span class="lineno">  407 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = <span class="nottickedoff">False</span></span>
+<span class="lineno">  408 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; handleList store v</span>
+<span class="lineno">  409 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  410 </span>
+<span class="lineno">  411 </span>-- | MEMORY_SEARCH (legacy shim): delegates to the search handler.
+<span class="lineno">  412 </span>memorySearchOp :: EmbeddingBackend -&gt; MemoryStore -&gt; Opcode
+<span class="lineno">  413 </span><span class="decl"><span class="istickedoff">memorySearchOp embedding store = TrustedOpcode</span>
+<span class="lineno">  414 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;MEMORY_SEARCH&quot;</span>
+<span class="lineno">  415 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = <span class="nottickedoff">Trusted</span></span>
+<span class="lineno">  416 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = <span class="nottickedoff">&quot;Semantic search over memory files. Returns ranked results by meaning. (Legacy — prefer MEMORY_MANAGE with action=\&quot;search\&quot;.)&quot;</span></span>
+<span class="lineno">  417 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = <span class="nottickedoff">object</span></span>
+<span class="lineno">  418 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span></span>
+<span class="lineno">  419 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;properties&quot; .= object</span></span>
+<span class="lineno">  420 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[ fromText &quot;query&quot; .= object</span></span>
+<span class="lineno">  421 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span></span>
+<span class="lineno">  422 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;Search query.&quot; :: Text)</span></span>
+<span class="lineno">  423 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  424 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">, fromText &quot;limit&quot; .= object</span></span>
+<span class="lineno">  425 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;integer&quot; :: Text)</span></span>
+<span class="lineno">  426 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;Max results (default: 10).&quot; :: Text)</span></span>
+<span class="lineno">  427 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  428 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">, fromText &quot;include_archived&quot; .= object</span></span>
+<span class="lineno">  429 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;boolean&quot; :: Text)</span></span>
+<span class="lineno">  430 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;Search archived memories too (default: false).&quot; :: Text)</span></span>
+<span class="lineno">  431 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  432 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  433 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;required&quot; .= ([&quot;query&quot;] :: [Text])</span></span>
+<span class="lineno">  434 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  435 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  436 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = <span class="nottickedoff">authorizeSearch</span></span>
+<span class="lineno">  437 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = <span class="nottickedoff">False</span></span>
+<span class="lineno">  438 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; handleSearch embedding store v</span>
+<span class="lineno">  439 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  440 </span>
+<span class="lineno">  441 </span>-- | MEMORY_ARCHIVE (legacy shim): delegates to the archive handler.
+<span class="lineno">  442 </span>memoryArchiveOp :: MemoryStore -&gt; EmbeddingBackend -&gt; Opcode
+<span class="lineno">  443 </span><span class="decl"><span class="istickedoff">memoryArchiveOp store embedding = TrustedOpcode</span>
+<span class="lineno">  444 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;MEMORY_ARCHIVE&quot;</span>
+<span class="lineno">  445 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  446 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = <span class="nottickedoff">&quot;Move a memory from active/ to archived/. The file is never deleted. (Legacy — prefer MEMORY_MANAGE with action=\&quot;archive\&quot;.)&quot;</span></span>
+<span class="lineno">  447 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = <span class="nottickedoff">object</span></span>
+<span class="lineno">  448 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span></span>
+<span class="lineno">  449 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;properties&quot; .= object</span></span>
+<span class="lineno">  450 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[ fromText &quot;path&quot; .= object</span></span>
+<span class="lineno">  451 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span></span>
+<span class="lineno">  452 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, &quot;description&quot; .= (&quot;Memory path to archive.&quot; :: Text)</span></span>
+<span class="lineno">  453 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  454 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  455 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;required&quot; .= ([&quot;path&quot;] :: [Text])</span></span>
+<span class="lineno">  456 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">  457 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  458 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = authorizeArchive</span>
+<span class="lineno">  459 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = False</span>
+<span class="lineno">  460 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; handleArchive store embedding v</span>
+<span class="lineno">  461 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,119 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE DeriveAnyClass #-}
+<span class="lineno">    2 </span>{-# LANGUAGE DeriveGeneric #-}
+<span class="lineno">    3 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    4 </span>-- | The harness capability handle — the seam the registry, reconcile loop,
+<span class="lineno">    5 </span>-- and (Phase 6b) the tab runtime use to drive one harness. A no-op handle
+<span class="lineno">    6 </span>-- backs the registry/reconcile tests so they need no real tmux. The
+<span class="lineno">    7 </span>-- sanitize helpers ('stripAnsi'/'stripControl') strip escape sequences and
+<span class="lineno">    8 </span>-- control bytes from captured screen content (a captured screen may carry
+<span class="lineno">    9 </span>-- escape sequences that could spoof the observer or the transcript).
+<span class="lineno">   10 </span>module Seal.Handles.Harness
+<span class="lineno">   11 </span>  ( HarnessStatus (..)
+<span class="lineno">   12 </span>  , HarnessError (..)
+<span class="lineno">   13 </span>  , HarnessHandle (..)
+<span class="lineno">   14 </span>  , noOpHarnessHandle
+<span class="lineno">   15 </span>  , stripAnsi
+<span class="lineno">   16 </span>  , stripControl
+<span class="lineno">   17 </span>  ) where
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>import Data.Aeson (FromJSON, ToJSON)
+<span class="lineno">   20 </span>import Data.Char (isControl)
+<span class="lineno">   21 </span>import Data.Text (Text)
+<span class="lineno">   22 </span>import Data.Text qualified as T
+<span class="lineno">   23 </span>import GHC.Generics (Generic)
+<span class="lineno">   24 </span>
+<span class="lineno">   25 </span>-- | The liveness states a harness can be in.
+<span class="lineno">   26 </span>data HarnessStatus
+<span class="lineno">   27 </span>  = HsIdle | HsThinking | HsAwaitingInput | HsExited | HsOrphaned
+<span class="lineno">   28 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">   29 </span>  deriving anyclass (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   30 </span>
+<span class="lineno">   31 </span>-- | The harness error type. Matched on to drive control flow (so it earns
+<span class="lineno">   32 </span>-- being a sum type per the haskell-coder skill).
+<span class="lineno">   33 </span>data HarnessError
+<span class="lineno">   34 </span>  = HeSpawnFailed Text
+<span class="lineno">   35 </span>  | HeCaptureFailed Text
+<span class="lineno">   36 </span>  | HeStopFailed Text
+<span class="lineno">   37 </span>  | HeNotFound Text
+<span class="lineno">   38 </span>  | HeTmuxMissing
+<span class="lineno">   39 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>-- | The capability record of IO actions for driving one harness. Every
+<span class="lineno">   42 </span>-- field is an IO action so the type is uniform between real (tmux-backed)
+<span class="lineno">   43 </span>-- and fake (no-op) variants.
+<span class="lineno">   44 </span>data HarnessHandle = HarnessHandle
+<span class="lineno">   45 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">hhSend</span></span></span>     :: Text -&gt; IO (Either HarnessError ())
+<span class="lineno">   46 </span>    -- ^ Send text (keystrokes) to the harness.
+<span class="lineno">   47 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">hhReceive</span></span></span>  :: IO (Either HarnessError [Text])
+<span class="lineno">   48 </span>    -- ^ Capture the current screen as sanitized lines.
+<span class="lineno">   49 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">hhSnapshot</span></span></span> :: IO (Either HarnessError Text)
+<span class="lineno">   50 </span>    -- ^ Full screen capture (sanitized).
+<span class="lineno">   51 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">hhStatus</span></span></span>   :: IO (Either HarnessError HarnessStatus)
+<span class="lineno">   52 </span>    -- ^ The current liveness.
+<span class="lineno">   53 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">hhStop</span></span></span>     :: IO (Either HarnessError ())
+<span class="lineno">   54 </span>    -- ^ Stop the harness (kill the tmux window).
+<span class="lineno">   55 </span>  }
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>-- | A no-op handle for tests: sends succeed, receive/snapshot return empty,
+<span class="lineno">   58 </span>-- status is HsIdle, stop succeeds.
+<span class="lineno">   59 </span>noOpHarnessHandle :: HarnessHandle
+<span class="lineno">   60 </span><span class="decl"><span class="istickedoff">noOpHarnessHandle = HarnessHandle</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">{ hhSend     = \_ -&gt; pure (Right ())</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">, hhReceive  = pure (Right [])</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="istickedoff">, hhSnapshot = pure (Right &quot;&quot;)</span>
+<span class="lineno">   64 </span><span class="spaces">  </span><span class="istickedoff">, hhStatus   = pure (Right HsIdle)</span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="istickedoff">, hhStop     = pure (Right ())</span>
+<span class="lineno">   66 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>-- | Strip ANSI escape sequences (CSI: @\\x1b[\\x30-\\x3f*@\\x20-\\x2f*@\\x40-\\x7e@)
+<span class="lineno">   69 </span>-- from a captured line. Pure.
+<span class="lineno">   70 </span>stripAnsi :: Text -&gt; Text
+<span class="lineno">   71 </span><span class="decl"><span class="istickedoff">stripAnsi = T.unfoldr go</span>
+<span class="lineno">   72 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   73 </span><span class="spaces">    </span><span class="istickedoff">go s</span>
+<span class="lineno">   74 </span><span class="spaces">      </span><span class="istickedoff">| T.null s = Nothing</span>
+<span class="lineno">   75 </span><span class="spaces">      </span><span class="istickedoff">| T.head s == '\x1b' = case T.uncons s of</span>
+<span class="lineno">   76 </span><span class="spaces">          </span><span class="istickedoff">Just ('\x1b', s1)</span>
+<span class="lineno">   77 </span><span class="spaces">            </span><span class="istickedoff">| Just ('[', s2) &lt;- T.uncons s1 -&gt;</span>
+<span class="lineno">   78 </span><span class="spaces">                </span><span class="istickedoff">-- CSI: ESC [ 0x30-0x3f* 0x20-0x2f* 0x40-0x7e</span>
+<span class="lineno">   79 </span><span class="spaces">                </span><span class="istickedoff">let rest = dropCsi s2</span>
+<span class="lineno">   80 </span><span class="spaces">                </span><span class="istickedoff">in go rest</span>
+<span class="lineno">   81 </span><span class="spaces">            </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span> -&gt; <span class="nottickedoff">go s1</span>  -- drop the ESC alone</span>
+<span class="lineno">   82 </span><span class="spaces">          </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span>  -- unreachable: s is non-null</span>
+<span class="lineno">   83 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Just (T.head s, T.tail s)</span>
+<span class="lineno">   84 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">   85 </span><span class="spaces">    </span><span class="istickedoff">-- Drop the parameter + intermediate bytes + the final byte.</span>
+<span class="lineno">   86 </span><span class="spaces">    </span><span class="istickedoff">dropCsi s =</span>
+<span class="lineno">   87 </span><span class="spaces">      </span><span class="istickedoff">let afterParams = T.dropWhile (\c -&gt; c &gt;= '\x30' &amp;&amp; c &lt;= '\x3f') s</span>
+<span class="lineno">   88 </span><span class="spaces">          </span><span class="istickedoff">afterInter  = T.dropWhile (\c -&gt; c &gt;= '\x20' &amp;&amp; c &lt;= '\x2f') afterParams</span>
+<span class="lineno">   89 </span><span class="spaces">      </span><span class="istickedoff">in case T.uncons afterInter of</span>
+<span class="lineno">   90 </span><span class="spaces">           </span><span class="istickedoff">Just (_final, rest) -&gt; rest</span>
+<span class="lineno">   91 </span><span class="spaces">           </span><span class="istickedoff">Nothing             -&gt; <span class="nottickedoff">T.empty</span></span></span>  -- incomplete CSI; drop everything
+<span class="lineno">   92 </span>
+<span class="lineno">   93 </span>-- | Strip ALL control characters (a superset of 'stripAnsi' — also removes
+<span class="lineno">   94 </span>-- NUL/BEL/BS/DEL etc., not just CSI sequences). Pure.
+<span class="lineno">   95 </span>stripControl :: Text -&gt; Text
+<span class="lineno">   96 </span><span class="decl"><span class="istickedoff">stripControl = T.filter (not . isControl)</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,169 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The shared logger handle for Seal Harness. Wraps a katip 'LogEnv' and
+<span class="lineno">    3 </span>-- provides 'IO'-level logging functions ('logIO') so that channel, transport,
+<span class="lineno">    4 </span>-- and gateway code (which runs in 'IO', not 'App') can emit structured katip
+<span class="lineno">    5 </span>-- logs without a monad transformer stack.
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- The logger is built once at startup via 'withSealLogger' (a bracket that
+<span class="lineno">    8 </span>-- closes the scribe on exit) and threaded through the shared dependency
+<span class="lineno">    9 </span>-- records ('ChannelDeps', 'SendDeps') and 'Env' ('envLogger'). Turn code
+<span class="lineno">   10 </span>-- refines the logger via 'withChannelContext' to attach 'ChannelContext'
+<span class="lineno">   11 </span>-- (channel kind, conversation id hash, session id) so every 'logIO' call
+<span class="lineno">   12 </span>-- within a turn automatically carries the metadata — context-free logging
+<span class="lineno">   13 </span>-- is never the easy path within a turn.
+<span class="lineno">   14 </span>--
+<span class="lineno">   15 </span>-- 'logIO' is best-effort: if the scribe write throws (e.g. closed handle,
+<span class="lineno">   16 </span>-- I/O error), the error is silently swallowed. The logger must never crash
+<span class="lineno">   17 </span>-- the caller, especially inside 'withExceptionLogging' where a logger crash
+<span class="lineno">   18 </span>-- would defeat the exception handler. Newlines in the 'LogStr' are escaped
+<span class="lineno">   19 </span>-- to @\\n@ / @\\r@ before emission (log-injection defense).
+<span class="lineno">   20 </span>module Seal.Logging.Logger
+<span class="lineno">   21 </span>  ( SealLogger (..)
+<span class="lineno">   22 </span>  , withSealLogger
+<span class="lineno">   23 </span>  , newSealLogger
+<span class="lineno">   24 </span>  , newSealLoggerWithScribe
+<span class="lineno">   25 </span>  , closeSealLogger
+<span class="lineno">   26 </span>  , testSealLogger
+<span class="lineno">   27 </span>  , logIO
+<span class="lineno">   28 </span>  , withChannelContext
+<span class="lineno">   29 </span>  , escapeNewlines
+<span class="lineno">   30 </span>  ) where
+<span class="lineno">   31 </span>
+<span class="lineno">   32 </span>import Control.Exception (catch, SomeException, bracket)
+<span class="lineno">   33 </span>import Control.Monad (void)
+<span class="lineno">   34 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   35 </span>import Data.Text (Text)
+<span class="lineno">   36 </span>import Data.Text qualified as T
+<span class="lineno">   37 </span>import System.IO (stderr)
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>import Katip
+<span class="lineno">   40 </span>  ( Severity (..), LogEnv, LogContexts, Namespace, Scribe (..)
+<span class="lineno">   41 </span>  , LogStr, unLogStr, permitItem, mkHandleScribeWithFormatter, bracketFormat
+<span class="lineno">   42 </span>  , registerScribe, defaultScribeSettings, initLogEnv
+<span class="lineno">   43 </span>  , closeScribes, textToSeverity, runKatipContextT
+<span class="lineno">   44 </span>  , liftPayload
+<span class="lineno">   45 </span>  )
+<span class="lineno">   46 </span>import qualified Katip as K
+<span class="lineno">   47 </span>import Katip.Monadic (logFM)
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>-- | The shared logger handle. Built once at startup, threaded through
+<span class="lineno">   50 </span>-- 'ChannelDeps', 'SendDeps', and 'Env'. Carries its own 'LogEnv' + context
+<span class="lineno">   51 </span>-- + namespace so 'logIO' can emit from 'IO' without a monad stack.
+<span class="lineno">   52 </span>data SealLogger = SealLogger
+<span class="lineno">   53 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">slLogEnv</span></span></span>    :: LogEnv
+<span class="lineno">   54 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">slContext</span></span></span>   :: LogContexts
+<span class="lineno">   55 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">slNamespace</span></span></span> :: Namespace
+<span class="lineno">   56 </span>  }
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>-- | Bracket the logger's lifetime. Creates the stderr scribe at the given
+<span class="lineno">   59 </span>-- severity level, runs the action, closes the scribe on exit. Used at all
+<span class="lineno">   60 </span>-- 4 startup sites ('runServeMain', 'runSignalMain', 'runTelegramMain',
+<span class="lineno">   61 </span>-- 'runTui').
+<span class="lineno">   62 </span>withSealLogger :: Text -&gt; (SealLogger -&gt; IO a) -&gt; IO a
+<span class="lineno">   63 </span><span class="decl"><span class="nottickedoff">withSealLogger logLevel = bracket makeLogEnv' closeLogEnv'</span>
+<span class="lineno">   64 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">   65 </span><span class="spaces">    </span><span class="nottickedoff">makeLogEnv' = do</span>
+<span class="lineno">   66 </span><span class="spaces">      </span><span class="nottickedoff">let sev = fromMaybe InfoS (textToSeverity logLevel)</span>
+<span class="lineno">   67 </span><span class="spaces">      </span><span class="nottickedoff">scribe &lt;- mkHandleScribeWithFormatter bracketFormat</span>
+<span class="lineno">   68 </span><span class="spaces">        </span><span class="nottickedoff">K.ColorIfTerminal stderr (permitItem sev) K.V2</span>
+<span class="lineno">   69 </span><span class="spaces">      </span><span class="nottickedoff">le &lt;- registerScribe &quot;stderr&quot; scribe defaultScribeSettings</span>
+<span class="lineno">   70 </span><span class="spaces">        </span><span class="nottickedoff">=&lt;&lt; initLogEnv &quot;seal-harness&quot; &quot;production&quot;</span>
+<span class="lineno">   71 </span><span class="spaces">      </span><span class="nottickedoff">pure SealLogger</span>
+<span class="lineno">   72 </span><span class="spaces">        </span><span class="nottickedoff">{ slLogEnv = le</span>
+<span class="lineno">   73 </span><span class="spaces">        </span><span class="nottickedoff">, slContext = mempty</span>
+<span class="lineno">   74 </span><span class="spaces">        </span><span class="nottickedoff">, slNamespace = &quot;seal-harness&quot;</span>
+<span class="lineno">   75 </span><span class="spaces">        </span><span class="nottickedoff">}</span>
+<span class="lineno">   76 </span><span class="spaces">    </span><span class="nottickedoff">closeLogEnv' logger = void (closeScribes (slLogEnv logger))</span></span>
+<span class="lineno">   77 </span>
+<span class="lineno">   78 </span>-- | Build a logger without a bracket (for tests). The caller is responsible
+<span class="lineno">   79 </span>-- for closing the scribe via 'closeSealLogger' (or process exit).
+<span class="lineno">   80 </span>newSealLogger :: Text -&gt; IO SealLogger
+<span class="lineno">   81 </span><span class="decl"><span class="nottickedoff">newSealLogger logLevel = do</span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="nottickedoff">let sev = fromMaybe InfoS (textToSeverity logLevel)</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="nottickedoff">scribe &lt;- mkHandleScribeWithFormatter bracketFormat</span>
+<span class="lineno">   84 </span><span class="spaces">    </span><span class="nottickedoff">K.ColorIfTerminal stderr (permitItem sev) K.V2</span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="nottickedoff">le &lt;- registerScribe &quot;stderr&quot; scribe defaultScribeSettings</span>
+<span class="lineno">   86 </span><span class="spaces">    </span><span class="nottickedoff">=&lt;&lt; initLogEnv &quot;seal-harness&quot; &quot;production&quot;</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="nottickedoff">pure SealLogger</span>
+<span class="lineno">   88 </span><span class="spaces">    </span><span class="nottickedoff">{ slLogEnv = le</span>
+<span class="lineno">   89 </span><span class="spaces">    </span><span class="nottickedoff">, slContext = mempty</span>
+<span class="lineno">   90 </span><span class="spaces">    </span><span class="nottickedoff">, slNamespace = &quot;seal-harness&quot;</span>
+<span class="lineno">   91 </span><span class="spaces">    </span><span class="nottickedoff">}</span></span>
+<span class="lineno">   92 </span>
+<span class="lineno">   93 </span>-- | Build a logger with a custom scribe (for tests that capture log output).
+<span class="lineno">   94 </span>-- The scribe is registered with the given permit severity.
+<span class="lineno">   95 </span>newSealLoggerWithScribe :: Scribe -&gt; Severity -&gt; IO SealLogger
+<span class="lineno">   96 </span><span class="decl"><span class="istickedoff">newSealLoggerWithScribe scribe _sev = do</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">le &lt;- registerScribe &quot;capture&quot; scribe defaultScribeSettings</span>
+<span class="lineno">   98 </span><span class="spaces">    </span><span class="istickedoff">=&lt;&lt; initLogEnv &quot;seal-harness&quot; &quot;test&quot;</span>
+<span class="lineno">   99 </span><span class="spaces">  </span><span class="istickedoff">pure SealLogger</span>
+<span class="lineno">  100 </span><span class="spaces">    </span><span class="istickedoff">{ slLogEnv = le</span>
+<span class="lineno">  101 </span><span class="spaces">    </span><span class="istickedoff">, slContext = mempty</span>
+<span class="lineno">  102 </span><span class="spaces">    </span><span class="istickedoff">, slNamespace = &quot;seal-harness&quot;</span>
+<span class="lineno">  103 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">  104 </span>
+<span class="lineno">  105 </span>-- | Close the logger's scribes (for non-bracket construction).
+<span class="lineno">  106 </span>closeSealLogger :: SealLogger -&gt; IO ()
+<span class="lineno">  107 </span><span class="decl"><span class="istickedoff">closeSealLogger logger = void (closeScribes (slLogEnv logger))</span></span>
+<span class="lineno">  108 </span>
+<span class="lineno">  109 </span>-- | A logger with a no-op scribe (for tests that don't assert log output).
+<span class="lineno">  110 </span>-- Uses a scribe that accepts all items but does nothing with them.
+<span class="lineno">  111 </span>testSealLogger :: IO SealLogger
+<span class="lineno">  112 </span><span class="decl"><span class="istickedoff">testSealLogger = do</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">let noopScribe = Scribe</span>
+<span class="lineno">  114 </span><span class="spaces">        </span><span class="istickedoff">{ liPush = \_ -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  115 </span><span class="spaces">        </span><span class="istickedoff">, scribePermitItem = permitItem DebugS</span>
+<span class="lineno">  116 </span><span class="spaces">        </span><span class="istickedoff">, scribeFinalizer = pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  117 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">newSealLoggerWithScribe noopScribe <span class="nottickedoff">DebugS</span></span></span>
+<span class="lineno">  119 </span>
+<span class="lineno">  120 </span>-- | Emit a log line from 'IO'. Uses the logger's 'LogEnv' + context +
+<span class="lineno">  121 </span>-- namespace. Newlines in the 'LogStr' are escaped to @\\n@ / @\\r@ before
+<span class="lineno">  122 </span>-- emission (log-injection defense). If the scribe write throws, the error
+<span class="lineno">  123 </span>-- is silently swallowed (best-effort logging — the logger must never crash
+<span class="lineno">  124 </span>-- the caller).
+<span class="lineno">  125 </span>logIO :: SealLogger -&gt; Severity -&gt; LogStr -&gt; IO ()
+<span class="lineno">  126 </span><span class="decl"><span class="istickedoff">logIO logger sev msg =</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="istickedoff">runKatipContextT (slLogEnv logger) (slContext logger)</span>
+<span class="lineno">  128 </span><span class="spaces">    </span><span class="istickedoff">(slNamespace logger) (logFM sev (escapeNewlines msg))</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="istickedoff">`catch` <span class="nottickedoff">\(_ :: SomeException) -&gt; pure ()</span></span></span>
+<span class="lineno">  130 </span>
+<span class="lineno">  131 </span>-- | Refine the logger with additional structured context. Returns a new
+<span class="lineno">  132 </span>-- 'SealLogger' whose 'slContext' is the merge
+<span class="lineno">  133 </span>-- @slContext &lt;&gt; liftPayload item@. This is how 'ChannelContext' is
+<span class="lineno">  134 </span>-- attached: the turn code calls @withChannelContext logger ctx@ once, then
+<span class="lineno">  135 </span>-- threads the refined logger through all subsequent 'logIO' calls.
+<span class="lineno">  136 </span>withChannelContext :: K.LogItem a =&gt; SealLogger -&gt; a -&gt; SealLogger
+<span class="lineno">  137 </span><span class="decl"><span class="istickedoff">withChannelContext logger item =</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="istickedoff">logger { slContext = slContext logger &lt;&gt; liftPayload item }</span></span>
+<span class="lineno">  139 </span>
+<span class="lineno">  140 </span>-- | Escape newlines in a 'LogStr' to prevent log injection. Replaces @\n@
+<span class="lineno">  141 </span>-- with @\\n@ and @\r@ with @\\r@ in the textual representation.
+<span class="lineno">  142 </span>escapeNewlines :: LogStr -&gt; LogStr
+<span class="lineno">  143 </span><span class="decl"><span class="istickedoff">escapeNewlines = K.ls . escapeText . T.pack . show . unLogStr</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  145 </span><span class="spaces">    </span><span class="istickedoff">escapeText :: Text -&gt; Text</span>
+<span class="lineno">  146 </span><span class="spaces">    </span><span class="istickedoff">escapeText = T.replace &quot;\n&quot; &quot;\\n&quot; . T.replace &quot;\r&quot; &quot;\\r&quot;</span></span>
+
+</pre>
+</body>
+</html>

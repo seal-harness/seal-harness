@@ -1,0 +1,263 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE ExistentialQuantification #-}
+<span class="lineno">    2 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    3 </span>{-# OPTIONS_GHC -Wno-partial-fields #-}
+<span class="lineno">    4 </span>-- | The provider-agnostic message/content/request/response model and the
+<span class="lineno">    5 </span>-- 'Provider' capability class. Concrete providers (Anthropic, …) implement it;
+<span class="lineno">    6 </span>-- 'SomeProvider' lets config pick one at runtime.
+<span class="lineno">    7 </span>module Seal.Providers.Class
+<span class="lineno">    8 </span>  ( Role (..)
+<span class="lineno">    9 </span>  , ToolResultPart (..)
+<span class="lineno">   10 </span>  , ContentBlock (..)
+<span class="lineno">   11 </span>  , Message (..)
+<span class="lineno">   12 </span>  , textMsg
+<span class="lineno">   13 </span>  , ToolDefinition (..)
+<span class="lineno">   14 </span>  , stubSchema
+<span class="lineno">   15 </span>  , ToolChoice (..)
+<span class="lineno">   16 </span>  , CompletionRequest (..)
+<span class="lineno">   17 </span>  , Usage (..)
+<span class="lineno">   18 </span>  , StopReason (..)
+<span class="lineno">   19 </span>  , CompletionResponse (..)
+<span class="lineno">   20 </span>  , Provider (..)
+<span class="lineno">   21 </span>  , SomeProvider (..)
+<span class="lineno">   22 </span>  , StreamEvent (..)
+<span class="lineno">   23 </span>  , StreamOutcome (..)
+<span class="lineno">   24 </span>  , providerStreamWithRetry
+<span class="lineno">   25 </span>  ) where
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>import Control.Monad (void, unless)
+<span class="lineno">   28 </span>import Control.Retry
+<span class="lineno">   29 </span>  ( RetryPolicyM, exponentialBackoff, limitRetries, retrying )
+<span class="lineno">   30 </span>import Data.Aeson
+<span class="lineno">   31 </span>import Data.Aeson.Key (fromString)
+<span class="lineno">   32 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   33 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   34 </span>import Data.Text (Text)
+<span class="lineno">   35 </span>import Data.Text qualified as T
+<span class="lineno">   36 </span>import GHC.Generics (Generic)
+<span class="lineno">   37 </span>
+<span class="lineno">   38 </span>import Seal.Core.Types (ModelId, OpName (..), ToolCallId)
+<span class="lineno">   39 </span>import Seal.Util.AesonUtils (stripPrefixToJSON, stripPrefixParseJSON)
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>data Role = User | Assistant deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">   42 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON Role</span></span></span></span></span></span></span></span> where <span class="decl"><span class="istickedoff">toJSON = stripPrefixToJSON</span></span>
+<span class="lineno">   43 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">FromJSON Role</span></span></span></span> where <span class="decl"><span class="istickedoff">parseJSON = stripPrefixParseJSON</span></span>
+<span class="lineno">   44 </span>
+<span class="lineno">   45 </span>newtype ToolResultPart = TrpText Text deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">   46 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON ToolResultPart</span></span></span></span></span></span></span></span> where <span class="decl"><span class="istickedoff">toJSON = stripPrefixToJSON</span></span>
+<span class="lineno">   47 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">FromJSON ToolResultPart</span></span></span></span> where <span class="decl"><span class="istickedoff">parseJSON = stripPrefixParseJSON</span></span>
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>-- | A single block of content in a message.
+<span class="lineno">   50 </span>--
+<span class="lineno">   51 </span>-- __Partial field selectors warning:__ The record fields 'cbId', 'cbName',
+<span class="lineno">   52 </span>-- 'cbInput', 'cbForId', 'cbParts', and 'cbIsError' are only defined on their
+<span class="lineno">   53 </span>-- respective constructors ('CbToolUse' and 'CbToolResult'). They are partial
+<span class="lineno">   54 </span>-- across the full type and will throw a runtime error if applied to the wrong
+<span class="lineno">   55 </span>-- constructor. Always access them inside a constructor-specific pattern match;
+<span class="lineno">   56 </span>-- never use them as bare accessor functions.
+<span class="lineno">   57 </span>--
+<span class="lineno">   58 </span>-- JSON keys (via 'stripPrefixToJSON'): @cbId@→@id@, @cbName@→@name@,
+<span class="lineno">   59 </span>-- @cbInput@→@input@, @cbForId@→@forId@, @cbParts@→@parts@,
+<span class="lineno">   60 </span>-- @cbIsError@→@isError@. The constructor tag (@CbText@/@CbToolUse@/
+<span class="lineno">   61 </span>-- @CbToolResult@) is emitted by aeson's default 'TaggedObject' sum encoding
+<span class="lineno">   62 </span>-- unchanged.
+<span class="lineno">   63 </span>data ContentBlock
+<span class="lineno">   64 </span>  = CbText Text
+<span class="lineno">   65 </span>  | CbToolUse    { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cbId</span></span></span> :: ToolCallId, <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cbName</span></span></span> :: OpName, <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cbInput</span></span></span> :: Value }
+<span class="lineno">   66 </span>  | CbToolResult { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cbForId</span></span></span> :: ToolCallId, <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cbParts</span></span></span> :: [ToolResultPart], <span class="nottickedoff"><span class="decl"><span class="nottickedoff">cbIsError</span></span></span> :: Bool }
+<span class="lineno">   67 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">   68 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON ContentBlock</span></span></span></span></span></span></span></span> where <span class="decl"><span class="istickedoff">toJSON = stripPrefixToJSON</span></span>
+<span class="lineno">   69 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">FromJSON ContentBlock</span></span></span></span> where <span class="decl"><span class="istickedoff">parseJSON = stripPrefixParseJSON</span></span>
+<span class="lineno">   70 </span>
+<span class="lineno">   71 </span>data Message = Message { <span class="istickedoff"><span class="decl"><span class="istickedoff">msgRole</span></span></span> :: Role, <span class="istickedoff"><span class="decl"><span class="istickedoff">msgContent</span></span></span> :: [ContentBlock] }
+<span class="lineno">   72 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">   73 </span>-- JSON keys: @msgRole@→@role@, @msgContent@→@content@.
+<span class="lineno">   74 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON Message</span></span></span></span></span></span></span></span> where <span class="decl"><span class="istickedoff">toJSON = stripPrefixToJSON</span></span>
+<span class="lineno">   75 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">FromJSON Message</span></span></span></span> where <span class="decl"><span class="istickedoff">parseJSON = stripPrefixParseJSON</span></span>
+<span class="lineno">   76 </span>
+<span class="lineno">   77 </span>textMsg :: Role -&gt; Text -&gt; Message
+<span class="lineno">   78 </span><span class="decl"><span class="istickedoff">textMsg r t = Message r [CbText t]</span></span>
+<span class="lineno">   79 </span>
+<span class="lineno">   80 </span>data ToolDefinition = ToolDefinition
+<span class="lineno">   81 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">tdName</span></span></span> :: OpName, <span class="istickedoff"><span class="decl"><span class="istickedoff">tdDescription</span></span></span> :: Text, <span class="istickedoff"><span class="decl"><span class="istickedoff">tdInputSchema</span></span></span> :: Value }
+<span class="lineno">   82 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">   83 </span>
+<span class="lineno">   84 </span>-- | Custom 'ToJSON': emits @name@ + @description@ always, and
+<span class="lineno">   85 </span>-- @input_schema@ only when it differs from 'stubSchema'. The keys follow the
+<span class="lineno">   86 </span>-- Anthropic wire shape (the @tools@ array is an external-facing payload, so
+<span class="lineno">   87 </span>-- the external convention applies — not the internal strip-prefix camelCase).
+<span class="lineno">   88 </span>-- This keeps the on-disk transcript envelope (@edTools@) and the debug
+<span class="lineno">   89 </span>-- @requests.jsonl@ consistent with the provider encoders (which also use
+<span class="lineno">   90 </span>-- @input_schema@ / @function.parameters@). The stub is omitted entirely so
+<span class="lineno">   91 </span>-- no @input_schema@ token cost leaks in on-demand mode.
+<span class="lineno">   92 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON ToolDefinition</span></span></span></span></span></span></span></span> where
+<span class="lineno">   93 </span>  <span class="decl"><span class="istickedoff">toJSON (ToolDefinition n d sch) =</span>
+<span class="lineno">   94 </span><span class="spaces">    </span><span class="istickedoff">if sch == stubSchema</span>
+<span class="lineno">   95 </span><span class="spaces">      </span><span class="istickedoff">then object [&quot;name&quot; .= n, &quot;description&quot; .= d]</span>
+<span class="lineno">   96 </span><span class="spaces">      </span><span class="istickedoff">else object [&quot;name&quot; .= n, &quot;description&quot; .= d, &quot;input_schema&quot; .= sch]</span></span>
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>-- | Custom 'FromJSON': @name@ + @description@ required; @input_schema@
+<span class="lineno">   99 </span>-- OPTIONAL, defaulting to 'stubSchema' when the key is ABSENT. The 'ToJSON'
+<span class="lineno">  100 </span>-- instance omits @input_schema@ for stub tools, so a required-field reader
+<span class="lineno">  101 </span>-- would reject those rows and — worse — take down the whole 'EnvelopeDelta'
+<span class="lineno">  102 </span>-- parse (aeson's 'parseJSON' is sequential), losing the system prompt from
+<span class="lineno">  103 </span>-- the reconstructed envelope. Key PRESENCE (not value null-ness)
+<span class="lineno">  104 </span>-- distinguishes &quot;stored stub, omitted by ToJSON&quot; from &quot;explicitly null&quot;: an
+<span class="lineno">  105 </span>-- absent key defaults to 'stubSchema' (closing the stub round-trip), while a
+<span class="lineno">  106 </span>-- present 'null' stays 'Null' (so the arbitrary-data round-trip property
+<span class="lineno">  107 </span>-- still holds).
+<span class="lineno">  108 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">FromJSON ToolDefinition</span></span></span></span> where
+<span class="lineno">  109 </span>  <span class="decl"><span class="istickedoff">parseJSON = withObject <span class="nottickedoff">&quot;ToolDefinition&quot;</span> $ \o -&gt; ToolDefinition</span>
+<span class="lineno">  110 </span><span class="spaces">    </span><span class="istickedoff">&lt;$&gt; o .: &quot;name&quot;</span>
+<span class="lineno">  111 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .: &quot;description&quot;</span>
+<span class="lineno">  112 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; pure (fromMaybe stubSchema (KeyMap.lookup (fromString &quot;input_schema&quot;) o))</span></span>
+<span class="lineno">  113 </span>
+<span class="lineno">  114 </span>-- | The minimal placeholder @input_schema@ emitted when on-demand schema
+<span class="lineno">  115 </span>-- loading is enabled. Both Anthropic and Ollama normally require an
+<span class="lineno">  116 </span>-- @input_schema@ / @parameters@ field on every tool definition; when a
+<span class="lineno">  117 </span>-- 'ToolDefinition' carries this exact value, the provider encoders OMIT
+<span class="lineno">  118 </span>-- the field entirely rather than sending it inline — saving the few tokens
+<span class="lineno">  119 </span>-- the stub would otherwise cost on every tool, every turn. The model is
+<span class="lineno">  120 </span>-- expected to call @OPCODE_DESCRIBE@ to retrieve a tool's real schema
+<span class="lineno">  121 </span>-- before calling it.
+<span class="lineno">  122 </span>stubSchema :: Value
+<span class="lineno">  123 </span><span class="decl"><span class="istickedoff">stubSchema = object [&quot;type&quot; .= (&quot;object&quot; :: Text)]</span></span>
+<span class="lineno">  124 </span>
+<span class="lineno">  125 </span>data ToolChoice = ToolAuto | ToolNone deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">  126 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON ToolChoice</span></span></span></span></span></span></span></span> where <span class="decl"><span class="istickedoff">toJSON = stripPrefixToJSON</span></span>
+<span class="lineno">  127 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">FromJSON ToolChoice</span></span></span></span> where <span class="decl"><span class="istickedoff">parseJSON = stripPrefixParseJSON</span></span>
+<span class="lineno">  128 </span>
+<span class="lineno">  129 </span>data CompletionRequest = CompletionRequest
+<span class="lineno">  130 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">crModel</span></span></span> :: ModelId, <span class="istickedoff"><span class="decl"><span class="istickedoff">crSystem</span></span></span> :: Maybe Text, <span class="istickedoff"><span class="decl"><span class="istickedoff">crMessages</span></span></span> :: [Message]
+<span class="lineno">  131 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">crTools</span></span></span> :: [ToolDefinition], <span class="istickedoff"><span class="decl"><span class="istickedoff">crToolChoice</span></span></span> :: ToolChoice, <span class="istickedoff"><span class="decl"><span class="istickedoff">crMaxTokens</span></span></span> :: Int }
+<span class="lineno">  132 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">  133 </span>-- JSON keys: @crModel@→@model@, @crSystem@→@system@, @crMessages@→@messages@,
+<span class="lineno">  134 </span>-- @crTools@→@tools@, @crToolChoice@→@toolChoice@, @crMaxTokens@→@maxTokens@.
+<span class="lineno">  135 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON CompletionRequest</span></span></span></span></span></span></span></span> where <span class="decl"><span class="istickedoff">toJSON = stripPrefixToJSON</span></span>
+<span class="lineno">  136 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON CompletionRequest</span></span></span></span> where <span class="decl"><span class="istickedoff">parseJSON = stripPrefixParseJSON</span></span>
+<span class="lineno">  137 </span>
+<span class="lineno">  138 </span>data Usage = Usage { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">uInput</span></span></span> :: Int, <span class="istickedoff"><span class="decl"><span class="istickedoff">uOutput</span></span></span> :: Int }
+<span class="lineno">  139 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">  140 </span>-- JSON keys: @uInput@→@input@, @uOutput@→@output@.
+<span class="lineno">  141 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON Usage</span></span></span></span></span></span></span></span> where <span class="decl"><span class="istickedoff">toJSON = stripPrefixToJSON</span></span>
+<span class="lineno">  142 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">FromJSON Usage</span></span></span></span> where <span class="decl"><span class="istickedoff">parseJSON = stripPrefixParseJSON</span></span>
+<span class="lineno">  143 </span>
+<span class="lineno">  144 </span>data StopReason = StopEnd | StopToolUse | StopMaxTokens | StopOther Text
+<span class="lineno">  145 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">  146 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON StopReason</span></span></span></span></span></span></span></span> where <span class="decl"><span class="istickedoff">toJSON = stripPrefixToJSON</span></span>
+<span class="lineno">  147 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">FromJSON StopReason</span></span></span></span> where <span class="decl"><span class="istickedoff">parseJSON = stripPrefixParseJSON</span></span>
+<span class="lineno">  148 </span>
+<span class="lineno">  149 </span>data CompletionResponse = CompletionResponse
+<span class="lineno">  150 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">rsContent</span></span></span> :: [ContentBlock], <span class="istickedoff"><span class="decl"><span class="istickedoff">rsStop</span></span></span> :: StopReason, <span class="istickedoff"><span class="decl"><span class="istickedoff">rsUsage</span></span></span> :: Usage }
+<span class="lineno">  151 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">  152 </span>-- JSON keys: @rsContent@→@content@, @rsStop@→@stop@, @rsUsage@→@usage@.
+<span class="lineno">  153 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON CompletionResponse</span></span></span></span></span></span></span></span> where <span class="decl"><span class="istickedoff">toJSON = stripPrefixToJSON</span></span>
+<span class="lineno">  154 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON CompletionResponse</span></span></span></span> where <span class="decl"><span class="istickedoff">parseJSON = stripPrefixParseJSON</span></span>
+<span class="lineno">  155 </span>
+<span class="lineno">  156 </span>class Provider p where
+<span class="lineno">  157 </span>  complete   :: p -&gt; CompletionRequest -&gt; IO (Either Text CompletionResponse)
+<span class="lineno">  158 </span>  listModels :: p -&gt; IO (Either Text [ModelId])
+<span class="lineno">  159 </span>  -- | Stream a completion request, invoking the callback for each 'StreamEvent'
+<span class="lineno">  160 </span>  -- as it arrives. The callback returns 'True' to continue streaming or 'False'
+<span class="lineno">  161 </span>  -- to abort early (e.g. the consumer is no longer interested). The final
+<span class="lineno">  162 </span>  -- 'StreamOutcome' carries the aggregated stop reason + usage. Providers
+<span class="lineno">  163 </span>  -- that do not support streaming can fall back to 'complete' + emit a single
+<span class="lineno">  164 </span>  -- 'StreamContentChunk' + 'StreamDone' (the default implementation does this).
+<span class="lineno">  165 </span>  streamComplete
+<span class="lineno">  166 </span>    :: p -&gt; CompletionRequest -&gt; (StreamEvent -&gt; IO Bool) -&gt; IO (Either Text StreamOutcome)
+<span class="lineno">  167 </span>  <span class="decl"><span class="istickedoff">streamComplete p cr k = do</span>
+<span class="lineno">  168 </span><span class="spaces">    </span><span class="istickedoff">-- Default: use the non-streaming 'complete' and emit events for each</span>
+<span class="lineno">  169 </span><span class="spaces">    </span><span class="istickedoff">-- content block (text + tool calls), then a final 'StreamDone'.</span>
+<span class="lineno">  170 </span><span class="spaces">    </span><span class="istickedoff">eresp &lt;- complete p cr</span>
+<span class="lineno">  171 </span><span class="spaces">    </span><span class="istickedoff">case eresp of</span>
+<span class="lineno">  172 </span><span class="spaces">      </span><span class="istickedoff">Left err -&gt; pure (Left err)</span>
+<span class="lineno">  173 </span><span class="spaces">      </span><span class="istickedoff">Right resp -&gt; do</span>
+<span class="lineno">  174 </span><span class="spaces">        </span><span class="istickedoff">mapM_ (emitBlock k) (rsContent resp)</span>
+<span class="lineno">  175 </span><span class="spaces">        </span><span class="istickedoff">_ &lt;- k (StreamDone <span class="nottickedoff">(rsStop resp)</span> <span class="nottickedoff">(rsUsage resp)</span>)</span>
+<span class="lineno">  176 </span><span class="spaces">        </span><span class="istickedoff">pure (Right (StreamOutcome (rsStop resp) (rsUsage resp)))</span></span>
+<span class="lineno">  177 </span>
+<span class="lineno">  178 </span>-- | Emit 'StreamEvent's for a single 'ContentBlock' (used by the default
+<span class="lineno">  179 </span>-- 'streamComplete' implementation that wraps the non-streaming 'complete').
+<span class="lineno">  180 </span>emitBlock :: (StreamEvent -&gt; IO Bool) -&gt; ContentBlock -&gt; IO ()
+<span class="lineno">  181 </span><span class="decl"><span class="istickedoff">emitBlock k block = case block of</span>
+<span class="lineno">  182 </span><span class="spaces">  </span><span class="istickedoff">CbText t -&gt; unless (T.null t) $</span>
+<span class="lineno">  183 </span><span class="spaces">    </span><span class="istickedoff">void (k (StreamTextChunk t))</span>
+<span class="lineno">  184 </span><span class="spaces">  </span><span class="istickedoff">CbToolUse tcid (OpName name) args -&gt;</span>
+<span class="lineno">  185 </span><span class="spaces">    </span><span class="istickedoff">void (k (StreamToolStart <span class="nottickedoff">tcid</span> <span class="nottickedoff">(OpName name)</span>) &gt;&gt;</span>
+<span class="lineno">  186 </span><span class="spaces">          </span><span class="istickedoff">k (StreamToolEnd tcid (OpName name) args))</span>
+<span class="lineno">  187 </span><span class="spaces">  </span><span class="istickedoff">CbToolResult{} -&gt; <span class="nottickedoff">pure ()</span></span></span>  -- tool results are not model output
+<span class="lineno">  188 </span>
+<span class="lineno">  189 </span>data SomeProvider = forall p. Provider p =&gt; SomeProvider p
+<span class="lineno">  190 </span>
+<span class="lineno">  191 </span>-- | A single streaming event emitted by 'streamComplete'. Mirrors the
+<span class="lineno">  192 </span>-- 'LLMEvent' contract from OpenCode: text deltas, tool-call lifecycle
+<span class="lineno">  193 </span>-- (start/delta/end), and a final done signal carrying the stop reason +
+<span class="lineno">  194 </span>-- usage. The events arrive incrementally as the model generates; the
+<span class="lineno">  195 </span>-- consumer aggregates them into 'ContentBlock's and writes to the
+<span class="lineno">  196 </span>-- transcript live.
+<span class="lineno">  197 </span>data StreamEvent
+<span class="lineno">  198 </span>  = StreamTextChunk Text
+<span class="lineno">  199 </span>  -- ^ A chunk of assistant text. Multiple chunks concatenate to form the
+<span class="lineno">  200 </span>  -- final 'CbText' block(s).
+<span class="lineno">  201 </span>  | StreamToolStart ToolCallId OpName
+<span class="lineno">  202 </span>  -- ^ The model began emitting a tool call. The id is synthesized by the
+<span class="lineno">  203 </span>  -- provider (Ollama carries no ids; the provider assigns sequential ones).
+<span class="lineno">  204 </span>  | StreamToolDelta ToolCallId Text
+<span class="lineno">  205 </span>  -- ^ A chunk of the tool-call's JSON arguments. Multiple deltas
+<span class="lineno">  206 </span>  -- concatenate to form the final 'cbInput' 'Value' (parsed at 'StreamToolEnd').
+<span class="lineno">  207 </span>  | StreamToolEnd ToolCallId OpName Value
+<span class="lineno">  208 </span>  -- ^ A tool call completed. Carries the fully-parsed 'cbInput'.
+<span class="lineno">  209 </span>  | StreamDone StopReason Usage
+<span class="lineno">  210 </span>  -- ^ The generation finished. Carries the final stop reason + usage. This
+<span class="lineno">  211 </span>  -- is always the last event (unless the stream was aborted by the callback
+<span class="lineno">  212 </span>  -- returning 'False' or a transport error).
+<span class="lineno">  213 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  214 </span>
+<span class="lineno">  215 </span>-- | The aggregated outcome of a completed stream: the final stop reason +
+<span class="lineno">  216 </span>-- usage. The loop uses this (alongside the accumulated 'ContentBlock's) to
+<span class="lineno">  217 </span>-- decide whether to continue (tool calls / truncation) or finish.
+<span class="lineno">  218 </span>data StreamOutcome = StreamOutcome
+<span class="lineno">  219 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">soStop</span></span></span> :: StopReason
+<span class="lineno">  220 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">soUsage</span></span></span> :: Usage
+<span class="lineno">  221 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  222 </span>
+<span class="lineno">  223 </span>-- | Retry policy for transient provider failures during streaming (same as
+<span class="lineno">  224 </span>-- the non-streaming path: up to 2 retries, 50ms exponential backoff).
+<span class="lineno">  225 </span>streamRetryPolicy :: RetryPolicyM IO
+<span class="lineno">  226 </span><span class="decl"><span class="istickedoff">streamRetryPolicy =</span>
+<span class="lineno">  227 </span><span class="spaces">  </span><span class="istickedoff">exponentialBackoff 50_000 &lt;&gt; limitRetries 2</span></span>
+<span class="lineno">  228 </span>
+<span class="lineno">  229 </span>-- | Call 'streamComplete' with retry on transient errors. Mirrors
+<span class="lineno">  230 </span>-- 'providerCompleteWithRetry' in the non-streaming path. The transient-error
+<span class="lineno">  231 </span>-- predicate is the same ('isTransientError' lives in the loop; here we
+<span class="lineno">  232 </span>-- accept a predicate so the streaming provider can reuse it).
+<span class="lineno">  233 </span>providerStreamWithRetry
+<span class="lineno">  234 </span>  :: SomeProvider -&gt; (Text -&gt; Bool) -&gt; CompletionRequest
+<span class="lineno">  235 </span>  -&gt; (StreamEvent -&gt; IO Bool) -&gt; IO (Either Text StreamOutcome)
+<span class="lineno">  236 </span><span class="decl"><span class="istickedoff">providerStreamWithRetry (SomeProvider p) isTransient cr k =</span>
+<span class="lineno">  237 </span><span class="spaces">  </span><span class="istickedoff">retrying streamRetryPolicy shouldRetry $ \_ -&gt; streamComplete p cr k</span>
+<span class="lineno">  238 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  239 </span><span class="spaces">    </span><span class="istickedoff">shouldRetry _ (Left err) = pure (isTransient err)</span>
+<span class="lineno">  240 </span><span class="spaces">    </span><span class="istickedoff">shouldRetry _ (Right _)  = pure False</span></span>
+
+</pre>
+</body>
+</html>

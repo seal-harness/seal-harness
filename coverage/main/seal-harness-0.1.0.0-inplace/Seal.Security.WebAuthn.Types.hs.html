@@ -1,0 +1,104 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Leaf types shared by the access-control config, the WebAuthn verifier and
+<span class="lineno">    3 </span>-- the gateway. This module deliberately depends on neither
+<span class="lineno">    4 </span>-- 'Seal.Config.Security' nor 'Seal.Gateway.*', so it can sit at the bottom of
+<span class="lineno">    5 </span>-- the import graph (design §5: no cycle).
+<span class="lineno">    6 </span>module Seal.Security.WebAuthn.Types
+<span class="lineno">    7 </span>  ( AccessMode (..)
+<span class="lineno">    8 </span>  , accessModeText
+<span class="lineno">    9 </span>  , parseAccessMode
+<span class="lineno">   10 </span>  , CosePublicKey (..)
+<span class="lineno">   11 </span>  , Credential (..)
+<span class="lineno">   12 </span>  ) where
+<span class="lineno">   13 </span>
+<span class="lineno">   14 </span>import Data.ByteString (ByteString)
+<span class="lineno">   15 </span>import Data.Text (Text)
+<span class="lineno">   16 </span>import Data.Text qualified as T
+<span class="lineno">   17 </span>import Data.Time (UTCTime)
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>-- | The operator's access-control decision, as recorded in
+<span class="lineno">   20 </span>-- @~\/.seal\/security.toml@.
+<span class="lineno">   21 </span>--
+<span class="lineno">   22 </span>-- 'AccessUnconfigured' is also the state of a @mode = \&quot;passkey\&quot;@ file whose
+<span class="lineno">   23 </span>-- credential list is empty — nobody could authenticate, so the gateway must be
+<span class="lineno">   24 </span>-- treatable as still awaiting setup. 'Seal.Config.Security' normalises that
+<span class="lineno">   25 </span>-- case.
+<span class="lineno">   26 </span>data AccessMode
+<span class="lineno">   27 </span>  = AccessUnconfigured
+<span class="lineno">   28 </span>  | AccessOpen
+<span class="lineno">   29 </span>  | AccessPasskey
+<span class="lineno">   30 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   31 </span>
+<span class="lineno">   32 </span>-- | The wire spelling of an 'AccessMode', as reported by
+<span class="lineno">   33 </span>-- @\/api\/auth\/status@ and consumed by the SPA.
+<span class="lineno">   34 </span>--
+<span class="lineno">   35 </span>-- This is deliberately NOT the config spelling: the config says @none@ (the
+<span class="lineno">   36 </span>-- operator's waiver), while the reported state says @open@ (what the gateway is
+<span class="lineno">   37 </span>-- actually doing). Keeping them distinct means &quot;access control is off&quot; can be
+<span class="lineno">   38 </span>-- stated in the API without the UI having to know that @none@ means open.
+<span class="lineno">   39 </span>accessModeText :: AccessMode -&gt; Text
+<span class="lineno">   40 </span><span class="decl"><span class="istickedoff">accessModeText mode = case mode of</span>
+<span class="lineno">   41 </span><span class="spaces">  </span><span class="istickedoff">AccessUnconfigured -&gt; &quot;unconfigured&quot;</span>
+<span class="lineno">   42 </span><span class="spaces">  </span><span class="istickedoff">AccessOpen         -&gt; &quot;open&quot;</span>
+<span class="lineno">   43 </span><span class="spaces">  </span><span class="istickedoff">AccessPasskey      -&gt; &quot;passkey&quot;</span></span>
+<span class="lineno">   44 </span>
+<span class="lineno">   45 </span>-- | Parse the config spelling. Anything other than @\&quot;none\&quot;@ or
+<span class="lineno">   46 </span>-- @\&quot;passkey\&quot;@ is rejected — fail-closed, so a typo can never silently mean
+<span class="lineno">   47 </span>-- &quot;open&quot;.
+<span class="lineno">   48 </span>parseAccessMode :: Text -&gt; Either Text AccessMode
+<span class="lineno">   49 </span><span class="decl"><span class="istickedoff">parseAccessMode t = case T.strip (T.toLower t) of</span>
+<span class="lineno">   50 </span><span class="spaces">  </span><span class="istickedoff">&quot;none&quot;    -&gt; Right AccessOpen</span>
+<span class="lineno">   51 </span><span class="spaces">  </span><span class="istickedoff">&quot;passkey&quot; -&gt; Right AccessPasskey</span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">other     -&gt; Left <span class="nottickedoff">(&quot;invalid access_control.mode \&quot;&quot; &lt;&gt; other</span></span>
+<span class="lineno">   53 </span><span class="spaces">                      </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;\&quot; (expected \&quot;passkey\&quot; or \&quot;none\&quot;)&quot;)</span></span></span>
+<span class="lineno">   54 </span>
+<span class="lineno">   55 </span>-- | A P-256 public key as the 64-byte uncompressed @x || y@ pair taken from a
+<span class="lineno">   56 </span>-- COSE EC2 key. A newtype so callers cannot mistake it for the SEC1
+<span class="lineno">   57 </span>-- @0x04@-prefixed or DER forms.
+<span class="lineno">   58 </span>newtype CosePublicKey = CosePublicKey ByteString
+<span class="lineno">   59 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   60 </span>
+<span class="lineno">   61 </span>-- | One enrolled passkey.
+<span class="lineno">   62 </span>data Credential = Credential
+<span class="lineno">   63 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">credId</span></span></span>        :: ByteString
+<span class="lineno">   64 </span>    -- ^ The raw WebAuthn credential id.
+<span class="lineno">   65 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">credPublicKey</span></span></span> :: CosePublicKey
+<span class="lineno">   66 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">credSignCount</span></span></span> :: Int
+<span class="lineno">   67 </span>    -- ^ The last sign counter accepted. 0 means the authenticator does not
+<span class="lineno">   68 </span>    -- implement one.
+<span class="lineno">   69 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">credLabel</span></span></span>     :: Text
+<span class="lineno">   70 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">credCreatedAt</span></span></span> :: UTCTime
+<span class="lineno">   71 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">credRpId</span></span></span>      :: Text
+<span class="lineno">   72 </span>    -- ^ The rpId this credential was created for. A credential only validates
+<span class="lineno">   73 </span>    -- against its own rpId, so this is compared with the boot-resolved rpId to
+<span class="lineno">   74 </span>    -- detect an orphaned credential.
+<span class="lineno">   75 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">credAddedVia</span></span></span>  :: Maybe Text
+<span class="lineno">   76 </span>    -- ^ How the credential was added — the @added_via@ vocabulary
+<span class="lineno">   77 </span>    -- (@cli_token@, @cli_window@, @assertion@, @legacy@). 'Text' rather than
+<span class="lineno">   78 </span>    -- 'Seal.Security.EnrollmentGrant.GrantSource' because that module imports
+<span class="lineno">   79 </span>    -- this one; the spelling is the storage format either way, and the UI
+<span class="lineno">   80 </span>    -- renders it as human copy.
+<span class="lineno">   81 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,99 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The on-disk session metadata record ('session.json'). Holds the session's
+<span class="lineno">    3 </span>-- selected provider label + model id (never a key), its channel of origin, the
+<span class="lineno">    4 </span>-- bound agent definition (if any — set at init from @default_agent@), and
+<span class="lineno">    5 </span>-- timestamps. The 'FromJSON' is tolerant (missing 'channel' defaults to
+<span class="lineno">    6 </span>-- @\&quot;cli\&quot;@, missing 'agent' defaults to 'Nothing') so older/partial files
+<span class="lineno">    7 </span>-- still load.
+<span class="lineno">    8 </span>module Seal.Session.Meta
+<span class="lineno">    9 </span>  ( SessionMeta (..)
+<span class="lineno">   10 </span>  ) where
+<span class="lineno">   11 </span>
+<span class="lineno">   12 </span>import Data.Aeson
+<span class="lineno">   13 </span>  ( FromJSON (..), ToJSON (..), object, withObject, (.:), (.:?), (.!=), (.=) )
+<span class="lineno">   14 </span>import Data.Text (Text)
+<span class="lineno">   15 </span>import Data.Time (UTCTime)
+<span class="lineno">   16 </span>
+<span class="lineno">   17 </span>import Seal.Agent.Def.Types (AgentDefId (..))
+<span class="lineno">   18 </span>import Seal.Core.Types (SessionId)
+<span class="lineno">   19 </span>
+<span class="lineno">   20 </span>data SessionMeta = SessionMeta
+<span class="lineno">   21 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">smId</span></span></span>         :: SessionId
+<span class="lineno">   22 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">smProvider</span></span></span>   :: Text      -- ^ Provider label, e.g. @\&quot;anthropic\&quot;@.
+<span class="lineno">   23 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">smModel</span></span></span>      :: Text      -- ^ Model id, e.g. @\&quot;claude-opus-4-8\&quot;@.
+<span class="lineno">   24 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">smChannel</span></span></span>    :: Text      -- ^ Channel that created the session, e.g. @\&quot;cli\&quot;@.
+<span class="lineno">   25 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">smAgent</span></span></span>      :: Maybe AgentDefId
+<span class="lineno">   26 </span>    -- ^ The agent definition bound to this session at init (from
+<span class="lineno">   27 </span>    -- @default_agent@ in @config.toml@). 'Nothing' means no agent is bound.
+<span class="lineno">   28 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">smSystemOverride</span></span></span> :: Maybe Text
+<span class="lineno">   29 </span>    -- ^ An ad-hoc system prompt supplied via the Session setup screen's
+<span class="lineno">   30 </span>    -- \&quot;Use a one-off agent file\&quot; upload. When 'Just', 'plainTurn' prefers
+<span class="lineno">   31 </span>    -- this over the bound agent's 'adSystem'. 'Nothing' means no override
+<span class="lineno">   32 </span>    -- (the agent's prompt, if any, is used).
+<span class="lineno">   33 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">smAgentName</span></span></span> :: Maybe Text
+<span class="lineno">   34 </span>    -- ^ Display label for the session's active agent (shown in the
+<span class="lineno">   35 </span>    -- sidebar / chat header as the @agent@ field of 'SessionInfo').
+<span class="lineno">   36 </span>    -- Populated whenever the session has an effective agent — either the
+<span class="lineno">   37 </span>    -- bound 'smAgent' (set to the agent def's id) or a one-off uploaded
+<span class="lineno">   38 </span>    -- file (set to the file's frontmatter @id@, or the filename when the
+<span class="lineno">   39 </span>    -- file has no frontmatter). 'Nothing' when no agent is active.
+<span class="lineno">   40 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">smDescription</span></span></span> :: Maybe Text
+<span class="lineno">   41 </span>    -- ^ A user-set display title for the session (the chat-header pencil).
+<span class="lineno">   42 </span>    -- 'Nothing' means no explicit title; the UI then falls back to the
+<span class="lineno">   43 </span>    -- auto-summary, first-message snippet, or agent name. Persisted to
+<span class="lineno">   44 </span>    -- @session.json@ so it survives restarts and propagates to the
+<span class="lineno">   45 </span>    -- sidebar (which reads the live session list, not a client-side
+<span class="lineno">   46 </span>    -- override).
+<span class="lineno">   47 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">smCreatedAt</span></span></span>  :: UTCTime
+<span class="lineno">   48 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">smLastActive</span></span></span> :: UTCTime
+<span class="lineno">   49 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON SessionMeta</span></span></span></span></span></span></span></span> where
+<span class="lineno">   52 </span>  <span class="decl"><span class="istickedoff">toJSON m = object</span>
+<span class="lineno">   53 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;id&quot;          .= smId m</span>
+<span class="lineno">   54 </span><span class="spaces">    </span><span class="istickedoff">, &quot;provider&quot;    .= smProvider m</span>
+<span class="lineno">   55 </span><span class="spaces">    </span><span class="istickedoff">, &quot;model&quot;       .= smModel m</span>
+<span class="lineno">   56 </span><span class="spaces">    </span><span class="istickedoff">, &quot;channel&quot;     .= smChannel m</span>
+<span class="lineno">   57 </span><span class="spaces">    </span><span class="istickedoff">, &quot;agent&quot;       .= smAgent m</span>
+<span class="lineno">   58 </span><span class="spaces">    </span><span class="istickedoff">, &quot;system_override&quot; .= smSystemOverride m</span>
+<span class="lineno">   59 </span><span class="spaces">    </span><span class="istickedoff">, &quot;agent_name&quot;  .= smAgentName m</span>
+<span class="lineno">   60 </span><span class="spaces">    </span><span class="istickedoff">, &quot;description&quot; .= smDescription m</span>
+<span class="lineno">   61 </span><span class="spaces">    </span><span class="istickedoff">, &quot;created_at&quot;  .= smCreatedAt m</span>
+<span class="lineno">   62 </span><span class="spaces">    </span><span class="istickedoff">, &quot;last_active&quot; .= smLastActive m</span>
+<span class="lineno">   63 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">   64 </span>
+<span class="lineno">   65 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON SessionMeta</span></span></span></span> where
+<span class="lineno">   66 </span>  <span class="decl"><span class="istickedoff">parseJSON = withObject <span class="nottickedoff">&quot;SessionMeta&quot;</span> $ \o -&gt; SessionMeta</span>
+<span class="lineno">   67 </span><span class="spaces">    </span><span class="istickedoff">&lt;$&gt; o .:  &quot;id&quot;</span>
+<span class="lineno">   68 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:  &quot;provider&quot;</span>
+<span class="lineno">   69 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:  &quot;model&quot;</span>
+<span class="lineno">   70 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;channel&quot; .!= &quot;cli&quot;</span>
+<span class="lineno">   71 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;agent&quot;</span>
+<span class="lineno">   72 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;system_override&quot;</span>
+<span class="lineno">   73 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;agent_name&quot;</span>
+<span class="lineno">   74 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:? &quot;description&quot;</span>
+<span class="lineno">   75 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:  &quot;created_at&quot;</span>
+<span class="lineno">   76 </span><span class="spaces">    </span><span class="istickedoff">&lt;*&gt; o .:  &quot;last_active&quot;</span></span>
+
+</pre>
+</body>
+</html>

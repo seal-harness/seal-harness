@@ -1,0 +1,85 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE DeriveAnyClass #-}
+<span class="lineno">    2 </span>{-# LANGUAGE DeriveGeneric #-}
+<span class="lineno">    3 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    4 </span>-- | The validated 'TabIndex' (0..35) — the single index type reused
+<span class="lineno">    5 </span>-- everywhere (TabList slots, /N routing, /tab close &lt;N&gt;, /tab focus &lt;N&gt;).
+<span class="lineno">    6 </span>-- Smart-constructed so an out-of-range index fails to compile into any path.
+<span class="lineno">    7 </span>-- Plus 'TabKind', the closed enumeration of tab kinds.
+<span class="lineno">    8 </span>module Seal.Handles.Tab
+<span class="lineno">    9 </span>  ( TabIndex (..)
+<span class="lineno">   10 </span>  , mkTabIndex
+<span class="lineno">   11 </span>  , tabIndexToInt
+<span class="lineno">   12 </span>  , tabIndexToChar
+<span class="lineno">   13 </span>  , tabIndexFromChar
+<span class="lineno">   14 </span>  , maxTabIndex
+<span class="lineno">   15 </span>  , TabKind (..)
+<span class="lineno">   16 </span>  ) where
+<span class="lineno">   17 </span>
+<span class="lineno">   18 </span>import Data.Aeson (FromJSON, ToJSON)
+<span class="lineno">   19 </span>import Data.Char (isAsciiLower, isDigit, toLower)
+<span class="lineno">   20 </span>import Data.Text (Text)
+<span class="lineno">   21 </span>import Data.Text qualified as T
+<span class="lineno">   22 </span>import GHC.Generics (Generic)
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>-- | The maximum tab index (0-based): 35 = 'z'. 36 slots total.
+<span class="lineno">   25 </span>maxTabIndex :: Int
+<span class="lineno">   26 </span><span class="decl"><span class="istickedoff">maxTabIndex = 35</span></span>
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>-- | A validated tab index: 0..35 (the terse grammar maps 0-9a-z to 0..35).
+<span class="lineno">   29 </span>-- Smart-constructed; the predicate rejects &lt;0 and &gt;35.
+<span class="lineno">   30 </span>newtype TabIndex = TabIndex Int
+<span class="lineno">   31 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">   32 </span>  deriving anyclass (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>mkTabIndex :: Int -&gt; Either Text TabIndex
+<span class="lineno">   35 </span><span class="decl"><span class="istickedoff">mkTabIndex n</span>
+<span class="lineno">   36 </span><span class="spaces">  </span><span class="istickedoff">| n &lt; 0           = Left <span class="nottickedoff">(&quot;tab index out of range: &quot; &lt;&gt; T.pack (show n))</span></span>
+<span class="lineno">   37 </span><span class="spaces">  </span><span class="istickedoff">| n &gt; maxTabIndex = Left <span class="nottickedoff">(&quot;tab index out of range: &quot; &lt;&gt; T.pack (show n))</span></span>
+<span class="lineno">   38 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>       = Right (TabIndex n)</span></span>
+<span class="lineno">   39 </span>
+<span class="lineno">   40 </span>tabIndexToInt :: TabIndex -&gt; Int
+<span class="lineno">   41 </span><span class="decl"><span class="istickedoff">tabIndexToInt (TabIndex n) = n</span></span>
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>-- | 0-&gt;'0', 9-&gt;'9', 10-&gt;'a', 35-&gt;'z'.
+<span class="lineno">   44 </span>tabIndexToChar :: TabIndex -&gt; Char
+<span class="lineno">   45 </span><span class="decl"><span class="istickedoff">tabIndexToChar (TabIndex n)</span>
+<span class="lineno">   46 </span><span class="spaces">  </span><span class="istickedoff">| n &lt; 10   = toEnum (fromEnum '0' + n)</span>
+<span class="lineno">   47 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = toEnum (fromEnum 'a' + (n - 10))</span></span>
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>-- | Inverse of 'tabIndexToChar', case-insensitive. 'Left' for non-[0-9a-z].
+<span class="lineno">   50 </span>tabIndexFromChar :: Char -&gt; Either Text TabIndex
+<span class="lineno">   51 </span><span class="decl"><span class="istickedoff">tabIndexFromChar c =</span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">let lo = toLower c</span>
+<span class="lineno">   53 </span><span class="spaces">  </span><span class="istickedoff">in case <span class="nottickedoff">lo</span> of</span>
+<span class="lineno">   54 </span><span class="spaces">       </span><span class="istickedoff">_ | isDigit lo      -&gt; mkTabIndex (fromEnum lo - fromEnum '0')</span>
+<span class="lineno">   55 </span><span class="spaces">         </span><span class="istickedoff">| isAsciiLower lo -&gt; mkTabIndex (fromEnum lo - fromEnum 'a' + 10)</span>
+<span class="lineno">   56 </span><span class="spaces">         </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>       -&gt; Left <span class="nottickedoff">(&quot;not a tab index char: &quot; &lt;&gt; T.pack [c])</span></span></span>
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>-- | The closed enumeration of tab kinds.
+<span class="lineno">   59 </span>data TabKind
+<span class="lineno">   60 </span>  = KindAi | KindProvider | KindHarness | KindShell | KindSsh | KindTmux
+<span class="lineno">   61 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Enum</span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Bounded</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">   62 </span>  deriving anyclass (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">FromJSON</span></span></span></span></span></span>)
+
+</pre>
+</body>
+</html>

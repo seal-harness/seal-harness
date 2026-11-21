@@ -1,0 +1,253 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Per-session concurrency control + reply fan-out.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- Two concerns are handled here:
+<span class="lineno">    5 </span>--
+<span class="lineno">    6 </span>-- 1. **Write lock**: a per-session 'MVar' serializes turns on the same
+<span class="lineno">    7 </span>--    session. Both the channel 'plainTurn' and the web 'plainTurn' acquire
+<span class="lineno">    8 </span>--    the session's lock before calling 'withTwoFileTranscript', preventing
+<span class="lineno">    9 </span>--    concurrent writes from corrupting the two-file transcript format.
+<span class="lineno">   10 </span>--    Different sessions run concurrently; only turns on the SAME session
+<span class="lineno">   11 </span>--    queue.
+<span class="lineno">   12 </span>--
+<span class="lineno">   13 </span>-- 2. **Reply fan-out**: a registry of 'ChannelHandle's subscribed to a
+<span class="lineno">   14 </span>--    session. When a turn completes (from any source — web, Telegram,
+<span class="lineno">   15 </span>--    Signal), the reply is sent to every registered channel handle for
+<span class="lineno">   16 </span>--    that session via 'chSend'. The web frontend already receives entries
+<span class="lineno">   17 </span>--    via the WS broker ('BeEntryRecorded'); the fan-out handles chat
+<span class="lineno">   18 </span>--    channels, which need an explicit 'chSend' to deliver the reply to
+<span class="lineno">   19 </span>--    the peer.
+<span class="lineno">   20 </span>module Seal.Session.Lock
+<span class="lineno">   21 </span>  ( SessionLocks
+<span class="lineno">   22 </span>  , newSessionLocks
+<span class="lineno">   23 </span>  , withSessionLock
+<span class="lineno">   24 </span>  , sessionTurnInFlight
+<span class="lineno">   25 </span>  , ReplyRegistry
+<span class="lineno">   26 </span>  , newReplyRegistry
+<span class="lineno">   27 </span>  , replySubscribe
+<span class="lineno">   28 </span>  , replyUnsubscribe
+<span class="lineno">   29 </span>  , replyFanout
+<span class="lineno">   30 </span>  , replyFanoutMessage
+<span class="lineno">   31 </span>  , replySubscriberCount
+<span class="lineno">   32 </span>  , replyMigrateAll
+<span class="lineno">   33 </span>  ) where
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>import Control.Concurrent.MVar
+<span class="lineno">   36 </span>  ( MVar, newMVar, tryReadMVar, withMVar )
+<span class="lineno">   37 </span>import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
+<span class="lineno">   38 </span>import Control.Exception (IOException, catch)
+<span class="lineno">   39 </span>import Data.Foldable (for_)
+<span class="lineno">   40 </span>import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+<span class="lineno">   41 </span>import Data.Map.Strict (Map)
+<span class="lineno">   42 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   43 </span>import Data.Maybe (isNothing)
+<span class="lineno">   44 </span>import Data.Text (Text)
+<span class="lineno">   45 </span>import Data.Text qualified as T
+<span class="lineno">   46 </span>
+<span class="lineno">   47 </span>import Katip (Severity (..), ls)
+<span class="lineno">   48 </span>import Seal.Core.Types (SessionId)
+<span class="lineno">   49 </span>import Seal.Handles.Channel (ChannelHandle (..))
+<span class="lineno">   50 </span>import Seal.Logging.Global (globalLogIO)
+<span class="lineno">   51 </span>
+<span class="lineno">   52 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   53 </span>-- Write locks
+<span class="lineno">   54 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   55 </span>
+<span class="lineno">   56 </span>-- | The per-session lock map. Each session gets its own 'MVar' on first
+<span class="lineno">   57 </span>-- use; subsequent turns on the same session acquire that 'MVar'.
+<span class="lineno">   58 </span>newtype SessionLocks = SessionLocks (TVar (Map SessionId (MVar ())))
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>-- | Build a new empty lock map.
+<span class="lineno">   61 </span>newSessionLocks :: IO SessionLocks
+<span class="lineno">   62 </span><span class="decl"><span class="istickedoff">newSessionLocks = SessionLocks &lt;$&gt; newTVarIO Map.empty</span></span>
+<span class="lineno">   63 </span>
+<span class="lineno">   64 </span>-- | Acquire the session's lock, run the action, release. Creates the
+<span class="lineno">   65 </span>-- 'MVar' on first use. Different sessions run concurrently; only turns on
+<span class="lineno">   66 </span>-- the SAME session serialize.
+<span class="lineno">   67 </span>withSessionLock :: SessionLocks -&gt; SessionId -&gt; IO a -&gt; IO a
+<span class="lineno">   68 </span><span class="decl"><span class="istickedoff">withSessionLock (SessionLocks tv) sid action = do</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">lock &lt;- do</span>
+<span class="lineno">   70 </span><span class="spaces">    </span><span class="istickedoff">m &lt;- readTVarIO tv</span>
+<span class="lineno">   71 </span><span class="spaces">    </span><span class="istickedoff">case Map.lookup sid m of</span>
+<span class="lineno">   72 </span><span class="spaces">      </span><span class="istickedoff">Just l  -&gt; <span class="nottickedoff">pure l</span></span>
+<span class="lineno">   73 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">   74 </span><span class="spaces">        </span><span class="istickedoff">l &lt;- newMVar <span class="nottickedoff">()</span></span>
+<span class="lineno">   75 </span><span class="spaces">        </span><span class="istickedoff">atomically $ do</span>
+<span class="lineno">   76 </span><span class="spaces">          </span><span class="istickedoff">m' &lt;- readTVar tv</span>
+<span class="lineno">   77 </span><span class="spaces">          </span><span class="istickedoff">case Map.lookup sid m' of</span>
+<span class="lineno">   78 </span><span class="spaces">            </span><span class="istickedoff">Just existing -&gt; <span class="nottickedoff">pure existing</span></span>
+<span class="lineno">   79 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">   80 </span><span class="spaces">              </span><span class="istickedoff">writeTVar tv <span class="nottickedoff">(Map.insert sid l m')</span></span>
+<span class="lineno">   81 </span><span class="spaces">              </span><span class="istickedoff">pure l</span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="istickedoff">withMVar lock (const action)</span></span>
+<span class="lineno">   83 </span>
+<span class="lineno">   84 </span>-- | Non-blocking check: is a turn currently in flight for this session?
+<span class="lineno">   85 </span>-- Returns 'True' if the session's lock MVar is empty (held by a running
+<span class="lineno">   86 </span>-- turn via 'withSessionLock'); 'False' if full (no turn in flight) or the
+<span class="lineno">   87 </span>-- session has no lock yet (never started a turn). Used by the web
+<span class="lineno">   88 </span>-- @POST /api/sessions/:id/stop@ endpoint to report @pending@ (design
+<span class="lineno">   89 </span>-- Blocker Resolution #2 + Designer round-2 question). Uses
+<span class="lineno">   90 </span>-- 'tryReadMVar' (non-blocking): 'Just ()' = full = not held = not in
+<span class="lineno">   91 </span>-- flight; 'Nothing' = empty = held = in flight.
+<span class="lineno">   92 </span>sessionTurnInFlight :: SessionLocks -&gt; SessionId -&gt; IO Bool
+<span class="lineno">   93 </span><span class="decl"><span class="nottickedoff">sessionTurnInFlight (SessionLocks tv) sid = do</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="nottickedoff">m &lt;- readTVarIO tv</span>
+<span class="lineno">   95 </span><span class="spaces">  </span><span class="nottickedoff">case Map.lookup sid m of</span>
+<span class="lineno">   96 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; pure False  -- no lock yet → never started a turn → not in flight</span>
+<span class="lineno">   97 </span><span class="spaces">    </span><span class="nottickedoff">Just lock -&gt; do</span>
+<span class="lineno">   98 </span><span class="spaces">      </span><span class="nottickedoff">mFilled &lt;- tryReadMVar lock</span>
+<span class="lineno">   99 </span><span class="spaces">      </span><span class="nottickedoff">pure (isNothing mFilled)</span></span>  -- Nothing = empty = held = in flight
+<span class="lineno">  100 </span>
+<span class="lineno">  101 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  102 </span>-- Reply fan-out
+<span class="lineno">  103 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  104 </span>
+<span class="lineno">  105 </span>-- | A reply sink wraps a 'ChannelHandle' and an 'IORef' guard so the
+<span class="lineno">  106 </span>-- same handle can be subscribed to at most one session at a time. The
+<span class="lineno">  107 </span>-- guard carries the 'SessionId' the handle is currently subscribed to;
+<span class="lineno">  108 </span>-- 'replyUnsubscribe' only removes it if the guard matches (preventing a
+<span class="lineno">  109 </span>-- race where the handle already re-subscribed to a different session).
+<span class="lineno">  110 </span>data ReplySink = ReplySink
+<span class="lineno">  111 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">rsHandle</span></span></span> :: ChannelHandle
+<span class="lineno">  112 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">rsGuard</span></span></span>  :: IORef (Maybe SessionId)
+<span class="lineno">  113 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">rsLabel</span></span></span>  :: Text
+<span class="lineno">  114 </span>  }
+<span class="lineno">  115 </span>
+<span class="lineno">  116 </span>-- | The per-session reply registry. Maps each 'SessionId' to the set of
+<span class="lineno">  117 </span>-- 'ReplySink's that should receive replies for that session. STM-backed
+<span class="lineno">  118 </span>-- so subscribe/unsubscribe/fan-out are race-safe. Multiple channels of
+<span class="lineno">  119 </span>-- DIFFERENT kinds can subscribe to the same session (e.g. a Telegram
+<span class="lineno">  120 </span>-- handle and a Signal handle both following the same tab); re-subscribing
+<span class="lineno">  121 </span>-- a channel of the same kind replaces the old handle for that kind.
+<span class="lineno">  122 </span>newtype ReplyRegistry = ReplyRegistry (TVar (Map SessionId [ReplySink]))
+<span class="lineno">  123 </span>
+<span class="lineno">  124 </span>-- | Build a new empty reply registry.
+<span class="lineno">  125 </span>newReplyRegistry :: IO ReplyRegistry
+<span class="lineno">  126 </span><span class="decl"><span class="istickedoff">newReplyRegistry = ReplyRegistry &lt;$&gt; newTVarIO Map.empty</span></span>
+<span class="lineno">  127 </span>
+<span class="lineno">  128 </span>-- | Subscribe a 'ChannelHandle' to a session's replies. Subscribers
+<span class="lineno">  129 </span>-- accumulate per channel kind: a new subscription for the same
+<span class="lineno">  130 </span>-- @chLabel@ replaces the old handle for that kind (so re-subscribing the
+<span class="lineno">  131 </span>-- same Telegram conversation updates its handle without creating a
+<span class="lineno">  132 </span>-- duplicate), but a DIFFERENT channel kind (e.g. Signal) is preserved.
+<span class="lineno">  133 </span>-- This lets a session be followed by one handle per append-only channel
+<span class="lineno">  134 </span>-- simultaneously, enabling cross-channel message mirroring. The handle is
+<span class="lineno">  135 </span>-- associated with an 'IORef' guard (returned to the caller) so it can be
+<span class="lineno">  136 </span>-- later unsubscribed.
+<span class="lineno">  137 </span>replySubscribe
+<span class="lineno">  138 </span>  :: ReplyRegistry -&gt; ChannelHandle -&gt; SessionId
+<span class="lineno">  139 </span>  -&gt; IO (IORef (Maybe SessionId))
+<span class="lineno">  140 </span><span class="decl"><span class="istickedoff">replySubscribe (ReplyRegistry tv) h sid = do</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">guard &lt;- newIORef <span class="nottickedoff">(Just sid)</span></span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">let sink = ReplySink h <span class="nottickedoff">guard</span> (chLabel h)</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">atomically $ do</span>
+<span class="lineno">  144 </span><span class="spaces">    </span><span class="istickedoff">m &lt;- readTVar tv</span>
+<span class="lineno">  145 </span><span class="spaces">    </span><span class="istickedoff">let sinks = Map.findWithDefault [] sid m</span>
+<span class="lineno">  146 </span><span class="spaces">        </span><span class="istickedoff">-- Drop any existing sink with the same channel label (replace</span>
+<span class="lineno">  147 </span><span class="spaces">        </span><span class="istickedoff">-- same-kind), then prepend the new one.</span>
+<span class="lineno">  148 </span><span class="spaces">        </span><span class="istickedoff">sinks' = sink : filter (\s -&gt; rsLabel s /= rsLabel sink) sinks</span>
+<span class="lineno">  149 </span><span class="spaces">    </span><span class="istickedoff">writeTVar tv (Map.insert sid sinks' m)</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="istickedoff">pure <span class="nottickedoff">guard</span></span></span>
+<span class="lineno">  151 </span>
+<span class="lineno">  152 </span>-- | Unsubscribe a handle from a session. The 'IORef' guard must match
+<span class="lineno">  153 </span>-- the session id; if it doesn't (the handle already re-subscribed to a
+<span class="lineno">  154 </span>-- different session), this is a no-op. This prevents a stale unsubscribe
+<span class="lineno">  155 </span>-- from removing a handle that's now listening to a different session.
+<span class="lineno">  156 </span>replyUnsubscribe :: ReplyRegistry -&gt; IORef (Maybe SessionId) -&gt; SessionId -&gt; IO ()
+<span class="lineno">  157 </span><span class="decl"><span class="nottickedoff">replyUnsubscribe (ReplyRegistry tv) guard sid = do</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="nottickedoff">g &lt;- readIORef guard</span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="nottickedoff">case g of</span>
+<span class="lineno">  160 </span><span class="spaces">    </span><span class="nottickedoff">Just s | s == sid -&gt; do</span>
+<span class="lineno">  161 </span><span class="spaces">      </span><span class="nottickedoff">atomically $ do</span>
+<span class="lineno">  162 </span><span class="spaces">        </span><span class="nottickedoff">m &lt;- readTVar tv</span>
+<span class="lineno">  163 </span><span class="spaces">        </span><span class="nottickedoff">let m' = Map.adjust (filter (\sink -&gt; rsGuard sink /= guard)) sid m</span>
+<span class="lineno">  164 </span><span class="spaces">        </span><span class="nottickedoff">writeTVar tv (Map.filter (not . null) m')</span>
+<span class="lineno">  165 </span><span class="spaces">      </span><span class="nottickedoff">writeIORef guard Nothing</span>
+<span class="lineno">  166 </span><span class="spaces">    </span><span class="nottickedoff">_ -&gt; pure ()</span></span>
+<span class="lineno">  167 </span>
+<span class="lineno">  168 </span>-- | Fan out a reply to every 'ChannelHandle' subscribed to a session.
+<span class="lineno">  169 </span>-- The reply text is sent via 'chSend' to each handle. The web frontend
+<span class="lineno">  170 </span>-- already receives entries via the WS broker, so it does not appear in
+<span class="lineno">  171 </span>-- this registry (only chat channels do). Errors are logged to stderr and
+<span class="lineno">  172 </span>-- swallowed (a dead channel handle should not prevent other handles from
+<span class="lineno">  173 </span>-- receiving the reply).
+<span class="lineno">  174 </span>replyFanout :: ReplyRegistry -&gt; SessionId -&gt; Text -&gt; IO ()
+<span class="lineno">  175 </span><span class="decl"><span class="istickedoff">replyFanout (ReplyRegistry tv) sid text = do</span>
+<span class="lineno">  176 </span><span class="spaces">  </span><span class="istickedoff">m &lt;- readTVarIO tv</span>
+<span class="lineno">  177 </span><span class="spaces">  </span><span class="istickedoff">for_ (Map.lookup sid m) $ \sinks -&gt;</span>
+<span class="lineno">  178 </span><span class="spaces">    </span><span class="istickedoff">mapM_ (\sink -&gt; safeSend (rsHandle sink) text) sinks</span>
+<span class="lineno">  179 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  180 </span><span class="spaces">    </span><span class="istickedoff">safeSend h t = chSend h t `catch` <span class="nottickedoff">\e -&gt;</span></span>
+<span class="lineno">  181 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">globalLogIO WarningS (&quot;reply fanout: send failed: &quot; &lt;&gt; ls (T.pack (show (e :: IOException))))</span></span></span>
+<span class="lineno">  182 </span>
+<span class="lineno">  183 </span>-- | Fan out a user message to every 'ChannelHandle' subscribed to a
+<span class="lineno">  184 </span>-- session EXCEPT the channel that sent the message (identified by its
+<span class="lineno">  185 </span>-- @excludeLabel@). Each receiving channel gets the message prefixed with
+<span class="lineno">  186 </span>-- the sender's channel label in brackets (e.g. @&quot;[telegram] hi&quot;@), so
+<span class="lineno">  187 </span>-- the user can see which channel the message originated from. This is
+<span class="lineno">  188 </span>-- the cross-channel message-mirroring primitive: every user message sent
+<span class="lineno">  189 </span>-- on any append-only channel is mirrored to all OTHER subscribed
+<span class="lineno">  190 </span>-- append-only channels. The web frontend is NOT in the registry (it
+<span class="lineno">  191 </span>-- sees the message directly via the transcript), so it is excluded by
+<span class="lineno">  192 </span>-- construction. Errors are logged and swallowed.
+<span class="lineno">  193 </span>replyFanoutMessage
+<span class="lineno">  194 </span>  :: ReplyRegistry -&gt; SessionId -&gt; Text -&gt; Text -&gt; IO ()
+<span class="lineno">  195 </span><span class="decl"><span class="istickedoff">replyFanoutMessage (ReplyRegistry tv) sid senderLabel text = do</span>
+<span class="lineno">  196 </span><span class="spaces">  </span><span class="istickedoff">m &lt;- readTVarIO tv</span>
+<span class="lineno">  197 </span><span class="spaces">  </span><span class="istickedoff">for_ (Map.lookup sid m) $ \sinks -&gt;</span>
+<span class="lineno">  198 </span><span class="spaces">    </span><span class="istickedoff">mapM_ (\sink -&gt;</span>
+<span class="lineno">  199 </span><span class="spaces">      </span><span class="istickedoff">if rsLabel sink == senderLabel</span>
+<span class="lineno">  200 </span><span class="spaces">        </span><span class="istickedoff">then pure <span class="nottickedoff">()</span>  -- don't mirror back to the sender</span>
+<span class="lineno">  201 </span><span class="spaces">        </span><span class="istickedoff">else safeSend (rsHandle sink) (&quot;[&quot; &lt;&gt; senderLabel &lt;&gt; &quot;] &quot; &lt;&gt; text))</span>
+<span class="lineno">  202 </span><span class="spaces">      </span><span class="istickedoff">sinks</span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  204 </span><span class="spaces">    </span><span class="istickedoff">safeSend h t = chSend h t `catch` <span class="nottickedoff">\e -&gt;</span></span>
+<span class="lineno">  205 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">globalLogIO WarningS (&quot;message fanout: send failed: &quot; &lt;&gt; ls (T.pack (show (e :: IOException))))</span></span></span>
+<span class="lineno">  206 </span>
+<span class="lineno">  207 </span>-- | The number of channels currently subscribed to a session's replies.
+<span class="lineno">  208 </span>-- Used by the web send path to decide whether the last assistant reply
+<span class="lineno">  209 </span>-- counts as &quot;seen&quot; (delivered to ≥1 chat channel) for the sidebar's
+<span class="lineno">  210 </span>-- tab-status indicator.
+<span class="lineno">  211 </span>replySubscriberCount :: ReplyRegistry -&gt; SessionId -&gt; IO Int
+<span class="lineno">  212 </span><span class="decl"><span class="istickedoff">replySubscriberCount (ReplyRegistry tv) sid =</span>
+<span class="lineno">  213 </span><span class="spaces">  </span><span class="istickedoff">maybe 0 length . Map.lookup sid &lt;$&gt; readTVarIO tv</span></span>
+<span class="lineno">  214 </span>
+<span class="lineno">  215 </span>-- | Migrate every 'ReplySink' subscribed to @oldSid@ to @newSid@. Used by
+<span class="lineno">  216 </span>-- @\/new@ when a tab is rebound to a fresh session: the channel handles
+<span class="lineno">  217 </span>-- subscribed to the old session should follow the rebind so future
+<span class="lineno">  218 </span>-- fan-outs (including tab-close notifications) reach them under the new
+<span class="lineno">  219 </span>-- session id. Single STM transaction — race-safe vs concurrent
+<span class="lineno">  220 </span>-- subscribe/unsubscribe/fan-out. Returns the count of migrated sinks.
+<span class="lineno">  221 </span>replyMigrateAll :: ReplyRegistry -&gt; SessionId -&gt; SessionId -&gt; IO Int
+<span class="lineno">  222 </span><span class="decl"><span class="nottickedoff">replyMigrateAll (ReplyRegistry tv) oldSid newSid = atomically $ do</span>
+<span class="lineno">  223 </span><span class="spaces">  </span><span class="nottickedoff">m &lt;- readTVar tv</span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="nottickedoff">let (matched, rest) = Map.partitionWithKey (\k _ -&gt; k == oldSid) m</span>
+<span class="lineno">  225 </span><span class="spaces">      </span><span class="nottickedoff">sinks = concat (Map.elems matched)</span>
+<span class="lineno">  226 </span><span class="spaces">      </span><span class="nottickedoff">m' = if null sinks</span>
+<span class="lineno">  227 </span><span class="spaces">             </span><span class="nottickedoff">then rest</span>
+<span class="lineno">  228 </span><span class="spaces">             </span><span class="nottickedoff">else Map.insertWith (++) newSid sinks (Map.delete oldSid rest)</span>
+<span class="lineno">  229 </span><span class="spaces">  </span><span class="nottickedoff">writeTVar tv m'</span>
+<span class="lineno">  230 </span><span class="spaces">  </span><span class="nottickedoff">pure (length sinks)</span></span>
+
+</pre>
+</body>
+</html>

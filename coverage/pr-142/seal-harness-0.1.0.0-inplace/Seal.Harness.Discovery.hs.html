@@ -1,0 +1,86 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | On-demand scan for unmanaged tmux windows (those without a @seal_id
+<span class="lineno">    3 </span>-- marker) that could be adopted by the harness registry.
+<span class="lineno">    4 </span>module Seal.Harness.Discovery
+<span class="lineno">    5 </span>  ( DiscoverableWindow (..)
+<span class="lineno">    6 </span>  , scanDiscoverableIO
+<span class="lineno">    7 </span>  ) where
+<span class="lineno">    8 </span>
+<span class="lineno">    9 </span>import Data.Text (Text)
+<span class="lineno">   10 </span>import Data.Text qualified as T
+<span class="lineno">   11 </span>
+<span class="lineno">   12 </span>import Seal.Handles.Harness (HarnessError)
+<span class="lineno">   13 </span>import Seal.Harness.Tmux (TmuxRunner (..))
+<span class="lineno">   14 </span>
+<span class="lineno">   15 </span>-- | A discovered tmux window that could be adopted.
+<span class="lineno">   16 </span>data DiscoverableWindow = DiscoverableWindow
+<span class="lineno">   17 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">dwTmuxCoord</span></span></span>    :: Text        -- ^ &quot;session:window&quot; or &quot;%&lt;pane&gt;&quot;
+<span class="lineno">   18 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">dwTitle</span></span></span>        :: Text        -- ^ the window's name
+<span class="lineno">   19 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">dwFlavourHint</span></span></span>  :: Maybe Text  -- ^ guessed from the title
+<span class="lineno">   20 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>-- | Scan for unmanaged tmux windows (no @seal_id marker). IO via the
+<span class="lineno">   23 </span>-- 'TmuxRunner' seam: @tmux list-windows -F &quot;#{window_id}:#{window_name}&quot;@
+<span class="lineno">   24 </span>-- (a real call would also check each window's markers; for 6a's
+<span class="lineno">   25 </span>-- fake-runner test, the scripted stdout is parsed as one window per line).
+<span class="lineno">   26 </span>-- Windows whose title starts with @seal:@ (the harness's own naming) are
+<span class="lineno">   27 </span>-- considered managed and filtered out.
+<span class="lineno">   28 </span>scanDiscoverableIO :: TmuxRunner -&gt; IO (Either HarnessError [DiscoverableWindow])
+<span class="lineno">   29 </span><span class="decl"><span class="istickedoff">scanDiscoverableIO runner = do</span>
+<span class="lineno">   30 </span><span class="spaces">  </span><span class="istickedoff">r &lt;- runTmux runner <span class="nottickedoff">[&quot;list-windows&quot;, &quot;-F&quot;, &quot;#{window_id}:#{window_name}&quot;]</span></span>
+<span class="lineno">   31 </span><span class="spaces">  </span><span class="istickedoff">pure $ case r of</span>
+<span class="lineno">   32 </span><span class="spaces">    </span><span class="istickedoff">Left e  -&gt; Left e</span>
+<span class="lineno">   33 </span><span class="spaces">    </span><span class="istickedoff">Right t -&gt; Right (parseWindows t)</span></span>
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>-- | Parse @tmux list-windows -F@ output: one line per window, format
+<span class="lineno">   36 </span>-- @&lt;coord&gt;:&lt;name&gt;@. Filter out managed harness windows (name starts with
+<span class="lineno">   37 </span>-- @seal-@ — the harness naming convention).
+<span class="lineno">   38 </span>parseWindows :: Text -&gt; [DiscoverableWindow]
+<span class="lineno">   39 </span><span class="decl"><span class="istickedoff">parseWindows = mapMaybe parseLine . T.lines</span>
+<span class="lineno">   40 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   41 </span><span class="spaces">    </span><span class="istickedoff">parseLine ln =</span>
+<span class="lineno">   42 </span><span class="spaces">      </span><span class="istickedoff">case T.breakOn &quot;:&quot; ln of</span>
+<span class="lineno">   43 </span><span class="spaces">        </span><span class="istickedoff">(coord, rest)</span>
+<span class="lineno">   44 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlyfalse">T.null rest</span> -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">   45 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt;</span>
+<span class="lineno">   46 </span><span class="spaces">              </span><span class="istickedoff">let title = T.drop 1 rest  -- drop the leading &quot;:&quot;</span>
+<span class="lineno">   47 </span><span class="spaces">              </span><span class="istickedoff">in if &quot;seal-&quot; `T.isPrefixOf` title</span>
+<span class="lineno">   48 </span><span class="spaces">                   </span><span class="istickedoff">then Nothing  -- managed harness window</span>
+<span class="lineno">   49 </span><span class="spaces">                   </span><span class="istickedoff">else Just (DiscoverableWindow coord <span class="nottickedoff">title</span> (guessFlavour title))</span></span>
+<span class="lineno">   50 </span>
+<span class="lineno">   51 </span>-- | Guess a flavour from the window title.
+<span class="lineno">   52 </span>guessFlavour :: Text -&gt; Maybe Text
+<span class="lineno">   53 </span><span class="decl"><span class="istickedoff">guessFlavour title</span>
+<span class="lineno">   54 </span><span class="spaces">  </span><span class="istickedoff">| &quot;claude&quot;  `T.isInfixOf` T.toCaseFold title = Just &quot;claude-code&quot;</span>
+<span class="lineno">   55 </span><span class="spaces">  </span><span class="istickedoff">| &quot;codex&quot;   `T.isInfixOf` T.toCaseFold title = Just &quot;codex&quot;</span>
+<span class="lineno">   56 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>                                  = Nothing</span></span>
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>-- local helper (avoid a Data.Maybe import for one helper)
+<span class="lineno">   59 </span>mapMaybe :: (a -&gt; Maybe b) -&gt; [a] -&gt; [b]
+<span class="lineno">   60 </span><span class="decl"><span class="istickedoff">mapMaybe _ []     = []</span>
+<span class="lineno">   61 </span><span class="spaces"></span><span class="istickedoff">mapMaybe f (x:xs) = case f x of</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">Just y  -&gt; y : mapMaybe f xs</span>
+<span class="lineno">   63 </span><span class="spaces">  </span><span class="istickedoff">Nothing -&gt; mapMaybe f xs</span></span>
+
+</pre>
+</body>
+</html>

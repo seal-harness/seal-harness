@@ -1,0 +1,144 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The vault's encryption seam. The real encryptor shells out to the @age@
+<span class="lineno">    3 </span>-- binary (so hardware-token support via age plugins is free); tests use the
+<span class="lineno">    4 </span>-- in-process mock, so the suite needs no binary on PATH.
+<span class="lineno">    5 </span>module Seal.Security.Vault.Age
+<span class="lineno">    6 </span>  ( VaultError (..)
+<span class="lineno">    7 </span>  , VaultEncryptor (..)
+<span class="lineno">    8 </span>  , AgeRecipient (..)
+<span class="lineno">    9 </span>  , AgeIdentity (..)
+<span class="lineno">   10 </span>  , mkAgeEncryptor
+<span class="lineno">   11 </span>  , mkMockEncryptor
+<span class="lineno">   12 </span>  , mkFailingEncryptor
+<span class="lineno">   13 </span>  ) where
+<span class="lineno">   14 </span>
+<span class="lineno">   15 </span>import Control.Exception (IOException, try)
+<span class="lineno">   16 </span>import Data.Bits (xor)
+<span class="lineno">   17 </span>import Data.ByteString (ByteString)
+<span class="lineno">   18 </span>import Data.ByteString qualified as BS
+<span class="lineno">   19 </span>import Data.Text (Text)
+<span class="lineno">   20 </span>import Data.Text qualified as T
+<span class="lineno">   21 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   22 </span>import System.Exit (ExitCode (..))
+<span class="lineno">   23 </span>import System.IO (hClose, hFlush)
+<span class="lineno">   24 </span>import System.Process
+<span class="lineno">   25 </span>  ( CreateProcess (..), StdStream (..), proc, waitForProcess, withCreateProcess )
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>-- | Run a process with a strict 'ByteString' stdin, capturing stdout and
+<span class="lineno">   28 </span>-- stderr as strict 'ByteString's. Used by the age encrypt/decrypt seam
+<span class="lineno">   29 </span>-- where the payload is binary (ciphertext) and must not be round-tripped
+<span class="lineno">   30 </span>-- through 'String'. Closes all handles and waits for the child before
+<span class="lineno">   31 </span>-- returning.
+<span class="lineno">   32 </span>readProcessBinary :: FilePath -&gt; [String] -&gt; ByteString
+<span class="lineno">   33 </span>                 -&gt; IO (ExitCode, ByteString, ByteString)
+<span class="lineno">   34 </span><span class="decl"><span class="nottickedoff">readProcessBinary cmdPath args input =</span>
+<span class="lineno">   35 </span><span class="spaces">  </span><span class="nottickedoff">withCreateProcess</span>
+<span class="lineno">   36 </span><span class="spaces">    </span><span class="nottickedoff">( (proc cmdPath args)</span>
+<span class="lineno">   37 </span><span class="spaces">        </span><span class="nottickedoff">{ std_in = CreatePipe, std_out = CreatePipe, std_err = CreatePipe }</span>
+<span class="lineno">   38 </span><span class="spaces">    </span><span class="nottickedoff">) $ \mIn mOut mErr ph -&gt; do</span>
+<span class="lineno">   39 </span><span class="spaces">      </span><span class="nottickedoff">(hIn, hOut, hErr) &lt;- case (mIn, mOut, mErr) of</span>
+<span class="lineno">   40 </span><span class="spaces">        </span><span class="nottickedoff">(Just a, Just b, Just c) -&gt; pure (a, b, c)</span>
+<span class="lineno">   41 </span><span class="spaces">        </span><span class="nottickedoff">_ -&gt; error &quot;readProcessBinary: pipe creation failed (unreachable)&quot;</span>
+<span class="lineno">   42 </span><span class="spaces">      </span><span class="nottickedoff">-- Feed stdin on a child thread so we can read stdout/stderr</span>
+<span class="lineno">   43 </span><span class="spaces">      </span><span class="nottickedoff">-- concurrently without deadlocking on a large payload.</span>
+<span class="lineno">   44 </span><span class="spaces">      </span><span class="nottickedoff">BS.hPutStr hIn input</span>
+<span class="lineno">   45 </span><span class="spaces">      </span><span class="nottickedoff">hFlush hIn</span>
+<span class="lineno">   46 </span><span class="spaces">      </span><span class="nottickedoff">hClose hIn</span>
+<span class="lineno">   47 </span><span class="spaces">      </span><span class="nottickedoff">-- Read stdout/stderr fully after stdin is closed (age reads the</span>
+<span class="lineno">   48 </span><span class="spaces">      </span><span class="nottickedoff">-- whole plaintext before emitting ciphertext, so this is safe).</span>
+<span class="lineno">   49 </span><span class="spaces">      </span><span class="nottickedoff">out &lt;- BS.hGetContents hOut</span>
+<span class="lineno">   50 </span><span class="spaces">      </span><span class="nottickedoff">err &lt;- BS.hGetContents hErr</span>
+<span class="lineno">   51 </span><span class="spaces">      </span><span class="nottickedoff">ec  &lt;- waitForProcess ph</span>
+<span class="lineno">   52 </span><span class="spaces">      </span><span class="nottickedoff">-- Force the lazy hGetContents results so the handles are fully read</span>
+<span class="lineno">   53 </span><span class="spaces">      </span><span class="nottickedoff">-- before withCreateProcess closes them.</span>
+<span class="lineno">   54 </span><span class="spaces">      </span><span class="nottickedoff">let !_ = BS.length out</span>
+<span class="lineno">   55 </span><span class="spaces">          </span><span class="nottickedoff">!_ = BS.length err</span>
+<span class="lineno">   56 </span><span class="spaces">      </span><span class="nottickedoff">pure (ec, out, err)</span></span>
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>-- | The vault's error type. The first four constructors are matched on to
+<span class="lineno">   59 </span>-- drive control flow (so they earn being a sum type per the haskell-coder
+<span class="lineno">   60 </span>-- skill); 'VaultBackendError' is the single catch-all for failures that are
+<span class="lineno">   61 </span>-- only reported — @age@ stderr, &quot;age not installed&quot;, corrupt vault data.
+<span class="lineno">   62 </span>data VaultError
+<span class="lineno">   63 </span>  = VaultLocked
+<span class="lineno">   64 </span>  | VaultNotFound
+<span class="lineno">   65 </span>  | VaultAlreadyExists
+<span class="lineno">   66 </span>  | VaultKeyNotFound Text
+<span class="lineno">   67 </span>  | VaultBackendError Text
+<span class="lineno">   68 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   69 </span>
+<span class="lineno">   70 </span>newtype AgeRecipient = AgeRecipient Text deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   71 </span>newtype AgeIdentity  = AgeIdentity  Text deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   72 </span>
+<span class="lineno">   73 </span>-- | Encrypt/decrypt with credentials already captured in the closure.
+<span class="lineno">   74 </span>data VaultEncryptor = VaultEncryptor
+<span class="lineno">   75 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">veEncrypt</span></span></span> :: ByteString -&gt; IO (Either VaultError ByteString)
+<span class="lineno">   76 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">veDecrypt</span></span></span> :: ByteString -&gt; IO (Either VaultError ByteString)
+<span class="lineno">   77 </span>  }
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- | Build a real encryptor backed by @age@. Preflights @age --version@ and
+<span class="lineno">   80 </span>-- reports a 'VaultBackendError' install hint if the binary is absent.
+<span class="lineno">   81 </span>mkAgeEncryptor :: AgeRecipient -&gt; AgeIdentity -&gt; IO (Either VaultError VaultEncryptor)
+<span class="lineno">   82 </span><span class="decl"><span class="istickedoff">mkAgeEncryptor (AgeRecipient recipient) (AgeIdentity identity) = do</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">versionResult &lt;- try @IOException (callProcessNoOutput &quot;age&quot; [&quot;--version&quot;])</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">case versionResult of</span>
+<span class="lineno">   85 </span><span class="spaces">    </span><span class="istickedoff">Right ExitSuccess -&gt;</span>
+<span class="lineno">   86 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">pure (Right VaultEncryptor</span></span>
+<span class="lineno">   87 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">{ veEncrypt = run [&quot;--encrypt&quot;, &quot;--recipient&quot;, T.unpack recipient]</span></span>
+<span class="lineno">   88 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">, veDecrypt = run [&quot;--decrypt&quot;, &quot;--identity&quot;, T.unpack identity]</span></span>
+<span class="lineno">   89 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">})</span></span>
+<span class="lineno">   90 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; pure notInstalled  -- IOException (binary absent) OR ExitFailure</span>
+<span class="lineno">   91 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   92 </span><span class="spaces">    </span><span class="istickedoff">notInstalled =</span>
+<span class="lineno">   93 </span><span class="spaces">      </span><span class="istickedoff">Left (VaultBackendError <span class="nottickedoff">&quot;age not installed; see https://age-encryption.org&quot;</span>)</span>
+<span class="lineno">   94 </span><span class="spaces">    </span><span class="istickedoff">run :: [String] -&gt; ByteString -&gt; IO (Either VaultError ByteString)</span>
+<span class="lineno">   95 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">run args input = do</span></span>
+<span class="lineno">   96 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">(code, out, err) &lt;- readProcessBinary &quot;age&quot; args input</span></span>
+<span class="lineno">   97 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">pure $ case code of</span></span>
+<span class="lineno">   98 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">ExitSuccess   -&gt; Right out</span></span>
+<span class="lineno">   99 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">ExitFailure _ -&gt; Left (VaultBackendError (TE.decodeUtf8Lenient err))</span></span></span>
+<span class="lineno">  100 </span>
+<span class="lineno">  101 </span>-- | Run a process, ignoring its stdout/stderr, returning only the exit code.
+<span class="lineno">  102 </span>-- Used for the @age --version@ preflight. Catches a launch failure as
+<span class="lineno">  103 </span>-- 'ExitFailure 127' (consistent with the git seam's convention).
+<span class="lineno">  104 </span>callProcessNoOutput :: FilePath -&gt; [String] -&gt; IO ExitCode
+<span class="lineno">  105 </span><span class="decl"><span class="istickedoff">callProcessNoOutput cmdPath args =</span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="istickedoff">withCreateProcess ((proc cmdPath args) { std_out = NoStream, std_err = NoStream }) $</span>
+<span class="lineno">  107 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">\_ _ _ ph -&gt; waitForProcess ph</span></span></span>
+<span class="lineno">  108 </span>
+<span class="lineno">  109 </span>-- | XOR-with-0xAB mock; reversible, no binary required.
+<span class="lineno">  110 </span>mkMockEncryptor :: VaultEncryptor
+<span class="lineno">  111 </span><span class="decl"><span class="istickedoff">mkMockEncryptor = VaultEncryptor</span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="istickedoff">{ veEncrypt = pure . Right . BS.map (`xor` 0xAB)</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">, veDecrypt = pure . Right . BS.map (`xor` 0xAB)</span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  115 </span>
+<span class="lineno">  116 </span>-- | An encryptor that always fails; for exercising vault error paths.
+<span class="lineno">  117 </span>mkFailingEncryptor :: VaultError -&gt; VaultEncryptor
+<span class="lineno">  118 </span><span class="decl"><span class="istickedoff">mkFailingEncryptor e = VaultEncryptor</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">{ veEncrypt = const (pure (Left e))</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">, veDecrypt = const (pure (Left e))</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+
+</pre>
+</body>
+</html>

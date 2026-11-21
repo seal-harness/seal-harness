@@ -1,0 +1,745 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Shared transcript-reading logic: read a session's on-disk transcript
+<span class="lineno">    3 </span>-- (legacy @transcript.jsonl@ or the two-file @conversation.jsonl@ +
+<span class="lineno">    4 </span>-- @entries.jsonl@) and convert it to the frontend's TranscriptEntry JSON
+<span class="lineno">    5 </span>-- shape. Used by both the HTTP GET seed ('Seal.Gateway.API.handleTranscript')
+<span class="lineno">    6 </span>-- and the WS broadcast path ('Seal.Gateway.Send' pushes new entries via the
+<span class="lineno">    7 </span>-- broker after a turn completes). Extracted to a leaf module to avoid the
+<span class="lineno">    8 </span>-- circular dependency between 'Seal.Gateway.API' (which imports
+<span class="lineno">    9 </span>-- 'Seal.Gateway.Send') and 'Seal.Gateway.Send' (which needs the transcript
+<span class="lineno">   10 </span>-- reader for broadcasting).
+<span class="lineno">   11 </span>module Seal.Gateway.Transcript
+<span class="lineno">   12 </span>  ( readTranscriptEntries
+<span class="lineno">   13 </span>  , readTranscriptEntriesTimed
+<span class="lineno">   14 </span>  , TranscriptSource (..)
+<span class="lineno">   15 </span>  , TranscriptTimings (..)
+<span class="lineno">   16 </span>  , renderServerTiming
+<span class="lineno">   17 </span>  , setEncodeMs
+<span class="lineno">   18 </span>  , firstUserMessageSnippet
+<span class="lineno">   19 </span>  , lastUserMessageAt
+<span class="lineno">   20 </span>  , showIso
+<span class="lineno">   21 </span>  , reconEntryToFrontend
+<span class="lineno">   22 </span>  ) where
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>import Data.Aeson (Value (..), object, (.=))
+<span class="lineno">   25 </span>import Data.Aeson qualified as A
+<span class="lineno">   26 </span>import Data.Aeson.Key (Key)
+<span class="lineno">   27 </span>import Data.Aeson.Key qualified as Key
+<span class="lineno">   28 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   29 </span>import Data.ByteString.Char8 qualified as BC
+<span class="lineno">   30 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   31 </span>import Data.Maybe (fromMaybe, mapMaybe)
+<span class="lineno">   32 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   33 </span>import Data.Set qualified as Set
+<span class="lineno">   34 </span>import Data.Text (Text)
+<span class="lineno">   35 </span>import Data.Text qualified as T
+<span class="lineno">   36 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   37 </span>import Data.Time (UTCTime, defaultTimeLocale, diffUTCTime, formatTime, getCurrentTime)
+<span class="lineno">   38 </span>import Data.Vector qualified as V
+<span class="lineno">   39 </span>import System.Directory (doesFileExist)
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>import Seal.Config.Paths
+<span class="lineno">   42 </span>  (SealPaths, sessionConversationPath, sessionEntriesPath, sessionTranscriptPath)
+<span class="lineno">   43 </span>import Seal.Core.Types (SessionId)
+<span class="lineno">   44 </span>import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
+<span class="lineno">   45 </span>import Seal.Transcript.Entries (EntryRecord (..))
+<span class="lineno">   46 </span>import Seal.Transcript.Reconstruct (reconstruct)
+<span class="lineno">   47 </span>import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
+<span class="lineno">   48 </span>import Seal.Util.StrictIO (readFileTextStrict)
+<span class="lineno">   49 </span>
+<span class="lineno">   50 </span>-- | Which on-disk source produced the entries. Surfaced in 'TranscriptTimings'
+<span class="lineno">   51 </span>-- so the @Server-Timing@ header can name the path the request took.
+<span class="lineno">   52 </span>data TranscriptSource
+<span class="lineno">   53 </span>  = TSMissing      -- ^ no transcript file exists
+<span class="lineno">   54 </span>  | TSLegacy       -- ^ legacy @transcript.jsonl@
+<span class="lineno">   55 </span>  | TSConvEntries  -- @conversation.jsonl@ + @entries.jsonl@ (reconstructed)
+<span class="lineno">   56 </span>  | TSConvOnly     -- @conversation.jsonl@ only (no entries sidecar)
+<span class="lineno">   57 </span>  deriving (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   58 </span>
+<span class="lineno">   59 </span>-- | Per-phase timings for a single 'readTranscriptEntries' call, in
+<span class="lineno">   60 </span>-- milliseconds. Phase durations are measured with 'getCurrentTime' (wall
+<span class="lineno">   61 </span>-- clock); for the small file sizes typical of a transcript, GHC's wall
+<span class="lineno">   62 </span>-- clock has enough resolution. Phases are exclusive of each other EXCEPT
+<span class="lineno">   63 </span>-- @ttTotal@, which spans the entire call. A phase that didn't run (e.g.
+<span class="lineno">   64 </span>-- @ttReconstruct@ when the legacy path was taken) is 0.
+<span class="lineno">   65 </span>data TranscriptTimings = TranscriptTimings
+<span class="lineno">   66 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">ttSource</span></span></span>       :: TranscriptSource
+<span class="lineno">   67 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ttEntryCount</span></span></span>   :: Int           -- ^ number of frontend entries returned
+<span class="lineno">   68 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ttFileReadMs</span></span></span>   :: Integer       -- ^ time spent in 'TIO.readFile' (conv + entries files combined)
+<span class="lineno">   69 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ttParseMs</span></span></span>      :: Integer       -- ^ 'A.decode' of every line (both files combined)
+<span class="lineno">   70 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ttReconstructMs</span></span></span> :: Integer      -- @'reconstruct' (two-file path only)
+<span class="lineno">   71 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ttRewriteMs</span></span></span>    :: Integer        -- 'teLineToFrontend' / 'reconEntryToFrontend' / 'convLineToFrontend'
+<span class="lineno">   72 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ttEncodeMs</span></span></span>     :: Integer        -- ^ 'A.encode' of the frontend [Value] (set by 'handleTranscript', 0 for the bare reader)
+<span class="lineno">   73 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ttTotalMs</span></span></span>      :: Integer       -- ^ wall-clock total of the whole call
+<span class="lineno">   74 </span>  }
+<span class="lineno">   75 </span>
+<span class="lineno">   76 </span>-- | Format a 'TranscriptTimings' as a @Server-Timing@ header value per
+<span class="lineno">   77 </span>-- &lt;https://www.w3.org/TR/server-timing/&gt;. Each phase is a separate
+<span class="lineno">   78 </span>-- comma-separated token with a short name, a numeric @dur@ (milliseconds,
+<span class="lineno">   79 </span>-- 3-decimal precision in the spec but we emit integers), and a @desc@
+<span class="lineno">   80 </span>-- naming the phase. The frontend parses these via @performance.getEntriesByName@
+<span class="lineno">   81 </span>-- or by reading the @Server-Timing@ response header directly.
+<span class="lineno">   82 </span>--
+<span class="lineno">   83 </span>-- Example output:
+<span class="lineno">   84 </span>--   @tt;dur=42;desc=&quot;total&quot;, fr;dur=3;desc=&quot;file-read&quot;, pr;dur=18;desc=&quot;parse&quot;, rc;dur=12;desc=&quot;reconstruct&quot;, rw;dur=4;desc=&quot;rewrite&quot;, en;dur=8;desc=&quot;encode&quot;, src;desc=&quot;conv+entries&quot;, n;desc=&quot;127&quot;@
+<span class="lineno">   85 </span>renderServerTiming :: TranscriptTimings -&gt; BC.ByteString
+<span class="lineno">   86 </span><span class="decl"><span class="istickedoff">renderServerTiming t =</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">let phase name ms desc =</span>
+<span class="lineno">   88 </span><span class="spaces">        </span><span class="istickedoff">BC.pack name &lt;&gt; &quot;;dur=&quot; &lt;&gt; BC.pack (show ms) &lt;&gt; &quot;;desc=\&quot;&quot; &lt;&gt; BC.pack desc &lt;&gt; &quot;\&quot;&quot;</span>
+<span class="lineno">   89 </span><span class="spaces">      </span><span class="istickedoff">tag name desc = BC.pack name &lt;&gt; &quot;;desc=\&quot;&quot; &lt;&gt; BC.pack desc &lt;&gt; &quot;\&quot;&quot;</span>
+<span class="lineno">   90 </span><span class="spaces">      </span><span class="istickedoff">srcDesc = case ttSource t of</span>
+<span class="lineno">   91 </span><span class="spaces">        </span><span class="istickedoff">TSMissing      -&gt; &quot;missing&quot;</span>
+<span class="lineno">   92 </span><span class="spaces">        </span><span class="istickedoff">TSLegacy       -&gt; &quot;legacy&quot;</span>
+<span class="lineno">   93 </span><span class="spaces">        </span><span class="istickedoff">TSConvEntries  -&gt; &quot;conv+entries&quot;</span>
+<span class="lineno">   94 </span><span class="spaces">        </span><span class="istickedoff">TSConvOnly     -&gt; &quot;conv-only&quot;</span>
+<span class="lineno">   95 </span><span class="spaces">      </span><span class="istickedoff">parts =</span>
+<span class="lineno">   96 </span><span class="spaces">        </span><span class="istickedoff">[ phase &quot;tt&quot; (ttTotalMs t)       &quot;total&quot;</span>
+<span class="lineno">   97 </span><span class="spaces">        </span><span class="istickedoff">, phase &quot;fr&quot; (ttFileReadMs t)    &quot;file-read&quot;</span>
+<span class="lineno">   98 </span><span class="spaces">        </span><span class="istickedoff">, phase &quot;pr&quot; (ttParseMs t)        &quot;parse&quot;</span>
+<span class="lineno">   99 </span><span class="spaces">        </span><span class="istickedoff">, phase &quot;rc&quot; (ttReconstructMs t) &quot;reconstruct&quot;</span>
+<span class="lineno">  100 </span><span class="spaces">        </span><span class="istickedoff">, phase &quot;rw&quot; (ttRewriteMs t)      &quot;rewrite&quot;</span>
+<span class="lineno">  101 </span><span class="spaces">        </span><span class="istickedoff">, phase &quot;en&quot; (ttEncodeMs t)       &quot;encode&quot;</span>
+<span class="lineno">  102 </span><span class="spaces">        </span><span class="istickedoff">, tag  &quot;src&quot; srcDesc</span>
+<span class="lineno">  103 </span><span class="spaces">        </span><span class="istickedoff">, tag  &quot;n&quot;   (show (ttEntryCount t))</span>
+<span class="lineno">  104 </span><span class="spaces">        </span><span class="istickedoff">]</span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="istickedoff">in BC.intercalate &quot;, &quot; parts</span></span>
+<span class="lineno">  106 </span>
+<span class="lineno">  107 </span>-- | Set the encode-phase duration + bump the total to span read+encode.
+<span class="lineno">  108 </span>-- 'handleTranscript' uses this after timing 'A.encode' so the @en@ token
+<span class="lineno">  109 </span>-- reflects the JSON-serialization cost (which dominates for transcripts
+<span class="lineno">  110 </span>-- carrying large web_fetch / shell-output tool_result blocks) and @tt@
+<span class="lineno">  111 </span>-- reflects the full read+encode cost.
+<span class="lineno">  112 </span>setEncodeMs :: Integer -&gt; Integer -&gt; TranscriptTimings -&gt; TranscriptTimings
+<span class="lineno">  113 </span><span class="decl"><span class="istickedoff">setEncodeMs encodeMs totalMs tt = tt { ttEncodeMs = encodeMs, ttTotalMs = totalMs }</span></span>
+<span class="lineno">  114 </span>
+<span class="lineno">  115 </span>-- | 'zipWith' + 'mapMaybe': apply a partial function across two lists
+<span class="lineno">  116 </span>-- in lockstep, dropping the elements for which the function returns
+<span class="lineno">  117 </span>-- 'Nothing'.
+<span class="lineno">  118 </span>zipWithMaybe :: (a -&gt; b -&gt; Maybe c) -&gt; [a] -&gt; [b] -&gt; [c]
+<span class="lineno">  119 </span><span class="decl"><span class="istickedoff">zipWithMaybe _ [] _ = <span class="nottickedoff">[]</span></span>
+<span class="lineno">  120 </span><span class="spaces"></span><span class="istickedoff">zipWithMaybe _ _ [] = []</span>
+<span class="lineno">  121 </span><span class="spaces"></span><span class="istickedoff">zipWithMaybe f (a : as) (b : bs) = case f a b of</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">Just c  -&gt; c : zipWithMaybe f as bs</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">Nothing -&gt; zipWithMaybe f as bs</span></span>
+<span class="lineno">  124 </span>
+<span class="lineno">  125 </span>-- | Read a session's transcript as the frontend's TranscriptEntry JSON shape.
+<span class="lineno">  126 </span>-- Returns @[]@ for a missing/invalid session. Discards timing information;
+<span class="lineno">  127 </span>-- see 'readTranscriptEntriesTimed' for the instrumented variant.
+<span class="lineno">  128 </span>readTranscriptEntries
+<span class="lineno">  129 </span>  :: SealPaths -&gt; Text -&gt; String -&gt; SessionId -&gt; IO [Value]
+<span class="lineno">  130 </span><span class="decl"><span class="istickedoff">readTranscriptEntries paths model fallbackTs sid =</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">fst &lt;$&gt; readTranscriptEntriesTimed paths model fallbackTs sid</span></span>
+<span class="lineno">  132 </span>
+<span class="lineno">  133 </span>-- | Instrumented variant of 'readTranscriptEntries': returns the frontend
+<span class="lineno">  134 </span>-- values alongside per-phase wall-clock timings. Used by the @/transcript@
+<span class="lineno">  135 </span>-- HTTP handler to emit a @Server-Timing@ header; other callers (broadcast,
+<span class="lineno">  136 </span>-- snippet helpers) can use the plain 'readTranscriptEntries' and ignore the
+<span class="lineno">  137 </span>-- overhead of timing capture.
+<span class="lineno">  138 </span>readTranscriptEntriesTimed
+<span class="lineno">  139 </span>  :: SealPaths -&gt; Text -&gt; String -&gt; SessionId -&gt; IO ([Value], TranscriptTimings)
+<span class="lineno">  140 </span><span class="decl"><span class="istickedoff">readTranscriptEntriesTimed paths model fallbackTs sid = do</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">tStart &lt;- getCurrentTime</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">let legacyPath = sessionTranscriptPath paths sid</span>
+<span class="lineno">  143 </span><span class="spaces">      </span><span class="istickedoff">convPath   = sessionConversationPath paths sid</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">legacyExists &lt;- doesFileExist legacyPath</span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="istickedoff">convExists   &lt;- doesFileExist convPath</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">legacyExists</span></span>
+<span class="lineno">  147 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">do</span></span>
+<span class="lineno">  148 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">tFr0 &lt;- getCurrentTime</span></span>
+<span class="lineno">  149 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">raw &lt;- readFileTextStrict legacyPath</span></span>
+<span class="lineno">  150 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">tFr1 &lt;- getCurrentTime</span></span>
+<span class="lineno">  151 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">tPr0 &lt;- getCurrentTime</span></span>
+<span class="lineno">  152 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">let vals = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)</span></span>
+<span class="lineno">  153 </span><span class="spaces">                          </span><span class="istickedoff"><span class="nottickedoff">(filter (not . T.null) (T.lines raw))</span></span>
+<span class="lineno">  154 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">tPr1 &lt;- getCurrentTime</span></span>
+<span class="lineno">  155 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">tRw0 &lt;- getCurrentTime</span></span>
+<span class="lineno">  156 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">let frontend = map teLineToFrontend vals</span></span>
+<span class="lineno">  157 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">tRw1 &lt;- getCurrentTime</span></span>
+<span class="lineno">  158 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">tEnd &lt;- getCurrentTime</span></span>
+<span class="lineno">  159 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">let tt = TranscriptTimings</span></span>
+<span class="lineno">  160 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">{ ttSource        = TSLegacy</span></span>
+<span class="lineno">  161 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, ttEntryCount    = length frontend</span></span>
+<span class="lineno">  162 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, ttFileReadMs    = ms tFr0 tFr1</span></span>
+<span class="lineno">  163 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, ttParseMs       = ms tPr0 tPr1</span></span>
+<span class="lineno">  164 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, ttReconstructMs = 0</span></span>
+<span class="lineno">  165 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, ttRewriteMs     = ms tRw0 tRw1</span></span>
+<span class="lineno">  166 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, ttEncodeMs      = 0</span></span>
+<span class="lineno">  167 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">, ttTotalMs       = ms tStart tEnd</span></span>
+<span class="lineno">  168 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">}</span></span>
+<span class="lineno">  169 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">pure (frontend, tt)</span></span>
+<span class="lineno">  170 </span><span class="spaces">    </span><span class="istickedoff">else if convExists</span>
+<span class="lineno">  171 </span><span class="spaces">      </span><span class="istickedoff">then do</span>
+<span class="lineno">  172 </span><span class="spaces">        </span><span class="istickedoff">tFr0 &lt;- getCurrentTime</span>
+<span class="lineno">  173 </span><span class="spaces">        </span><span class="istickedoff">raw &lt;- readFileTextStrict convPath</span>
+<span class="lineno">  174 </span><span class="spaces">        </span><span class="istickedoff">tFr1 &lt;- getCurrentTime</span>
+<span class="lineno">  175 </span><span class="spaces">        </span><span class="istickedoff">tPr0 &lt;- getCurrentTime</span>
+<span class="lineno">  176 </span><span class="spaces">        </span><span class="istickedoff">let msgVals = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)</span>
+<span class="lineno">  177 </span><span class="spaces">                               </span><span class="istickedoff">(filter (not . T.null) (T.lines raw)) :: [A.Value]</span>
+<span class="lineno">  178 </span><span class="spaces">            </span><span class="istickedoff">msgs    = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)</span>
+<span class="lineno">  179 </span><span class="spaces">                               </span><span class="istickedoff">(filter (not . T.null) (T.lines raw)) :: [Message]</span>
+<span class="lineno">  180 </span><span class="spaces">        </span><span class="istickedoff">tPr1 &lt;- getCurrentTime</span>
+<span class="lineno">  181 </span><span class="spaces">        </span><span class="istickedoff">entriesExist &lt;- doesFileExist (sessionEntriesPath paths sid)</span>
+<span class="lineno">  182 </span><span class="spaces">        </span><span class="istickedoff">if entriesExist</span>
+<span class="lineno">  183 </span><span class="spaces">          </span><span class="istickedoff">then do</span>
+<span class="lineno">  184 </span><span class="spaces">            </span><span class="istickedoff">tFr2 &lt;- getCurrentTime</span>
+<span class="lineno">  185 </span><span class="spaces">            </span><span class="istickedoff">eraw &lt;- readFileTextStrict (sessionEntriesPath paths sid)</span>
+<span class="lineno">  186 </span><span class="spaces">            </span><span class="istickedoff">tFr3 &lt;- getCurrentTime</span>
+<span class="lineno">  187 </span><span class="spaces">            </span><span class="istickedoff">tPr2 &lt;- getCurrentTime</span>
+<span class="lineno">  188 </span><span class="spaces">            </span><span class="istickedoff">let evs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)</span>
+<span class="lineno">  189 </span><span class="spaces">                               </span><span class="istickedoff">(filter (not . T.null) (T.lines eraw)) :: [EntryRecord]</span>
+<span class="lineno">  190 </span><span class="spaces">            </span><span class="istickedoff">tPr3 &lt;- getCurrentTime</span>
+<span class="lineno">  191 </span><span class="spaces">            </span><span class="istickedoff">tRc0 &lt;- getCurrentTime</span>
+<span class="lineno">  192 </span><span class="spaces">            </span><span class="istickedoff">let reconstructed = reconstruct msgs evs</span>
+<span class="lineno">  193 </span><span class="spaces">                </span><span class="istickedoff">frontend = zipWithMaybe reconEntryToFrontend [0..] reconstructed</span>
+<span class="lineno">  194 </span><span class="spaces">            </span><span class="istickedoff">tRc1 &lt;- getCurrentTime</span>
+<span class="lineno">  195 </span><span class="spaces">            </span><span class="istickedoff">tEnd &lt;- getCurrentTime</span>
+<span class="lineno">  196 </span><span class="spaces">            </span><span class="istickedoff">let <span class="nottickedoff">tt = TranscriptTimings</span></span>
+<span class="lineno">  197 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">{ ttSource        = TSConvEntries</span></span>
+<span class="lineno">  198 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, ttEntryCount    = length frontend</span></span>
+<span class="lineno">  199 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, ttFileReadMs    = ms tFr0 tFr1 + ms tFr2 tFr3</span></span>
+<span class="lineno">  200 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, ttParseMs       = ms tPr0 tPr1 + ms tPr2 tPr3</span></span>
+<span class="lineno">  201 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, ttReconstructMs = ms tRc0 tRc1</span></span>
+<span class="lineno">  202 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, ttRewriteMs     = 0  -- reconstruction includes rewrite</span></span>
+<span class="lineno">  203 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, ttEncodeMs      = 0</span></span>
+<span class="lineno">  204 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">, ttTotalMs       = ms tStart tEnd</span></span>
+<span class="lineno">  205 </span><span class="spaces">                  </span><span class="istickedoff"><span class="nottickedoff">}</span></span>
+<span class="lineno">  206 </span><span class="spaces">            </span><span class="istickedoff">pure (frontend, <span class="nottickedoff">tt</span>)</span>
+<span class="lineno">  207 </span><span class="spaces">          </span><span class="istickedoff">else do</span>
+<span class="lineno">  208 </span><span class="spaces">            </span><span class="istickedoff">tRw0 &lt;- getCurrentTime</span>
+<span class="lineno">  209 </span><span class="spaces">            </span><span class="istickedoff">let frontend = zipWith (convLineToFrontend model [] fallbackTs) [0..] msgVals</span>
+<span class="lineno">  210 </span><span class="spaces">            </span><span class="istickedoff">tRw1 &lt;- getCurrentTime</span>
+<span class="lineno">  211 </span><span class="spaces">            </span><span class="istickedoff">tEnd &lt;- getCurrentTime</span>
+<span class="lineno">  212 </span><span class="spaces">            </span><span class="istickedoff">let tt = TranscriptTimings</span>
+<span class="lineno">  213 </span><span class="spaces">                  </span><span class="istickedoff">{ ttSource        = TSConvOnly</span>
+<span class="lineno">  214 </span><span class="spaces">                  </span><span class="istickedoff">, ttEntryCount    = length frontend</span>
+<span class="lineno">  215 </span><span class="spaces">                  </span><span class="istickedoff">, ttFileReadMs    = ms tFr0 tFr1</span>
+<span class="lineno">  216 </span><span class="spaces">                  </span><span class="istickedoff">, ttParseMs       = ms tPr0 tPr1</span>
+<span class="lineno">  217 </span><span class="spaces">                  </span><span class="istickedoff">, ttReconstructMs = 0</span>
+<span class="lineno">  218 </span><span class="spaces">                  </span><span class="istickedoff">, ttRewriteMs     = ms tRw0 tRw1</span>
+<span class="lineno">  219 </span><span class="spaces">                  </span><span class="istickedoff">, ttEncodeMs      = <span class="nottickedoff">0</span></span>
+<span class="lineno">  220 </span><span class="spaces">                  </span><span class="istickedoff">, ttTotalMs       = <span class="nottickedoff">ms tStart tEnd</span></span>
+<span class="lineno">  221 </span><span class="spaces">                  </span><span class="istickedoff">}</span>
+<span class="lineno">  222 </span><span class="spaces">            </span><span class="istickedoff">pure (frontend, tt)</span>
+<span class="lineno">  223 </span><span class="spaces">      </span><span class="istickedoff">else do</span>
+<span class="lineno">  224 </span><span class="spaces">        </span><span class="istickedoff">tEnd &lt;- getCurrentTime</span>
+<span class="lineno">  225 </span><span class="spaces">        </span><span class="istickedoff">let tt = TranscriptTimings</span>
+<span class="lineno">  226 </span><span class="spaces">              </span><span class="istickedoff">{ ttSource        = TSMissing</span>
+<span class="lineno">  227 </span><span class="spaces">              </span><span class="istickedoff">, ttEntryCount    = 0</span>
+<span class="lineno">  228 </span><span class="spaces">              </span><span class="istickedoff">, ttFileReadMs    = 0</span>
+<span class="lineno">  229 </span><span class="spaces">              </span><span class="istickedoff">, ttParseMs       = 0</span>
+<span class="lineno">  230 </span><span class="spaces">              </span><span class="istickedoff">, ttReconstructMs = 0</span>
+<span class="lineno">  231 </span><span class="spaces">              </span><span class="istickedoff">, ttRewriteMs     = 0</span>
+<span class="lineno">  232 </span><span class="spaces">              </span><span class="istickedoff">, ttEncodeMs      = <span class="nottickedoff">0</span></span>
+<span class="lineno">  233 </span><span class="spaces">              </span><span class="istickedoff">, ttTotalMs       = <span class="nottickedoff">ms tStart tEnd</span></span>
+<span class="lineno">  234 </span><span class="spaces">              </span><span class="istickedoff">}</span>
+<span class="lineno">  235 </span><span class="spaces">        </span><span class="istickedoff">pure ([], tt)</span>
+<span class="lineno">  236 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  237 </span><span class="spaces">    </span><span class="istickedoff">ms a b = round (realToFrac (b `diffUTCTime` a) * 1000 :: Double)</span></span>
+<span class="lineno">  238 </span>
+<span class="lineno">  239 </span>-- | Extract a short snippet of the first user message in a session's
+<span class="lineno">  240 </span>-- transcript, for use as the default session title when the user has not
+<span class="lineno">  241 </span>-- set an explicit description. Reads the two-file format
+<span class="lineno">  242 </span>-- (@conversation.jsonl@) first, falling back to the legacy
+<span class="lineno">  243 </span>-- @transcript.jsonl@. Returns 'Nothing' when the session has no transcript
+<span class="lineno">  244 </span>-- or no user message with text content. The snippet is truncated to 80
+<span class="lineno">  245 </span>-- characters (on a codepoint boundary) to keep the sessions list compact.
+<span class="lineno">  246 </span>firstUserMessageSnippet :: SealPaths -&gt; SessionId -&gt; IO (Maybe Text)
+<span class="lineno">  247 </span><span class="decl"><span class="istickedoff">firstUserMessageSnippet paths sid = do</span>
+<span class="lineno">  248 </span><span class="spaces">  </span><span class="istickedoff">let legacyPath = sessionTranscriptPath paths sid</span>
+<span class="lineno">  249 </span><span class="spaces">      </span><span class="istickedoff">convPath   = sessionConversationPath paths sid</span>
+<span class="lineno">  250 </span><span class="spaces">  </span><span class="istickedoff">legacyExists &lt;- doesFileExist legacyPath</span>
+<span class="lineno">  251 </span><span class="spaces">  </span><span class="istickedoff">convExists   &lt;- doesFileExist convPath</span>
+<span class="lineno">  252 </span><span class="spaces">  </span><span class="istickedoff">if convExists</span>
+<span class="lineno">  253 </span><span class="spaces">    </span><span class="istickedoff">then do</span>
+<span class="lineno">  254 </span><span class="spaces">      </span><span class="istickedoff">raw &lt;- readFileTextStrict convPath</span>
+<span class="lineno">  255 </span><span class="spaces">      </span><span class="istickedoff">let msgs = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)</span>
+<span class="lineno">  256 </span><span class="spaces">                          </span><span class="istickedoff">(filter (not . T.null) (T.lines raw)) :: [Message]</span>
+<span class="lineno">  257 </span><span class="spaces">      </span><span class="istickedoff">pure (snippetFromMessages msgs)</span>
+<span class="lineno">  258 </span><span class="spaces">    </span><span class="istickedoff">else if <span class="tickonlyfalse">legacyExists</span></span>
+<span class="lineno">  259 </span><span class="spaces">      </span><span class="istickedoff">then <span class="nottickedoff">do</span></span>
+<span class="lineno">  260 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">raw &lt;- readFileTextStrict legacyPath</span></span>
+<span class="lineno">  261 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">let entries = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)</span></span>
+<span class="lineno">  262 </span><span class="spaces">                               </span><span class="istickedoff"><span class="nottickedoff">(filter (not . T.null) (T.lines raw)) :: [TranscriptEntry]</span></span>
+<span class="lineno">  263 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">pure (snippetFromMessages (legacyRequestMessages entries))</span></span>
+<span class="lineno">  264 </span><span class="spaces">      </span><span class="istickedoff">else pure Nothing</span></span>
+<span class="lineno">  265 </span>
+<span class="lineno">  266 </span>-- | Extract the first user message's text from a list of messages, truncated
+<span class="lineno">  267 </span>-- to 80 characters. Tool-use and tool-result blocks are skipped (only the
+<span class="lineno">  268 </span>-- first 'CbText' block of the first 'User' message is used).
+<span class="lineno">  269 </span>snippetFromMessages :: [Message] -&gt; Maybe Text
+<span class="lineno">  270 </span><span class="decl"><span class="istickedoff">snippetFromMessages msgs =</span>
+<span class="lineno">  271 </span><span class="spaces">  </span><span class="istickedoff">case filter (\m -&gt; msgRole m == User) msgs of</span>
+<span class="lineno">  272 </span><span class="spaces">    </span><span class="istickedoff">(m : _) -&gt; case [t | CbText t &lt;- msgContent m] of</span>
+<span class="lineno">  273 </span><span class="spaces">      </span><span class="istickedoff">(t : _) -&gt; Just (truncateSnippet 80 t)</span>
+<span class="lineno">  274 </span><span class="spaces">      </span><span class="istickedoff">[]      -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  275 </span><span class="spaces">    </span><span class="istickedoff">[] -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  276 </span>
+<span class="lineno">  277 </span>-- | Truncate a snippet to at most @n@ characters, appending an ellipsis when
+<span class="lineno">  278 </span>-- truncation occurs. 'T.take' is codepoint-safe for UTF-8 'Text'.
+<span class="lineno">  279 </span>truncateSnippet :: Int -&gt; Text -&gt; Text
+<span class="lineno">  280 </span><span class="decl"><span class="istickedoff">truncateSnippet n t</span>
+<span class="lineno">  281 </span><span class="spaces">  </span><span class="istickedoff">| T.length t &lt;= n = t</span>
+<span class="lineno">  282 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>       = T.take n t &lt;&gt; &quot;…&quot;</span></span>
+<span class="lineno">  283 </span>
+<span class="lineno">  284 </span>-- | Extract the request messages from legacy @transcript.jsonl@ entries.
+<span class="lineno">  285 </span>-- Only 'Request'-direction entries carry a payload with a @messages@ array;
+<span class="lineno">  286 </span>-- we collect messages from every request entry (the first user message is
+<span class="lineno">  287 </span>-- always in the first request).
+<span class="lineno">  288 </span>legacyRequestMessages :: [TranscriptEntry] -&gt; [Message]
+<span class="lineno">  289 </span><span class="decl"><span class="nottickedoff">legacyRequestMessages = concatMap go</span>
+<span class="lineno">  290 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  291 </span><span class="spaces">    </span><span class="nottickedoff">go te</span>
+<span class="lineno">  292 </span><span class="spaces">      </span><span class="nottickedoff">| teDirection te /= Request = []</span>
+<span class="lineno">  293 </span><span class="spaces">      </span><span class="nottickedoff">| otherwise = case tePayload te of</span>
+<span class="lineno">  294 </span><span class="spaces">          </span><span class="nottickedoff">A.Object o -&gt; case KeyMap.lookup (Key.fromText &quot;messages&quot;) o of</span>
+<span class="lineno">  295 </span><span class="spaces">            </span><span class="nottickedoff">Just (A.Array arr) -&gt; mapMaybe decodeMsg (V.toList arr)</span>
+<span class="lineno">  296 </span><span class="spaces">            </span><span class="nottickedoff">_ -&gt; []</span>
+<span class="lineno">  297 </span><span class="spaces">          </span><span class="nottickedoff">_ -&gt; []</span>
+<span class="lineno">  298 </span><span class="spaces">    </span><span class="nottickedoff">decodeMsg v = case A.fromJSON v :: A.Result Message of</span>
+<span class="lineno">  299 </span><span class="spaces">      </span><span class="nottickedoff">A.Success m -&gt; Just m</span>
+<span class="lineno">  300 </span><span class="spaces">      </span><span class="nottickedoff">A.Error _   -&gt; Nothing</span></span>
+<span class="lineno">  301 </span>
+<span class="lineno">  302 </span>-- | Map a legacy on-disk transcript line (Haskell TranscriptEntry JSON
+<span class="lineno">  303 </span>-- with @te*@-prefixed fields) to the frontend's TranscriptEntry shape.
+<span class="lineno">  304 </span>teLineToFrontend :: A.Value -&gt; A.Value
+<span class="lineno">  305 </span><span class="decl"><span class="nottickedoff">teLineToFrontend rawLine =</span>
+<span class="lineno">  306 </span><span class="spaces">  </span><span class="nottickedoff">let o = case rawLine of</span>
+<span class="lineno">  307 </span><span class="spaces">        </span><span class="nottickedoff">A.Object m -&gt; m</span>
+<span class="lineno">  308 </span><span class="spaces">        </span><span class="nottickedoff">_          -&gt; KeyMap.empty</span>
+<span class="lineno">  309 </span><span class="spaces">      </span><span class="nottickedoff">k = Key.fromText</span>
+<span class="lineno">  310 </span><span class="spaces">      </span><span class="nottickedoff">lookupT key = case KeyMap.lookup (k key) o of</span>
+<span class="lineno">  311 </span><span class="spaces">        </span><span class="nottickedoff">Just (A.String t) -&gt; Just t</span>
+<span class="lineno">  312 </span><span class="spaces">        </span><span class="nottickedoff">_                 -&gt; Nothing</span>
+<span class="lineno">  313 </span><span class="spaces">      </span><span class="nottickedoff">-- The on-disk `payload` field is a JSON string; decode it to a Value</span>
+<span class="lineno">  314 </span><span class="spaces">      </span><span class="nottickedoff">-- so we can send it as a JSON object (not a string) in the wire</span>
+<span class="lineno">  315 </span><span class="spaces">      </span><span class="nottickedoff">-- response. Falls back to the raw string when it's not valid JSON</span>
+<span class="lineno">  316 </span><span class="spaces">      </span><span class="nottickedoff">-- (defensive against a malformed on-disk line).</span>
+<span class="lineno">  317 </span><span class="spaces">      </span><span class="nottickedoff">payloadVal = case KeyMap.lookup (k &quot;payload&quot;) o of</span>
+<span class="lineno">  318 </span><span class="spaces">        </span><span class="nottickedoff">Just (A.String s) -&gt; case A.decode (BL.fromStrict (TE.encodeUtf8 s)) of</span>
+<span class="lineno">  319 </span><span class="spaces">          </span><span class="nottickedoff">Just v  -&gt; v</span>
+<span class="lineno">  320 </span><span class="spaces">          </span><span class="nottickedoff">Nothing -&gt; A.String s</span>
+<span class="lineno">  321 </span><span class="spaces">        </span><span class="nottickedoff">other -&gt; fromMaybe A.Null other</span>
+<span class="lineno">  322 </span><span class="spaces">      </span><span class="nottickedoff">-- The legacy transcript.jsonl entry's `meta` field carries the</span>
+<span class="lineno">  323 </span><span class="spaces">      </span><span class="nottickedoff">-- channel label (stamped by runTurn's requestMeta). Extract it so</span>
+<span class="lineno">  324 </span><span class="spaces">      </span><span class="nottickedoff">-- the frontend can attribute user messages to their channel on the</span>
+<span class="lineno">  325 </span><span class="spaces">      </span><span class="nottickedoff">-- legacy path too. Null when absent (response entries, old entries).</span>
+<span class="lineno">  326 </span><span class="spaces">      </span><span class="nottickedoff">mChannel = case KeyMap.lookup (k &quot;meta&quot;) o of</span>
+<span class="lineno">  327 </span><span class="spaces">        </span><span class="nottickedoff">Just (A.Object mo) -&gt; case KeyMap.lookup (k &quot;channel&quot;) mo of</span>
+<span class="lineno">  328 </span><span class="spaces">          </span><span class="nottickedoff">Just (A.String ch) -&gt; Just ch</span>
+<span class="lineno">  329 </span><span class="spaces">          </span><span class="nottickedoff">_                  -&gt; Nothing</span>
+<span class="lineno">  330 </span><span class="spaces">        </span><span class="nottickedoff">_ -&gt; Nothing</span>
+<span class="lineno">  331 </span><span class="spaces">  </span><span class="nottickedoff">in object</span>
+<span class="lineno">  332 </span><span class="spaces">     </span><span class="nottickedoff">[ &quot;id&quot;        .= lookupT &quot;id&quot;</span>
+<span class="lineno">  333 </span><span class="spaces">     </span><span class="nottickedoff">, &quot;timestamp&quot; .= lookupT &quot;timestamp&quot;</span>
+<span class="lineno">  334 </span><span class="spaces">     </span><span class="nottickedoff">, &quot;direction&quot; .= lookupT &quot;direction&quot;</span>
+<span class="lineno">  335 </span><span class="spaces">     </span><span class="nottickedoff">, &quot;payload&quot;   .= payloadVal</span>
+<span class="lineno">  336 </span><span class="spaces">     </span><span class="nottickedoff">, &quot;harness&quot;   .= lookupT &quot;correlation&quot;</span>
+<span class="lineno">  337 </span><span class="spaces">     </span><span class="nottickedoff">, &quot;model&quot;     .= lookupT &quot;model&quot;</span>
+<span class="lineno">  338 </span><span class="spaces">     </span><span class="nottickedoff">, &quot;channel&quot;   .= mChannel</span>
+<span class="lineno">  339 </span><span class="spaces">     </span><span class="nottickedoff">, &quot;raw&quot;       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))</span>
+<span class="lineno">  340 </span><span class="spaces">     </span><span class="nottickedoff">]</span></span>
+<span class="lineno">  341 </span>
+<span class="lineno">  342 </span>-- | Synthesize a frontend TranscriptEntry from a conversation.jsonl line
+<span class="lineno">  343 </span>-- (@role@/@content@). User → request; Assistant → response. The
+<span class="lineno">  344 </span>-- line index (0-based) is used as the entry id — conversation.jsonl
+<span class="lineno">  345 </span>-- carries no per-entry id, and the line index is stable across reads of
+<span class="lineno">  346 </span>-- the same file, so the frontend's dedup-by-id works.
+<span class="lineno">  347 </span>convLineToFrontend :: Text -&gt; [String] -&gt; String -&gt; Int -&gt; A.Value -&gt; A.Value
+<span class="lineno">  348 </span><span class="decl"><span class="istickedoff">convLineToFrontend model entryTimestamps fallbackTs idx rawLine =</span>
+<span class="lineno">  349 </span><span class="spaces">  </span><span class="istickedoff">let o = case rawLine of</span>
+<span class="lineno">  350 </span><span class="spaces">        </span><span class="istickedoff">A.Object m -&gt; m</span>
+<span class="lineno">  351 </span><span class="spaces">        </span><span class="istickedoff">_          -&gt; <span class="nottickedoff">KeyMap.empty</span></span>
+<span class="lineno">  352 </span><span class="spaces">      </span><span class="istickedoff">k = Key.fromText</span>
+<span class="lineno">  353 </span><span class="spaces">      </span><span class="istickedoff">role = case KeyMap.lookup (k &quot;role&quot;) o of</span>
+<span class="lineno">  354 </span><span class="spaces">        </span><span class="istickedoff">Just (A.String t) -&gt; t</span>
+<span class="lineno">  355 </span><span class="spaces">        </span><span class="istickedoff">_                  -&gt; <span class="nottickedoff">&quot;user&quot;</span></span>
+<span class="lineno">  356 </span><span class="spaces">      </span><span class="istickedoff">rawContent = case KeyMap.lookup (k &quot;content&quot;) o of</span>
+<span class="lineno">  357 </span><span class="spaces">        </span><span class="istickedoff">Just (A.Array arr) -&gt; arr</span>
+<span class="lineno">  358 </span><span class="spaces">        </span><span class="istickedoff">_                  -&gt; <span class="nottickedoff">mempty</span></span>
+<span class="lineno">  359 </span><span class="spaces">      </span><span class="istickedoff">contentBlocks = map cbToFrontend (V.toList rawContent)</span>
+<span class="lineno">  360 </span><span class="spaces">      </span><span class="istickedoff">content = A.Array (V.fromList contentBlocks)</span>
+<span class="lineno">  361 </span><span class="spaces">      </span><span class="istickedoff">direction :: Text</span>
+<span class="lineno">  362 </span><span class="spaces">      </span><span class="istickedoff">direction = if T.toCaseFold role == &quot;user&quot; then &quot;request&quot; else &quot;response&quot;</span>
+<span class="lineno">  363 </span><span class="spaces">      </span><span class="istickedoff">payloadJson = if direction == &quot;request&quot;</span>
+<span class="lineno">  364 </span><span class="spaces">        </span><span class="istickedoff">then A.object [&quot;messages&quot; A..= [A.object [&quot;role&quot; A..= (&quot;user&quot; :: Text), &quot;content&quot; A..= content]]]</span>
+<span class="lineno">  365 </span><span class="spaces">        </span><span class="istickedoff">else A.object [&quot;content&quot; A..= content]</span>
+<span class="lineno">  366 </span><span class="spaces">      </span><span class="istickedoff">entryId = T.pack (show idx)</span>
+<span class="lineno">  367 </span><span class="spaces">      </span><span class="istickedoff">ts = fromMaybe fallbackTs (lookup <span class="nottickedoff">idx</span> (zip [0..] entryTimestamps))</span>
+<span class="lineno">  368 </span><span class="spaces">    </span><span class="istickedoff">in object</span>
+<span class="lineno">  369 </span><span class="spaces">       </span><span class="istickedoff">[ &quot;id&quot;        .= entryId</span>
+<span class="lineno">  370 </span><span class="spaces">       </span><span class="istickedoff">, &quot;timestamp&quot; .= T.pack ts</span>
+<span class="lineno">  371 </span><span class="spaces">       </span><span class="istickedoff">, &quot;direction&quot; .= direction</span>
+<span class="lineno">  372 </span><span class="spaces">       </span><span class="istickedoff">, &quot;payload&quot;   .= payloadJson</span>
+<span class="lineno">  373 </span><span class="spaces">       </span><span class="istickedoff">, &quot;harness&quot;   .= (Nothing :: Maybe Text)</span>
+<span class="lineno">  374 </span><span class="spaces">       </span><span class="istickedoff">, &quot;model&quot;     .= model</span>
+<span class="lineno">  375 </span><span class="spaces">       </span><span class="istickedoff">, &quot;channel&quot;   .= (Nothing :: Maybe Text)</span>
+<span class="lineno">  376 </span><span class="spaces">      </span><span class="istickedoff">, &quot;raw&quot;       .= TE.decodeUtf8 (BL.toStrict (A.encode rawLine))</span>
+<span class="lineno">  377 </span><span class="spaces">      </span><span class="istickedoff">]</span></span>
+<span class="lineno">  378 </span>
+<span class="lineno">  379 </span>-- | Rewrite one on-disk 'ContentBlock' (GHC-Generics 'TaggedObject' shape)
+<span class="lineno">  380 </span>-- into the Anthropic-style block the frontend parses.
+<span class="lineno">  381 </span>cbToFrontend :: A.Value -&gt; A.Value
+<span class="lineno">  382 </span><span class="decl"><span class="istickedoff">cbToFrontend blk =</span>
+<span class="lineno">  383 </span><span class="spaces">  </span><span class="istickedoff">let bo = case blk of</span>
+<span class="lineno">  384 </span><span class="spaces">        </span><span class="istickedoff">A.Object m -&gt; m</span>
+<span class="lineno">  385 </span><span class="spaces">        </span><span class="istickedoff">_          -&gt; <span class="nottickedoff">KeyMap.empty</span></span>
+<span class="lineno">  386 </span><span class="spaces">      </span><span class="istickedoff">k = Key.fromText</span>
+<span class="lineno">  387 </span><span class="spaces">      </span><span class="istickedoff">tag = case KeyMap.lookup (k &quot;tag&quot;) bo of</span>
+<span class="lineno">  388 </span><span class="spaces">        </span><span class="istickedoff">Just (A.String t) -&gt; Just t</span>
+<span class="lineno">  389 </span><span class="spaces">        </span><span class="istickedoff">_                  -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  390 </span><span class="spaces">      </span><span class="istickedoff">contents = KeyMap.lookup (k &quot;contents&quot;) bo</span>
+<span class="lineno">  391 </span><span class="spaces">      </span><span class="istickedoff">lookupT key m = case KeyMap.lookup (k key) m of</span>
+<span class="lineno">  392 </span><span class="spaces">        </span><span class="istickedoff">Just (A.String t) -&gt; Just t</span>
+<span class="lineno">  393 </span><span class="spaces">        </span><span class="istickedoff">_                 -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  394 </span><span class="spaces">      </span><span class="istickedoff">lookupB key m = case KeyMap.lookup (k key) m of</span>
+<span class="lineno">  395 </span><span class="spaces">        </span><span class="istickedoff">Just (A.Bool b) -&gt; Just b</span>
+<span class="lineno">  396 </span><span class="spaces">        </span><span class="istickedoff">_               -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  397 </span><span class="spaces">  </span><span class="istickedoff">in case tag of</span>
+<span class="lineno">  398 </span><span class="spaces">       </span><span class="istickedoff">Just &quot;CbText&quot; -&gt; case contents of</span>
+<span class="lineno">  399 </span><span class="spaces">         </span><span class="istickedoff">Just (A.String t) -&gt; object [&quot;type&quot; .= (&quot;text&quot; :: Text), &quot;text&quot; .= t]</span>
+<span class="lineno">  400 </span><span class="spaces">         </span><span class="istickedoff">_                 -&gt; <span class="nottickedoff">fallback</span></span>
+<span class="lineno">  401 </span><span class="spaces">       </span><span class="istickedoff">Just &quot;CbToolUse&quot; -&gt; object</span>
+<span class="lineno">  402 </span><span class="spaces">         </span><span class="istickedoff">[ &quot;type&quot;  .= (&quot;tool_use&quot; :: Text)</span>
+<span class="lineno">  403 </span><span class="spaces">         </span><span class="istickedoff">, &quot;id&quot;    .= fromMaybe <span class="nottickedoff">&quot;&quot;</span> (lookupT &quot;id&quot; bo)</span>
+<span class="lineno">  404 </span><span class="spaces">         </span><span class="istickedoff">, &quot;name&quot;  .= fromMaybe <span class="nottickedoff">&quot;&quot;</span> (lookupT &quot;name&quot; bo)</span>
+<span class="lineno">  405 </span><span class="spaces">         </span><span class="istickedoff">, &quot;input&quot; .= fromMaybe <span class="nottickedoff">A.Null</span> (KeyMap.lookup (k &quot;input&quot;) bo)</span>
+<span class="lineno">  406 </span><span class="spaces">         </span><span class="istickedoff">]</span>
+<span class="lineno">  407 </span><span class="spaces">       </span><span class="istickedoff">Just &quot;CbToolResult&quot; -&gt; object</span>
+<span class="lineno">  408 </span><span class="spaces">         </span><span class="istickedoff">[ &quot;type&quot;        .= (&quot;tool_result&quot; :: Text)</span>
+<span class="lineno">  409 </span><span class="spaces">         </span><span class="istickedoff">, &quot;tool_use_id&quot; .= fromMaybe <span class="nottickedoff">&quot;&quot;</span> (lookupT &quot;forId&quot; bo)</span>
+<span class="lineno">  410 </span><span class="spaces">         </span><span class="istickedoff">, &quot;content&quot;     .= toolResultPartsToFrontend (KeyMap.lookup (k &quot;parts&quot;) bo)</span>
+<span class="lineno">  411 </span><span class="spaces">         </span><span class="istickedoff">, &quot;is_error&quot;    .= fromMaybe <span class="nottickedoff">False</span> (lookupB &quot;isError&quot; bo)</span>
+<span class="lineno">  412 </span><span class="spaces">         </span><span class="istickedoff">]</span>
+<span class="lineno">  413 </span><span class="spaces">       </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">fallback</span></span>
+<span class="lineno">  414 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  415 </span><span class="spaces">     </span><span class="istickedoff"><span class="nottickedoff">fallback = object [&quot;type&quot; .= (&quot;text&quot; :: Text), &quot;text&quot; .= TE.decodeUtf8 (BL.toStrict (A.encode blk))]</span></span></span>
+<span class="lineno">  416 </span>
+<span class="lineno">  417 </span>-- | Rewrite the on-disk 'parts' value into the Anthropic-style array
+<span class="lineno">  418 </span>-- the frontend parses (@[{type:&quot;text&quot;, text:&quot;...&quot;}]@). 'ToolResultPart'
+<span class="lineno">  419 </span>-- is a @newtype TrpText Text@, so aeson's derived 'ToJSON' serializes it
+<span class="lineno">  420 </span>-- as a bare JSON string (not a 'TaggedObject'). The on-disk 'parts' is
+<span class="lineno">  421 </span>-- thus @[&quot;text&quot;]@, not @[{tag:&quot;TrpText&quot;, contents:&quot;text&quot;}]@. Handles both
+<span class="lineno">  422 </span>-- the bare-string shape and the object shape (defensive fallback).
+<span class="lineno">  423 </span>toolResultPartsToFrontend :: Maybe A.Value -&gt; A.Value
+<span class="lineno">  424 </span><span class="decl"><span class="istickedoff">toolResultPartsToFrontend mparts =</span>
+<span class="lineno">  425 </span><span class="spaces">  </span><span class="istickedoff">case mparts of</span>
+<span class="lineno">  426 </span><span class="spaces">    </span><span class="istickedoff">Just (A.Array arr) -&gt;</span>
+<span class="lineno">  427 </span><span class="spaces">      </span><span class="istickedoff">A.Array (V.fromList (map trpToFrontend (V.toList arr)))</span>
+<span class="lineno">  428 </span><span class="spaces">    </span><span class="istickedoff">other -&gt; <span class="nottickedoff">fromMaybe A.Null other</span></span></span>
+<span class="lineno">  429 </span>
+<span class="lineno">  430 </span>trpToFrontend :: A.Value -&gt; A.Value
+<span class="lineno">  431 </span><span class="decl"><span class="istickedoff">trpToFrontend blk =</span>
+<span class="lineno">  432 </span><span class="spaces">  </span><span class="istickedoff">case blk of</span>
+<span class="lineno">  433 </span><span class="spaces">    </span><span class="istickedoff">A.String t -&gt; object [&quot;type&quot; .= (&quot;text&quot; :: Text), &quot;text&quot; .= t]</span>
+<span class="lineno">  434 </span><span class="spaces">    </span><span class="istickedoff">A.Object m -&gt;</span>
+<span class="lineno">  435 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">let tag = case KeyMap.lookup (Key.fromString &quot;tag&quot;) m of</span></span>
+<span class="lineno">  436 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Just (A.String t) -&gt; Just t</span></span>
+<span class="lineno">  437 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">_                 -&gt; Nothing</span></span>
+<span class="lineno">  438 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">contents = KeyMap.lookup (Key.fromString &quot;contents&quot;) m</span></span>
+<span class="lineno">  439 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">in case tag of</span></span>
+<span class="lineno">  440 </span><span class="spaces">           </span><span class="istickedoff"><span class="nottickedoff">Just &quot;TrpText&quot; -&gt; case contents of</span></span>
+<span class="lineno">  441 </span><span class="spaces">             </span><span class="istickedoff"><span class="nottickedoff">Just (A.String t) -&gt; object [&quot;type&quot; .= (&quot;text&quot; :: Text), &quot;text&quot; .= t]</span></span>
+<span class="lineno">  442 </span><span class="spaces">             </span><span class="istickedoff"><span class="nottickedoff">_                 -&gt; object [&quot;type&quot; .= (&quot;text&quot; :: Text), &quot;text&quot; .= TE.decodeUtf8 (BL.toStrict (A.encode blk))]</span></span>
+<span class="lineno">  443 </span><span class="spaces">           </span><span class="istickedoff"><span class="nottickedoff">_ -&gt; object [&quot;type&quot; .= (&quot;text&quot; :: Text), &quot;text&quot; .= TE.decodeUtf8 (BL.toStrict (A.encode blk))]</span></span>
+<span class="lineno">  444 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">object [&quot;type&quot; .= (&quot;text&quot; :: Text), &quot;text&quot; .= TE.decodeUtf8 (BL.toStrict (A.encode blk))]</span></span></span>
+<span class="lineno">  445 </span>
+<span class="lineno">  446 </span>-- | The set of opcode names whose 'EKHarness' entries should surface to
+<span class="lineno">  447 </span>-- the web frontend SPA as distinct harness entries (not be dropped by
+<span class="lineno">  448 </span>-- 'reconEntryToFrontend'). v1: @SKILL_LOAD@ so /skill load invocations
+<span class="lineno">  449 </span>-- appear in the transcript as identifiable skill-load events (per the
+<span class="lineno">  450 </span>-- user's &quot;properly identified as a skill load operation&quot; requirement);
+<span class="lineno">  451 </span>-- @SETUP_REPO@ so the clone/no-op/conflict/failure outcome of a
+<span class="lineno">  452 </span>-- repo-attached session creation is visible in the chat (the frontend's
+<span class="lineno">  453 </span>-- 'transcriptToMessages' renders it as a tool-call box; without this
+<span class="lineno">  454 </span>-- whitelist entry, the SETUP_REPO result recorded by
+<span class="lineno">  455 </span>-- 'recordSetupRepoResult' is dropped before reaching either the WS
+<span class="lineno">  456 </span>-- broadcast or the HTTP seed, so the user sees nothing for the repo
+<span class="lineno">  457 </span>-- setup).
+<span class="lineno">  458 </span>-- Approval-bearing entries always surface regardless of this whitelist.
+<span class="lineno">  459 </span>-- A 'Set' rather than a list to make the shared-state surface
+<span class="lineno">  460 </span>-- discoverable (see the design doc's §8 risk 2).
+<span class="lineno">  461 </span>userSurfacingOps :: Set.Set Text
+<span class="lineno">  462 </span><span class="decl"><span class="istickedoff">userSurfacingOps = Set.fromList [&quot;SKILL_LOAD&quot;, &quot;SETUP_REPO&quot;]</span></span>
+<span class="lineno">  463 </span>
+<span class="lineno">  464 </span>-- | Predicate: does a harness payload's @op.name@ fall in
+<span class="lineno">  465 </span>-- 'userSurfacingOps'? Returns 'False' for payloads with no @op@ key, a
+<span class="lineno">  466 </span>-- non-object @op@, or no @name@ field — those are dropped by the filter
+<span class="lineno">  467 </span>-- (matching the pre-v1 behavior for non-approval harness entries).
+<span class="lineno">  468 </span>isUserSurfacingOp :: KeyMap.KeyMap Value -&gt; Bool
+<span class="lineno">  469 </span><span class="decl"><span class="istickedoff">isUserSurfacingOp o =</span>
+<span class="lineno">  470 </span><span class="spaces">  </span><span class="istickedoff">case KeyMap.lookup (Key.fromText &quot;op&quot;) o of</span>
+<span class="lineno">  471 </span><span class="spaces">    </span><span class="istickedoff">Just (Object opObj) -&gt;</span>
+<span class="lineno">  472 </span><span class="spaces">      </span><span class="istickedoff">case KeyMap.lookup (Key.fromText &quot;name&quot;) opObj of</span>
+<span class="lineno">  473 </span><span class="spaces">        </span><span class="istickedoff">Just (String n) -&gt; n `Set.member` userSurfacingOps</span>
+<span class="lineno">  474 </span><span class="spaces">        </span><span class="istickedoff">_               -&gt; <span class="nottickedoff">False</span></span>
+<span class="lineno">  475 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">False</span></span></span>
+<span class="lineno">  476 </span>
+<span class="lineno">  477 </span>-- | Map a reconstructed 'TranscriptEntry' (from 'reconstruct') to the
+<span class="lineno">  478 </span>-- frontend's TranscriptEntry JSON shape.
+<span class="lineno">  479 </span>reconEntryToFrontend :: Int -&gt; TranscriptEntry -&gt; Maybe A.Value
+<span class="lineno">  480 </span><span class="decl"><span class="istickedoff">reconEntryToFrontend idx te =</span>
+<span class="lineno">  481 </span><span class="spaces">  </span><span class="istickedoff">case tePayload te of</span>
+<span class="lineno">  482 </span><span class="spaces">    </span><span class="istickedoff">A.Null -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  483 </span><span class="spaces">    </span><span class="istickedoff">-- Drop harness entries (opcode invocations from the dispatcher) that</span>
+<span class="lineno">  484 </span><span class="spaces">    </span><span class="istickedoff">-- carry a &quot;harness&quot; key in the payload — UNLESS they also carry an</span>
+<span class="lineno">  485 </span><span class="spaces">    </span><span class="istickedoff">-- &quot;approval&quot; key (which marks them as approval-evidence entries that</span>
+<span class="lineno">  486 </span><span class="spaces">    </span><span class="istickedoff">-- should surface so the user sees the confirmation decision in the</span>
+<span class="lineno">  487 </span><span class="spaces">    </span><span class="istickedoff">-- transcript), OR their op.name is in 'userSurfacingOps' (which marks</span>
+<span class="lineno">  488 </span><span class="spaces">    </span><span class="istickedoff">-- them as user-surfacing opcode invocations like /skill load that</span>
+<span class="lineno">  489 </span><span class="spaces">    </span><span class="istickedoff">-- should appear as distinct harness entries, not be folded into the</span>
+<span class="lineno">  490 </span><span class="spaces">    </span><span class="istickedoff">-- surrounding user/assistant bubbles).</span>
+<span class="lineno">  491 </span><span class="spaces">    </span><span class="istickedoff">A.Object o</span>
+<span class="lineno">  492 </span><span class="spaces">      </span><span class="istickedoff">| KeyMap.member (Key.fromText &quot;harness&quot;) o,</span>
+<span class="lineno">  493 </span><span class="spaces">        </span><span class="istickedoff">not (KeyMap.member (Key.fromText &quot;approval&quot;) o),</span>
+<span class="lineno">  494 </span><span class="spaces">        </span><span class="istickedoff">not (isUserSurfacingOp o) -&gt; Nothing</span>
+<span class="lineno">  495 </span><span class="spaces">    </span><span class="istickedoff">payloadVal -&gt; Just $</span>
+<span class="lineno">  496 </span><span class="spaces">      </span><span class="istickedoff">let dirStr = case teDirection te of</span>
+<span class="lineno">  497 </span><span class="spaces">            </span><span class="istickedoff">Request  -&gt; &quot;request&quot; :: Text</span>
+<span class="lineno">  498 </span><span class="spaces">            </span><span class="istickedoff">Response -&gt; &quot;response&quot;</span>
+<span class="lineno">  499 </span><span class="spaces">          </span><span class="istickedoff">payloadJson = rewritePayload False payloadVal (teDirection te)</span>
+<span class="lineno">  500 </span><span class="spaces">          </span><span class="istickedoff">-- The `raw` view preserves full tool input_schemas so the</span>
+<span class="lineno">  501 </span><span class="spaces">          </span><span class="istickedoff">-- &quot;View raw JSON&quot; modal shows the verbatim schemas the LLM was</span>
+<span class="lineno">  502 </span><span class="spaces">          </span><span class="istickedoff">-- sent (the `payload` field strips them to keep the wire small).</span>
+<span class="lineno">  503 </span><span class="spaces">          </span><span class="istickedoff">rawJson = rewritePayload True payloadVal (teDirection te)</span>
+<span class="lineno">  504 </span><span class="spaces">          </span><span class="istickedoff">entryId = let raw = teId te in if T.null raw then T.pack (show idx) else raw</span>
+<span class="lineno">  505 </span><span class="spaces">          </span><span class="istickedoff">-- The originating channel label (e.g. &quot;telegram&quot;, &quot;web&quot;, &quot;cli&quot;),</span>
+<span class="lineno">  506 </span><span class="spaces">          </span><span class="istickedoff">-- stamped into the request entry's erMeta by runTurn's</span>
+<span class="lineno">  507 </span><span class="spaces">          </span><span class="istickedoff">-- requestMeta (and into SKILL_LOAD entries by</span>
+<span class="lineno">  508 </span><span class="spaces">          </span><span class="istickedoff">-- recordSkillLoadResult). Surfaced as a top-level `channel` field</span>
+<span class="lineno">  509 </span><span class="spaces">          </span><span class="istickedoff">-- so the frontend can attribute user messages — and skill loads —</span>
+<span class="lineno">  510 </span><span class="spaces">          </span><span class="istickedoff">-- to the channel they came from. Null when the entry carries no</span>
+<span class="lineno">  511 </span><span class="spaces">          </span><span class="istickedoff">-- channel (e.g. response entries, CLI TUI turns with no</span>
+<span class="lineno">  512 </span><span class="spaces">          </span><span class="istickedoff">-- MessageSource).</span>
+<span class="lineno">  513 </span><span class="spaces">          </span><span class="istickedoff">mChannel = case Map.lookup &quot;channel&quot; (teMeta te) of</span>
+<span class="lineno">  514 </span><span class="spaces">            </span><span class="istickedoff">Just (A.String ch) -&gt; Just ch</span>
+<span class="lineno">  515 </span><span class="spaces">            </span><span class="istickedoff">_                  -&gt; Nothing</span>
+<span class="lineno">  516 </span><span class="spaces">      </span><span class="istickedoff">in object</span>
+<span class="lineno">  517 </span><span class="spaces">         </span><span class="istickedoff">[ &quot;id&quot;        .= entryId</span>
+<span class="lineno">  518 </span><span class="spaces">         </span><span class="istickedoff">, &quot;timestamp&quot; .= T.pack (showIso (teTimestamp te))</span>
+<span class="lineno">  519 </span><span class="spaces">         </span><span class="istickedoff">, &quot;direction&quot; .= dirStr</span>
+<span class="lineno">  520 </span><span class="spaces">         </span><span class="istickedoff">-- `payload` is a JSON OBJECT (not a string) so the frontend can</span>
+<span class="lineno">  521 </span><span class="spaces">         </span><span class="istickedoff">-- access its fields directly without a second JSON.parse pass.</span>
+<span class="lineno">  522 </span><span class="spaces">         </span><span class="istickedoff">-- The old format encoded payload as a JSON string</span>
+<span class="lineno">  523 </span><span class="spaces">         </span><span class="istickedoff">-- (TE.decodeUtf8 (A.encode payloadJson)), which forced the browser</span>
+<span class="lineno">  524 </span><span class="spaces">         </span><span class="istickedoff">-- to parse the outer JSON (un-escaping every `\&quot;` in the payload</span>
+<span class="lineno">  525 </span><span class="spaces">         </span><span class="istickedoff">-- string), then call JSON.parse(payload) AGAIN to parse the inner</span>
+<span class="lineno">  526 </span><span class="spaces">         </span><span class="istickedoff">-- JSON — two full parse passes with O(n) escape processing in</span>
+<span class="lineno">  527 </span><span class="spaces">         </span><span class="istickedoff">-- between. For a 279KB body this took ~889ms; as an object it's a</span>
+<span class="lineno">  528 </span><span class="spaces">         </span><span class="istickedoff">-- single pass and should be &lt;10ms.</span>
+<span class="lineno">  529 </span><span class="spaces">         </span><span class="istickedoff">, &quot;payload&quot;   .= payloadJson</span>
+<span class="lineno">  530 </span><span class="spaces">         </span><span class="istickedoff">, &quot;harness&quot;   .= (Nothing :: Maybe Text)</span>
+<span class="lineno">  531 </span><span class="spaces">         </span><span class="istickedoff">, &quot;model&quot;     .= (Nothing :: Maybe Text)</span>
+<span class="lineno">  532 </span><span class="spaces">         </span><span class="istickedoff">, &quot;channel&quot;   .= mChannel</span>
+<span class="lineno">  533 </span><span class="spaces">         </span><span class="istickedoff">-- The `raw` field carries the full rewritten payload with tool</span>
+<span class="lineno">  534 </span><span class="spaces">         </span><span class="istickedoff">-- input_schemas preserved, so the frontend's &quot;View raw JSON&quot;</span>
+<span class="lineno">  535 </span><span class="spaces">         </span><span class="istickedoff">-- modal shows the verbatim schemas the LLM was sent. The legacy</span>
+<span class="lineno">  536 </span><span class="spaces">         </span><span class="istickedoff">-- path (teLineToFrontend) still ships the verbatim on-disk line.</span>
+<span class="lineno">  537 </span><span class="spaces">         </span><span class="istickedoff">, &quot;raw&quot;       .= TE.decodeUtf8 (BL.toStrict (A.encode rawJson))</span>
+<span class="lineno">  538 </span><span class="spaces">         </span><span class="istickedoff">]</span></span>
+<span class="lineno">  539 </span>
+<span class="lineno">  540 </span>-- | Rewrite a reconstructed payload 'Value' from GHC-Generics
+<span class="lineno">  541 </span>-- 'TaggedObject' encoding to the Anthropic-style JSON the frontend parses.
+<span class="lineno">  542 </span>-- When @preserveSchemas@ is 'True', the @tools@ array keeps its full
+<span class="lineno">  543 </span>-- @input_schema@/parameters fields — used to build the @raw@ view so the
+<span class="lineno">  544 </span>-- &quot;View raw JSON&quot; modal shows the verbatim schemas the LLM was sent. When
+<span class="lineno">  545 </span>-- 'False', 'toolsWithDescriptions' strips them to keep the wire payload
+<span class="lineno">  546 </span>-- small (the frontend's collapsed Tools row only needs names + descriptions).
+<span class="lineno">  547 </span>rewritePayload :: Bool -&gt; A.Value -&gt; Direction -&gt; A.Value
+<span class="lineno">  548 </span><span class="decl"><span class="istickedoff">rewritePayload preserveSchemas val dir =</span>
+<span class="lineno">  549 </span><span class="spaces">  </span><span class="istickedoff">case val of</span>
+<span class="lineno">  550 </span><span class="spaces">    </span><span class="istickedoff">A.Object o -&gt;</span>
+<span class="lineno">  551 </span><span class="spaces">      </span><span class="istickedoff">let k = Key.fromText</span>
+<span class="lineno">  552 </span><span class="spaces">          </span><span class="istickedoff">rewriteMsgs = case KeyMap.lookup (k &quot;messages&quot;) o of</span>
+<span class="lineno">  553 </span><span class="spaces">            </span><span class="istickedoff">Just (A.Array arr) -&gt;</span>
+<span class="lineno">  554 </span><span class="spaces">              </span><span class="istickedoff">let msgs = map rewriteMessage (V.toList arr)</span>
+<span class="lineno">  555 </span><span class="spaces">              </span><span class="istickedoff">in [&quot;messages&quot; .= A.Array (V.fromList msgs)]</span>
+<span class="lineno">  556 </span><span class="spaces">            </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">[]</span></span>
+<span class="lineno">  557 </span><span class="spaces">          </span><span class="istickedoff">rewriteContent = case KeyMap.lookup (k &quot;content&quot;) o of</span>
+<span class="lineno">  558 </span><span class="spaces">            </span><span class="istickedoff">Just (A.Array arr) -&gt;</span>
+<span class="lineno">  559 </span><span class="spaces">              </span><span class="istickedoff">let blocks = map cbToFrontend (V.toList arr)</span>
+<span class="lineno">  560 </span><span class="spaces">              </span><span class="istickedoff">in [&quot;content&quot; .= A.Array (V.fromList blocks)]</span>
+<span class="lineno">  561 </span><span class="spaces">            </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">[]</span></span>
+<span class="lineno">  562 </span><span class="spaces">          </span><span class="istickedoff">passthrough key = case KeyMap.lookup key o of</span>
+<span class="lineno">  563 </span><span class="spaces">            </span><span class="istickedoff">Just v  -&gt; [key .= v]</span>
+<span class="lineno">  564 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; []</span>
+<span class="lineno">  565 </span><span class="spaces">          </span><span class="istickedoff">usageFields = case KeyMap.lookup (k &quot;usage&quot;) o of</span>
+<span class="lineno">  566 </span><span class="spaces">            </span><span class="istickedoff">Just (A.Object uo) -&gt;</span>
+<span class="lineno">  567 </span><span class="spaces">              </span><span class="istickedoff">let uIn  = case KeyMap.lookup (k &quot;input&quot;)  uo of</span>
+<span class="lineno">  568 </span><span class="spaces">                    </span><span class="istickedoff">Just n -&gt; Just n; _ -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  569 </span><span class="spaces">                  </span><span class="istickedoff">uOut = case KeyMap.lookup (k &quot;output&quot;) uo of</span>
+<span class="lineno">  570 </span><span class="spaces">                    </span><span class="istickedoff">Just n -&gt; Just n; _ -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  571 </span><span class="spaces">              </span><span class="istickedoff">in case (uIn, uOut) of</span>
+<span class="lineno">  572 </span><span class="spaces">                   </span><span class="istickedoff">(Just _, Just _) -&gt;</span>
+<span class="lineno">  573 </span><span class="spaces">                     </span><span class="istickedoff">[ &quot;usage&quot; .= object</span>
+<span class="lineno">  574 </span><span class="spaces">                       </span><span class="istickedoff">[ &quot;input_tokens&quot;  .= uIn</span>
+<span class="lineno">  575 </span><span class="spaces">                       </span><span class="istickedoff">, &quot;output_tokens&quot; .= uOut</span>
+<span class="lineno">  576 </span><span class="spaces">                       </span><span class="istickedoff">]</span>
+<span class="lineno">  577 </span><span class="spaces">                     </span><span class="istickedoff">]</span>
+<span class="lineno">  578 </span><span class="spaces">                   </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">[]</span></span>
+<span class="lineno">  579 </span><span class="spaces">            </span><span class="istickedoff">_ -&gt; []</span>
+<span class="lineno">  580 </span><span class="spaces">          </span><span class="istickedoff">toolsField = if preserveSchemas</span>
+<span class="lineno">  581 </span><span class="spaces">            </span><span class="istickedoff">then passthrough (k &quot;tools&quot;)</span>
+<span class="lineno">  582 </span><span class="spaces">            </span><span class="istickedoff">else toolsWithDescriptions o</span>
+<span class="lineno">  583 </span><span class="spaces">          </span><span class="istickedoff">fields = case dir of</span>
+<span class="lineno">  584 </span><span class="spaces">            </span><span class="istickedoff">Request -&gt;</span>
+<span class="lineno">  585 </span><span class="spaces">              </span><span class="istickedoff">passthrough (k &quot;system&quot;)</span>
+<span class="lineno">  586 </span><span class="spaces">               </span><span class="istickedoff">&lt;&gt; passthrough (k &quot;model&quot;)</span>
+<span class="lineno">  587 </span><span class="spaces">               </span><span class="istickedoff">-- Replace the full tool definitions with name + description,</span>
+<span class="lineno">  588 </span><span class="spaces">               </span><span class="istickedoff">-- stripping input_schema/parameters to keep the wire payload</span>
+<span class="lineno">  589 </span><span class="spaces">               </span><span class="istickedoff">-- small. The full definitions (with input_schema) are the</span>
+<span class="lineno">  590 </span><span class="spaces">               </span><span class="istickedoff">-- same across every request turn and can be 11KB+ each;</span>
+<span class="lineno">  591 </span><span class="spaces">               </span><span class="istickedoff">-- shipping them in all 73 request entries of a 146-turn</span>
+<span class="lineno">  592 </span><span class="spaces">               </span><span class="istickedoff">-- session wastes ~840KB. The frontend's &quot;Tools&quot; collapsed</span>
+<span class="lineno">  593 </span><span class="spaces">               </span><span class="istickedoff">-- row shows the names + descriptions, and the expanded</span>
+<span class="lineno">  594 </span><span class="spaces">               </span><span class="istickedoff">-- view's JSON carries the name + description array (useful</span>
+<span class="lineno">  595 </span><span class="spaces">               </span><span class="istickedoff">-- for seeing WHAT tools were available + what they do, just</span>
+<span class="lineno">  596 </span><span class="spaces">               </span><span class="istickedoff">-- not the full schemas). The frontend already deduplicates</span>
+<span class="lineno">  597 </span><span class="spaces">               </span><span class="istickedoff">-- tools via `seenTools` so only the first occurrence renders.</span>
+<span class="lineno">  598 </span><span class="spaces">               </span><span class="istickedoff">-- The @raw@ view (built with preserveSchemas=True) ships the</span>
+<span class="lineno">  599 </span><span class="spaces">               </span><span class="istickedoff">-- full tools array so the &quot;View raw JSON&quot; modal shows the</span>
+<span class="lineno">  600 </span><span class="spaces">               </span><span class="istickedoff">-- verbatim schemas the LLM was sent.</span>
+<span class="lineno">  601 </span><span class="spaces">               </span><span class="istickedoff">&lt;&gt; toolsField</span>
+<span class="lineno">  602 </span><span class="spaces">               </span><span class="istickedoff">&lt;&gt; passthrough (k &quot;toolChoice&quot;)</span>
+<span class="lineno">  603 </span><span class="spaces">               </span><span class="istickedoff">&lt;&gt; passthrough (k &quot;maxTokens&quot;)</span>
+<span class="lineno">  604 </span><span class="spaces">               </span><span class="istickedoff">&lt;&gt; passthrough (k &quot;approval&quot;)</span>
+<span class="lineno">  605 </span><span class="spaces">               </span><span class="istickedoff">&lt;&gt; passthrough (k &quot;op&quot;)</span>
+<span class="lineno">  606 </span><span class="spaces">               </span><span class="istickedoff">-- Harness/opcode-invocation entries (EKHarness) carry the</span>
+<span class="lineno">  607 </span><span class="spaces">               </span><span class="istickedoff">-- opcode's input + result under these keys (see</span>
+<span class="lineno">  608 </span><span class="spaces">               </span><span class="istickedoff">-- Seal.Transcript.Reconstruct.harnessPayload). The SKILL_LOAD</span>
+<span class="lineno">  609 </span><span class="spaces">               </span><span class="istickedoff">-- result entry is a Request-direction harness entry; without</span>
+<span class="lineno">  610 </span><span class="spaces">               </span><span class="istickedoff">-- passing @input@ + @result@ through, the frontend's</span>
+<span class="lineno">  611 </span><span class="spaces">               </span><span class="istickedoff">-- @transcriptToMessages@ sees @op.name = &quot;SKILL_LOAD&quot;@ but no</span>
+<span class="lineno">  612 </span><span class="spaces">               </span><span class="istickedoff">-- @result@, so the skill-load tool-call box never renders.</span>
+<span class="lineno">  613 </span><span class="spaces">                </span><span class="istickedoff">&lt;&gt; passthrough (k &quot;input&quot;)</span>
+<span class="lineno">  614 </span><span class="spaces">                </span><span class="istickedoff">&lt;&gt; passthrough (k &quot;result&quot;)</span>
+<span class="lineno">  615 </span><span class="spaces">                </span><span class="istickedoff">&lt;&gt; passthrough (k &quot;channel&quot;)</span>
+<span class="lineno">  616 </span><span class="spaces">                </span><span class="istickedoff">&lt;&gt; rewriteMsgs</span>
+<span class="lineno">  617 </span><span class="spaces">            </span><span class="istickedoff">Response -&gt;</span>
+<span class="lineno">  618 </span><span class="spaces">              </span><span class="istickedoff">passthrough (k &quot;model&quot;)</span>
+<span class="lineno">  619 </span><span class="spaces">               </span><span class="istickedoff">&lt;&gt; rewriteContent</span>
+<span class="lineno">  620 </span><span class="spaces">               </span><span class="istickedoff">&lt;&gt; usageFields</span>
+<span class="lineno">  621 </span><span class="spaces">               </span><span class="istickedoff">&lt;&gt; passthrough (k &quot;stop&quot;)</span>
+<span class="lineno">  622 </span><span class="spaces">               </span><span class="istickedoff">&lt;&gt; passthrough (k &quot;durationMs&quot;)</span>
+<span class="lineno">  623 </span><span class="spaces">      </span><span class="istickedoff">in A.object fields</span>
+<span class="lineno">  624 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">val</span></span></span>
+<span class="lineno">  625 </span>
+<span class="lineno">  626 </span>-- | Extract name + description from a tools array, dropping input_schema /
+<span class="lineno">  627 </span>-- parameters to keep the wire payload small. Returns
+<span class="lineno">  628 </span>-- @[&quot;tools&quot; .= [...]]@ where each element is
+<span class="lineno">  629 </span>-- @{&quot;name&quot;: &quot;&lt;toolName&gt;&quot;, &quot;description&quot;: &quot;&lt;toolDesc&gt;&quot;}@ — the shape the
+<span class="lineno">  630 </span>-- frontend's 'extractToolDefNames' parses. Returns @[]@ when the tools field
+<span class="lineno">  631 </span>-- is absent or not an array.
+<span class="lineno">  632 </span>toolsWithDescriptions :: KeyMap.KeyMap Value -&gt; [(Key, Value)]
+<span class="lineno">  633 </span><span class="decl"><span class="istickedoff">toolsWithDescriptions o =</span>
+<span class="lineno">  634 </span><span class="spaces">  </span><span class="istickedoff">case KeyMap.lookup (Key.fromText &quot;tools&quot;) o of</span>
+<span class="lineno">  635 </span><span class="spaces">    </span><span class="istickedoff">Just (A.Array arr) -&gt;</span>
+<span class="lineno">  636 </span><span class="spaces">      </span><span class="istickedoff">let defs = map toolNameDesc (V.toList arr)</span>
+<span class="lineno">  637 </span><span class="spaces">      </span><span class="istickedoff">in [&quot;tools&quot; .= A.Array (V.fromList defs)]</span>
+<span class="lineno">  638 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; []</span>
+<span class="lineno">  639 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  640 </span><span class="spaces">    </span><span class="istickedoff">-- Extract {name, description} from a tool definition Value, dropping</span>
+<span class="lineno">  641 </span><span class="spaces">    </span><span class="istickedoff">-- input_schema / parameters. Handles both the Anthropic shape</span>
+<span class="lineno">  642 </span><span class="spaces">    </span><span class="istickedoff">-- ({name, description, input_schema}) and the Ollama shape</span>
+<span class="lineno">  643 </span><span class="spaces">    </span><span class="istickedoff">-- ({type:&quot;function&quot;, function:{name, description, parameters}}).</span>
+<span class="lineno">  644 </span><span class="spaces">    </span><span class="istickedoff">toolNameDesc v = case v of</span>
+<span class="lineno">  645 </span><span class="spaces">      </span><span class="istickedoff">A.Object td -&gt;</span>
+<span class="lineno">  646 </span><span class="spaces">        </span><span class="istickedoff">case ( KeyMap.lookup (Key.fromText &quot;name&quot;) td</span>
+<span class="lineno">  647 </span><span class="spaces">             </span><span class="istickedoff">, KeyMap.lookup (Key.fromText &quot;description&quot;) td ) of</span>
+<span class="lineno">  648 </span><span class="spaces">          </span><span class="istickedoff">(Just n, Just d) -&gt; A.object [&quot;name&quot; .= n, &quot;description&quot; .= d]</span>
+<span class="lineno">  649 </span><span class="spaces">          </span><span class="istickedoff">(Just n, Nothing) -&gt; <span class="nottickedoff">A.object [&quot;name&quot; .= n]</span></span>
+<span class="lineno">  650 </span><span class="spaces">          </span><span class="istickedoff">(Nothing, _) -&gt; case KeyMap.lookup (Key.fromText &quot;function&quot;) td of</span>
+<span class="lineno">  651 </span><span class="spaces">            </span><span class="istickedoff">Just (A.Object fn) -&gt; case KeyMap.lookup (Key.fromText &quot;name&quot;) fn of</span>
+<span class="lineno">  652 </span><span class="spaces">              </span><span class="istickedoff">Just n -&gt; case KeyMap.lookup (Key.fromText &quot;description&quot;) fn of</span>
+<span class="lineno">  653 </span><span class="spaces">                </span><span class="istickedoff">Just d -&gt; A.object [&quot;name&quot; .= n, &quot;description&quot; .= d]</span>
+<span class="lineno">  654 </span><span class="spaces">                </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">A.object [&quot;name&quot; .= n]</span></span>
+<span class="lineno">  655 </span><span class="spaces">              </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">A.object [&quot;name&quot; .= A.Null]</span></span>
+<span class="lineno">  656 </span><span class="spaces">            </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">A.object [&quot;name&quot; .= A.Null]</span></span>
+<span class="lineno">  657 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">A.object [&quot;name&quot; .= A.Null]</span></span></span>
+<span class="lineno">  658 </span>
+<span class="lineno">  659 </span>-- | Rewrite one 'Message' (@{role, content: [...]}@, strip-prefix camelCase
+<span class="lineno">  660 </span>-- JSON) to the Anthropic-style shape (@{role, content: [...]}@) the frontend
+<span class="lineno">  661 </span>-- parses, with content blocks rewritten by 'cbToFrontend'. The role is
+<span class="lineno">  662 </span>-- lowercased because GHC-Generics encodes 'User'/'Assistant' as
+<span class="lineno">  663 </span>-- @&quot;User&quot;@/@&quot;Assistant&quot;@ but the frontend checks @msg.role === &quot;user&quot;@.
+<span class="lineno">  664 </span>rewriteMessage :: A.Value -&gt; A.Value
+<span class="lineno">  665 </span><span class="decl"><span class="istickedoff">rewriteMessage msg =</span>
+<span class="lineno">  666 </span><span class="spaces">  </span><span class="istickedoff">case msg of</span>
+<span class="lineno">  667 </span><span class="spaces">    </span><span class="istickedoff">A.Object mo -&gt;</span>
+<span class="lineno">  668 </span><span class="spaces">      </span><span class="istickedoff">let k = Key.fromText</span>
+<span class="lineno">  669 </span><span class="spaces">          </span><span class="istickedoff">role = case KeyMap.lookup (k &quot;role&quot;) mo of</span>
+<span class="lineno">  670 </span><span class="spaces">            </span><span class="istickedoff">Just (A.String t) -&gt; T.toLower t</span>
+<span class="lineno">  671 </span><span class="spaces">            </span><span class="istickedoff">_                 -&gt; <span class="nottickedoff">&quot;user&quot; :: Text</span></span>
+<span class="lineno">  672 </span><span class="spaces">          </span><span class="istickedoff">rawContent = case KeyMap.lookup (k &quot;content&quot;) mo of</span>
+<span class="lineno">  673 </span><span class="spaces">            </span><span class="istickedoff">Just (A.Array arr) -&gt; arr</span>
+<span class="lineno">  674 </span><span class="spaces">            </span><span class="istickedoff">_                  -&gt; <span class="nottickedoff">mempty</span></span>
+<span class="lineno">  675 </span><span class="spaces">          </span><span class="istickedoff">blocks = map cbToFrontend (V.toList rawContent)</span>
+<span class="lineno">  676 </span><span class="spaces">      </span><span class="istickedoff">in A.object</span>
+<span class="lineno">  677 </span><span class="spaces">         </span><span class="istickedoff">[ &quot;role&quot;    .= role</span>
+<span class="lineno">  678 </span><span class="spaces">         </span><span class="istickedoff">, &quot;content&quot; .= A.Array (V.fromList blocks)</span>
+<span class="lineno">  679 </span><span class="spaces">         </span><span class="istickedoff">]</span>
+<span class="lineno">  680 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">msg</span></span></span>
+<span class="lineno">  681 </span>
+<span class="lineno">  682 </span>-- | ISO-8601 with milliseconds + Z (the frontend's expected timestamp shape).
+<span class="lineno">  683 </span>showIso :: UTCTime -&gt; String
+<span class="lineno">  684 </span><span class="decl"><span class="istickedoff">showIso = formatTime <span class="nottickedoff">defaultTimeLocale</span> &quot;%Y-%m-%dT%H:%M:%S%3QZ&quot;</span></span>
+<span class="lineno">  685 </span>
+<span class="lineno">  686 </span>-- | The ISO timestamp of the most recent @request@-direction entry in a
+<span class="lineno">  687 </span>-- session's transcript (the last time the USER sent a message), or 'Nothing'
+<span class="lineno">  688 </span>-- when the session has no transcript or no user message. Used by the sidebar
+<span class="lineno">  689 </span>-- to sort tabs by last-user-message time (oldest first within each status
+<span class="lineno">  690 </span>-- bucket). Reads the same transcript paths as 'firstUserMessageSnippet';
+<span class="lineno">  691 </span>-- returns the timestamp as an ISO string (matching the frontend's
+<span class="lineno">  692 </span>-- TranscriptEntry.timestamp shape).
+<span class="lineno">  693 </span>lastUserMessageAt :: SealPaths -&gt; SessionId -&gt; IO (Maybe Text)
+<span class="lineno">  694 </span><span class="decl"><span class="istickedoff">lastUserMessageAt paths sid = do</span>
+<span class="lineno">  695 </span><span class="spaces">  </span><span class="istickedoff">-- model + fallbackTs are only used for synthesized conversation.jsonl</span>
+<span class="lineno">  696 </span><span class="spaces">  </span><span class="istickedoff">-- entries that lack an entries.jsonl sidecar; the empty model + a</span>
+<span class="lineno">  697 </span><span class="spaces">  </span><span class="istickedoff">-- neutral fallback keep that path consistent without affecting the</span>
+<span class="lineno">  698 </span><span class="spaces">  </span><span class="istickedoff">-- entries.jsonl path (which carries real timestamps).</span>
+<span class="lineno">  699 </span><span class="spaces">  </span><span class="istickedoff">entries &lt;- readTranscriptEntries paths &quot;&quot; &quot;&quot; sid</span>
+<span class="lineno">  700 </span><span class="spaces">  </span><span class="istickedoff">pure (lastRequestTimestamp entries)</span>
+<span class="lineno">  701 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  702 </span><span class="spaces">    </span><span class="istickedoff">-- Walk the frontend-shaped entries in reverse, return the first</span>
+<span class="lineno">  703 </span><span class="spaces">    </span><span class="istickedoff">-- (i.e. most recent) @request@-direction entry's timestamp.</span>
+<span class="lineno">  704 </span><span class="spaces">    </span><span class="istickedoff">lastRequestTimestamp :: [A.Value] -&gt; Maybe Text</span>
+<span class="lineno">  705 </span><span class="spaces">    </span><span class="istickedoff">lastRequestTimestamp vals =</span>
+<span class="lineno">  706 </span><span class="spaces">      </span><span class="istickedoff">case reverse vals of</span>
+<span class="lineno">  707 </span><span class="spaces">        </span><span class="istickedoff">[] -&gt; Nothing</span>
+<span class="lineno">  708 </span><span class="spaces">        </span><span class="istickedoff">xs -&gt; go xs</span>
+<span class="lineno">  709 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno">  710 </span><span class="spaces">        </span><span class="istickedoff">k = Key.fromText</span>
+<span class="lineno">  711 </span><span class="spaces">        </span><span class="istickedoff">isBlank (A.String t) = T.null t</span>
+<span class="lineno">  712 </span><span class="spaces">        </span><span class="istickedoff">isBlank _ = <span class="nottickedoff">True</span></span>
+<span class="lineno">  713 </span><span class="spaces">        </span><span class="istickedoff">go [] = Nothing</span>
+<span class="lineno">  714 </span><span class="spaces">        </span><span class="istickedoff">go (v : rest) =</span>
+<span class="lineno">  715 </span><span class="spaces">          </span><span class="istickedoff">case v of</span>
+<span class="lineno">  716 </span><span class="spaces">            </span><span class="istickedoff">A.Object o -&gt;</span>
+<span class="lineno">  717 </span><span class="spaces">              </span><span class="istickedoff">case ( KeyMap.lookup (k &quot;direction&quot;) o</span>
+<span class="lineno">  718 </span><span class="spaces">                   </span><span class="istickedoff">, KeyMap.lookup (k &quot;timestamp&quot;) o ) of</span>
+<span class="lineno">  719 </span><span class="spaces">                </span><span class="istickedoff">(Just (A.String d), Just (A.String t))</span>
+<span class="lineno">  720 </span><span class="spaces">                  </span><span class="istickedoff">| d == &quot;request&quot; &amp;&amp; not (isBlank (A.String t)) -&gt; Just t</span>
+<span class="lineno">  721 </span><span class="spaces">                </span><span class="istickedoff">_ -&gt; go rest</span>
+<span class="lineno">  722 </span><span class="spaces">            </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">go rest</span></span></span>
+
+</pre>
+</body>
+</html>
