@@ -613,6 +613,30 @@ export interface FileContent {
   isBinary: boolean
 }
 
+/** Image extensions the file explorer previews inline. Mirrors the backend
+ *  allowlist in `Seal.Gateway.MediaType`; the two must not drift, or the
+ *  viewer shows a broken image for a path the backend will not serve as an
+ *  image.
+ *
+ *  `.svg` IS included. SVG is scriptable, but the preview renders it through
+ *  an `<img>`, where browsers never execute SVG script or load its
+ *  subresources. The remaining risk — the file is also reachable as a
+ *  document at its own URL — is closed server-side by the hardening CSP that
+ *  the backend attaches to every inline SVG response, not here. */
+const INLINE_IMAGE_EXTENSIONS = [
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.bmp', '.ico', '.svg',
+] as const
+
+/** True when `path` names a file the backend will serve as an inline image.
+ *  Judged on the final extension, case-insensitively, and never when the
+ *  whole filename is the suffix (a `.png` dotfile is not an image). */
+export function isPreviewableImage(path: string): boolean {
+  const base = path.slice(path.lastIndexOf('/') + 1)
+  const dot = base.lastIndexOf('.')
+  if (dot <= 0) return false
+  return (INLINE_IMAGE_EXTENSIONS as readonly string[]).includes(base.slice(dot).toLowerCase())
+}
+
 /** The result of `GET /api/files/stat?path=<file>`. Mirrors the backend's
  *  `FileStat` JSON. `mtimeEpoch` is null when mtime is unavailable. */
 export interface FileStat {
