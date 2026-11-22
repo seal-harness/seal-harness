@@ -105,6 +105,16 @@ jobs:
       - name: Run frontend tests
         run: nix develop --command bash -c 'cd frontend && npm ci --prefer-offline && npm test'
 
+      # Build and test the docs site. This is the PR-level guarantee that a
+      # broken internal link or a missing nav entry cannot reach `main`: the
+      # builder fails on either, so the failure surfaces here rather than after
+      # the merge that triggers the Pages deploy.
+      #
+      # It also runs on a release tag (release.yml calls this workflow), which
+      # is what we want: a tag must not publish through a weaker check.
+      - name: Build and test the docs site
+        run: nix develop --command bash -c 'cd site && npm ci --prefer-offline && npm test && npm run build'
+
       # ───────────────────────────────────────────────────────────────────
       # Assert the artifact is actually a working single binary. A UI-less
       # build is valid for developers but never for a release, and nothing

@@ -1,0 +1,298 @@
+/* Seal Harness docs site.
+ *
+ * Tokens are copied from frontend/design-tokens.css so the site and the app are
+ * recognisably the same product. They are duplicated rather than imported: the
+ * app's copy is bundled into the binary via file-embed, and coupling a docs
+ * build to that pipeline would make every docs change an npmDepsHash churn in
+ * flake.nix.
+ */
+
+:root {
+  --bg-base:        #0F1117;
+  --bg-sunken:      #0B0D13;
+  --bg-surface:     #161922;
+  --bg-elevated:    #1E2235;
+  --accent-primary:   #7C6CF6;
+  --accent-secondary: #4F8EF7;
+  --accent-gradient:  linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+  --text-primary:   #E8E9F0;
+  --text-muted:     #9598B8;
+  --text-faint:     #8A8FAD;
+  --border:         #252A40;
+  --font-sans: 'Geist Sans', system-ui, -apple-system, sans-serif;
+  --font-mono: 'Geist Mono', 'SF Mono', 'Fira Code', monospace;
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  margin: 0;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Top bar ──────────────────────────────────────────────────────────── */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-surface);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.brand {
+  color: var(--text-primary);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+}
+
+.brand-tag {
+  color: var(--text-faint);
+  font-weight: 400;
+  font-size: 0.85em;
+  margin-left: 6px;
+}
+
+.topnav a {
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: 0.9rem;
+  margin-left: 18px;
+}
+
+.topnav a:hover { color: var(--text-primary); }
+
+/* ── Shell: sidebar + content ─────────────────────────────────────────── */
+
+.shell {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  max-width: 1180px;
+  margin: 0 auto;
+  gap: 40px;
+  padding: 32px 24px 64px;
+}
+
+.sidebar {
+  position: sticky;
+  top: 72px;
+  align-self: start;
+  font-size: 0.9rem;
+}
+
+.nav-section { margin-bottom: 22px; }
+
+.nav-heading {
+  margin: 0 0 6px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--accent-primary);
+}
+
+.nav-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.nav-link {
+  display: block;
+  padding: 5px 10px;
+  color: var(--text-muted);
+  text-decoration: none;
+  border-radius: 6px;
+  border-left: 2px solid transparent;
+}
+
+.nav-link:hover {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+
+.nav-link[aria-current="page"] {
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+  border-left-color: var(--accent-primary);
+  font-weight: 500;
+}
+
+/* ── Content ───────────────────────────────────────────────────────────── */
+
+.content { min-width: 0; }
+
+.content h1 {
+  font-size: 2.1rem;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  margin: 0 0 12px;
+}
+
+.content h2 {
+  font-size: 1.35rem;
+  letter-spacing: -0.01em;
+  margin: 40px 0 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.content h3 {
+  font-size: 1.05rem;
+  margin: 26px 0 8px;
+}
+
+.content p, .content li { color: var(--text-primary); }
+
+.content a { color: var(--accent-secondary); text-decoration: none; }
+.content a:hover { text-decoration: underline; }
+
+.content code {
+  font-family: var(--font-mono);
+  font-size: 0.87em;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 5px;
+}
+
+.content pre {
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  line-height: 1.55;
+}
+
+.content pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.85rem;
+}
+
+.content blockquote {
+  margin: 18px 0;
+  padding: 2px 0 2px 16px;
+  border-left: 3px solid var(--accent-primary);
+  color: var(--text-muted);
+}
+
+.content table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 18px 0;
+  font-size: 0.92rem;
+}
+
+.content th, .content td {
+  border: 1px solid var(--border);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.content th { background: var(--bg-surface); color: var(--text-muted); }
+
+.content :not(pre) > code { white-space: nowrap; }
+
+.content hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
+
+/* ── Landing page bits ─────────────────────────────────────────────────── */
+
+.hero { padding: 24px 0 8px; }
+
+.hero-eyebrow {
+  color: var(--accent-primary);
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  font-size: 0.72rem;
+  font-weight: 600;
+  margin: 0 0 10px;
+}
+
+.hero-title {
+  font-size: 2.9rem;
+  line-height: 1.1;
+  letter-spacing: -0.03em;
+  margin: 0 0 14px;
+}
+
+.hero-lede {
+  font-size: 1.12rem;
+  color: var(--text-muted);
+  max-width: 62ch;
+  margin: 0 0 24px;
+}
+
+.hero-actions { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 28px; }
+
+.btn {
+  display: inline-block;
+  padding: 9px 16px;
+  border-radius: 8px;
+  text-decoration: none;
+  font-size: 0.92rem;
+  font-weight: 500;
+  border: 1px solid transparent;
+}
+
+.btn-primary { background: var(--accent-primary); color: #fff; }
+.btn-primary:hover { filter: brightness(1.08); text-decoration: none; }
+
+.btn-ghost {
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  border-color: var(--border);
+}
+.btn-ghost:hover { color: var(--text-primary); text-decoration: none; }
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+  margin: 22px 0 8px;
+  padding: 0;
+  list-style: none;
+}
+
+.card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+}
+
+.card h3 { margin: 0 0 6px; font-size: 0.98rem; }
+.card p { margin: 0 0 8px; color: var(--text-muted); font-size: 0.9rem; }
+.card a { font-size: 0.86rem; }
+
+.footer {
+  border-top: 1px solid var(--border);
+  padding: 22px 24px;
+  color: var(--text-faint);
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+/* ── Narrow screens: sidebar becomes a block above the content ─────────── */
+
+@media (max-width: 780px) {
+  .shell { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+  .sidebar { position: static; }
+  .hero-title { font-size: 2.1rem; }
+}
