@@ -37,3 +37,7 @@ frontend/playwright-report/
 /seal-*.tar.gz.sha256
 patch_plan.py
 *.log
+
+# Stray screenshots from local visual checks
+/site-landing.png
+/*.png

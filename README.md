@@ -13,6 +13,8 @@
   <br>
   <a href="https://seal-harness.github.io/seal-harness/api/index.html">API Docs</a>
   &nbsp;&bull;&nbsp;
+  <a href="https://seal-harness.github.io/seal-harness/docs/getting-started.html">Getting Started</a>
+  &nbsp;&bull;&nbsp;
   <a href="https://seal-harness.github.io/seal-harness/coverage/main/hpc_index.html">Code Coverage</a>
 </p>
 
