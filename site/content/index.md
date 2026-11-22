@@ -11,7 +11,7 @@ tamper with.
 </p>
 
 <div class="hero-actions">
-  <a class="btn btn-primary" href="docs/index.md">Read the docs</a>
+  <a class="btn btn-primary" href="docs/getting-started.md">Read the docs</a>
   <a class="btn btn-ghost" href="https://github.com/seal-harness/seal-harness">GitHub</a>
 </div>
 

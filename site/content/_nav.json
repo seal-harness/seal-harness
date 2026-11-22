@@ -8,7 +8,9 @@
   {
     "section": "Get started",
     "pages": [
-      { "title": "Documentation", "file": "docs/index.md" }
+      { "title": "Documentation", "file": "docs/index.md" },
+      { "title": "Getting started", "file": "docs/getting-started.md" },
+      { "title": "Sessions and working directories", "file": "docs/sessions-and-workdirs.md" }
     ]
   }
 ]

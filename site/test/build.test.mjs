@@ -11,6 +11,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { tmpdir } from 'node:os'
 import { buildSite, BuildError } from '../build.mjs'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 
 // ── Fixture helper ───────────────────────────────────────────────────────
 
