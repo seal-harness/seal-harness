@@ -1,0 +1,14 @@
+[
+  {
+    "section": null,
+    "pages": [
+      { "title": "Seal Harness", "file": "index.md" }
+    ]
+  },
+  {
+    "section": "Get started",
+    "pages": [
+      { "title": "Documentation", "file": "docs/index.md" }
+    ]
+  }
+]
