@@ -97,3 +97,48 @@ export function readinessTone(state: ProviderReadiness): ReadinessTone {
       return 'ok'
   }
 }
+
+/**
+ * Is this the one readiness state that positively means "there is nothing here
+ * to use"?
+ *
+ * Only `not-installed` qualifies. It is the state the backend derives after
+ * finding no daemon answering *and* no `ollama` binary on PATH — nothing the
+ * operator can reach from this form. It is the only state that keeps a
+ * provider out of a picker.
+ *
+ * Everything else stays listed, because everything else is one command away or
+ * genuinely unknown:
+ *
+ * - `not-running` — installed; `ollama serve` fixes it.
+ * - `no-models` — installed; `ollama pull <model>` fixes it.
+ * - `no-fitting-model` — advisory only (design D5.4).
+ * - `unknown` / `pending` — we have not observed anything. Absence of evidence
+ *   must never become a claim, so these are never hidden.
+ * - `ready` / `cloud` — usable.
+ *
+ * `undefined` (a non-Ollama provider, or an older payload) is likewise not
+ * installed-absent: it is "not applicable", so it stays.
+ */
+export function isNotInstalled(readiness: ProviderReadiness | undefined): boolean {
+  return readiness === 'not-installed'
+}
+
+/**
+ * Is this provider one a picker may offer, or the form auto-select?
+ *
+ * The single definition of "offerable", shared by the dropdown filter
+ * (`ProviderSelect`) and the new-tab form's auto-selection, so the two cannot
+ * disagree: a value the dropdown hides is exactly a value the form must not
+ * choose on the operator's behalf.
+ *
+ * `configured` absent means configured (back-compat with older payloads).
+ * Absence is then the second, observed axis — see `isNotInstalled`.
+ */
+export function isOfferableProvider(p: {
+  configured?: boolean
+  readiness?: ProviderReadiness
+}): boolean {
+  if (p.configured === false) return false
+  return !isNotInstalled(p.readiness)
+}

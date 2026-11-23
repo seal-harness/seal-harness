@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useConfiguredProviders, fetchProviderModels, useDiscoverableWindows, useRepos, type CreateTabBody, fetchUiState, putUiState, addCustomModel, addRepo, type LastOptions } from './useApi'
 import type { DiscoverableWindow, ProviderInfo } from '../types'
+import { isOfferableProvider } from '../lib/readiness'
 
 export type NewTabKind = 'provider' | 'harness' | 'attach'
 
@@ -203,21 +204,23 @@ export function useNewTabSpec(
   }, [])
 
   // Default the provider to whatever Seal is configured to use (the entry
-  // marked isDefault by the backend) — but only among the *configured*
-  // providers. Falling back to the first configured one, then the first
-  // overall (so an unconfigured provider is never auto-selected even when
-  // it is the only entry). `configured` is absent => configured (back-compat).
+  // marked isDefault by the backend) — but only among the providers the picker
+  // will actually offer: configured, and not positively absent. A provider the
+  // dropdown hides must never be auto-selected, or the form would submit a
+  // session bound to something that cannot answer, with the choice invisible.
+  // Falls back to the first usable provider; when there is none the provider
+  // stays empty and `validationError` explains why.
   useEffect(() => {
     if (!providersLoaded || configuredProviders.length === 0) return
-    const names = configuredProviders.map((p) => p.name)
-    const isCfg = (n: string) =>
-      configuredProviders.find((p) => p.name === n)?.configured !== false
-    if (!provider || !names.includes(provider) || !isCfg(provider)) {
-      const cfg = configuredProviders.filter((p) => p.configured !== false)
-      const def = cfg.find((p) => p.isDefault)
-      const fallback = (def ?? cfg[0] ?? configuredProviders[0])!.name
-      setProvider(fallback)
-    }
+    const usable = configuredProviders.filter(isOfferableProvider)
+    // An explicit selection the operator restored or made is kept — readiness
+    // is re-read on focus, so a briefly-unusable provider must not be swapped
+    // out under their hands.
+    const chosen = configuredProviders.find((p) => p.name === provider)
+    if (chosen !== undefined && isOfferableProvider(chosen)) return
+    const def = usable.find((p) => p.isDefault)
+    const next = (def ?? usable[0])?.name ?? ''
+    if (next !== provider) setProvider(next)
   }, [providersLoaded, configuredProviders, provider])
 
   // Fetch the model list when the provider changes (and we're in provider
@@ -286,6 +289,12 @@ export function useNewTabSpec(
     if (kind === 'provider') {
       if (providersLoaded && !configuredProviders.some((p) => p.configured !== false)) {
         return 'No providers configured — set an API key or start Ollama'
+      }
+      // Configured providers exist but none can be offered (today: an Ollama
+      // whose probe found neither a daemon nor a binary). The dropdown is
+      // empty, so name the reason instead of the generic "Pick a model".
+      if (providersLoaded && !configuredProviders.some(isOfferableProvider)) {
+        return 'No usable provider — Seal found nothing to talk to. Install Ollama, or configure another provider in the Providers tab'
       }
       if (modelsLoading) return 'Loading models…'
       if (!model.trim()) return useCustomModel ? 'Enter a custom model id' : 'Pick a model'
