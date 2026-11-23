@@ -296,7 +296,33 @@ measured.
 
 `-f remote-only-untrusted` is documented (AGENTS.md, spec §3 Layer B) as the
 compile-time guarantee that untrusted execution cannot run on the control
-plane. **It does not hold.**
+plane. **The build succeeds; the guarantee does not hold.** Measured, not
+inferred:
+
+```
+$ cabal build lib:seal-harness -f remote-only-untrusted   # EXIT: 0
+[79 of 218] Compiling Seal.Tools.Exec.Local ( src/Seal/Tools/Exec/Local.hs, ... )
+$ nm -g .../Seal/Tools/Exec/UntrustedIO.o | grep -c mkLocalUntrustedIO
+2
+```
+
+So the artifact **compiles and links fine** — an earlier draft of this doc said
+"broken build", which was wrong. The accurate claim is narrower and still
+security-relevant: `Local.hs` is compiled and `mkLocalUntrustedIO` is in the
+binary, contradicting the spec's "it is not compiled and not linked" and "the
+capability … does not exist in the binary".
+
+What the flag *does* do today is change **handle selection** (the `#if` arms at
+`Cli.hs:485` and `Security.hs:796`), so a hardened binary picks the remote stub
+by default. That is a working *runtime* protection — which is why deleting
+`mode` would unplug it. What is absent is the *compile-time* property the docs
+promise.
+
+**Therefore WU-0 is a documentation/artifact fix, not an emergency repair**, and
+this feature does not strictly depend on it: the `allow_local` coercion can be
+re-pointed inside WU-6. Decide with the operator whether to (a) correct the
+docs to describe the flag truthfully, or (b) make the flag deliver the artifact
+property by CPP-gating the three imports.
 
 | Evidence | Finding |
 |---|---|
@@ -305,7 +331,7 @@ plane. **It does not hold.**
 | `Remote.hs:67` | unconditional import (`readBounded`, `withManagedProcess`) |
 | `AgentMetaCache.hs:82` | unconditional import (`readBounded`, `withManagedProcess`) |
 | `ghc-options: -Wno-missing-home-modules` (`cabal:345`) | the authors' own acknowledgement the module still compiles in |
-| `.github/workflows`, `Makefile`, `nix/` | the flag is **never built** |
+| `.github/workflows`, `Makefile`, `nix/` | the flag is **never built in CI** (so its guarantee is untested, whether or not it holds) |
 
 What actually blocks local execution today is `localModeResult` coercing `mode`
 to `UemRemote` under `-DREMOTE_ONLY_UNTRUSTED` (`Security.hs:795-798`).
