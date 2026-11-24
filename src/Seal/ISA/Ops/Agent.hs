@@ -953,6 +953,9 @@ handleHandoff wiring handoffDeps v = do
           cfg <- liftIO (aswConfig wiring)
           let (_, _, _, orchEnabled) = resolveDelegationConfig cfg
               runtime = aswRuntime wiring
+              -- WU-4: the caller is the parent session — the parent for
+              -- the sidecar append and the lineage registration.
+              parentSid = aswParentSession wiring
               -- Handoff sessions are top-level peers: their own workdir
               -- (ctIsolateWorkdir) and their own repo checkout.
               task = ChildTask defId goal (textFieldMaybe "context" v) Nothing True effectiveRepo
@@ -961,9 +964,26 @@ handleHandoff wiring handoffDeps v = do
                 registerCompletedAgentResult runtime (crSubagentId result) result
                 globalLogIO DebugS (ls ("[handoff] completion registered: subagent=" <> subagentIdText (crSubagentId result)
                   <> " session=" <> maybe "none" sessionIdText (crChildSession result)))
+                -- WU-4: the handoff's caller is the parent session —
+                -- deliver the completion the same way background
+                -- children do: append to the caller's sidecar (drained
+                -- at the parent's next turn start) and wake an idle
+                -- parent. Pre-WU-4 the result was registered but never
+                -- delivered: the parent never saw the handoff finish.
+                appendCompletionToSidecar (aswPaths wiring) parentSid (completionMessage result)
+                globalLogIO DebugS (ls ("[handoff] completion appended to sidecar: subagent=" <> subagentIdText (crSubagentId result)
+                  <> " parentSid=" <> sessionIdText parentSid
+                  <> " childSession=" <> maybe "none" sessionIdText (crChildSession result)
+                  <> " messageChars=" <> T.pack (show (T.length (completionMessage result)))))
+                globalLogIO DebugS (ls ("[handoff] firing onIdleCompletion hook: subagent=" <> subagentIdText (crSubagentId result)))
+                forM_ (aswOnIdleCompletion wiring) id
               spawnCb :: SpawnCallback
+              -- WU-4: register the SPAWNING session as the parent — the
+              -- registry's aiParentSession is what hasRunningChildren
+              -- filters, so a self-parented registration lied about the
+              -- lineage and broke idle gating for the caller.
               spawnCb sid def childSid =
-                registerRunningAgent runtime (adId def) sid childSid childSid 0
+                registerRunningAgent runtime (adId def) sid parentSid childSid 0
           eSpawnInfos <- liftIO (runDelegateAsync
                                    cfg
                                    (aswPauseFlag wiring)

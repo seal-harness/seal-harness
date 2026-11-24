@@ -23,8 +23,9 @@ import Seal.Agent.Runtime.Registry
   ( AgentRuntime
   , newAgentRuntime
   , listAgents
+  , aiParentSession
   )
-import Seal.Config.Paths (SealPaths (..))
+import Seal.Config.Paths (SealPaths (..), sessionDir)
 import Seal.Core.Types (SessionId, mkSystemSessionId)
 import Seal.ISA.Opcode
   ( OpResult (..), localBackend, opAuthorize, opRun, toDesc, toInSchema )
@@ -420,6 +421,77 @@ specHandoffRepo = describe "AGENT_MANAGE action=handoff (repo)" $ do
       threadDelay 100000
       readIORef ran `shouldReturn` 0
 
+  describe "AGENT_MANAGE action=handoff (WU-4: parent linkage)" $ do
+    -- Three defects fixed by WU-4 (plan §4): the handoff callback
+    -- registered the child as its own parent, never appended the
+    -- completion to the caller's sidecar, and never woke an idle parent.
+    -- The fix mirrors handleStartBackground's callback shape.
+    it "registers the handoff child with the SPAWNING session as parent (not itself)" $ do
+      withSystemTempDirectory "seal-handoff-parent" $ \tmp -> do
+        let paths = samplePathsAt tmp
+        backend <- noneBackend
+        rt <- newAgentRuntime
+        pauseFlag <- newSpawnPauseFlag
+        _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                               (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text)
+                                       , "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+        ran <- newIORef (0 :: Int)
+        let wiring = mkWiringAt paths backend rt pauseFlag
+        r <- runTestApp (opRun (agentManageOp wiring (stubDeps (recordingWorker ran))) localBackend
+                              (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text)
+                                      , "goal" .= ("go" :: Text)]))
+        orIsError r `shouldBe` False
+        threadDelay 150000
+        insts <- listAgents rt
+        case insts of
+          [i] -> aiParentSession i `shouldBe` sampleSession
+          _   -> expectationFailure "expected exactly one registered instance"
+    it "appends the handoff completion to the CALLER's sidecar (visible in the parent transcript)" $ do
+      withSystemTempDirectory "seal-handoff-sidecar" $ \tmp -> do
+        let paths = samplePathsAt tmp
+        backend <- noneBackend
+        rt <- newAgentRuntime
+        pauseFlag <- newSpawnPauseFlag
+        -- Production invariant: the CALLER session always has a state
+        -- dir (its transcript lives there). The sidecar append targets
+        -- <state>/sessions/<caller>/agent-completions.jsonl; create the
+        -- caller's dir by persisting its meta, as the real gateway does.
+        saveSessionMeta paths (callerMetaWithRepo Nothing)
+        _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                               (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text)
+                                       , "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+        ran <- newIORef (0 :: Int)
+        let wiring = mkWiringAt paths backend rt pauseFlag
+        r <- runTestApp (opRun (agentManageOp wiring (stubDeps (recordingWorker ran))) localBackend
+                              (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text)
+                                      , "goal" .= ("go" :: Text)]))
+        orIsError r `shouldBe` False
+        threadDelay 150000
+        -- The sidecar file lives at <state>/sessions/<parent>/agent-completions.jsonl
+        sidecar <- liftIOReadFile (sessionDir paths sampleSession </> "agent-completions.jsonl")
+        -- ^ the sidecar the turn engine drains at the next turn start
+        --   (Handles.Transcript.completionSidecarPath)
+        T.isInfixOf "done" sidecar `shouldBe` True
+    it "fires the idle-completion hook so an idle parent wakes" $ do
+      withSystemTempDirectory "seal-handoff-wake" $ \tmp -> do
+        let paths = samplePathsAt tmp
+        backend <- noneBackend
+        rt <- newAgentRuntime
+        pauseFlag <- newSpawnPauseFlag
+        _ <- runTestApp (opRun (agentDefWriteOp backend sampleSession) localBackend
+                               (object ["id" .= ("a1" :: Text), "name" .= ("g" :: Text)
+                                       , "provider" .= ("ollama" :: Text), "model" .= ("llama3" :: Text)]))
+        ran <- newIORef (0 :: Int)
+        wokeRef <- newIORef (0 :: Int)
+        let wiring' = (mkWiringAt paths backend rt pauseFlag)
+                        { aswOnIdleCompletion = Just (modifyIORef' wokeRef (+1)) }
+        r <- runTestApp (opRun (agentManageOp wiring' (stubDeps (recordingWorker ran))) localBackend
+                              (object ["action" .= ("handoff" :: Text), "id" .= ("a1" :: Text)
+                                      , "goal" .= ("go" :: Text)]))
+        orIsError r `shouldBe` False
+        threadDelay 150000
+        readIORef wokeRef `shouldReturn` 1
+
   it "exposes `repo` and `branch` in the AGENT_MANAGE input schema and names them in toDesc" $ do
     backend <- noneBackend
     rt <- newAgentRuntime
@@ -430,6 +502,12 @@ specHandoffRepo = describe "AGENT_MANAGE action=handoff (repo)" $ do
     T.isInfixOf "branch" schema `shouldBe` True
     T.isInfixOf "repo" (toDesc op) `shouldBe` True
     T.isInfixOf "branch" (toDesc op) `shouldBe` True
+
+liftIOReadFile :: FilePath -> IO Text
+liftIOReadFile p = do
+  s <- readFile p
+  pure (T.pack s)
+
 
 -- | A 'SealPaths' fixture rooted at @tmp@.
 samplePathsAt :: FilePath -> SealPaths
