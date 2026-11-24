@@ -14,7 +14,8 @@ three reviewer claims were rejected or corrected (see §Corrections). The two
 findings that changed the shape of this design:
 
 1. **Local execution is not one construction site — it is four, and the
-   compile-time backstop is dead.** A prerequisite (WU-0) is now required.
+   compile-time backstop is absent.** Split out to issue #347; this feature
+   still owes the `allow_local` coercion that replaces it (WU-2b).
 2. **The file explorer cannot be made multi-machine at the cost this feature
    can bear** (96 `adFileExplorer` references, a second cabal library, a second
    hand-maintained route table, and a 7-URL frontend sweep). It moves to
@@ -238,15 +239,15 @@ measurement is a grep, not new analytics.**
 
 | Signal | Target | How observed | Verdict if missed |
 |---|---|---|---|
-| Sessions pinned to a non-`default` machine | ≥1 within 2 weeks of WU-4 shipping | `grep exec_machine ~/.seal/sessions/*/session.json` | **Nobody pins ⇒ the premise is unvalidated. Keep single-machine, drop the picker (WU-8), keep the inventory+pin plumbing only if it earned its keep via WU-0.** |
+| Sessions pinned to a non-`default` machine | ≥1 within 2 weeks of WU-4 shipping | `grep exec_machine ~/.seal/sessions/*/session.json` | **Nobody pins ⇒ the premise is unvalidated. Keep single-machine, drop the picker (WU-8), keep the inventory+pin plumbing only if it earned its keep.** |
 | Sessions moved by adding a machine | 0 — existing sessions' `exec_machine` and `workdir` unchanged | integration test + the same grep before/after | A migration that re-points sessions is a regression, not a feature |
 | Machine visible without a click (UC-3) | shown in header + list when it carries information | frontend test | UC-3 unimplemented |
 | Rename recoverable (UC-4) | a refused session can be re-pinned, no hand-edited `session.json` | integration test on `PUT` + `/session machine` | UC-4 unimplemented |
-| Hardened build | `-f remote-only-untrusted` **builds and passes tests in CI** | new CI job (WU-0) | WU-0 incomplete — the whole D6 argument is unsupported |
+| Hardened build | `-f remote-only-untrusted` builds in CI | issue #347 (out of scope here) | #347 unaddressed — the artifact property stays absent |
 
 The last row is the one that matters most: before this feature, the hardened
-build was never exercised, so its guarantee was assumed. After WU-0 it is
-measured.
+build was never exercised, so its guarantee was assumed. Issue #347 makes it
+measured; this feature only owes the runtime coercion.
 
 ## Goals
 
@@ -292,7 +293,7 @@ measured.
 
 ## Design decisions
 
-### D0 — Prerequisite: repair the hardened build (WU-0)
+### D0 — The hardened build: what it does and does not do (→ issue #347)
 
 `-f remote-only-untrusted` is documented (AGENTS.md, spec §3 Layer B) as the
 compile-time guarantee that untrusted execution cannot run on the control
@@ -318,11 +319,16 @@ by default. That is a working *runtime* protection — which is why deleting
 `mode` would unplug it. What is absent is the *compile-time* property the docs
 promise.
 
-**Therefore WU-0 is a documentation/artifact fix, not an emergency repair**, and
-this feature does not strictly depend on it: the `allow_local` coercion can be
-re-pointed inside WU-6. Decide with the operator whether to (a) correct the
-docs to describe the flag truthfully, or (b) make the flag deliver the artifact
-property by CPP-gating the three imports.
+**DECISION (operator, 2026-11-23): split out to issue #347.** The flag will be
+made to match the docs (CPP-gate the three imports, add the build to CI).
+That work is **out of scope here**; this feature does not depend on it.
+
+What this feature *must* still do, because it deletes `mode` and `mode`'s
+coercion is the only working runtime protection: **WU-2b must re-point
+`localModeResult`'s coercion at `allow_local`** so that under
+`-DREMOTE_ONLY_UNTRUSTED`, `allow_local` is forced `False`. That is a
+~5-line CPP-guarded change plus a test, and it is the piece this feature
+genuinely owes. Issue #347 handles the separate artifact-property gap.
 
 | Evidence | Finding |
 |---|---|
@@ -339,7 +345,7 @@ to `UemRemote` under `-DREMOTE_ONLY_UNTRUSTED` (`Security.hs:795-798`).
 backstop. `enforceRemoteOnly` — cited in the first draft as Layer B — has **no
 production call site** (definition + 2 tests only).
 
-WU-0 must:
+The out-of-scope follow-up (#347) must:
 1. Gate all **three** imports behind real CPP.
 2. Add an `allow_local := False` coercion under the flag (replacing
    `localModeResult`'s role), with a test.
@@ -953,10 +959,12 @@ misdescribed it as three).
 
 | WU | Scope | Depends |
 |---|---|---|
-| **0** | Repair hardened build: 3 CPP guards, `allow_local := False` coercion, delete `untrustedIOFromSecurity`, add flag to CI | — |
-| **1** | `Seal.Execution.Types` + `Seal.Execution.Resolve`: `MachineName`, `SshMachineSpec`, `ExecutionConfig`, `TargetError`, `ResolvedTarget`, `SelfIdentity`, pure `resolveTarget`/`validateTarget`/`parseIpv4Loose`, IO `getSelfIdentity`/`resolveTargetIO`. Fully unit-tested incl. D16. **Cabal wiring is part of this WU, not WU-9** — a module with no stanza is never typechecked (`cabal build` exits 0 on a deliberate type error), so deferring the wiring would let compile errors through WU-1..8 undetected. Per D17: Security must not import it; `Exec.Untrusted` must not import it | 0 |
+| **1** | `Seal.Execution.Types` + `Seal.Execution.Resolve`: `MachineName`, `SshMachineSpec`, `ExecutionConfig`, `TargetError`, `ResolvedTarget`, `SelfIdentity`, pure `resolveTarget`/`validateTarget`/`parseIpv4Loose`, IO `getSelfIdentity`/`resolveTargetIO`. Fully unit-tested incl. D16. **Cabal wiring is part of this WU, not WU-9** — a module with no stanza is never typechecked (`cabal build` exits 0 on a deliberate type error), so deferring the wiring would let compile errors through WU-1..8 undetected. Per D17: Security must not import it; `Exec.Untrusted` must not import it | — |
 | **2** | `Seal.Config.Execution` load/save/template + `allow_local` in security config + `WorkspaceRoot'`/`KeyFilePath` validators + port range. **Additive only** — `mode` still works | 1 |
-| **2b** | **Destructive**: delete `mode`/`UntrustedExecMode`/`resolveRemoteSsh`; migration in `Seal.Config.Migrate`; rewrite **all** affected specs — `Phase4Spec`, `UntrustedSpec`, `TemplatesSpec`, `ApiTestHarness`, **plus `SecuritySpec` (5+3 record literals), `ExecCacheSpec:95,180,184`, `WorkdirSpec:329`, `TemplatesSpec:375`**; and the `src` call sites with no other owner: `Workdir.hs:182`, `ExecCache.hs:99`, `Serve.hs:538,677`, `API.hs:1212,1710`, `TurnEngine.hs:653,669`, `Cli.hs:158,474`. **Also the signature cutover**: `mkSessionExec` + `cachedSessionExec` take `ResolvedTarget`/`Where` instead of `SecurityConfig` (they re-derive local-vs-remote internally today — the bypass shape, D11) | 2 |
+| **2b** | **Destructive**: delete `mode`/`UntrustedExecMode`/`resolveRemoteSsh`; migration in `Seal.Config.Migrate`; rewrite **all** affected specs — `Phase4Spec`, `UntrustedSpec`, `TemplatesSpec`, `ApiTestHarness`, **plus `SecuritySpec` (5+3 record literals), `ExecCacheSpec:95,180,184`, `WorkdirSpec:329`, `TemplatesSpec:375`**; and the `src` call sites with no other owner: `Workdir.hs:182`, `ExecCache.hs:99`, `Serve.hs:538,677`, `API.hs:1212,1710`, `TurnEngine.hs:653,669`, `Cli.hs:158,474`. **Also**: re-point the `-DREMOTE_ONLY_UNTRUSTED` coercion at `allow_local`
+(replacing `localModeResult`'s role — this is the piece the feature **owes**,
+see D0), delete `untrustedIOFromSecurity` (`Cli.hs:472-486`, dead code, which
+also removes the `#if` arm at `:485`). **Also the signature cutover**: `mkSessionExec` + `cachedSessionExec` take `ResolvedTarget`/`Where` instead of `SecurityConfig` (they re-derive local-vs-remote internally today — the bypass shape, D11) | 2 |
 | **3** | `defaultSessionMeta` (75 sites, mechanical, no behaviour change) | — |
 | **4** | `smExecMachine` + creation plumbing (`CreateTabBody`, `newSession`) + validation at creation (400 in the form) + child/handoff/branch inheritance + `execMachine` on the wire **+ `--machine` (long-only) in `Seal.Command.New` and `src-gateway-types/…/NewArgs.parseNewArgs`** — moved here from WU-8 so WU-4 is the first *demoable* increment (PM round-2 blocker 2) | 1,3 |
 | **5** | Delete the now-orphaned local constructors: `mkLocalUIO` (`UIO/Internal.hs:117`), `mkSessionUntrustedIO` (`Workdir.hs:308`), and `mkSessionExec`'s `Nothing` arm (gone in 2b); rewrite `UIOSpec`/`WorkdirSpec`. DoD: a local arm is unconstructible without a `WhereLocal` value — asserted structurally, not just by deletions | 1,4,2b |
@@ -965,7 +973,8 @@ misdescribed it as three).
 | **8** | Frontend: machine picker in `NewTabComposer` **with defined 0-/1-machine and all-unselectable states**; chat-header + session-list display **gated on being informative**; refused-session flag; re-pin UI; `execMachine`/`execRefusal` in `frontend/src/types.ts::SessionInfo`; explorer notice + workdir link from D11a | 7 |
 | **9** | Docs, README, `security.toml` template — **including fixing line 3's "Boot-only and agent-immutable"** (`config/templates/security.toml:3`), which becomes false once `allow_local` is re-read per turn (PM round-2 blocker 5) — plus the residual-risk note; `execution.toml` template; **`.cabal` wiring** (`exposed-modules`, `other-modules`, `test/Main.hs`, `extra-source-files`); CHANGELOG | all |
 
-**Ordering note (CTO round-2 #3) — resolved by re-cutting, not reordering.** Deleting `mode` breaks `mkSessionExec` (`Workdir.hs:182`), and the original split assigned that symbol to WU-5, which ran *after* WU-2b — leaving the tree red in between. Rather than reorder (which creates an incoherent intermediate state: `mkSessionExec` taking a `ResolvedTarget` while `mode` still exists), **the signature cutover moves into WU-2b**, since 2b must touch those call sites anyway. WU-5 then owns only the now-orphaned local constructor deletions. Effective order: WU-0, 1, 2, 3, 4, 2b, 5, 6, 7, 8, 9.
+**Ordering note (CTO round-2 #3) — resolved by re-cutting, not reordering.** Deleting `mode` breaks `mkSessionExec` (`Workdir.hs:182`), and the original split assigned that symbol to WU-5, which ran *after* WU-2b — leaving the tree red in between. Rather than reorder (which creates an incoherent intermediate state: `mkSessionExec` taking a `ResolvedTarget` while `mode` still exists), **the signature cutover moves into WU-2b**, since 2b must touch those call sites anyway. WU-5 then owns only the now-orphaned local constructor deletions. Effective order: WU-1, 2, 3, 4, 2b, 5, 6, 7, 8, 9. (The hardened-build
+artifact gap is issue #347, out of scope.)
 
 **WU-2 is split** (2 / 2b) because as one unit it could not go green: deleting
 `mode` breaks `Phase4Spec`, `UntrustedSpec`, `ApiTestHarness`, and
@@ -981,8 +990,8 @@ or the sdist stops building and `file-embed` ships a stale copy
 
 | Risk | Mitigation |
 |---|---|
-| Agent adds a self-host machine to escape `allow_local` | D6 (`SelfIdentity` + `-F /dev/null`); D16 property; compile-time coercion in WU-0 |
-| Hardened build silently regresses again | WU-0 adds it to CI |
+| Agent adds a self-host machine to escape `allow_local` | D6 (`SelfIdentity` + `-F /dev/null`); D16 property; runtime coercion in WU-2b |
+| Hardened build silently regresses again | issue #347 adds it to CI |
 | Re-pinning serves a stale exec | D11 fingerprint inside the cache + `ceSessionPin` guard |
 | Migration strips `security.toml` comments | surgical key removal, not re-encode; migration log says so if a re-encode is unavoidable |
 | `WorkspaceRoot'` validation misses a form | D7 property test |
