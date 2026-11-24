@@ -51,12 +51,16 @@
   handleInstances renders only aiStatus (Agent.hs:775-783)
 
 ## Disclosed landmines from WU-1 review (not owned by any current WU)
-1. Heartbeat orphan: a propagated ThreadKilled (AGENT_STOP) now skips
+1. Heartbeat orphan: FIXED by WU-1.5 (ab7eabd).
+   (Was: a propagated ThreadKilled (AGENT_STOP) skipped)
    `void (tryPutMVar hbStop ()); killThread hbThreadId` cleanup at
    Delegation.hs:624-629/:806-810 — heartbeatLoop never exits, keeps
    touching the parent-activity cell every 30s, defeating the parent's
-   inactivity timeout. One leak per stopped child. Fix: bracket the
-   heartbeat around runChildWithTimeout.
+   inactivity timeout. One leak per stopped child.)
+
+## Tooling notes (session-proven)
+- Multi-line commit messages: use BIN_EXEC (SHELL_EXEC mangles \n to
+  literal text; fix required an amend).
 2. Batch pool: forkIO'd runOne with a semaphore has no async-safe putMVar;
    an async kill escaping runOne in a DiBatch hangs the parent's readMVar
    (unreachable in production today — only registered tids are killed).

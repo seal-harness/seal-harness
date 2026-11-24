@@ -15,6 +15,7 @@ Execution: orchestrated (6 work units), user-selected 2026-11-24.
 | WU | Title | Status | Commit |
 |---|---|---|---|
 | WU-1 | runChildWithTimeout seam + catchChildSync + three catch sites | complete | d72af9e |
+| WU-1.5 | withHeartbeat bracket (operator-approved; disclosed by WU-1 review) | complete | ab7eabd |
 | WU-2 | Structural exit reason (aeStopFanoutDone + terminalReasonRef + childStopKind) | pending | — |
 | WU-3 | Registry truthfulness (real crStatus + log line) | pending | — |
 | WU-4 | Handoff callback (parentSid, sidecar append, parent wake) | pending | — |
