@@ -79,6 +79,7 @@ import Seal.Agent.Runtime.Delegation
   , AgentCompletionCallback
   , SpawnCallback
   , ChildResult (..)
+  , ChildExitReason (..)
   , ChildTask (..)
   , RepoSpec (..)
   , DelegationConfig
@@ -778,6 +779,12 @@ handleInstances runtime = do
         [] -> "(no agents running)"
         _  -> T.intercalate "\n"
                 [ subagentIdText (aiSubagentId i) <> ": " <> agentDefIdText (aiId i) <> " — " <> renderStatus (aiStatus i)
+                    -- WU-3: a completed child shows WHY it ended — the
+                    -- exit reason from the stored aiResult (the same
+                    -- field handleStatus enriches from), so a timed-out
+                    -- child is distinguishable from a normally-stopped
+                    -- one at a glance in AGENT_INSTANCES.
+                    <> maybe "" (\r -> " (" <> exitReasonText (crExitReason r) <> ")") (nonCompletionReason i)
                 | i <- insts ]
       recorded = object
         [ "count" .= length insts
@@ -1271,6 +1278,24 @@ renderStatus = \case
   Stopped      -> "stopped"
   Interrupted  -> "interrupted"
   Crashed m    -> "crashed: " <> m
+
+-- | The stored result of a child that did NOT complete normally, if any —
+-- 'Nothing' for running children and for children whose exit reason was
+-- CerCompleted (no suffix is wanted on those lines).
+nonCompletionReason :: AgentInstance -> Maybe ChildResult
+nonCompletionReason i = case aiResult i of
+  Just r | crExitReason r /= CerCompleted -> Just r
+  _ -> Nothing
+
+-- | A one-word human rendering of a non-completion exit reason for the
+-- AGENT_INSTANCES line suffix.
+exitReasonText :: ChildExitReason -> Text
+exitReasonText = \case
+  CerCompleted     -> "completed"
+  CerError         -> "error"
+  CerMaxIterations -> "max-iterations"
+  CerTimeout       -> "timeout"
+  CerInterrupted   -> "interrupted"
 
 -- | Extract the @subagent_id@ string field from a JSON object.
 subagentIdField :: Value -> Maybe SubagentId
