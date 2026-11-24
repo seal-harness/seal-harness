@@ -70,7 +70,7 @@ string `localhost`. Read D6 carefully.
    log and `mkLocalUntrustedIO` is in the artifact. Operator decided: fix the
    flag to match the docs, **as a separate issue**. Not this feature's problem.
 
-2. **Unfiled finding — file this before starting.** `sanitizeHref`
+2. **Issue #348** — `sanitizeHref`
    (`frontend/src/lib/markdown.ts:72`) blocks `startsWith('/api/files/download')`,
    which is bypassable by path traversal:
    ```
