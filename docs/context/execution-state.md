@@ -1,10 +1,25 @@
 # Execution State
-<!-- updated: 2026-11-24 16:10 -->
+<!-- updated: 2026-11-24 17:10 -->
 
 ## Current Position
--- Active work unit: WU-4 (handoff callback) — orchestrator-implemented
-- Current phase: pre-IMPLEMENT (reading the handoff regions)
+- Active work unit: WU-5 (live broadcast) — orchestrator-implemented
+- Current phase: pre-IMPLEMENT (reading the TurnEngine/dwdOnEntry regions)
 - Retry count: 0
+
+## WU-4 implementation record (uncommitted)
+- Agent.hs handleHandoff: parentSid bound from aswParentSession;
+  spawnCb registers parentSid (was childSid self-parent, plan defect 1);
+  callback appends completionMessage to the caller's sidecar (defect 2)
+  and fires aswOnIdleCompletion (defect 3) — mirrors the background
+  delivery shape.
+- Deferred-delivery check (shouldDeferDelivery) from the background path
+  NOT mirrored: handoffs are top-level peers (no nested descendants);
+  noted for the reviewer.
+- RED: wu4-red5.log (36 ex, 3 failures — all three defects). GREEN:
+  wu4-green2.log (36/0). hlint No hints (wu4-hlint2.log). Full suite
+  running (wu4-full-test.log).
+- Test-side fix during GREEN: sidecar test needed the caller's session
+  dir (production invariant); persisted caller meta via callerMetaWithRepo.
 
 ## WU-3 record (complete)
 - Commit b4d4040. Adversarial review PASS (wu-adversarial-reviewer-
@@ -33,6 +48,20 @@
 - Constructor reality: ChildStatus = CsCompleted/CsFailed/CsTimeout/
   CsInterrupted/CsError (no CsMaxIter; CerMaxIterations → CsFailed per
   childStatusFor Delegation.hs:905).
+
+## WU-4 record (complete)
+- Commit a9e2f3b. Adversarial review PASS after ONE retry: first
+  reviewer (d3b90b52) died at the 600s deadline with no verdict
+  (reproduction #9 — brief too broad for the module size); fresh
+  reviewer (6ca7e0a2) with a tightened, anchor-first brief PASSed.
+- Reviewer-verified: RED failures genuinely discriminate
+  (fresh-session vs s1; NoSuchThing on the sidecar; 0 wake fires);
+  shouldDeferDelivery has one production call site (background only).
+- 2 cosmetic nits fixed pre-commit (stale completions.txt comment,
+  detached Haddock on samplePathsAt); re-verified 36/0 + hlint.
+- LESSON for WU-5: reviewer/coder briefs must include exact line
+  anchors + priority ordering; a 1453-line module cannot be audited
+  open-ended inside the 600s child deadline.
 
 ## Completed work units
 | WU | Status | Phase | Retries |
