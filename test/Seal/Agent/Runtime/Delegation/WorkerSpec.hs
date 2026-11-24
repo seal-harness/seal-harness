@@ -5,7 +5,7 @@
 -- depth plumb) lives in Gateway.AgentIntegrationSpec.
 module Seal.Agent.Runtime.Delegation.WorkerSpec (spec) where
 
-import Control.Exception (SomeException, catch)
+import Control.Exception (SomeException, catch, throwIO)
 import Data.Aeson (object, withObject, (.:), (.:?))
 import Data.Aeson.Types (parseMaybe)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
@@ -121,6 +121,61 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
           Nothing     -> pure ()
           Just "leaf" -> pure ()
           Just other  -> expectationFailure ("widened to: " <> T.unpack other)
+
+  describe "resolveExitReason (WU-2: structural exit reason)" $ do
+    it "a genuine final answer (fanoutDone, summary present) is CerCompleted" $ do
+      resolveExitReason (Just "done") True Nothing `shouldBe` CerCompleted
+    it "crash reason wins even when a summary leaked in (the WU-1 bug shape)" $ do
+      resolveExitReason (Just "child runTurn raised: kaboom") False (Just CerError)
+        `shouldBe` CerError
+    it "summary text is never treated as completion when the fanout never fired" $ do
+      resolveExitReason (Just "(stopped: reached the 90-turn limit for this message. Ask again to continue, or raise `max_turns` in config.toml.)") False Nothing
+        `shouldBe` CerMaxIterations
+    it "provider error text classifies to CerError, not completion" $ do
+      resolveExitReason (Just "ollama/llama3> provider error: connection refused") False Nothing
+        `shouldBe` CerError
+    it "retry-exhausted text classifies to CerError" $ do
+      resolveExitReason (Just "ollama/llama3> The model returned an unusable response (no text or tool calls) after 3 attempts. This is typically a temporary model issue — try sending your message again. Details are in the session's seal.log.") False Nothing
+        `shouldBe` CerError
+    it "truncation text classifies to CerError" $ do
+      resolveExitReason (Just "ollama/llama3> partial text\n\n(stopped: response truncated at the 4096-token output limit after 3 continuation attempts. Send any message to continue.)") False Nothing
+        `shouldBe` CerError
+    it "abort text (exact (stopped)) classifies to CerInterrupted" $ do
+      resolveExitReason (Just "(stopped)") False Nothing `shouldBe` CerInterrupted
+    it "non-completion with no summary is CerMaxIterations (preserved residual)" $ do
+      resolveExitReason Nothing False Nothing `shouldBe` CerMaxIterations
+    it "fanoutDone with no summary is still CerCompleted (fanout is the completion signal)" $ do
+      resolveExitReason Nothing True Nothing `shouldBe` CerCompleted
+    it "a fanoutDone text that happens to contain an abort marker is STILL CerCompleted (crash reason absent — real answers win)" $ do
+      resolveExitReason (Just "I did the work, then typed (stopped) as part of my answer") True Nothing
+        `shouldBe` CerCompleted
+
+  describe "mkDelegateWorker exit reason (WU-2 behavioral)" $ do
+    it "normal completion reports CerCompleted with the final answer as summary" $ do
+      withSystemTempDirectory "seal-worker-exit" $ \tmp -> do
+        anchorRef <- newIORef Nothing
+        lineageRef <- newIORef Nothing
+        deps <- mkWorkerDepsIO tmp anchorRef lineageRef
+        let worker = mkDelegateWorker deps
+            task = ChildTask "a1" "do the thing" Nothing Nothing False Nothing
+            childSid = mkSystemSessionId "child"
+        hooks <- mkHooks
+        outcome <- worker sampleAgentDef childSid task hooks
+        cwoExitReason outcome `shouldBe` CerCompleted
+        cwoSummary outcome `shouldBe` Just "ollama/llama3> done"
+        -- ^ deliverFinal is called with the channel-prefixed text
+        --   (Loop.hs: "deliverFinal alreadySentText (prefix <> ...)");
+        --   the fan-out hook (aeOnStop) captures it verbatim.
+    it "a synchronously crashing runTurn yields CerError with NO summary (the reason is structural, not textual)" $ do
+      withSystemTempDirectory "seal-worker-crash" $ \tmp -> do
+        deps <- mkCrashingWorkerDepsIO tmp
+        let worker = mkDelegateWorker deps
+            task = ChildTask "a1" "do the thing" Nothing Nothing False Nothing
+            childSid = mkSystemSessionId "child"
+        hooks <- mkHooks
+        outcome <- worker sampleAgentDef childSid task hooks
+        cwoExitReason outcome `shouldBe` CerError
+        cwoSummary outcome `shouldBe` Nothing
 
   describe "intersectAllowList (def tools ∧ base ops)" $ do
     it "AllowOnly keeps only ops that exist in the base set" $ do
@@ -402,6 +457,22 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
 baseSet :: Set.Set OpName
 baseSet = Set.fromList
   [ agentStart, OpName "FILE_READ", OpName "FILE_WRITE", OpName "MEMORY_READ" ]
+
+-- | Like 'mkWorkerDepsIO', but 'dwdOnEntry' throws synchronously. The
+-- on-entry hook fires inside 'runTurn' (after each transcript-entry
+-- write), i.e. INSIDE the guarded region — the sync exception reaches
+-- the 'catchChildSync' guard rather than escaping the worker. This is
+-- the production crash shape (any sync exception inside the child's
+-- turn): WU-2 must report the reason structurally, never as a fake
+-- summary in the outcome.
+mkCrashingWorkerDepsIO :: FilePath -> IO DelegationWorkerDeps
+mkCrashingWorkerDepsIO tmp = do
+  anchorRef <- newIORef Nothing
+  lineageRef <- newIORef Nothing
+  deps <- mkWorkerDepsIO tmp anchorRef lineageRef
+  pure deps
+    { dwdOnEntry = throwIO (userError "crash: on-entry hook blew up")
+    }
 
 -- ---------------------------------------------------------------------------
 -- WU-4 workdir anchoring + WU3 lineage test helpers

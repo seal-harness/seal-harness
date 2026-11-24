@@ -21,6 +21,7 @@ import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, threadDelay
 import Control.Concurrent.MVar (newEmptyMVar, takeMVar)
 import Control.Exception (AsyncException (..), SomeException, fromException, throwIO, try)
 import Control.Monad (forever, unless, void)
+import Seal.Agent.Loop (ChildStopKind (..), childStopKind)
 import Data.IORef (newIORef, readIORef, atomicModifyIORef', modifyIORef', writeIORef)
 import Data.List (nub)
 import Data.Text (Text)
@@ -575,3 +576,31 @@ spec = describe "Seal.Agent.Runtime.Delegation.Concurrent" $ do
       spawned <- readIORef spawnedRef
       length spawned `shouldBe` 1
       asStop spy
+
+  ------------------------------------------------------------------
+  -- 17. childStopKind: the five-way marker classifier
+  ------------------------------------------------------------------
+  -- The worker's residual classifier: the five 'notifyStop' outcome texts
+  -- produced by 'Loop' (max turns / provider error / retry exhausted /
+  -- truncation / abort) must map to exactly one kind each; a genuine
+  -- final answer must map to Nothing. 'resolveExitReason' in Worker.hs
+  -- consumes this when the fanout never fired.
+  describe "childStopKind (WU-2)" $ do
+    it "classifies the max-turns marker" $
+      childStopKind "(stopped: reached the 90-turn limit for this message. Ask again to continue, or raise `max_turns` in config.toml.)"
+        `shouldBe` Just CskMaxTurns
+    it "classifies the provider-error marker" $
+      childStopKind "anthropic/claude-opus-4> provider error: rate limited"
+        `shouldBe` Just CskProviderError
+    it "classifies the retry-exhausted marker" $
+      childStopKind "ollama/llama3> The model returned an unusable response (no text or tool calls) after 3 attempts. This is typically a temporary model issue — try sending your message again. Details are in the session's seal.log."
+        `shouldBe` Just CskRetryExhausted
+    it "classifies the truncation marker" $
+      childStopKind "ollama/llama3> partial\n\n(stopped: response truncated at the 4096-token output limit after 3 continuation attempts. Send any message to continue.)"
+        `shouldBe` Just CskTruncation
+    it "classifies the abort marker (exact)" $
+      childStopKind "(stopped)" `shouldBe` Just CskAbort
+    it "does not classify a genuine final answer" $
+      childStopKind "Here is your answer: the build succeeded." `shouldBe` Nothing
+    it "does not classify text that merely mentions stopping" $
+      childStopKind "I stopped the server and restarted it." `shouldBe` Nothing
