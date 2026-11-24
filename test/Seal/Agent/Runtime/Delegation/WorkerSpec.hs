@@ -31,6 +31,8 @@ import Seal.Agent.Runtime.Delegation
   , RepoSpec (..)
   )
 import Seal.Agent.Runtime.Delegation.Worker
+import Seal.Core.TurnEngine (broadcastSessionEntries)
+import Seal.Gateway.StreamBroker (newStreamBroker, readEntryCursor)
 import Seal.Channel.Caps (ChannelCaps)
 import Seal.Config.Paths
   ( SealPaths (..), agentSessionDir, sessionDir, sessionEntriesPath, sessionMetaPath )
@@ -149,6 +151,74 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
     it "a fanoutDone text that happens to contain an abort marker is STILL CerCompleted (crash reason absent — real answers win)" $ do
       resolveExitReason (Just "I did the work, then typed (stopped) as part of my answer") True Nothing
         `shouldBe` CerCompleted
+
+  describe "dwdOnEntry receives the child's session id (WU-5)" $ do
+    it "the on-entry hook is called with the child's sid, not the parent's" $ do
+      withSystemTempDirectory "seal-worker-onentry" $ \tmp -> do
+        hookSidRef <- newIORef (Nothing :: Maybe SessionId)
+        anchorRef <- newIORef Nothing
+        lineageRef <- newIORef Nothing
+        deps0 <- mkWorkerDepsIO tmp anchorRef lineageRef
+        let deps = deps0 { dwdOnEntry = writeIORef hookSidRef . Just }
+            worker = mkDelegateWorker deps
+            task = ChildTask "a1" "do the thing" Nothing Nothing False Nothing
+            childSid = mkSystemSessionId "child"
+        hooks <- mkHooks
+        _ <- worker sampleAgentDef childSid task hooks
+        -- The worker completes (ScriptProvider yields "done"); the hook
+        -- must have fired with the CHILD's sid.
+        mSeen <- readIORef hookSidRef
+        mSeen `shouldBe` Just childSid
+
+  describe "broadcastSessionEntries — production path (WU-5)" $ do
+    -- The reviewer-found gap: the sid-threading test proves the hook
+    -- receives the child's sid, but nothing exercised the PRODUCTION
+    -- helper. These tests run the real helper against a real broker.
+    it "a handoff child's entries are live-broadcast while it runs (cursor advances)" $ do
+      withSystemTempDirectory "seal-wu5-broadcast" $ \tmp -> do
+        broker <- newStreamBroker 4
+        let paths = samplePaths tmp
+            childSid = mkSystemSessionId "handoff-child"
+        deps0 <- sampleWorkerDeps tmp
+        let deps = deps0
+              { dwdTopLevel = True
+              , dwdOnEntry = broadcastSessionEntries (Just broker) paths
+              }
+            worker = mkDelegateWorker deps
+            task = ChildTask (agentDefIdText (adId sampleAgentDef)) "continue the work"
+                             Nothing Nothing True Nothing
+        hooks <- mkHooks
+        _ <- worker sampleAgentDef childSid task hooks
+                  `catch` \(_e :: SomeException) ->
+                    pure (ChildWorkerOutcome Nothing CerError 0 0 (Just childSid))
+        -- The worker recorded at least one transcript entry (the task
+        -- goal) and the hook broadcast it: the broker's per-session
+        -- entry cursor for the child must be > 0.
+        cursor <- readEntryCursor broker childSid
+        cursor `shouldSatisfy` (> 0)
+
+    it "a nested child's entries are NOT broadcast by the top-level hook (recorded limitation)" $ do
+      withSystemTempDirectory "seal-wu5-nested" $ \tmp -> do
+        broker <- newStreamBroker 4
+        let paths = samplePaths tmp
+            childSid = mkSystemSessionId "nested-child"
+        deps0 <- sampleWorkerDeps tmp
+        let deps = deps0
+              { dwdTopLevel = False
+              , dwdOnEntry = broadcastSessionEntries (Just broker) paths
+              }
+            worker = mkDelegateWorker deps
+            task = ChildTask (agentDefIdText (adId sampleAgentDef)) "continue the work"
+                             Nothing Nothing False Nothing
+        hooks <- mkHooks
+        _ <- worker sampleAgentDef childSid task hooks
+                  `catch` \(_e :: SomeException) ->
+                    pure (ChildWorkerOutcome Nothing CerError 0 0 (Just childSid))
+        -- The nested child's meta lives under the parent's agents/ dir,
+        -- so the top-level meta lookup misses and the broadcast is a
+        -- no-op — the cursor stays 0. (Follow-up work, recorded.)
+        cursor <- readEntryCursor broker childSid
+        cursor `shouldBe` 0
 
   describe "mkDelegateWorker exit reason (WU-2 behavioral)" $ do
     it "normal completion reports CerCompleted with the final answer as summary" $ do
@@ -471,7 +541,7 @@ mkCrashingWorkerDepsIO tmp = do
   lineageRef <- newIORef Nothing
   deps <- mkWorkerDepsIO tmp anchorRef lineageRef
   pure deps
-    { dwdOnEntry = throwIO (userError "crash: on-entry hook blew up")
+    { dwdOnEntry = \_ -> throwIO (userError "crash: on-entry hook blew up")
     }
 
 -- ---------------------------------------------------------------------------
@@ -539,7 +609,7 @@ mkWorkerDepsIO tmp anchorRef lineageRef = do
         writeIORef lineageRef (Just lineage)
         pure (mkRegistry [])
     , dwdChildSystemPrompt = \_ _ -> pure Nothing
-    , dwdOnEntry = pure ()
+    , dwdOnEntry = \_ -> pure ()
     , dwdChannel = "test"
     , dwdAbortFlag = const newAbortFlag
     , dwdRepeatTrack = lookupOrCreateRepeatTrack repeatReg
@@ -552,6 +622,14 @@ mkWorkerDepsIO tmp anchorRef lineageRef = do
     }
 
 -- | A minimal 'SealPaths' fixture rooted at @tmp@.
+-- | Worker deps for the broadcast tests: the standard fixture with the
+-- on-entry hook overridden by the caller and a Nothing-refs setup.
+sampleWorkerDeps :: FilePath -> IO DelegationWorkerDeps
+sampleWorkerDeps tmp = do
+  anchorRef <- newIORef Nothing
+  lineageRef <- newIORef Nothing
+  mkWorkerDepsIO tmp anchorRef lineageRef
+
 samplePaths :: FilePath -> SealPaths
 samplePaths tmp = SealPaths
   { spHome = tmp

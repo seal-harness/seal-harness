@@ -234,9 +234,10 @@ data DelegationWorkerDeps = DelegationWorkerDeps
     -- task's @ctContext@. Runs in 'IO' so the wiring layer can load the
     -- auto-injected skill (default @seal-usage@) from the skill backend and
     -- append it. 'Nothing' means no system prompt.
-  , dwdOnEntry :: IO ()
-    -- ^ The on-entry hook for the child's transcript (live broadcast).
-    -- 'pure ()' for the CLI; 'broadcastNewEntries' for web/channels.
+  , dwdOnEntry :: SessionId -> IO ()
+    -- ^ The on-entry hook for the child's transcript (live broadcast),
+    -- receiving the CHILD's own session id. @\\_ -> pure ()@ for the
+    -- CLI; the turn engine's entry broadcast for web/channels.
   , dwdChannel :: Text
     -- ^ The parent session's channel label (e.g. @\"telegram\"@, @\"web\"@,
     -- @\"cli\"@), inherited by the child so the child's request entries are
@@ -367,7 +368,7 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
                   , aeDebugResponsePath = Nothing
                   , aeMaxModelRetries = 3
                   , aeRetryBaseDelayMs = 1000
-              , aeOnEntry    = dwdOnEntry deps
+              , aeOnEntry    = dwdOnEntry deps childSid
               , aeOnUserMessage = Nothing
               , aeOnStop     = childEnvOnStop
               , aeStopFanoutDone = stopFanoutDoneRef
