@@ -1,9 +1,9 @@
 # Execution State
-<!-- updated: 2026-11-24 17:10 -->
+<!-- updated: 2026-11-24 19:05 -->
 
 ## Current Position
-- Active work unit: WU-5 (live broadcast) — orchestrator-implemented
-- Current phase: pre-IMPLEMENT (reading the TurnEngine/dwdOnEntry regions)
+- Active work unit: WU-6 (make check + final comprehensive review)
+- Current phase: VALIDATE (final gate running)
 - Retry count: 0
 
 ## WU-4 implementation record (uncommitted)
@@ -48,6 +48,44 @@
 - Constructor reality: ChildStatus = CsCompleted/CsFailed/CsTimeout/
   CsInterrupted/CsError (no CsMaxIter; CerMaxIterations → CsFailed per
   childStatusFor Delegation.hs:905).
+
+## WU-5 record (complete — commit 02b6cc0)
+- Rev 1 review FAIL (e8422ad6): nested-child no-op + zero production-path
+  coverage. Rev 2 (scope-anchored to plan DoD 8 = HANDOFF sessions):
+  exported broadcastSessionEntries; real-broker tests (cursor > 0
+  handoff; cursor 0 nested, pinned limitation); fresh reviewer PASS
+  (7acc18cc). Doc-association nit fixed (Haddock reattached to
+  broadcastNewEntries; helper moved after it); re-verified 55/0 + hlint.
+- FOLLOW-UP WORK (recorded, outside WU-5 scope): directory-aware entry
+  reader in Gateway/Transcript.hs so NESTED delegated children can
+  live-broadcast; per-entry loadSessionMeta cost for no-op paths.
+- FIRST adversarial review (e8422ad6): FAIL with 2 blocking findings:
+  1. The where-bound broadcastChildEntries reads the child's meta via
+     loadSessionMeta (top-level sessions/<sid>/), but NESTED children
+     (non-handoff) write meta+transcript under the parent's agents/<sid>/
+     dir — so the helper was a guaranteed no-op for nested children.
+  2. Zero production-path test coverage: no test invoked the production
+     helper (broker always Nothing in tests).
+- RESOLUTION (scope-anchored in the plan): DoD 8 names HANDOFF sessions —
+  which ARE top-level peers (sessionDir, saveSessionMeta), so the helper
+  works for the DoD-8 case. The nested-child limitation is real, but
+  fixing it requires a directory-aware entry reader (Gateway/Transcript
+  readTranscriptEntriesTimed hardcodes sessionTranscriptPath) — outside
+  WU-5's declared file scope. Recorded as follow-up work, documented on
+  the export, pinned by a negative test.
+- Rev 2 changes: helper extracted to exported top-level
+  broadcastSessionEntries :: Maybe StreamBroker -> SealPaths -> SessionId
+  -> IO () (TurnEngine.hs, with the limitation documented on it); the
+  worker-deps wiring calls it directly; 2 new production-path tests with
+  a REAL broker (newStreamBroker + readEntryCursor): handoff child ->
+  cursor > 0; nested child -> cursor 0 (limitation pinned). Plus the
+  sid-threading test from rev 1.
+- Process notes: one python range-deletion error wiped ~380 lines of
+  TurnEngine.hs mid-edit; recovered via git checkout -- file and clean
+  re-apply of the (small) intended diff. Build/test/hlint all re-verified.
+- GREEN: WorkerSpec 55/0 (wu5-green4.log) incl. both broker tests by
+  name. hlint No hints (wu5-hlint3.log). Full suite: running
+  (wu5-full2-test.log).
 
 ## WU-4 record (complete)
 - Commit a9e2f3b. Adversarial review PASS after ONE retry: first
