@@ -1,29 +1,25 @@
 # Active Plan
-<!-- approved: 2026-11-14 -->
-<!-- gate-iterations: 3 -->
+<!-- approved: 2026-11-24 -->
+<!-- gate-iterations: 2 -->
 <!-- user-approved: true -->
-<!-- status: completed -->
+<!-- status: in-progress -->
 
-Chunked Resumable Download — full implementation plan.
+Sub-agent termination is reported as success — root cause + truthful status +
+handoff parent linkage + UI visibility (rev 6).
 
 Canonical plan (full text, work units, DoD):
-`docs/superpowers/plans/2026-11-14-chunked-resumable-download-plan.md`
+`docs/superpowers/plans/2026-11-24-subagent-termination-truthfulness-plan.md`
 
-Design spec:
-`docs/superpowers/specs/2026-11-13-chunked-resumable-download-design.md`
-
-Execution: orchestrated (6 work units).
-
-Operator decisions:
-- Full downloader (Slice 1 + Slice 2)
-- Both local and remote arms
-- No cross-reload resume (in-memory only, no IndexedDB)
+Execution: orchestrated (6 work units), user-selected 2026-11-24.
 
 | WU | Title | Status | Commit |
 |---|---|---|---|
-| WU-1 | Backend: ceiling split + readBoundedFile fix + FileStat + feReadRange + runRemoteStream | complete | e4d8e50 |
-| WU-2 | Backend: stat + manifest + chunk routes + config + blocked-path | complete | df18a2d |
-| WU-3 | Frontend: confirm dialog + stat + .partial naming + modalStack | complete | 7fe6ed7 |
-| WU-4 | Frontend: chunked download orchestration + progress UI | complete | 8e979a6 |
-| WU-5 | Security: sanitizeHref link block | complete | cdc56ec |
-| WU-6 | Docs + full gate | complete | — |
+| WU-1 | runChildWithTimeout seam + catchChildSync + three catch sites | complete | d72af9e |
+| WU-2 | Structural exit reason (aeStopFanoutDone + terminalReasonRef + childStopKind) | pending | — |
+| WU-3 | Registry truthfulness (real crStatus + log line) | pending | — |
+| WU-4 | Handoff callback (parentSid, sidecar append, parent wake) | pending | — |
+| WU-5 | Live broadcast (dwdOnEntry :: SessionId -> IO ()) | pending | — |
+| WU-6 | make check green | pending | — |
+
+Prior active plan (completed 2026-11-14):
+`docs/superpowers/plans/2026-11-14-chunked-resumable-download-plan.md`
