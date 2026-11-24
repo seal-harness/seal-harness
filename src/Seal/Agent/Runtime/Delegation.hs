@@ -65,6 +65,10 @@ module Seal.Agent.Runtime.Delegation
   , ChildRunHooks (..)
   , ChildWorkerOutcome (..)
     -- * Run
+    , catchChildSync
+      -- ^ rethrows async exceptions ('Timeout'/'ThreadKilled') untouched;
+      --   converts only synchronous ones to an error outcome.
+    , runChildWithTimeout
     , DelegateInput (..)
     , runDelegate
     , runDelegateAsync
@@ -89,7 +93,7 @@ import Control.Concurrent.STM
 import Control.Concurrent.MVar
   ( MVar, newEmptyMVar, newMVar, putMVar, readMVar, tryPutMVar
   , tryTakeMVar )
-import Control.Exception (SomeException, bracket, catch)
+import Control.Exception (SomeAsyncException (..), SomeException, bracket, catch, fromException, throwIO)
 import Control.Monad (forM, void, when)
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
@@ -100,7 +104,6 @@ import Data.Text qualified as T
 import Data.Time.Clock (diffUTCTime, getCurrentTime, UTCTime)
 import System.Random (randomRIO)
 import System.Timeout (timeout)
-
 import Katip (Severity (..), ls)
 import Seal.Logging.Global (globalLogIO)
 
@@ -109,8 +112,39 @@ import Seal.Core.Types (SessionId, sessionIdText)
 import qualified Seal.Config.File as ConfigFile
 
 -- ---------------------------------------------------------------------------
+-- Child-run seam
+-- ---------------------------------------------------------------------------
+
+-- | Rethrow any async exception raised inside the child action; catch only
+-- synchronous ones. 'System.Timeout.timeout' delivers its budget as an
+-- async exception (a 'SomeAsyncException' wrapper that is /not/ an
+-- 'Control.Exception.AsyncException.AsyncException'), and AGENT_STOP kills
+-- the child thread with 'Control.Exception.AsyncException.ThreadKilled' —
+-- a bare @catch @SomeException@ at the worker seam swallows both, so
+-- @timeout@ never observes 'Nothing' and a killed child is reported as an
+-- ordinary error result. Discriminating on 'SomeAsyncException' (not
+-- 'Control.Exception.AsyncException.AsyncException') is what makes the
+-- timeout budget propagate: @fromException e :: Maybe SomeAsyncException@
+-- is 'Just' for 'Timeout' but 'Nothing' for a userError.
+catchChildSync
+  :: IO a
+  -> (SomeException -> IO a)
+  -> IO a
+catchChildSync act handler =
+  act `catch` \e -> case fromException e :: Maybe SomeAsyncException of
+    Just _  -> throwIO e
+    Nothing -> handler e
+
+-- | Run a child worker under the delegation timeout budget. 'Nothing' means
+-- the budget expired — the caller maps that to 'CsTimeout'/'CerTimeout'.
+-- Point-free: it is 'System.Timeout.timeout' under a Haddock contract.
+runChildWithTimeout :: Int -> IO ChildWorkerOutcome -> IO (Maybe ChildWorkerOutcome)
+runChildWithTimeout = timeout
+
+-- ---------------------------------------------------------------------------
 -- Config
 -- ---------------------------------------------------------------------------
+
 
 -- | The @[delegation]@ section of @config.toml@. Every field is optional; a
 -- missing key decodes as 'Nothing' and the resolver falls back to a default.
@@ -586,11 +620,10 @@ runDelegate cfg pauseFlag mParentActivity parentDepth input resolveTask = do
           hbStop <- newEmptyMVar
           hbThreadId <- forkIO (heartbeatLoop mParentActivity hbStop)
           let runWithCatch =
-                worker def childSid task hooks
-                  `catch` \e -> pure (ChildWorkerOutcome
+                catchChildSync (worker def childSid task hooks) $ \e -> pure (ChildWorkerOutcome
                                        (Just (T.pack (show (e :: SomeException))))
                                        CerError 0 0 (Just childSid))
-          mOutcome <- timeout micros runWithCatch
+          mOutcome <- runChildWithTimeout micros runWithCatch
           -- Stop the heartbeat.
           void (tryPutMVar hbStop ())
           killThread hbThreadId
@@ -768,11 +801,10 @@ runDelegateAsync cfg pauseFlag mParentActivity parentDepth input resolveTask cal
       hbStop <- newEmptyMVar
       hbThreadId <- forkIO (heartbeatLoop mParentActivity hbStop)
       let runWithCatch =
-            worker def childSid task hooks
-              `catch` \e -> pure (ChildWorkerOutcome
+            catchChildSync (worker def childSid task hooks) $ \e -> pure (ChildWorkerOutcome
                                    (Just (T.pack (show (e :: SomeException))))
                                    CerError 0 0 (Just childSid))
-      mOutcome <- timeout micros runWithCatch
+      mOutcome <- runChildWithTimeout micros runWithCatch
       -- Stop the heartbeat.
       void (tryPutMVar hbStop ())
       killThread hbThreadId

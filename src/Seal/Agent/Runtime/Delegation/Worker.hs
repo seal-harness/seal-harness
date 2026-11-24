@@ -24,7 +24,7 @@ module Seal.Agent.Runtime.Delegation.Worker
   , DelegationWorkerDeps (..)
   ) where
 
-import Control.Exception (SomeException, catch)
+import Control.Exception (SomeException)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (object, (.=))
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -45,6 +45,7 @@ import Seal.Agent.Runtime.Delegation
   , ChildTask (..)
   , ChildWorkerOutcome (..)
   , RepoSpec (..)
+  , catchChildSync
   )
 import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
@@ -372,9 +373,9 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
                , aeRepeatTrack = childRepeatTrack
                , aeToolTimeout = dwdToolTimeout deps
               }
-        runApp (dwdAppEnv deps) (runTurn env (ctGoal task))
-          `catch` \e -> writeIORef summaryRef
-                       (Just ("child runTurn raised: " <> T.pack (show (e :: SomeException))))
+        catchChildSync (runApp (dwdAppEnv deps) (runTurn env (ctGoal task))) $ \e ->
+          writeIORef summaryRef
+            (Just ("child runTurn raised: " <> T.pack (show (e :: SomeException))))
         summary <- readIORef summaryRef
         let exitReason = case summary of
               Just _  -> CerCompleted

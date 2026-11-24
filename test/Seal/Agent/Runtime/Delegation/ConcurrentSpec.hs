@@ -18,7 +18,7 @@
 module Seal.Agent.Runtime.Delegation.ConcurrentSpec (spec) where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (throwIO)
+import Control.Exception (AsyncException (..), SomeException, throwIO)
 import Data.IORef (newIORef, atomicModifyIORef')
 import Data.List (nub)
 import Data.Text (Text)
@@ -363,3 +363,52 @@ spec = describe "Seal.Agent.Runtime.Delegation.Concurrent" $ do
       case eResults of
         Left err -> err `shouldSatisfy` ("paused" `T.isInfixOf`)
         Right _ -> expectationFailure "expected Left (paused), got Right"
+
+  ------------------------------------------------------------------
+  -- 12. Async-exception truthfulness (the termination bug)
+  ------------------------------------------------------------------
+  -- AGENT_STOP kills a child thread with ThreadKilled; the delegation
+  -- budget kills it with Timeout. Both are async exceptions. A bare
+  -- `catch @SomeException` at the worker seam converts either into an
+  -- error outcome, so a killed child is reported as a *result* — and a
+  -- timed-out child as success. The seam must rethrow async exceptions
+  -- so the kill propagates out of runDelegate.
+  describe "async-exception truthfulness — ThreadKilled escapes runDelegate" $ do
+    it "a worker throwing ThreadKilled propagates out of runDelegate instead of becoming Right [CsError]" $ do
+      let killedWorker _def _sid _task _hooks = throwIO ThreadKilled
+          task = ChildTask "test-def" "doomed to be killed" Nothing Nothing False Nothing
+      runWith (DiSingle task) killedWorker
+        `shouldThrow` (== ThreadKilled)
+
+  ------------------------------------------------------------------
+  -- 13. catchChildSync: the sync/async discriminator
+  ------------------------------------------------------------------
+  describe "catchChildSync" $ do
+    it "invokes the handler for a synchronous exception" $ do
+      e <- catchChildSync (throwIO (userError "sync boom")) pure
+      show (e :: SomeException) `shouldContain` "sync boom"
+    it "rethrows ThreadKilled instead of invoking the handler" $
+
+      catchChildSync (throwIO ThreadKilled) (pure . Just . show)
+        `shouldThrow` (== ThreadKilled)
+
+  ------------------------------------------------------------------
+  -- 14. runChildWithTimeout: the budget seam
+  ------------------------------------------------------------------
+  describe "runChildWithTimeout" $ do
+    it "returns Nothing for a worker that outlives the budget" $ do
+      let slowWorker = do
+            threadDelay 5000000  -- 5s against a 50ms budget
+            pure (ChildWorkerOutcome (Just "too late") CerCompleted 0 0 Nothing)
+      r <- runChildWithTimeout 50000 slowWorker
+      case r of
+        Nothing -> pure ()
+        Just _  -> expectationFailure "expected Nothing for an over-budget worker, got Just"
+    it "returns Just the outcome for a worker that finishes within the budget" $ do
+      let fastWorker = pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 Nothing)
+      r <- runChildWithTimeout 50000 fastWorker
+      case r of
+        Nothing -> expectationFailure "expected Just for a within-budget worker, got Nothing"
+        Just o -> do
+          cwoSummary o `shouldBe` Just "done"
+          cwoExitReason o `shouldBe` CerCompleted
