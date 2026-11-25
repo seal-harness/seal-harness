@@ -101,7 +101,7 @@ export function mapDiscoverableWindow(wire: DiscoverableWindowWire): Discoverabl
   }
 }
 
-async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T | null> {
+export async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T | null> {
   try {
     const res = await fetch(url, signal ? { signal } : undefined)
     if (!res.ok) return null

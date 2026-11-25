@@ -60,6 +60,12 @@ export interface SessionInfo {
    *  or no user message. Used by the sidebar to sort the Active Tabs list
    *  (newest last-user-message first within each status bucket). */
   lastUserMessageAt: string | null
+  /** Context occupancy of the most recent completed response (the provider's
+   *  reported `input + output` tokens), derived server-side from the whole
+   *  session's `entries.jsonl`. Null when no response has reported usage.
+   *  Optional so the SPA still works against an older server that omits the
+   *  field; `undefined` reads as "unknown" (rendered as 0). */
+  tokensUsed?: number | null
   /** Whether the harness injects its own front matter (static guidance
    *  blocks, the auto-loaded `seal-usage` skill, the codegraph skill, and
    *  the available-skills / available-agents catalogs) into the session's

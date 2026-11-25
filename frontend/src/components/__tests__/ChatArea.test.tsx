@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-library/react'
-import { ChatArea, transcriptToMessages, computeTokensUsed, providerFromRuntime } from '../ChatArea'
+import { ChatArea, transcriptToMessages, providerFromRuntime } from '../ChatArea'
 import type { Agent, Message, SessionInfo, ToolCallInfo, TranscriptEntry } from '../../types'
 import { WS_RECONNECT_ALERT_THRESHOLD } from '../../types/stream'
 import type { StreamStatus } from '../../types/stream'
@@ -1355,45 +1355,7 @@ describe('ChatArea', () => {
   })
 })
 
-// ── computeTokensUsed + providerFromRuntime ──────────────────────────────────
-
-describe('computeTokensUsed', () => {
-  it('returns real usage (last input_tokens + cumulative output_tokens) when present', () => {
-    const entries: TranscriptEntry[] = [
-      makeEntry({
-        id: 'r1',
-        direction: 'response',
-        payload: JSON.stringify({ content: [{ type: 'text', text: 'hi' }], usage: { input_tokens: 100, output_tokens: 20 } }),
-      }),
-      makeEntry({
-        id: 'r2',
-        direction: 'response',
-        payload: JSON.stringify({ content: [{ type: 'text', text: 'hi2' }], usage: { input_tokens: 150, output_tokens: 30 } }),
-      }),
-    ]
-    // last input (150) + cumulative output (20+30=50) = 200
-    expect(computeTokensUsed(entries)).toBe(200)
-  })
-
-  it('falls back to a 4-char-per-token estimate when no usage is present', () => {
-    const entries: TranscriptEntry[] = [
-      makeEntry({
-        id: 'u1',
-        direction: 'request',
-        payload: 'a'.repeat(40), // 10 tokens
-      }),
-      makeEntry({
-        id: 'r1',
-        direction: 'response',
-        payload: JSON.stringify({ content: [{ type: 'text', text: 'b'.repeat(40) }] }), // 10 tokens
-      }),
-    ]
-    // Non-JSON request payload contributes ceil(40/4)=10 to estimatedTokens;
-    // the response's text block contributes ceil(40/4)=10; the fallback then
-    // adds the last-request-payload estimate (ceil(40/4)=10). Total = 30.
-    expect(computeTokensUsed(entries)).toBe(30)
-  })
-})
+// ── providerFromRuntime ─────────────────────────────────────────────────────
 
 describe('providerFromRuntime', () => {
   it('extracts the provider from a "session:<provider>" runtime string', () => {

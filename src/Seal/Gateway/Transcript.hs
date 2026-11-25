@@ -55,8 +55,7 @@ import Seal.Config.Paths
   (SealPaths, sessionConversationPath, sessionConversationIndexPath
   , sessionEntriesPath, sessionTranscriptPath)
 import Seal.Core.Types (SessionId)
-import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
-import Seal.Providers.Class (Usage (..))
+import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..), Usage (..))
 import Seal.Transcript.ConvIndex
   (convLineCount, ensureIndex, readConvLinesRaw)
 import Seal.Transcript.Entries (EntryRecord (..), EntryKind (..))
