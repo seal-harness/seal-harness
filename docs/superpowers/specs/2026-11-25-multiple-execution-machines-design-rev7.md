@@ -47,7 +47,7 @@ except two which are my own errors:
 | **§9 verdict keeps the inventory and resolver; drops only the surfaces** | Rev 5 would have deleted the substrate the requester's stated next want (per-tool-call routing) is built on |
 | **§6.3 extended to `sshExecArgvForwarding`, rsync, `GIT_SSH_COMMAND`** | `-F /dev/null` in `sshExecArgv` alone leaves git and rsync traffic re-pointable by a `Host *` stanza |
 | **`erMeta.machine`'s true cost is 92 sites**, not ~60 | Rev 5 said "~60 call sites"; it is 92 applications. The cost is nevertheless ~zero because `mkTestUIOEnv u c = UIOEnv u c Nothing` keeps the arity |
-| **§4.1 reasoning corrected** | `localAddressNames` *does* emit `127.0.0.1`/`::1` (loopback is an interface). The literals are load-bearing for the alternate **spellings** and the enumeration-failure case, not for loopback itself |
+| **§4 rewritten: the localhost denylist is deleted** | The operator decided to trust the authenticated user. The real control is that **no agent-reachable path can add a machine** — passkey-gated `POST /api/machines`, mirroring `POST /api/repos`, with no opcode writing `executionFilePath`. ~40 lines of address/host-key detection removed (the `localAddressNames` rationale row it replaced is gone with it) |
 
 ## Revision log — what changed from rev 4
 
@@ -58,7 +58,7 @@ either: **delete `mode` and replace it with `allow_localhost`.**
 | Change | Why |
 |---|---|
 | **`mode` deleted.** `allow_localhost :: Bool` (default `true`) replaces it | One concept instead of two that could disagree. See §1 |
-| **`allow_localhost` is enforced by refusing known-local targets**, not by inspecting intent | The user's framing: "completely prevent any tool call on localhost, 127.0.0.1, or any IP the local machine has" |
+| **`allow_localhost` gates the fallback**, with no address classifier | An earlier revision tried to refuse known-local targets. Deleted in favour of the operator-only write model (§4): a denylist cannot bind the principal who owns the file |
 | **`local` becomes a pinnable, reserved machine name** | Without `mode`, a user with an inventory must still be able to put one session on the laptop and one on builder — the headline use case |
 | `execution.toml` **stays in `~/.seal/config/`** (rev 4 said the same; my §2 argument justifying it was wrong and is corrected in §3) | Version-controlling the inventory is a *feature*: you want `builder` defined on every machine you set up. V8's rule protects *decisions* files, not provisioning data |
 | **`-F /dev/null` restored** (rev 4 wrongly deleted it with D6) | It is not a D6 measure: without it a `Host *` stanza in `~/.ssh/config` re-points `Hostname`/`ProxyCommand`. Reproduced |
@@ -96,17 +96,16 @@ can reach it. Everything else in this document follows.
 
 ### 1.2 `false` means: no tool call may touch this machine
 
-`allow_localhost = false` is enforced by **refusing known-local targets** at
-config load (§4). A machine entry that provably denotes this box is a load error
-naming the offending machine. This is what makes the sentence in §1.1 true
-rather than aspirational.
+`allow_localhost = false` gates the **fallback**: when it is `false` and no machine
+applies, resolution returns `TargetNoMachine` (§5 row 4) and nothing runs. It is not
+an address classifier — the denylist is deleted (§4.1), because the inventory is
+operator-authored and an address denylist cannot bind the principal who owns the file.
 
-**Refuse only what we can prove.** A host we cannot classify — any DNS name,
-CNAME, tailscale MagicDNS name, `mDNS` `.local` name, or this box's own FQDN —
-is **allowed**. Refusing unknowns would break legitimate installs (a machine
-whose name happens to resolve oddly) and Layer 1 cannot resolve DNS anyway. The
-DNS-based circumvention this leaves open is stated as a known gap in §4.3 and is
-pre-existing.
+The guarantee that replaces it is upstream and stronger: **no agent-reachable path can
+add, remove, or edit a machine** (§4.3–4.4). Given that, the only way a
+localhost-denoting machine gets into the inventory is that the operator put it there —
+and if they want untrusted code on this kernel, `allow_localhost = true` says so
+directly.
 
 ### 1.3 Default `true`
 
@@ -227,6 +226,8 @@ important line deleted, so it is stated here in both halves.
 
 ```toml
 # ~/.seal/config/execution.toml
+# Hand-editable, but the supported path is POST /api/machines (passkey-gated, WU-7).
+# No opcode can read or write this file (§4.3).
 default = "builder"                  # required when >= 2 machines; implied when exactly 1
 
 [machines.builder]
@@ -260,30 +261,20 @@ it in your dotfiles so `builder` is defined everywhere. So:
 
 | | Where | Git-versioned | Agent-writable |
 |---|---|---|---|
-| machine inventory | `config/execution.toml` | **yes, by design** | under `allow_localhost = true` only |
+| machine inventory | `config/execution.toml` | **yes, by design** | **no** — passkey-gated route only (§4.3) |
 | `allow_localhost` | `security.toml` | no | no |
 
-**What actually holds under `allow_localhost = false`, stated precisely** (rev 6
-overclaimed here):
+**The write path is the control, not the file's contents** (§4.3–4.4). What matters
+is not whether the inventory is agent-writable in the filesystem sense — it is that
+**no agent-reachable path can add, remove, or edit a machine.** That holds because
+`POST /api/machines` is passkey-gated (`accessControlMiddleware` is default-deny) and
+no opcode writes `executionFilePath`. Under `allow_localhost = false` the one local
+write primitive that does not go through `FILE_WRITE` — `group` in
+`SKILL_WRITE`/`AGENT_DEF` — is closed by WU-2's sanitisation.
 
-- `FILE_WRITE` cannot reach it: it is contained under `WorkspaceRoot`, and
-  `blockedNames` includes `.seal` (`Path.hs:53`), so `~/.seal` is doubly out of reach.
-- `SHELL_EXEC` runs on the remote box, so it cannot touch the harness filesystem.
-- `SKILL_WRITE`/`AGENT_DEF` write **locally** without either of those: `defPath`
-  (`Agent/Def/Backend.hs:139-144`) and `skillPath` (`Skills/Backend.hs:418-423`)
-  build `root </> T.strip group </> <id>.md` and `createDirectoryIfMissing True`, with
-  `group` taken raw from `groupField` (`Skills.hs:92-97`, `T.strip` only).
-  `group = "../../.."` therefore escapes the config tree while
-  `allow_localhost = false`. **It cannot forge `execution.toml` only because `.md` is
-  unconditionally appended** — that is an accident, not a designed boundary. WU-2
-  adds charset sanitisation to `group` (`[A-Za-z0-9_-]`, rejecting `.`/`..`/separators)
-  with a test that `group = "../../.."` is refused. Hanging inventory integrity on a
-  file suffix would lose it at the next refactor.
-- Under `allow_localhost = true` the agent can write the inventory, but local
-  execution is already permitted, so pointing an entry at this box gains nothing.
-
-The residual — a cloned config repo carrying `host = "localhost"` — is exactly what
-§4's load-time check refuses.
+The residual — a cloned dotfiles repo carrying a localhost entry — arrives as an
+operator action in a file they version-control. §4.5 records that as the accepted
+trade.
 
 ### 3.2 Field validation
 
@@ -297,80 +288,100 @@ The residual — a cloned config repo carrying `host = "localhost"` — is exact
 | `workspace` | `mkRemotePath` (rejects empty, leading `-`, control chars) |
 | unknown keys | **decided**: a warning at load, not an error — a typo'd `identiy` silently defaulting to ssh-agent is the failure this catches |
 
-## 4. Localhost protection
+## 4. Trust model: the operator adds machines, and nobody else
 
-### 4.1 Layer 1 — address check, at config load (v1)
+### 4.1 Decision
 
-`localAddressNames` already exists and is exactly the right primitive:
+**No address- or host-key-based localhost detection.** Earlier revisions spent three subsections
+on enumerating loopback spellings, interface addresses, numeric re-encodings and (in a
+deferred layer) host-key fingerprints, all to stop an `execution.toml` entry that
+denotes the harness box. **All of it is deleted.**
 
-```haskell
--- Security/TlsCert.hs:222-232
-localAddressNames :: IO [Text]
-localAddressNamesWith :: IO [NetworkInterface] -> IO [Text]
-  rendered iface = [T.pack (show (ipv4 iface)), T.pack (show (ipv6 iface))]
-```
+Not because the concern is unreal, but because **it defends against the wrong actor.**
+The inventory is a human-authored file in the operator's own config tree. A machine
+entry naming `localhost` is an operator decision — and if the operator wants untrusted
+code to run on this kernel, `allow_localhost = true` already says so in one word. An
+address denylist cannot meaningfully bind a principal who owns the file, can edit the
+setting, and has shell access as the same user.
 
-It emits **only** interface addresses — never `localhost`, never a hostname. Note that
-loopback **is** an interface, so `127.0.0.1`/`::1` *are* enumerated
-(`TlsCertSpec.hs:126-127` asserts exactly that). The explicit literals are therefore
-load-bearing for three different reasons, and the doc should say which:
+So the guarantee is: **`execution.toml` is human-authored, and no agent-reachable path
+can add, remove, or edit a machine.** Everything in §4 is about holding that line.
+Given it, `allow_localhost` needs no classifier — it gates the *fallback* (§5 row 3),
+not the inventory.
 
-1. the alternate **spellings** enumeration never produces (`127.1`, `0177.0.0.1`,
-   `0x7f000001`, `2130706433`, `LOCALHOST`, `localhost.`, `[::1]`, `ip6-localhost`,
-   `0.0.0.0`);
-2. the **enumeration-failure** case — `localAddressNamesWith` returns `[]` on error
-   (`TlsCert.hs:229-230`), so without literals a network failure would disable the
-   protection entirely;
-3. the box's `nodeName`/FQDN, which are not interface addresses at all.
+### 4.2 The control: passkey-gated writes, on the `/api/repos` pattern
 
-`localAddressNamesWith` is a working seam, already used by `TlsCertSpec.hs:124-130`.
+The codebase already has exactly this shape, and it is the one to copy:
 
-Rejected set when `allow_localhost = false`:
+| | `POST /api/repos` (existing) | `POST /api/machines` (new, WU-7) |
+|---|---|---|
+| Route gated by `accessControlMiddleware` | yes — default-deny, `AccessControl.hs:341-352` | yes, same middleware, no new auth |
+| Writes a file in `config/` | `repos.toml` via `updateRepoRegistry` | `execution.toml` via `updateExecutionConfig` |
+| Serialised by a process lock | `repoRegistryWriteLock` (`Registry.hs:77`) | `executionWriteLock` (same pattern) |
+| Written atomically, 0600 | `saveRepoRegistry` | `writeSecretFile` + `openUniqueTemp` (`Security.hs:538,578`) |
+| Reachable by an opcode | **no** | **no** |
 
-- loopback literals: `localhost`, `localhost.`, `LOCALHOST`, `127.0.0.1`, `127.1`,
-  `::1`, `[::1]`, `ip6-localhost`, `0.0.0.0`
-- numeric re-encodings: `2130706433`, `0x7f000001`, `0177.0.0.1`
-- the whole `127.0.0.0/8` block
-- every address from `localAddressNames`
-- the box's own `nodeName` and FQDN
+`accessControlMiddleware` is default-deny: everything except `/api/auth` requires a
+valid passkey session. So "only an authenticated operator adds machines" is **not a new
+control** — it is the existing control, pointed at a new route. No new auth mechanism,
+no new session concept, no new exemption to get wrong.
 
-All folded for case and a trailing dot. **IO at load, not at resolve time**:
-`loadExecutionConfig` already returns `IO`, so `resolveTarget` stays pure and
-total. A matched machine is a **config-load error** naming it.
+### 4.3 The opcode ban (the load-bearing part)
 
-**Not covered (stated, not hidden):** any DNS name resolving to this box. See §4.3.
+This is the property to test, and it is cheap to test:
 
-### 4.2 Layer 2 — host-key identity, defeating port forwarding (deferred)
+1. **No opcode writes `execution.toml`.** A grep test asserting zero occurrences of
+   `executionFilePath` under `src/Seal/ISA/`. Same posture as `security.toml`
+   (`AGENTS.md` rule 3).
+2. **No opcode adds, removes, or edits a machine.** No `MACHINE_*` opcode exists in
+   `Seal.ISA.Registry`; a test asserts the registry contains none.
+3. **The write function is not exported to any opcode-reachable module.** Same
+   structural argument `Seal.Config.Security` already makes for itself: the narrow
+   writer's callback sees only machine fields, so an opcode cannot express a change
+   even if one were wired up by mistake.
 
-Layer 1 cannot see through a TCP tunnel: an entry with `host = "tunnel.example"`,
-`port = 2222` forwarding to `localhost:22` presents a non-local hostname. Comparing
-**host keys** catches it, because the box's real key is presented regardless of the
-address used to reach it.
+And the reason this suffices, stated plainly: **an agent that could write
+`execution.toml` under `allow_localhost = false` would be an escalation** — it could
+add a machine pointing anywhere. §4.4 closes that. Under `allow_localhost = true` it
+would gain nothing, since local execution is already permitted.
 
-Design: probe the box's own addresses once (`ssh-keyscan`, `probeHostKey` and the
-SHA256 fingerprint helper already exist at `HostKeyAdoption.hs:156,199`), collect
-this machine's keys, then compare the presented key at connect. `HostKeyAdoption`
-is the correct precedent — a `TurnDeps`-threaded capability no opcode can reach.
+### 4.4 Why the ban holds — including the one path that does not go through `FILE_WRITE`
 
-**Deferred to its own unit, because it is not cheap:** it needs boot-time IO, a
-host-key capture point in the connect path (today `mkRealRemoteRunner` sees only
-stderr and detects `ExecHostKeyMismatch` by string match, `Remote.hs:307-320`), and
-a fail-**closed** policy when the probe cannot establish this box's keys (no sshd
-running, firewall) — otherwise the protection silently disables itself.
+Under `allow_localhost = false`:
 
-**Boundary, stated so the doc does not overclaim:** this defends against a *machine
-entry* tunnelled to this box. It does **not** defend against an agent running
-`ssh -L`/`socat` inside `SHELL_EXEC`. That needs egress policy — a different
-feature.
+- `FILE_WRITE` cannot reach `~/.seal/` — contained under `WorkspaceRoot`, and
+  `blockedNames` includes `.seal` (`Path.hs:53`). Doubly out of reach.
+- `SHELL_EXEC` runs on the **remote** box, so it cannot touch the harness filesystem.
+- **`SKILL_WRITE` / `AGENT_DEF` write locally without either of those.** `defPath`
+  (`Agent/Def/Backend.hs:139-144`) and `skillPath` (`Skills/Backend.hs:418-423`) build
+  `root </> T.strip group </> <id>.md` with `createDirectoryIfMissing True`, and
+  `group` comes raw from `groupField` (`Skills.hs:92-97`, `T.strip` only).
+  `group = "../../.."` escapes the config tree **today**, independent of this feature.
+  It cannot forge `execution.toml` only because `.md` is unconditionally appended —
+  an accident, not a boundary.
 
-### 4.3 The known gap
+  **WU-2 adds charset sanitisation to `group`** (`[A-Za-z0-9_-]`, rejecting `.`/`..`/
+  separators) with a test that `group = "../../.."` is refused. This is the one place
+  where trusting the operator is not enough, because the hole is an *agent* write
+  primitive that happens to be aimed at the operator's config tree.
 
-DNS-based circumvention (an entry whose name resolves to this box) passes Layer 1
-and is not caught until Layer 2. **This is pre-existing**:
-`[untrusted_execution.remote] host = "<this box's tailscale name>"` under
-`mode = "remote"` already ran untrusted code on the harness kernel before this
-feature existed. The protection here is that `execution.toml` is human-authored and
-git-audited, not a resolver pretending to enumerate a machine's identities.
+Under `allow_localhost = true` the agent can write the inventory and it does not
+matter — local execution is already permitted, so no entry gains authority.
+
+### 4.5 What this gives up, stated rather than buried
+
+- **An operator can add `localhost` as a machine.** That is the point. It is their
+  harness, the file is theirs, and `allow_localhost` is right there.
+- **A cloned or dotfiles-synced `execution.toml` can carry a localhost entry.** It
+  arrives as an operator action, in a file they version-control. If that is not
+  acceptable for a given deployment, the answer is a deny-list — which rev 7 spent 70
+  lines on and this revision deletes. Recorded here so the trade is visible, not so it
+  can be re-added silently.
+- **An agent can still run `ssh -L`/`socat` inside `SHELL_EXEC`.** Never defended
+  against by any revision of this design; needs egress policy, a different feature.
+
+The guarantee this buys instead is narrower and *true*: **no agent-reachable path can
+change which machines exist.** That is the sentence the tests assert.
 
 ## 5. Resolution
 
@@ -622,7 +633,9 @@ pass.)*
 
 ### WU-3 — `Seal.Execution.Resolve`
 `resolveTarget` (**five rows** 0-4, pure), `loadAndResolveTargetIO` (turns a load
-failure into `TargetConfigLoadError`), and the §4.1 localhost predicate.
+failure into `TargetConfigLoadError`). **No address classifier** — the localhost
+denylist this unit carried in earlier revisions is deleted (§4.1), making it ~40
+lines smaller.
 
 ### WU-4 — the per-session pin
 `SessionMeta` gains `smExecMachine :: Maybe MachineName`; key `exec_machine`, wire
@@ -734,10 +747,26 @@ server ignores) — one rule, not two.
 
 `renderNewSessionConfirmation` gains the machine name.
 
-### WU-7 — `GET /api/machines` + the dropdown
-`200 {default: string|null, machines: [{name, kind, default}], resolvable: boolean,
-error: string|null}`. Degraded shapes are **200, never 500**; a malformed file must
-not break the New Tab form.
+### WU-7 — the machine API: `GET /api/machines`, `POST /api/machines`, and the dropdown
+
+**The write route is the security control (§4.2–4.3), so it is the load-bearing part of
+this unit, not the read.** `POST /api/machines` follows `POST /api/repos` exactly:
+
+- passes through `accessControlMiddleware` unchanged — passkey-gated, default-deny,
+  **no new auth mechanism**;
+- body `{name, host, user, port?, identity?, known_hosts, workspace}`, validated by
+  WU-2's codec, returning the same field-specific `Left` messages;
+- serialised by `executionWriteLock` (same pattern as `repoRegistryWriteLock`,
+  `Registry.hs:77`) and written via `writeSecretFile` + `openUniqueTemp`
+  (`Security.hs:538,578`);
+- `DELETE /api/machines/:name` alongside it, refusing to remove a machine that is
+  `default` (or reassigning `default` explicitly);
+- **`MachinesWrite` exported only to `Seal.Gateway.API`** — no opcode module may import
+  it. A grep test asserts zero `executionFilePath` references under `src/Seal/ISA/`.
+
+`GET /api/machines` — `200 {default: string|null, machines: [{name, kind, default}],
+resolvable: boolean, error: string|null}`. Degraded shapes are **200, never 500**; a
+malformed file must not break the New Tab form.
 
 **`local` is always in the list when `allow_localhost = true`** — so with no
 `execution.toml` the honest shape is
@@ -812,11 +841,12 @@ TDD throughout. Properties worth QuickCheck, per unit:
 | WU-1 | `mkMachineName` accepts iff charset-valid **and** not reserved; empty / leading `.` / leading `-` / 64 vs 65 / control chars; `sshConfigFromMachine` total and field-preserving; `mkSshHost`/`mkSshUser` reject leading `-`; **`renderTargetError` total, all six strings exact** (`TargetUnknownMachine` names the available set *and* the remedy; `TargetNoMachine` names **both** fixes) |
 | WU-1b (§6.3/6.4) | `-F /dev/null`, `ProxyCommand=none`, `ProxyJump=none` present in all four builders; two `SshConfig`s differing only in `identity` get **different** ControlPaths; duplicate `host:port:user` ⇒ `Left`; the five updated `RemoteSpec` assertions |
 | WU-2 | codec round-trip; each required field missing ⇒ `Left` naming it; `[machines.local]`/`[machines.default]` ⇒ `Left`; invalid name as key ⇒ `Left`; port `0`/`65536`; duplicate `host:port` ⇒ `Left`; unknown key ⇒ warning not error |
-| WU-3 | four-row table; row 3 ≡ today's behaviour for every `SecurityConfig`; **no inventory or pin can produce `WhereLocal` unless `allow_localhost`**; localhost literals + interface addresses rejected when `false`; a DNS name **allowed** (documented gap); enumeration failure ⇒ still rejects literals |
+| WU-3 | five rows 0-4; row 3 ≡ today's behaviour for every `SecurityConfig`; **no inventory or pin can produce `WhereLocal` unless `allow_localhost`**; row 4 returns `TargetNoMachine` when `allow_localhost = false` and nothing applies. — the rev-7 loopback suite is deleted with §4.1 |
 | WU-4 | `exec_machine` round-trips; absent ⇒ `Nothing`; malformed text ⇒ `Nothing` + a warning; **a valid pin naming an absent machine ⇒ `TargetUnknownMachine`**; all five inheritance sites copy the value; **a dead pin fails closed in the child, never falls back to `WhereLocal`**; `SESSION_MANAGE action=new` + `machine` key ⇒ default |
 | WU-5 | **two sessions on two machines in one cache get distinct execs** (the headline feature); a target change rebuilds; an unchanged target reuses; `invalidateExec` clears all targets for the sid; a legacy `mode=remote` install with no `execution.toml` produces byte-identical argv |
 | WU-6 | `--machine` parses; value-less `--machine` ⇒ error not silent; unknown machine ⇒ 400 whose body carries the available set; **no `session.json` minted on refusal**; web path sends an identical body when the picker is hidden |
-| WU-7 | golden JSON; absent file + `allow_localhost = true` ⇒ `{default:"local", machines:[{name:"local",kind:"local"}]}`; absent file + `false` ⇒ `machines:[], resolvable:false`; `local` appears iff `allow_localhost`; route count 82; `≥2` render rule; Start disabled on `resolvable:false` |
+| WU-7 | golden JSON as before; absent file + `allow_localhost = true` ⇒ `{default:"local", machines:[{name:"local",kind:"local"}]}`; absent file + `false` ⇒ `machines:[], resolvable:false`; route count **83** (read + add + remove); `≥2` render rule; Start disabled on `resolvable:false` |
+| WU-7 (opcode ban) | **grep: zero `executionFilePath` under `src/Seal/ISA/`**; registry contains no `MACHINE_*` opcode; `POST /api/machines` returns 401 without a passkey session (the middleware test, not a new one); `DELETE` of the `default` machine is refused |
 | WU-8 | workdir response carries both machines; they differ ⇒ badge shown **and** the Files link is inert |
 | WU-9 (CPP) | the `-DREMOTE_ONLY_UNTRUSTED` variant builds and asserts `allow_localhost = false` **with `security.toml` absent**; an explicit `allow_localhost = true` in the file is overridden |
 
@@ -868,19 +898,21 @@ ambiguous. Recorded here so the option is not lost.
 
 | Risk | Mitigation |
 |---|---|
-| An entry names this box under a DNS alias | §4.3 — pre-existing, not widened; Layer 2 closes it; `execution.toml` is human-authored and git-audited |
+| An operator adds `localhost` as a machine | **Accepted by design** (§4.5). They own the file; `allow_localhost` is the setting that decides whether it matters. The guarantee is that no *agent* can add one |
 | A machine becomes unreachable mid-session | Every subsequent turn fail-closes with a message naming the machine; re-pinning is §11 |
-| A removed/renamed machine strands a pinned session | Fail-closed decode (§6.1) + `TargetUnknownMachine` naming the machine. **Remedy: a fresh session — *not* a branch or handoff**, since inheritance falls back to the default rather than propagating the dead pin (§5). No `/machine` command in v1 (§11) |
+| A removed/renamed machine strands a pinned session | `TargetUnknownMachine` naming the machine. **Remedy: a fresh session — *not* a branch or handoff**, since inheritance copies the pin and a dead pin fails closed rather than falling back (§5). No `/machine` command in v1 (§11) |
 | Two entries share a mux master despite different keys | §6.4: fold `identity`+`known_hosts` into the ControlPath, and reject duplicate `host:port:user` at load |
 | Two sessions on two machines share one exec cache | The key change is the mitigation; it has its own test |
 | The explorer is a boot-time global, so a `builder` session's Files link is wrong | WU-8 renders the link inert on mismatch + a badge. **Accepted v1 cost**, sharpest for UC-1's compile session |
 
 ## 11. Out of scope
 
-Layer 2 host-key protection (§4.2); per-tool-call routing; multiple machines per
-turn; cross-machine workdir anchoring (v1 already gives two machines two disjoint
-filesystems because the remote path roots at `scWorkspace` — only *anchoring a
-child across machines* needs a transfer); OS/load routing; adding machines from the
-web UI; per-machine vaults; IPv6 targets; a `/machine` re-pin command (remedy is a
-new session); `seal exec-machine` CLI group; fixing #347's artifact property or
-#348.
+Host-key identity checks (§4.5 — unnecessary once only the operator can add machines);
+per-tool-call routing; multiple machines per turn; cross-machine workdir anchoring (v1
+already gives two machines two disjoint filesystems because the remote path roots at
+`scWorkspace` — only *anchoring a child across machines* needs a transfer); OS/load
+routing; per-machine vaults; IPv6 targets; a `/machine` re-pin command (remedy is a new
+session); `seal exec-machine` CLI group; fixing #347's artifact property or #348.
+
+**Adding machines from the web UI has moved *into* scope** (WU-7). It was a non-goal
+when the inventory was hand-edited only; under §4 it is the control.
