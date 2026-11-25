@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 import sys
+import os
 
 NUMBER_WORDS = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
@@ -308,6 +309,60 @@ def check_file_line_double_ownership(text: str, r: Report) -> None:
         r.ok(f"no file:line is owned by two units ({len(owners)} citations checked)")
 
 
+def check_digit_counts(text: str, r: Report, repo_root: str = "") -> None:
+    """Digit-form counts the word-form checks cannot see.
+
+    Round 8 found that `check_word_counts` was defined and never called, so every
+    word-form check ran zero times, and that no check looked at digit-form counts
+    at all — which is how "75 sites" survived four revisions when the script said
+    77. This closes both: it is called from main, and it handles digits.
+    """
+    checks_passed = 0
+
+    # (a) the SessionMeta total, if the doc states one, must match the script.
+    stated = re.search(r"\*\*(\d+)\s+sites?\s+across\s+(\d+)\s+files", text)
+    if stated and repo_root:
+        import subprocess
+        script = os.path.join(repo_root, "scripts", "count-sessionmeta-sites.py")
+        if os.path.exists(script):
+            try:
+                out = subprocess.run(
+                    [sys.executable, script], capture_output=True, text=True,
+                    cwd=repo_root, timeout=60,
+                ).stdout
+                m = re.search(r"construction sites: (\d+) in (\d+) files", out)
+                if m:
+                    if (int(m.group(1)), int(m.group(2))) != (
+                        int(stated.group(1)), int(stated.group(2))
+                    ):
+                        r.bad(
+                            f"doc says {stated.group(1)} sites across "
+                            f"{stated.group(2)} files; the script says "
+                            f"{m.group(1)} in {m.group(2)}"
+                        )
+                    else:
+                        checks_passed += 1
+            except (subprocess.SubprocessError, OSError):
+                pass
+
+    # (b) "N record / M positional" must sum to the stated total.
+    shapes = re.search(r"(\d+)\s+record\s*/\s*(\d+)\s+positional", text)
+    total = re.search(r"\*\*(\d+)\s+sites?", text)
+    if shapes and total:
+        if int(shapes.group(1)) + int(shapes.group(2)) != int(total.group(1)):
+            r.bad(
+                f"record({shapes.group(1)}) + positional({shapes.group(2)}) "
+                f"!= the stated total of {total.group(1)}"
+            )
+        else:
+            checks_passed += 1
+
+    if checks_passed:
+        r.ok(f"{checks_passed} digit-form count(s) cross-checked against a script")
+    elif stated or shapes:
+        r.ok("digit-form counts present but not cross-checkable")
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print(__doc__)
@@ -332,6 +387,7 @@ def main() -> int:
     check_cite_set_agreement(text, r)
     check_signature_types_owned(text, r)
     check_file_line_double_ownership(text, r)
+    check_digit_counts(text, r, repo_root)
     return r.finish()
 
 

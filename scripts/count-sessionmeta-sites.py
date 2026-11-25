@@ -86,33 +86,61 @@ def record_brace_on_next_line(line: str, following: str) -> bool:
     return following.lstrip().startswith("{")
 
 
-def count_file(path: str) -> int:
+def count_file_shapes(path: str) -> tuple[int, int]:
+    """(record-form, positional) construction sites in one file.
+
+    The split matters: a new field on `SessionMeta` breaks record literals via
+    `-Wmissing-fields`, but breaks *positional* applications via **arity**, which
+    `-Wmissing-fields` does not report. They need different fixes, so a bare
+    total is not enough to scope the work.
+    """
     with open(path, encoding="utf-8", errors="replace") as fh:
         lines = fh.read().split("\n")
-    total = 0
+    rec = pos = 0
     for i, line in enumerate(lines):
-        total += constructors_in_line(line)
+        if line.lstrip().startswith("--"):
+            continue
+        for m in re.finditer(r"\bSessionMeta\b", line):
+            before, after = line[: m.start()], line[m.end() :]
+            if is_type_use(before, after):
+                continue
+            if re.match(r"\s*\{", after):
+                rec += 1
+                continue
+            tokens = [t for t in re.split(r"\s+", after.strip()) if t]
+            if len(tokens) >= 3 and re.match(r"\s+\S", after):
+                pos += 1
         nxt = lines[i + 1] if i + 1 < len(lines) else ""
         if record_brace_on_next_line(line, nxt):
-            total += 1
-    return total
+            rec += 1
+    return rec, pos
+
+
+def count_file(path: str) -> int:
+    rec, pos = count_file_shapes(path)
+    return rec + pos
 
 
 def main() -> int:
     files_only = "--files" in sys.argv
     per_file = {}
+    shapes = {}
     for root in ROOTS:
         for dirpath, _dirs, names in os.walk(root):
             for name in names:
                 if not name.endswith(".hs"):
                     continue
                 path = os.path.join(dirpath, name)
-                n = count_file(path)
+                rec, pos = count_file_shapes(path)
+                n = rec + pos
                 if n:
                     per_file[path] = n
+                    shapes[path] = (rec, pos)
 
     counted = {p: n for p, n in per_file.items() if p != EXEMPT}
     total = sum(counted.values())
+    rec_total = sum(shapes[p][0] for p in counted)
+    pos_total = sum(shapes[p][1] for p in counted)
 
     if files_only:
         for path in sorted(counted):
@@ -120,10 +148,14 @@ def main() -> int:
         return 0
 
     print(f"construction sites: {total} in {len(counted)} files")
+    print(f"  record form  : {rec_total}  (break via -Wmissing-fields)")
+    print(f"  positional   : {pos_total}  (break via ARITY, which -Wmissing-fields")
+    print(f"                 does not report — these need rewriting, not a base record)")
     print(f"(excluded: {EXEMPT} — it holds `defaultSessionMeta` itself)")
     print()
     for path, n in sorted(counted.items(), key=lambda kv: (-kv[1], kv[0])):
-        print(f"{n:4d}  {path}")
+        rec, pos = shapes[path]
+        print(f"{n:4d}  ({rec:2d} rec / {pos:2d} pos)  {path}")
     return 0
 
 
