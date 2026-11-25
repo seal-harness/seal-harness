@@ -48,9 +48,11 @@ warns — does not refuse — on a loopback host, since the denylist is gone and
 consequence is now a *diagnostic* one; `group` sanitisation moved out of WU-2 into its
 own unit (it is an independent pre-existing escape, not load-bearing for §4.3).
 
-**Count slips, fixed and now checked:** four renderings (not five), six resolution rows
-(not five), twelve units (not ten — WU-1b/7a/7b/7c are all headings), duplicate
-`host:port:user` (not `host:port`).
+**Count slips, fixed and now checked mechanically rather than by eye** (four renderings,
+not five; six resolution rows, not five; fourteen units, not ten — WU-1b/6b/7a/7b/7c/10
+are all headings; duplicate `host:port:user`, not `host:port`). A script asserts the unit
+headings and the §8 test rows are 1:1. Counting by eye has been wrong in four
+consecutive revisions, which is why the check is now a script.
 
 ---
 
@@ -148,7 +150,7 @@ blockers were my own errors, verified against source:**
 
 | Change | Why |
 |---|---|
-| **WU-4: the 75-site sweep is unavoidable, not eliminated** | I claimed "no arity change ⇒ ~100 edits avoided". False: `-Wmissing-fields` is part of `-Wall` (`seal-harness.cabal:33`, `-Werror`), so **every named-field `SessionMeta` literal breaks** the moment the field is added — all 75 (73 test / 4 src). Mitigation named: a `defaultSessionMeta`-based constructor so each site adds one line rather than re-listing 14 fields |
+| **WU-4: the 77-site sweep is unavoidable, not eliminated** | I claimed "no arity change ⇒ ~100 edits avoided". False: `-Wmissing-fields` is part of `-Wall` (`seal-harness.cabal:33`, `-Werror`), so **every named-field `SessionMeta` literal breaks** the moment the field is added — all 77 (73 test / 4 src). Mitigation named: a `defaultSessionMeta`-based constructor so each site adds one line rather than re-listing 14 fields |
 | **§6.4/§6.3: the ControlPath change is NOT invisible to the suite** | Rev 6 said "insertion is invisible to the assertions". True for *flag insertion*, false for the *ControlPath value*: `RemoteSpec.hs:236,241,242,247` compare it exactly (`checkAdjacentPair argv "ControlPath" (home </> ".seal/ssh-mux/m-%C")`) and `:252` asserts the `-m-%C` suffix. Those 5 assertions are part of the unit |
 | **§6.1: fail-closed decode has no error channel** | `readSessionMeta :: IO (Maybe SessionMeta)` and `decodeFileStrict` collapse every parse failure to `Nothing` — and **30 call sites** depend on that type. Rev 6's own test ("invalid ⇒ `TargetUnknownMachine`, not `Nothing`") could not pass. Resolved by scoping: a *renamed* machine is already caught by §5 row 0, so only *malformed* text is in question, and for that, `Nothing` + a load-time warning is correct — making the whole `session.json` undecodable would render the session unreadable, which is worse than the silent move it prevents |
 | **§5: inheritance fails closed instead of falling back** | Rev 6's "fall back to the default and warn" can land `WhereLocal`: `allow_localhost = true`, one ssh machine, no explicit `default`, session pinned to it, machine renamed ⇒ child falls to row 3 ⇒ **untrusted subagent code on the harness kernel** with only a warning. A dead pin is now a `TargetError`, full stop |
@@ -261,8 +263,9 @@ feature **owes** it: under `-DREMOTE_ONLY_UNTRUSTED`, `allow_localhost` is force
 covers an install that has the section; a hardened build with **no**
 `security.toml` would keep the field absent, `allow_localhost` absent ⇒ `true` ⇒
 row 3 ⇒ `WhereLocal`. So the coercion belongs in the *accessor* that resolves the
-field to a `Bool` (`allowLocalhostFrom :: UntrustedExecFileConfig -> Bool`), which is
-total over the absent case. `mkLocalUntrustedIO` has **no** CPP guard
+field to a `Bool` (`allowLocalhostFrom :: Maybe UntrustedExecFileConfig -> Bool`),
+which is total over the absent case because absence lives at `scUntrustedExec ::
+Maybe UntrustedExecFileConfig` (`Security.hs:124`). `mkLocalUntrustedIO` has **no** CPP guard
 (`UntrustedIO.hs:79` imports `Local` unconditionally), so this value is the only thing
 standing between the hardened build and local execution.
 
@@ -354,6 +357,17 @@ UC-4's re-pin is deferred (§9).
   `cargo build` failure is diagnosable · WHEN opening the session (the surface is
   WU-8's chat-header badge; the session *list* is not touched in v1, stated here so the
   use case does not promise a surface no unit delivers).
+
+- **UC-5 — getting the first (and second) machine in.** WHO an operator with one
+  machine · WANTS to know that a second machine gives per-session choice, and how to
+  add one · SO THAT the feature is reachable without reading a design doc · WHEN they
+  open the Machines screen or the New Tab form.
+
+UC-5 exists because the previous four rounds kept finding the same defect: five
+revisions specified the *picker* and never the *ramp* that populates it. The picker
+renders at `≥ 2` machines, so a user with zero or one has no in-product signal that the
+feature exists — WU-7c's empty-state copy and its `==1` hint are that signal, and they
+are the whole of UC-5's delivery.
 
 ### 2.2 Evidence caveat (do not delete this again)
 
@@ -533,6 +547,12 @@ Under `allow_localhost = false`:
 Under `allow_localhost = true` the agent can write the inventory and it does not
 matter — local execution is already permitted, so no entry gains authority.
 
+**Scope note — this is not an audit of every write primitive in the harness.** Only
+primitives whose path could reach `config/execution.toml` are in scope. `MEMORY_WRITE`
+writes under `~/.seal/memory/`, and the memory system is unrelated to execution
+machines; it is mentioned solely so a reader does not mistake this section for a
+complete enumeration.
+
 ### 4.5 What this gives up, stated rather than buried
 
 - **An operator can add `localhost` as a machine.** That is the point. It is their
@@ -586,8 +606,8 @@ So `DELETE` must:
 1. compute the **effective** default (explicit *or* implied, §5), and refuse to remove
    it unless `?force=true`;
 2. if the machine is pinned by sessions, refuse unless `?force=true` **and report the
-   pin count** in the refusal body. The count is free — §9 already specifies the
-   `session.json` grep, honour `SEAL_HOME`;
+   pin count** in the refusal body. The count is a bounded `session.json` walk — cheap,
+   not free — and §9 already specifies the grep (honour `SEAL_HOME`);
 3. log the removal at audit level with the count.
 
 `POST` is an **upsert**: `201` on create, `200` on replace — **and a replace is guarded
@@ -603,7 +623,16 @@ document (including the ≥ 2-machines-need-a-default rule) before the rename. W
 this the screen cannot create the very state the route then refuses to repair, because
 `updateExecutionConfig` loads the file first.
 
-`DELETE` answers `204` with no body on success; `409` with `{error, pinned, unpinned,
+**Removal does not touch live exec caches.** `invalidateExec` (WU-5) is keyed by
+session, and the cache's memo key includes the target (`(SessionId, ResolvedTarget)`),
+so a deleted machine's next turn rebuilds, hits row 0/1b, and fail-closes. No cascade
+eviction is needed, and the design should say so rather than leaving the reader to
+wonder whether a stale in-memory `SessionExec` can outlive the entry. It cannot: the
+resolved-target key changes the moment the machine is gone.
+
+`DELETE` answers `204` with no body on success; `400` on `DELETE /api/machines/local`,
+since `local` has no `[machines.local]` row to remove and exists only when
+`allow_localhost = true` (it is a reserved name, not an entry). `409` with `{error, pinned, unpinned,
 fallback}` on refusal without `?force`. Guard (2) reports **unpinned** sessions too —
 they are the population that silently moves when the effective default is removed, and
 guard (2) as written in rev 9 counted only the pinned ones.
@@ -814,7 +843,7 @@ this with D6, which was a mistake — it is endpoint integrity, not self-host
 detection.
 
 **Not just `sshExecArgv`.** `sshExecArgvForwarding` (`Remote.hs:130`), the rsync rsh
-string (`AgentMetaCache.hs:186-196`) and `GIT_SSH_COMMAND` (`Clone.hs:481`) also
+string (`Session/AgentMetaCache.hs:186-196`) and `GIT_SSH_COMMAND` (`SourceControl/Clone.hs:481`) also
 honour `~/.ssh/config`, so a `Host *` stanza re-points git and rsync traffic too. One
 line each. Verified non-breaking: every existing argv assertion is membership- or
 adjacency-based (`checkAdjacentPair`, `elem`, `isSuffixOf "-m-%C"`), and
@@ -892,7 +921,7 @@ stanza is never typechecked). Prefixes `smsHost`/`smsUser`/… to match `scHost`
 
 `-F /dev/null -o ProxyCommand=none -o ProxyJump=none` in all four builders
 (`sshExecArgv`, `sshExecArgvForwarding`, the rsync rsh string in
-`AgentMetaCache.hs:186-196`, `GIT_SSH_COMMAND` in `Clone.hs:481`); the
+`Session/AgentMetaCache.hs:186-196`, `GIT_SSH_COMMAND` in `SourceControl/Clone.hs:481`); the
 `identity`+`known_hosts` hash folded into `ControlPath`; the stale comment at
 `Remote.hs:154-156` corrected. **Five assertions update with it**
 (`RemoteSpec.hs:236,241,242,247,252`).
@@ -926,6 +955,13 @@ pass.)*
 - **The legacy-block synthesis** (§1.5): the implicit machine `default` from a
   complete `[untrusted_execution.remote]` is built *here*, because WU-2 is the only
   place that sees both configs. Without this clause the unit is unwritable as scoped.
+
+**If WU-2 proves too large in practice, the seam is between the read side and the
+writer**: the codec + `executionFilePath` + template + legacy synthesis + the
+`Seal.Config.Security` deprecation edits form one coherent commit (the synthesis needs
+both codecs), and the writer trio (`saveExecutionConfig`/`updateExecutionConfig`/
+`executionWriteLock`) could move to WU-7a, its only caller. Named so the split is a
+mechanical decision during implementation rather than a redesign.
 
 **The writer's three tests ship with the writer**, not with its caller (AGENTS.md rule
 4 — a unit ships with its test): a rejected write leaves the file byte-identical; a
@@ -963,17 +999,21 @@ lines smaller.
 `SessionMeta` gains `smExecMachine :: Maybe MachineName`; key `exec_machine`, wire
 `execMachine`. `FromJSON` is **explicit**, not derived (§6.1).
 
-**The 75-site sweep is unavoidable — rev 6 was wrong about this.** Haskell has no
+**The sweep is unavoidable — rev 6 was wrong about this.** Haskell has no
 record-field defaults, and `-Wmissing-fields` is part of `-Wall`
 (`seal-harness.cabal:33`, with `-Werror`), so **every** named-field `SessionMeta`
-literal becomes a compile error the moment the field is added: **75 sites across 25
-files**, 73 test / 4 src (`scripts/count-sessionmeta-sites.py` reports 77 including two
-in `Meta.hs` itself). There is no arity change to `newSession`/`newSessionMeta`, but
-that saves nothing — the literals are the cost, not the function signatures.
+literal becomes a compile error the moment the field is added. Measured by
+`scripts/count-sessionmeta-sites.py`: **77 sites across 25 files — 73 test / 4 src**.
+(The four src sites: `Delegation/Worker.hs` ×2, `Core/TurnEngine.hs` ×1,
+`Session/Store.hs` ×1.) The script excludes `src/Seal/Session/Meta.hs`, which holds the
+`ToJSON`/`FromJSON` pair and is hand-written in this unit. Earlier revisions said "75
+sites" — wrong, because 73 + 4 = 77; the total and the split disagreed and nobody added
+them up. There is no arity change to `newSession`/`newSessionMeta`, but that saves
+nothing — the literals are the cost, not the function signatures.
 
 Mitigation, named so this unit is writable: add
 `defaultSessionMeta :: SessionId -> UTCTime -> SessionMeta` in `Seal.Session.Meta`, so
-each of the 75 sites becomes one record-update line
+each of the 77 sites becomes one record-update line
 (`defaultSessionMeta sid now { smProvider = … }`) instead of re-listing 14 fields. That
 is the same helper rev 3c's D15 asked for, and it makes the sweep mechanical rather
 than error-prone. A `setExecMachine :: MachineName -> SessionMeta -> SessionMeta`
@@ -1202,7 +1242,7 @@ UI.** Without it the operator has no way to use the control, and the only machin
 affordance in the product (`NewTabComposer`'s picker) renders at `≥ 2` machines — i.e.
 hidden in exactly the zero-and-one state where a machine must first be added.
 
-- A `Machines` section in `TopBar`'s `Section` union and `App.tsx`'s path→section
+- A `Machines` member in `TopBar`'s `TopSection` union and `frontend/src/App.tsx`'s path→section
   switch (`/machines`, mirroring `/repos` at `App.tsx:74`). Without a `Section` member
   the route is unreachable.
 - `MachinesView.tsx` cloning `ReposView`: list rows showing name/host/user/default,
@@ -1212,6 +1252,14 @@ hidden in exactly the zero-and-one state where a machine must first be added.
 - **Reachable in every state**, including `resolvable: false` — the operator in exactly
   that state must be able to fix it from the web UI, which is the one place the control
   is needed most.
+- **Empty-state copy says *why* it is empty**, not just that it is: with
+  `resolvable: false` the screen reads "`allow_localhost = false` and no SSH machines
+  are configured — add one to run anything", rather than a bare "No machines".
+- **At `machines.length == 1` the screen hints that a second machine unlocks the
+  per-session picker.** This is the only cheap lever on §9 criterion 1's population:
+  without it, an operator with one machine never learns the picker exists, and the
+  metric's denominator stays empty for reasons unrelated to the feature's value.
+- The composer's `resolvable: false` error links to `/machines`.
 - Shows the derived `allow_localhost` posture read-only with a "set in
   `~/.seal/security.toml`" note, so a list missing `local` does not read as broken.
 - **Required fields marked**: `name`, `host`, `user`, `known_hosts`, `workspace` are
@@ -1225,7 +1273,10 @@ hidden in exactly the zero-and-one state where a machine must first be added.
 ### WU-8 — session-viewer surface
 `GET /api/sessions/:id/workdir` returns `{path, machine, files_machine}`
 (`handleSessionWorkdir` returns `{path}` today and derives it from `mode`, so it must
-resolve the pin; `files_machine` is `null` when the explorer is `FeDisabled`).
+resolve the pin). **Value domain for both**: `"local" | <machine name> | null`, where
+`null` occurs **only** when the explorer is `FeDisabled` — pinned here, because rev 9
+defined `null` but left the live case implicit, so the badge condition had no total
+meaning.
 
 **The badge alone is not the fix.** `OpenWorkdirLink` (`ChatArea.tsx:358`) builds
 `/files?path=<path>`, and the file explorer is a **single boot-time global**
