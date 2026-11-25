@@ -35,3 +35,7 @@ frontend/playwright-report/
 /seal-*.tar.gz.sha256
 patch_plan.py
 *.log
+
+# Python bytecode (the spec/site-count scripts are imported in-process)
+__pycache__/
+*.pyc
