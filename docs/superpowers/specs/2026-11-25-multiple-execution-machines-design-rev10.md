@@ -49,7 +49,7 @@ consequence is now a *diagnostic* one; `group` sanitisation moved out of WU-2 in
 own unit (it is an independent pre-existing escape, not load-bearing for §4.3).
 
 **Count slips, fixed and now checked mechanically rather than by eye** (four renderings,
-not five; six resolution rows, not five; fourteen units, not ten — WU-1b/6b/7a/7b/7c/10
+not five; seven resolution rows, not five; fourteen units, not ten — WU-1b/6b/7a/7b/7c/10
 are all headings; duplicate `host:port:user`, not `host:port`). A script asserts the unit
 headings and the §8 test rows are 1:1. Counting by eye has been wrong in four
 consecutive revisions, which is why the check is now a script.
@@ -151,7 +151,7 @@ blockers were my own errors, verified against source:**
 | Change | Why |
 |---|---|
 | **WU-4: the 77-site sweep is unavoidable, not eliminated** | I claimed "no arity change ⇒ ~100 edits avoided". False: `-Wmissing-fields` is part of `-Wall` (`seal-harness.cabal:33`, `-Werror`), so **every named-field `SessionMeta` literal breaks** the moment the field is added — all 77 (73 test / 4 src). Mitigation named: a `defaultSessionMeta`-based constructor so each site adds one line rather than re-listing 14 fields |
-| **§6.4/§6.3: the ControlPath change is NOT invisible to the suite** | Rev 6 said "insertion is invisible to the assertions". True for *flag insertion*, false for the *ControlPath value*: `RemoteSpec.hs:236,241,242,247` compare it exactly (`checkAdjacentPair argv "ControlPath" (home </> ".seal/ssh-mux/m-%C")`) and `:252` asserts the `-m-%C` suffix. Those 5 assertions are part of the unit |
+| **§6.4/§6.3: the ControlPath change is NOT invisible to the suite** | Rev 6 said "insertion is invisible to the assertions". True for *flag insertion*, false for the *ControlPath value*: five assertions in `RemoteSpec.hs` compare it, and they are enumerated once in §6.4. Those five are part of WU-1b. |
 | **§6.1: fail-closed decode has no error channel** | `readSessionMeta :: IO (Maybe SessionMeta)` and `decodeFileStrict` collapse every parse failure to `Nothing` — and **30 call sites** depend on that type. Rev 6's own test ("invalid ⇒ `TargetUnknownMachine`, not `Nothing`") could not pass. Resolved by scoping: a *renamed* machine is already caught by §5 row 0, so only *malformed* text is in question, and for that, `Nothing` + a load-time warning is correct — making the whole `session.json` undecodable would render the session unreadable, which is worse than the silent move it prevents |
 | **§5: inheritance fails closed instead of falling back** | Rev 6's "fall back to the default and warn" can land `WhereLocal`: `allow_localhost = true`, one ssh machine, no explicit `default`, session pinned to it, machine renamed ⇒ child falls to row 3 ⇒ **untrusted subagent code on the harness kernel** with only a warning. A dead pin is now a `TargetError`, full stop |
 | **§1.4: the `-f remote-only-untrusted` coercion applies to the default, not just a present section** | Otherwise a hardened build with **no** `security.toml` keeps `allow_localhost = true` and yields `WhereLocal`. `mkLocalUntrustedIO` has no CPP guard, so this value is the only thing between the hardened build and local execution |
@@ -232,10 +232,11 @@ That single sentence replaces rev 3c/4's five-row table plus a cross-checked
 invariant. A pin cannot reach it, a default cannot reach it, no inventory entry
 can reach it. Everything else in this document follows.
 
-### 1.2 `false` means: no tool call may touch this machine
+### 1.2 `false` means: no tool call may *fall back* to this machine
 
 `allow_localhost = false` gates the **fallback**: when it is `false` and no machine
-applies, resolution returns `TargetNoMachine` (§5 row 4) and nothing runs. It is not
+applies, resolution returns `TargetNoMachine` (§5 row 4) and nothing runs. It does not
+gate an inventory entry that resolves to this host — §4.5 records that consequence. It is not
 an address classifier — the denylist is deleted (§4.1), because the inventory is
 operator-authored and an address denylist cannot bind the principal who owns the file.
 
@@ -366,9 +367,10 @@ UC-4's re-pin is deferred (§9).
   Named for **discoverability**, which is what WU-7c delivers (an empty state that says
   why it is empty, and a hint at exactly one ssh machine). The other half of the
   journey — an operator with zero machines adds one through the screen and a turn runs
-  on it — is WU-7a + WU-7c's integration test, not a use case; claiming it under UC-5's
-  title would have been the fourth revision to promise an activation journey that no
-  unit accepts.
+  on it — has **one** §8 assertion (WU-7c's ramp row: default install → add a machine → the
+  picker renders two options → a session mints there), not a use case. Claiming it under
+  UC-5's title without that row would have been the fourth revision to promise an
+  activation journey no unit accepts.
 
 UC-5 exists because the previous four rounds kept finding the same defect: five
 revisions specified the *picker* and never the *ramp* that populates it. The picker
@@ -434,7 +436,7 @@ is not whether the inventory is agent-writable in the filesystem sense — it is
 `POST /api/machines` is passkey-gated (`accessControlMiddleware` is default-deny) and
 no opcode writes `executionFilePath`. Under `allow_localhost = false` the one local
 write primitive that does not go through `FILE_WRITE` — `group` in
-`SKILL_WRITE`/`AGENT_DEF` — is closed by WU-2's sanitisation.
+`SKILL_WRITE`/`AGENT_DEF` — is closed by **WU-10's** sanitisation.
 
 The residual — a cloned dotfiles repo carrying a localhost entry — arrives as an
 operator action in a file they version-control. §4.5 records that as the accepted
@@ -488,7 +490,13 @@ The codebase already has exactly this shape, and it is the one to copy:
 | File mode | default (umask) | default — it holds paths and hostnames, not secrets |
 | Reachable by an opcode | **no** | **no** |
 
-**"Passkey-gated" is not automatic, and rev 8 was wrong to say it was.** `decide`
+**"Authenticated-session-gated" is the accurate term** — `hasServiceToken`
+(`AccessControl.hs:313`) admits an in-process bearer token on any non-auth path in
+`AccessPasskey` mode. That token is minted in memory, never logged and never in the
+environment, and a same-uid shell already dominates it (§4.5), so it is not a new class;
+but "passkey-gated" overstates the predicate.
+
+**And it is not automatic: rev 8 was wrong to say it was.** `decide`
 short-circuits `AccessOpen -> AuthAllow` for *every* path (`AccessControl.hs:305`),
 and `access_mode = "none"` is a documented supported choice meaning "anyone who can
 reach the gateway has full control". Under `allow_localhost = false` + `AccessOpen` +
@@ -546,7 +554,7 @@ Under `allow_localhost = false`:
   It cannot forge `execution.toml` only because `.md` is unconditionally appended —
   an accident, not a boundary.
 
-  **WU-2 adds charset sanitisation to `group`** (`[A-Za-z0-9_-]`, rejecting `.`/`..`/
+  **WU-10 adds charset sanitisation to `group`** (`[A-Za-z0-9_-]`, rejecting `.`/`..`/
   separators) with a test that `group = "../../.."` is refused. This is the one place
   where trusting the operator is not enough, because the hole is an *agent* write
   primitive that happens to be aimed at the operator's config tree.
@@ -597,7 +605,7 @@ agent with a local shell *can* write the inventory; what it cannot do is gain an
 since local execution is already permitted. Rev 9 stated the sentence unconditionally,
 which made the very tests that assert it capable of certifying a false property.
 
-### 4.6 `DELETE` semantics: the implied default is the dangerous one
+### 4.6 `DELETE` semantics: the **explicit** default is the dangerous one
 
 Two distinct deletions, and only one of them is obvious:
 
@@ -647,8 +655,9 @@ resolved-target key changes the moment the machine is gone.
 
 `DELETE` answers `204` with no body on success; `400` on `DELETE /api/machines/local`,
 since `local` has no `[machines.local]` row to remove and exists only when
-`allow_localhost = true` (it is a reserved name, not an entry). `409` with `{error, pinned, unpinned,
-fallback}` on refusal without `?force`. Guard (2) reports **unpinned** sessions too —
+`allow_localhost = true` (it is a reserved name, not an entry). `409` with a **typed** body `{error: string, pinned: Int, unpinned: Int, fallback: string|null}`
+on refusal without `?force` (`fallback` is the machine unpinned sessions land on; `null`
+means `TargetNoMachine`). Guard (2) reports **unpinned** sessions too —
 they are the population that silently moves when the effective default is removed, and
 guard (2) as written in rev 9 counted only the pinned ones.
 
@@ -683,10 +692,10 @@ the only errors a hardened install ever sees:
 
 | Constructor | Rendering |
 |---|---|
-| `TargetUnknownMachine n avail` | `No execution machine named "<n>"; available: <avail>. Add one on the Machines screen, or pin the session to one of them.` |
-| `TargetLocalNotAllowed n` | `machine "<n>" runs on this host, but allow_localhost = false in <security.toml>. Pin the session to another machine, or set allow_localhost = true.` |
+| `TargetUnknownMachine n avail` | `No execution machine named "<n>"; available: <avail>. Start a new session pinned to one of them, or add one on the Machines screen.` |
+| `TargetLocalNotAllowed n` | `machine "<n>" runs on this host, but allow_localhost = false in <security.toml>. Set allow_localhost = true, or start a new session pinned elsewhere.` |
 | `TargetConfigLoadError why` | `<execution.toml>: <why>` (the codec's field-specific `Left` becomes the payload) |
-| `TargetNoMachine` | `No execution machine is configured. Add one on the Machines screen, or add a [machines.<name>] block to <execution.toml>, or set allow_localhost = true in <security.toml>.` |
+| `TargetNoMachine` | `No execution machine is configured. Add one on the Machines screen, or add a [machines.<name>] block to <execution.toml>, or set allow_localhost = true in <security.toml>.` (The third clause is inert under `-f remote-only-untrusted`, which forces the flag false — WU-9. Kept because the string is shared and only one clause is wrong in that build.) |
 
 The paths are **parameters, not literals**: `renderTargetError :: TargetPaths ->
 TargetError -> Text` where `tpExecution`/`tpSecurity` are derived from `SealPaths`.
@@ -892,9 +901,9 @@ rev 5.
 
 **This is not free: it breaks five existing assertions.** Rev 6 claimed the change was
 "invisible to the suite" — true of inserting a *flag*, false of changing the
-`ControlPath` *value*. `RemoteSpec.hs:236,241,242,247` compare it exactly
+`ControlPath` *value*. `RemoteSpec.hs:236,241,242,247,252` compare it exactly
 (`checkAdjacentPair argv "ControlPath" (home </> ".seal/ssh-mux/m-%C")`), and `:252`
-asserts the `-m-%C` suffix. Those five are part of WU-1's commit.
+asserts the `-m-%C` suffix. Those five are part of **WU-1b's** commit — WU-1 is pure and produces no argv.
 
 Similarly §6.3's `-F /dev/null` insertion **is** invisible — every ssh-argv assertion
 elsewhere is membership- or adjacency-based, and `grep 'argv !!'` finds zero positional
@@ -922,8 +931,20 @@ path is exactly what to avoid. `erMeta.machine` is dropped (§9).
 `ResolvedTarget` (**needs `Ord` on itself and on `MachineName`**), the
 four-constructor `TargetError`, `renderTargetError`,
 `sshConfigFromMachine :: SshMachineSpec -> SshConfig` (total),
-`targetLabel :: ResolvedTarget -> Text`, and
-`targetSshConfig :: ResolvedTarget -> Maybe SshConfig`.
+`targetLabel :: ResolvedTarget -> Text`,
+`targetSshConfig :: ResolvedTarget -> Maybe SshConfig`, and
+
+```haskell
+data TargetPaths = TargetPaths
+  { tpExecution :: Text   -- ^ from SealPaths (executionFilePath), never a literal
+  , tpSecurity  :: Text   -- ^ from SealPaths (securityFilePath)
+  }
+```
+
+`TargetPaths` is built by WU-3's call sites from `SealPaths`; it exists so
+`renderTargetError` never hardcodes `~/.seal/` (§5). It was referenced by two
+signatures in rev 10 and declared by none — the same "cites something that does not
+exist" defect as rev 8's helpers.
 
 **Also in this commit, in `Seal.Tools.Exec.Types`:** `deriving Ord` on `SshHost`
 (`:124`), `SshUser` (`:139`) and `SshConfig` (`:83-91`), plus the leading-`-` guard in
@@ -976,7 +997,9 @@ writer**: the codec + `executionFilePath` + template + legacy synthesis + the
 `Seal.Config.Security` deprecation edits form one coherent commit (the synthesis needs
 both codecs), and the writer trio (`saveExecutionConfig`/`updateExecutionConfig`/
 `executionWriteLock`) could move to WU-7a, its only caller. Named so the split is a
-mechanical decision during implementation rather than a redesign.
+mechanical decision during implementation rather than a redesign. **If the seam is
+taken, the writer's §8 row moves with the trio** — otherwise the split silently
+re-creates the double-ownership this revision just fixed.
 
 **The writer's three tests ship with the writer**, not with its caller (AGENTS.md rule
 4 — a unit ships with its test): a rejected write leaves the file byte-identical; a
@@ -995,9 +1018,9 @@ three under WU-7a, whose code ships later.
   when absent.
 
 **`uefcMode`'s ripples are costed**, not just named — 7 sites the type change breaks:
-**one** `shouldBe "local"` assertion (`MigrateSpec.hs:137`) and **six**
-`uefcMode = "local"` literals (`SecuritySpec.hs:139,158,178,187`,
-`WorkdirSpec.hs:329`, `ApiTestHarness.hs:766`).
+**one** `shouldBe "local"` assertion (`MigrateSpec.hs:137`) and **six** `uefcMode`
+literals — one `"local"` (`SecuritySpec.hs:139`) and five `"remote"`
+(`SecuritySpec.hs:158,178,187`, `WorkdirSpec.hs:329`, `ApiTestHarness.hs:766`).
 
 **`group` sanitisation is NOT here** — it moved to WU-10. It returns `Either` from
 `skillPath`/`defPath`, rippling `writeSkill`/`writeAgentDef` and both backend records,
@@ -1012,7 +1035,12 @@ lines smaller.
 
 ### WU-4 — the per-session pin
 `SessionMeta` gains `smExecMachine :: Maybe MachineName`; key `exec_machine`, wire
-`execMachine`. `FromJSON` is **explicit**, not derived (§6.1).
+`execMachine`. `FromJSON` is **explicit**, not derived (§6.1). **`ToJSON` must *omit* the key when
+`smExecMachine` is `Nothing`, not emit `null`** — and that is asserted. The surrounding
+style in `Session/Meta.hs` is `"repo_url" .= smRepoUrl m`, i.e. `Maybe → null`, so
+copying it here would make every post-deploy session carry a *present* key, and §9's "a
+present key means a deliberate choice" would be false on exactly the population the
+metric uses. This is the same encoder-vs-test agreement WU-7b pins for `MachineInfo`.
 
 **The sweep is unavoidable — rev 6 was wrong about this.** Haskell has no
 record-field defaults, and `-Wmissing-fields` is part of `-Wall`
@@ -1125,9 +1153,14 @@ lands on the default — the silent-authority-change class §6.1 exists to elimi
 live bug today. Rev 9 called this "four more edits"; the real count is **7–9 plus two
 fixtures**: `mintBody`/`rebindBody` signatures, two handlers with pre-mint validation,
 two `400`→`ccSend` relays, the `createBareSession` decision, `createTab`'s swallowed
-`!res.ok`, and `NewTabComposer.tsx:81`'s `if (res)` inversion. Roughly a day.
+`!res.ok`, and the composer's `if (res)` inversion (both WU-6's, above). Roughly a day.
 
 Split from WU-6 so the demo checkpoint (CLI + web) does not wait on it.
+
+**Two UI fixes are WU-6's, not this unit's, and are not counted in its budget:** the
+`createTab` error-body return and the composer's `if (res)` → `if (!res || !res.ok)`
+inversion (both specified in WU-6). Rev 10 listed them in both units; WU-6b only *relays*
+a chat 400 through `ccSend` and touches neither.
 
 **Scope decision, stated so it is reviewable either way:** WU-6b ships in the same PR.
 The alternative — defer it to v1.1 and have the chat parser **reject** `--machine` with
@@ -1159,8 +1192,10 @@ earlier revision got wrong or omitted:
    consequence of a `localhost` entry is a *diagnostic* one, not an authorization one:
    the session resolves `WhereSsh` while executing here, so `cdIsRemote` picks the
    deploy-key clone path and the Files link goes inert. `POST` returns a `warning` field
-   (same posture as unknown-keys: warn, never block) naming that consequence, surfaced
-   next to `machines-form-error` in WU-7c.
+   (same posture as unknown-keys: warn, never block) whose text names the
+   **consequence**, not merely "this is localhost": *"this entry denotes this host;
+   sessions pinned to it will be treated as remote but execute here, so the Files link
+   and the deploy-key clone path will both be wrong."*
 5. **`stat` the two key paths at write time** and return a field-specific `Left` if
    either does not exist. §3.2 already validates them as absolute, `..`-free and
    `blockedNames`-free; existence is the same class of check, runs on the filesystem the
@@ -1239,7 +1274,11 @@ mount; nothing refetched after a write, so the headline flow — add the first m
 open a New Tab — showed a stale picker until F5. One line of precedent:
 `BeReposChanged` → `repos-changed` → `useRepos` (`StreamBroker.hs:310`,
 `streamClient.ts`). This unit adds `BeMachinesChanged`/`broadcastMachinesChanged`, the
-`machines-changed` client frame, and `useMachines` refetching on it.
+`machines-changed` client frame, and `useMachines` refetching on it. **The two emitter
+call sites are WU-7a's** — `broadcastMachinesChanged` after a successful `POST` and
+after a successful `DELETE`. Rev 10 said "this unit adds the frame" without saying who
+calls it, so a test could inject the frame and pass while the real route never
+broadcast.
 
 ### WU-7c — the Machines screen
 
@@ -1263,11 +1302,13 @@ hidden in exactly the zero-and-one state where a machine must first be added.
   endpoint). So: *attempt → `409 {error, pinned, unpinned, fallback}` → surface those
   counts with a "Do it anyway" control that retries with `?force`*. One flow, two
   entry points, and two §8 rows.
-- **The form carries a "set as default" control** (its own `data-testid`). Without it
+- **The form carries a "set as default" control** (`data-testid="machines-set-default"`). Without it
   the screen cannot add the *second* machine: §4.6 makes the writer validate the
   resulting document, and ≥ 2 ssh machines with no `default` is a load error — so the
   add would be refused and the state unrepairable from the UI.
-- **`kind === "local"` rows render no edit, no delete and no default control.** It is
+- **`kind === "local"` rows render no edit, no delete and no default control, and
+  display the same string as the select option — "This machine (where Seal runs)" — not
+  the bare reserved name.** It is
   the fallback, not a peer; a form pre-filled with four empty required fields, and a
   Delete that `400`s, are both bugs waiting to be written.
 - **Reachable in every state**, including `resolvable: false` — the operator in exactly
@@ -1281,8 +1322,13 @@ hidden in exactly the zero-and-one state where a machine must first be added.
   without it, an operator with one machine never learns the picker exists, and the
   metric's denominator stays empty for reasons unrelated to the feature's value.
 - The composer's `resolvable: false` error links to `/machines`.
-- Shows the derived `allow_localhost` posture read-only with a "set in
-  `~/.seal/security.toml`" note, so a list missing `local` does not read as broken.
+- **WU-7c owns four copy surfaces that other units promise *to* it**, each with a
+  `data-testid` and a §8 assertion: the persistent `error` banner (a malformed
+  `execution.toml` — §7b says "WU-7c is that somewhere"), the empty-state *why*, the
+  `machines.length == 1` hint, and `POST`'s loopback `warning` (§7a constraint 4).
+  Without them those four promises have no deliverer, and two of them *are* the whole of
+  UC-5's delivery.
+- Shows the derived `allow_localhost` posture read-only with a "set in `security.toml`" note (**no directory** — §5 forbids hardcoding `~/.seal/` on `SEAL_HOME` installs), so a list missing `local` does not read as broken.
 - **Required fields marked**: `name`, `host`, `user`, `known_hosts`, `workspace` are
   required; `port` defaults to 22 and `identity` defaults to ssh-agent. §3.2 gains this
   axis — rev 8 had no required/optional column, so the form was unbuildable.
@@ -1299,9 +1345,15 @@ resolve the pin). **Value domain for both**: `"local" | <machine name> | null`, 
 defined `null` but left the live case implicit, so the badge condition had no total
 meaning.
 
+**`files_machine == null` means the explorer is `FeDisabled` — which is the *normal*
+state on a non-loopback bind — and the link must be inert in that case too.** Rev 10
+defined `null` but then applied only the `machine ≠ files_machine` rule, under which
+`null == null` leaves the link **active** against a disabled explorer, returning
+`403 file explorer disabled`. So: **the link is inert when `files_machine` is `null` or
+differs from `machine`.**
+
 **The badge alone is not the fix.** `OpenWorkdirLink` (`ChatArea.tsx:358`) builds
-`/files?path=<path>`, and the file explorer is a **single boot-time global**
-(`Serve.hs:677`) with no session input. Today remote mode and the explorer always
+`/files?path=<path>`, and the file explorer is a **single boot-time global** (built in `WU-5`'s boot wiring) with no session input. Today remote mode and the explorer always
 agree; with per-session pins a `builder` session gets
 `path = /srv/seal/workspace/workdirs/<sid>` while the explorer is local, so the link
 opens a nonexistent local path and the user sees "not found" for a directory that
@@ -1318,7 +1370,9 @@ Promoted from a §1.4 paragraph to a unit, because it was prose-only across thre
 revisions and is the last thing standing between a hardened build and local execution.
 
 Under `-DREMOTE_ONLY_UNTRUSTED`, `allowLocalhostFrom` returns `False`
-**unconditionally** — including when `security.toml` is absent, which is the case rev 6
+**unconditionally** — and it must **override the function**, not re-derive the default in
+a second place, or the codebase gains a second authority-decider (the exact shape WU-5
+is deleting) — including when `security.toml` is absent, which is the case rev 6
 missed. `mkLocalUntrustedIO` has no CPP guard (`UntrustedIO.hs:79` imports `Local`
 unconditionally), so this value *is* the guarantee.
 
@@ -1355,16 +1409,16 @@ TDD throughout. Properties worth QuickCheck, per unit:
 | Unit | Tests |
 |---|---|
 | WU-1 | `mkMachineName` accepts iff charset-valid **and** not reserved; empty / leading `.` / leading `-` / 64 vs 65 / control chars; `sshConfigFromMachine` total and field-preserving; `mkSshHost`/`mkSshUser` reject leading `-`; **`renderTargetError` total, all four renderings exact**, with paths supplied (not `~/.seal/` literals). `TargetUnknownMachine`'s rendering names the available set **and** the Machines screen; `TargetNoMachine` names all three remedies |
-| WU-1b (§6.3/6.4) | `-F /dev/null`, `ProxyCommand=none`, `ProxyJump=none` present in all four builders; two `SshConfig`s differing only in `identity` get **different** ControlPaths; the five updated `RemoteSpec` assertions (`:236,241` compare the path exactly; `:244,248,252` keep passing but become **vacuous** under a hashed path, which is why all five are updated) |
+| WU-1b (§6.3/6.4) | `-F /dev/null`, `ProxyCommand=none`, `ProxyJump=none` present in all four builders; two `SshConfig`s differing only in `identity` get **different** ControlPaths; the five updated `RemoteSpec` assertions (**the five line numbers are stated once, in §6.4** — do not restate them here) |
 | WU-3 | **seven rows** 0/1/1a/1b/2/3/4; row 3 ≡ today's behaviour for every `SecurityConfig`; **no inventory or pin can produce `WhereLocal` unless `allow_localhost`**; **row 1a: `default = "local"` + `allow_localhost = false` ⇒ `TargetLocalNotAllowed`**; row 4 returns `TargetNoMachine` when `allow_localhost = false` and nothing applies |
 | WU-2 | codec round-trip; each required field missing ⇒ `Left` naming it; `[machines.local]`/`[machines.default]` ⇒ `Left`; invalid name as key ⇒ `Left`; **`default` naming an absent machine ⇒ `Left`, and `default = "local"` + `allow_localhost = false` ⇒ `Left`**; port `0`/`65536`; duplicate **`host:port:user`** ⇒ `Left`; unknown key ⇒ warning not error; **`[untrusted_execution.remote]` without `mode` decodes**; `uefcMode = Nothing` ⇒ `allow_localhost` derived correctly; **writer: rejected write leaves the file byte-identical; concurrent writes serialise; write→load→resolve round-trip** |
 | WU-4 | `exec_machine` round-trips; absent ⇒ `Nothing`; malformed text ⇒ `Nothing` + a warning; **a valid pin naming an absent machine ⇒ `TargetUnknownMachine`**; all five inheritance sites copy the value; **a dead pin fails closed in the child, never falls back to `WhereLocal`**; `SESSION_MANAGE action=new` + `machine` key ⇒ default |
 | WU-5 | **two sessions on two machines in one cache get distinct execs** (the headline feature); a target change rebuilds; an unchanged target reuses; `invalidateExec` clears all targets for the sid; a legacy `mode=remote` install with no `execution.toml` produces byte-identical argv |
-| WU-6 | `--machine` parses; value-less `--machine` ⇒ error not silent; unknown machine ⇒ 400 whose body carries the available set; **no `session.json` minted on refusal**; web path sends an identical body when the picker is hidden |
+| WU-6 | `--machine` parses; value-less `--machine` ⇒ error not silent; unknown machine ⇒ 400 whose body carries the available set; **no `session.json` minted on refusal**; web path sends an identical body when the picker is hidden; **`createTab` returns `{ok:false,error}` on a 400 and `NewTabComposer` does not call `onSubmit`/`persistOnSubmit`** |
 | WU-7a | **`403` when `acsMode /= AccessPasskey`** (the `AccessOpen` fixture is the regression test — rev 8's "401 without a passkey session" could not pass there); `DELETE` of the effective default refused; `DELETE` of a pinned machine returns the pin count and requires `?force`; **`POST` replacing an existing machine's `host` refuses without `?force` and reports the pin count** (the rev-10 fix, previously untested); `POST` validates the **resulting** document (adding the second machine with no `default` is refused); the loopback `warning` field is present; a non-existent `identity`/`known_hosts` ⇒ field-specific `Left`. *The writer's three unit-level tests (byte-identical rejection, concurrency, round-trip) live in WU-2's row — they ship with the writer, not with this caller.* |
 | WU-7a (opcode ban) | **grep: zero `executionFilePath` under `src/Seal/ISA/`**; **`Seal.ISA.Registry`'s import closure excludes `updateExecutionConfig`**; no `MACHINE_*` opcode in the registry |
-| WU-7b | golden JSON incl. the full `MachineInfo` spec **with both `local` (ssh fields omitted) and `ssh` (fields present) rows**; sentinel option ⇒ an untouched picker omits `machine` from the body; **`machines-changed` triggers a refetch, so adding a machine updates the composer without a reload**; absent file + `allow_localhost = true` ⇒ `{default:"local", machines:[{name:"local",kind:"local"}]}`; absent file + `false` ⇒ `machines:[], resolvable:false`; **malformed file + `true` ⇒ `resolvable:true` with non-null `error`**; route count **84**; `≥2` render rule; untouched picker omits `machine` from the body; Start disabled on `resolvable:false` |
-| WU-7c | the section renders at `/machines` (and the `App.tsx` render branch is present, not the Sessions fallback); **add ⇒ the row appears; edit ⇒ the form pre-fills from the stored spec**; **the `?force` flow: 409 surfaces `pinned`/`unpinned`/`fallback` and "Do it anyway" retries with `?force`, for both delete and host-changing edit**; the "set as default" control lets the second machine be added; a `kind === "local"` row has no edit/delete/default controls; **the composer's `resolvable:false` error links to `/machines`**; reachable when `resolvable:false`; each field has a `data-testid`; a codec error renders in `machines-form-error`; delete confirm shows the pin count |
+| WU-7b | golden JSON incl. the full `MachineInfo` spec **with both `local` (ssh fields omitted) and `ssh` (fields present) rows**; sentinel option ⇒ an untouched picker omits `machine` from the body; **`machines-changed` triggers a refetch, so adding a machine updates the composer without a reload**; absent file + `allow_localhost = true` ⇒ `{default:"local", machines:[{name:"local",kind:"local",default:true}], resolvable:true, error:null}`; absent file + `false` ⇒ `machines:[], resolvable:false`; **malformed file + `true` ⇒ `resolvable:true` with non-null `error`**; route count **84**; `≥2` render rule; untouched picker omits `machine` from the body; Start disabled on `resolvable:false` |
+| WU-7c | **the end-to-end ramp on a default install**: no `execution.toml` → add one machine → the picker renders two options → a session mints on it; the section renders at `/machines` (and the `App.tsx` render branch is present, not the Sessions fallback); **add ⇒ the row appears; edit ⇒ the form pre-fills from the stored spec**; **the `?force` flow: the 409 force-confirm (`data-testid="machines-force-confirm"`) shows `pinned`/`unpinned`/`fallback` and "Do it anyway" retries with `?force`, for both delete and host-changing edit**; the "set as default" control lets the second machine be added; a `kind === "local"` row has no edit/delete/default controls; **the composer's `resolvable:false` error links to `/machines`**; reachable when `resolvable:false`; each field has a `data-testid`; a codec error renders in `machines-form-error`; delete confirm shows the pin count |
 | WU-8 | workdir response carries both machines; they differ ⇒ badge shown **and** the Files link is inert |
 | WU-6b | `--machine` from a chat channel reaches `handleSessionNew` and lands on the chosen machine; an unknown machine relays the available set via `ccSend`; a value-less `--machine` errors rather than defaulting |
 | WU-10 | `group = "../../.."` refused at both `skillPath`/`defPath` and the op level; `POST /api/skills` with a traversal group is refused |
@@ -1391,7 +1445,7 @@ fixture, and WU-5 changes it.
 
 | Signal | Target | Observed by | Verdict if missed |
 |---|---|---|---|
-| **Both machines are used**, and neither dominates | on installs where the picker rendered (`machines.length ≥ 2`), counting **only sessions with `smCreatedAt` after the WU-7c deploy** (pre-feature `session.json` files have no `exec_machine` key and would otherwise all count on the default side, diluting the rate to ~0 — the rev-5 denominator bug moved from the machine axis to the time axis): **both** names appear in the window, **and** the minority side is ≥ 20% of sessions, with ≥ 10 sessions total (else "insufficient data", not "pass"); owner: the operator; evaluated **2 weeks after first WU-7c deploy**, once extended to 4 weeks if data is insufficient | `grep exec_machine ~/.seal/state/sessions/*/session.json` (honour `SEAL_HOME`; `sessionsRoot = spState </> "sessions"`, `Paths.hs:233`), with `ecDefault` recorded at evaluation time. A session with **no** `exec_machine` key took the default: the picker carries a sentinel option whose value is omitted (§7b), so a *present* key means the user changed the select. Without that sentinel the select would render preselected and every web session would record a pin, biasing the rate toward whichever option was preselected and making the metric false on its own population | **Keep the inventory and resolver**; drop only the surfaces (WU-6/7b/7c/8). See below |
+| **Both machines are used**, and neither dominates | on installs where the picker rendered (`machines.length ≥ 2`), counting **only `channel == "web"` sessions with `smCreatedAt` after the WU-7c deploy** (pre-feature `session.json` files have no `exec_machine` key and would otherwise all count on the default side, diluting the rate to ~0 — the rev-5 denominator bug moved from the machine axis to the time axis): **both** names appear in the window, **and** the minority side is ≥ 20% of sessions, with ≥ 10 sessions total (else "insufficient data", not "pass"); owner: the operator; evaluated **2 weeks after first WU-7c deploy**, once extended to 4 weeks if data is insufficient | `grep exec_machine ~/.seal/state/sessions/*/session.json` (honour `SEAL_HOME`; `sessionsRoot = spState </> "sessions"`, `Paths.hs:233`), with `ecDefault` recorded at evaluation time. A session with **no** `exec_machine` key took the default: the picker carries a sentinel option whose value is omitted (§7b), so a *present* key means the user changed the select. Without that sentinel the select would render preselected and every web session would record a pin, biasing the rate toward whichever option was preselected and making the metric false on its own population | **Keep the inventory and resolver**; drop only the surfaces (WU-6/7b/7c/8). See below |
 | Two sessions on two machines, both executing | 1 observed | manual, at the demo | UC-1 unvalidated |
 | Sessions moved by adding a machine | 0 | integration test + the same grep before/after | A regression, not a feature |
 | Machine visible without a click | shown when it differs from the explorer's | WU-8 test | UC-3 unimplemented |
@@ -1401,6 +1455,16 @@ fixture, and WU-5 changes it.
 where the picker never rendered (`machines.length < 2`), where the rate is
 structurally 0% — so a single-machine install would drag the rate under the threshold
 and *delete the feature on a measurement artefact*.
+
+**The channel axis is the third denominator bug, and the pattern is now stated once:**
+only `NewTabComposer` renders a picker, so only `web` sessions can carry a
+sentinel-absent key. `cli`/`tg`/`bg` sessions *cannot* express a pick and would score on
+the default side, deflating the rate below the threshold and deleting the surfaces on an
+artefact — the same class as rev 5's machine axis and rev 6's time axis. CLI `--machine`
+pins are deliberate and countable separately if wanted. Note also that
+`sessions/*/session.json` does **not** match `sessions/<parent>/agents/<child>/session.json`,
+so the stated command and the stated inheritance bias describe different populations;
+the glob is the metric's population and child sessions are excluded by design.
 
 **One residual bias, stated:** branched and child sessions *inherit* the parent's pin, so
 a branch-heavy install can inflate the minority side with inheritance rather than

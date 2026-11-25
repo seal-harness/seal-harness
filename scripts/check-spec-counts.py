@@ -129,6 +129,27 @@ def check_numbered_rows(text: str, r: Report) -> None:
             else:
                 r.ok(f"resolution table rows ({len(labels)}) match '{stated[0]} rows'")
 
+    # Stated counts that are NOT bolded and NOT adjacent to an enumeration.
+    # This is the gap that let a known-open blocker pass a green run: line 52
+    # said "six resolution rows, not five" with no enumeration nearby.
+    if labels:
+        actual = len(labels)
+        for m in re.finditer(
+            r"\b(one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+            r"(?:resolution\s+)?rows?\b(?!\s*0/)",
+            text,
+            re.I,
+        ):
+            stated = NUMBER_WORDS[m.group(1).lower()]
+            # skip "N rows" that is really "N rows of the table above" prose
+            # only if it matches the real count
+            if stated != actual:
+                near = text[max(0, m.start() - 90): m.start()].replace("\n", " ")
+                r.bad(
+                    f"'{m.group(0)}' disagrees with the {actual} labelled "
+                    f"resolution rows (context: ...{near[-70:]})"
+                )
+
 
 def check_word_counts(text: str, r: Report, phrase: str, pattern: str) -> None:
     """Every 'N <phrase>' claim must agree with the actual count of `pattern`."""
@@ -231,6 +252,62 @@ def check_double_owned(text: str, r: Report) -> None:
     r.ok("no identical long sentence is claimed by two units")
 
 
+def check_cite_set_agreement(text: str, r: Report) -> None:
+    """The same file cited twice with equal-size but different line sets."""
+    from collections import defaultdict
+    cites: dict[str, set[frozenset[str]]] = defaultdict(set)
+    for m in re.finditer(
+        r"([A-Za-z0-9_/]+\.(?:hs|ts|tsx))((?::\d+)(?:,\d+)*(?:\s+and\s+:?\d+)*)", text
+    ):
+        fname = m.group(1).rsplit("/", 1)[-1]
+        nums = frozenset(re.findall(r"\d+", m.group(2)))
+        if len(nums) >= 2:
+            cites[fname].add(nums)
+    bad = [f for f, sets in cites.items() if len(sets) > 1]
+    if bad:
+        for f in bad:
+            sets = sorted((sorted(s) for s in cites[f]))
+            r.bad(f"{f} is cited with different line sets: {sets}")
+    else:
+        r.ok(f"no file is cited with conflicting line sets ({len(cites)} files cited by line)")
+
+
+def check_signature_types_owned(text: str, r: Report) -> None:
+    """A type appearing in a §5 signature should be mentioned by some work unit."""
+    sig_types = set(re.findall(r"::[^\n]*?->\s*([A-Z][A-Za-z]*)", text))
+    sig_types |= set(re.findall(r"::\s*([A-Z][A-Za-z]*)\s*->", text))
+    builtin = {
+        "Maybe", "Either", "IO", "Text", "Int", "Bool", "Map", "Set", "Seq",
+        "NonEmpty", "Value", "App", "IO", "FilePath", "String",
+    }
+    unit_section = text[text.find("## 7. Work units"):] if "## 7. Work units" in text else ""
+    unowned = sorted(
+        t for t in sig_types - builtin
+        if t not in unit_section
+    )
+    if unowned:
+        r.bad(f"types used in a signature but named by no work unit: {unowned}")
+    else:
+        r.ok(f"every signature type is named by a work unit ({len(sig_types - builtin)} checked)")
+
+
+def check_file_line_double_ownership(text: str, r: Report) -> None:
+    """An imperative file:line under two different units."""
+    from collections import defaultdict
+    sections = re.split(r"^### (WU-[0-9]+[a-z]?)\b", text, flags=re.M)
+    owners: dict[str, set[str]] = defaultdict(set)
+    for i in range(1, len(sections), 2):
+        unit, body = sections[i], sections[i + 1]
+        for m in re.finditer(r"([A-Za-z0-9_]+\.(?:hs|ts|tsx)):(\d+)", body):
+            owners[f"{m.group(1)}:{m.group(2)}"].add(unit)
+    shared = {k: v for k, v in owners.items() if len(v) > 1}
+    if shared:
+        for k, v in sorted(shared.items()):
+            r.bad(f"{k} is owned by more than one unit: {sorted(v)}")
+    else:
+        r.ok(f"no file:line is owned by two units ({len(owners)} citations checked)")
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print(__doc__)
@@ -252,6 +329,9 @@ def main() -> int:
     check_section_refs(text, r)
     check_stated_scripts_exist(text, r, repo_root)
     check_double_owned(text, r)
+    check_cite_set_agreement(text, r)
+    check_signature_types_owned(text, r)
+    check_file_line_double_ownership(text, r)
     return r.finish()
 
 
