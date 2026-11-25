@@ -21,7 +21,8 @@ module Seal.Gateway.Transcript
   , firstUserMessageSnippet
   , lastUserMessageAt
   , firstUserMessageSnippetFast
-  , lastUserMessageAtFast
+  , sessionEntryFactsFast
+  , SessionEntryFacts (..)
   , showIso
   , reconEntryToFrontend
   , teLineToFrontend
@@ -55,6 +56,7 @@ import Seal.Config.Paths
   , sessionEntriesPath, sessionTranscriptPath)
 import Seal.Core.Types (SessionId)
 import Seal.Providers.Class (ContentBlock (..), Message (..), Role (..))
+import Seal.Providers.Class (Usage (..))
 import Seal.Transcript.ConvIndex
   (convLineCount, ensureIndex, readConvLinesRaw)
 import Seal.Transcript.Entries (EntryRecord (..), EntryKind (..))
@@ -1022,21 +1024,59 @@ firstUserMessageSnippetFast paths sid = do
             _ -> Nothing
         _ -> Nothing
 
--- | Fast variant of 'lastUserMessageAt': reads only 'entries.jsonl' (avg
--- ~128KB, vs 2.7MB for conversation.jsonl) and finds the last
--- 'EKRequest' entry's timestamp. Returns 'Nothing' when 'entries.jsonl'
--- doesn't exist (the frontend falls back to @smLastActive@ for sorting).
--- This avoids the full 'readTranscriptEntries' call which reads BOTH
--- files, parses everything, and reconstructs entries.
-lastUserMessageAtFast :: SealPaths -> SessionId -> IO (Maybe Text)
-lastUserMessageAtFast paths sid = do
+-- | The per-session facts derived from @entries.jsonl@ in ONE parse. Kept as
+-- one type so adding a fact never costs another read of the file (see
+-- 'sessionEntryFactsFast').
+data SessionEntryFacts = SessionEntryFacts
+  { sefLastUserMessageAt :: Maybe Text
+    -- ^ Timestamp of the last 'EKRequest' (sidebar sort order).
+  , sefTokensUsed        :: Maybe Int
+    -- ^ Context occupancy of the most recent completed response:
+    -- @input + output@ of the last 'EKResponse' that reported non-zero usage.
+    -- 'Nothing' when no response ever reported usage.
+  } deriving stock (Eq, Show)
+
+-- | Read the session's @entries.jsonl@ ONCE and derive both per-session facts.
+--
+-- This file is payload-free by design (avg ~128KB, vs 2.7MB for
+-- @conversation.jsonl@) and its 'EntryRecord.erUsage' carries the provider's
+-- reported token counts for each response. Deriving the token count here — from
+-- the whole session rather than from whatever chunk window a client happens to
+-- have loaded — is what makes the status-bar count independent of scrolling.
+--
+-- 'Nothing' fields when @entries.jsonl@ is absent (a brand-new session, or a
+-- legacy @transcript.jsonl@-only one).
+sessionEntryFactsFast :: SealPaths -> SessionId -> IO SessionEntryFacts
+sessionEntryFactsFast paths sid = do
   let entriesPath = sessionEntriesPath paths sid
   entriesExist <- doesFileExist entriesPath
   if not entriesExist
-    then pure Nothing
+    then pure (SessionEntryFacts Nothing Nothing)
     else do
       raw <- readFileTextStrict entriesPath
-      pure (lastRequestTs (parseEntryRecordsLazy raw))
+      let es = parseEntryRecordsLazy raw
+      pure SessionEntryFacts
+        { sefLastUserMessageAt = lastRequestTs es
+        , sefTokensUsed        = lastNonZeroUsageTokens es
+        }
+
+-- | Walk the entry list and return @input + output@ for the most recent
+-- 'EKResponse' whose usage was non-zero.
+--
+-- Zero usage is NOT a measurement: the local Ollama path emits @Usage 0 0@ when
+-- a stream ends without a usage frame ('Seal.Providers.Ollama'), so a zero must
+-- fall through to the previous real measurement rather than reporting that the
+-- session's context is empty.
+lastNonZeroUsageTokens :: [EntryRecord] -> Maybe Int
+lastNonZeroUsageTokens = go Nothing
+  where
+    go acc [] = acc
+    go acc (e : es) = case erKind e of
+      EKResponse -> case erUsage e of
+        Just (Usage uIn uOut)
+          | uIn + uOut > 0 -> go (Just (uIn + uOut)) es
+        _ -> go acc es
+      _ -> go acc es
 
 -- ── internals ──────────────────────────────────────────────────────────
 
