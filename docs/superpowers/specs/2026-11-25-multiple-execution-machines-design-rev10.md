@@ -1055,25 +1055,32 @@ copying it here would make every post-deploy session carry a *present* key, and 
 present key means a deliberate choice" would be false on exactly the population the
 metric uses. This is the same encoder-vs-test agreement WU-7b pins for `MachineInfo`.
 
-**The sweep is unavoidable — rev 6 was wrong about this.** Haskell has no
-record-field defaults, and `-Wmissing-fields` is part of `-Wall`
-(`seal-harness.cabal:33`, with `-Werror`), so **every** named-field `SessionMeta`
-literal becomes a compile error the moment the field is added. Measured by
-`scripts/count-sessionmeta-sites.py`: **77 sites across 25 files — 73 test / 4 src**.
-(The four src sites: `Delegation/Worker.hs` ×2, `Core/TurnEngine.hs` ×1,
-`Session/Store.hs` ×1.) The script excludes `src/Seal/Session/Meta.hs`, which holds the
-`ToJSON`/`FromJSON` pair and is hand-written in this unit. Earlier revisions said "75
-sites" — wrong, because 73 + 4 = 77; the total and the split disagreed and nobody added
-them up. There is no arity change to `newSession`/`newSessionMeta`, but that saves
-nothing — the literals are the cost, not the function signatures.
+**The sweep is two different problems, and earlier revisions conflated them.** Adding a
+field to `SessionMeta` breaks construction sites in **two distinct ways**, needing two
+distinct fixes:
 
-Mitigation, named so this unit is writable: add
-`defaultSessionMeta :: SessionId -> UTCTime -> SessionMeta` in `Seal.Session.Meta`, so
-each of the 77 sites becomes one record-update line
-(`defaultSessionMeta sid now { smProvider = … }`) instead of re-listing 14 fields. That
-is the same helper rev 3c's D15 asked for, and it makes the sweep mechanical rather
-than error-prone. A `setExecMachine :: MachineName -> SessionMeta -> SessionMeta`
-helper keeps the field out of opcode-reachable construction.
+| Shape | Count | Breaks via | Fix |
+|---|---|---|---|
+| record literal `SessionMeta { … }` | **27** | `-Wmissing-fields` (in `-Wall`, `seal-harness.cabal:33`, `-Werror`) | one record-update line off a base value |
+| positional application `SessionMeta sid "ollama" …` (13 args) | **50** | **arity** — which `-Wmissing-fields` does **not** report | must be **rewritten**, one argument inserted per site |
+
+Measured by `scripts/count-sessionmeta-sites.py`: **77 sites in 25 files**, 27 record /
+50 positional, 73 test / 4 src. The four src sites are `Delegation/Worker.hs` ×2,
+`Core/TurnEngine.hs` ×1, `Session/Store.hs` ×1. The script excludes
+`src/Seal/Session/Meta.hs`, which holds the `ToJSON`/`FromJSON` pair and is hand-written
+here.
+
+Rev 9 said "75 sites" (73 + 4 = 77 — the total and the split disagreed). Rev 10 said all
+77 were named-field literals, which would have left ~50 compile errors after the
+"mechanical" pass and a plan asserting coverage it did not have.
+
+Mitigation for the 27: add `defaultSessionMeta :: SessionId -> UTCTime -> SessionMeta` in
+`Seal.Session.Meta`, so each becomes `defaultSessionMeta sid now { smProvider = … }`
+instead of re-listing 14 fields (the helper rev 3c's D15 asked for). **The 50 positional
+sites get no such help** — each needs its missing argument in the right position, which
+is why the plan enumerates them per file rather than treating WU-4 as a find-and-replace.
+A `setExecMachine :: MachineName -> SessionMeta -> SessionMeta` helper keeps the field out
+of opcode-reachable construction.
 
 Inheritance copies the parent's **value**, and a dead value fails closed (§5):
 `writeChildMeta` (`Worker.hs:404`), `writeHandoffMeta` (`:518`), `fallbackMeta`
