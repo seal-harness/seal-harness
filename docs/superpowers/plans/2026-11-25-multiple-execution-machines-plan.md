@@ -634,7 +634,14 @@ on.**
 - `src/Seal/Gateway/OpenApi.hs` (`openApiMeta`)
 - `src/Seal/Gateway/AccessControl.hs` (`decide` — the method+path predicate)
 - `src/Seal/Gateway/API.hs` (two handlers, `broadcastMachinesChanged` calls)
-- `src/Seal/Gateway/StreamBroker.hs` (`BeMachinesChanged` constructor)
+- **`src-gateway-types/Seal/Gateway/Types/Stream.hs:38`** — `data BrokerEvent` lives
+  **here**, not in `StreamBroker.hs`. Add the `BeMachinesChanged` constructor here.
+- **`src/Seal/Gateway/StreamBroker.hs`** — **two further closed cases over `BrokerEvent`
+  with no catch-all**, both of which break under `-Werror` and one of which decides
+  behaviour: `shouldSend` (`:261-272`, the send filter — an omission here means the frame
+  is silently never sent) and `eventSession` (`:281-294`). Plus
+  `broadcastMachinesChanged = broadcast broker BeMachinesChanged`, mirroring
+  `broadcastReposChanged` (`:310`).
 - **`src/Seal/Gateway/Stream.hs`** — `sendEvent` at `:191-231` is a **closed, exhaustive
   case over every `BrokerEvent` constructor with no catch-all**. Adding
   `BeMachinesChanged` makes it fail `-Wincomplete-patterns` under `-Werror`. A new
@@ -702,8 +709,12 @@ call:
 A refusal that reports a count is auditable; a silent one is not.
 
 **`broadcastMachinesChanged` after each successful POST and DELETE** — WU-7b adds the
-frame, but the emitter calls are here. Otherwise a test injects the frame and passes while
-the real route never broadcasts.
+frame, but the emitter calls are here. **And they must be tested here**: the hazard is that
+a test which *injects* the frame passes while the real route never broadcasts, so the
+assertion has to be that a successful `POST` and a successful `DELETE` each put a
+`BeMachinesChanged` on the broker. Deleting both emitter calls must turn a test red —
+otherwise the headline flow ("add the first machine, open a New Tab") silently never
+invalidates the picker while every planned test stays green.
 
 ### Tests
 - **`403` when `acsMode /= AccessPasskey`** — the `AccessOpen` fixture is the regression
@@ -715,6 +726,8 @@ the real route never broadcasts.
   without `?force`**; `POST` validates the resulting document (second machine without
   `default` refused); the loopback `warning` is present; a nonexistent key path ⇒
   field-specific `Left`; `DELETE /local` ⇒ `400`.
+- **The emitters fire**: a successful `POST` and a successful `DELETE` each broadcast
+  `BeMachinesChanged` (assert on the broker, not on an injected frame); a 4xx does not.
 - **Opcode ban:** zero `executionFilePath` under `src/Seal/ISA/`; `Seal.ISA.Registry`'s
   import closure excludes `updateExecutionConfig`; no `MACHINE_*` opcode.
 
@@ -733,6 +746,10 @@ lands, the feature still has a defensible posture.
 - `src-gateway-types/…/Route.hs`, `OpenApi.hs` (third route)
 - `test/Seal/Gateway/ApiRouteSpec.hs` (`83 → 84`), `ApiSpec.hs`
 - `frontend/src/hooks/useApi.ts` (`useMachines`, `machines-changed`)
+- **`frontend/src/types/stream.ts`** — the `ServerEvent` union (`:189-205`) is closed and
+  `StreamClient` (`:256-259`) ends at `onReposChanged`. Under `strict: true`,
+  `streamClient.ts`'s `switch (event.type)` will not compile a `machines-changed` case
+  without the union member, and `useMachines` needs the interface member.
 - `frontend/src/lib/streamClient.ts` (the frame)
 - `frontend/src/hooks/useNewTabSpec.ts` (`buildBody` omission rule, sentinel)
 - `frontend/src/components/NewTabComposer.tsx` (the `<select>`)
@@ -881,8 +898,11 @@ nonexistent local path, and the `null` (`FeDisabled`) case is equally inert.
 
 ### Files
 - `src/Seal/Config/Security.hs` (`allowLocalhostFrom` CPP branch)
-- `test/Seal/Config/SecuritySpec.hs` (CPP-guarded spec — **no** second cabal test-suite)
-- `seal-harness.cabal` — only if the guard needs a flag to be visible to the spec
+- `seal-harness.cabal` (`cpp-options` on the `tests` stanza, plus the `LocalSpec`
+  exclusion — see below)
+- `test/Seal/Tools/Exec/LocalSpec.hs` (guard the import) and the `tests` stanza's
+  `other-modules` entry for it
+- `test/Seal/Config/SecuritySpec.hs`
 
 ### Deliverables
 Under `-DREMOTE_ONLY_UNTRUSTED`, `allowLocalhostFrom` returns `False` **unconditionally**,
@@ -893,38 +913,75 @@ unconditionally), so this value *is* the runtime guarantee.
 It must **override the function**, not re-derive the default in a second place — a second
 authority-decider is exactly the shape WU-5 just deleted.
 
-### The variant cannot be built — read this before planning the test
+### Why the obvious test does not work (verified by experiment, not inferred)
 
-**Measured, not inferred.** Under `-f remote-only-untrusted` the flag removes
-`Seal.Tools.Exec.Local` from `exposed-modules` (`seal-harness.cabal:338-341`), while
-`test/Seal/Tools/Exec/LocalSpec.hs:16` unconditionally imports it and
-`Seal.Tools.Exec.LocalSpec` is listed unconditionally in the single `tests` stanza
-(`:647`). `cabal build test:tests -f remote-only-untrusted` fails with `Could not find
-module 'Seal.Tools.Exec.Local'` — this repo's own planning history records it twice.
+**CPP is processed per-file.** A `#define` in a spec module does **not** affect how the
+library module was compiled. Demonstrated:
 
-**The obvious fallback also fails.** `test-suite tests` declares no `cpp-options` (it
-inherits only `settings`), so a `#if defined(REMOTE_ONLY_UNTRUSTED)` inside the spec never
-fires in a normal build; and adding `cpp-options` to that stanza reproduces the `LocalSpec`
-failure.
+```haskell
+-- Lib.hs        {-# LANGUAGE CPP #-}   ... #ifdef MY_FLAG ... f = True #else f = False #endif
+-- Spec.hs       {-# LANGUAGE CPP #-}   #define MY_FLAG 1   import Lib (f)
+-- ghc -o t Spec.hs Lib.hs && ./t   →   False
+```
 
-**So the honest scope is: the hardened build cannot be tested in this PR.** Do this
-instead, and say so in the PR body:
+So "a local `#define` under `{-# LANGUAGE CPP #-}`" **cannot** exercise
+`allowLocalhostFrom`'s guarded branch, and neither can a `#if` inside the existing spec:
+adding `cpp-options` to the `tests` stanza would define the macro for *every* module in the
+suite, which then fails to build because `test/Seal/Tools/Exec/LocalSpec.hs:16` imports
+`Seal.Tools.Exec.Local` unconditionally while the flag removes it from `exposed-modules`
+(`seal-harness.cabal:338-341`).
 
-- Verify the *function*: a spec that makes the macro visible to itself (a local
-  `#define` under `{-# LANGUAGE CPP #-}`) asserts `allowLocalhostFrom Nothing == False`
-  under the flag and that an explicit `allow_localhost = true` in the file is overridden.
-- Do **not** claim anywhere that "the hardened build is tested" or that "the artifact is
-  verified". Issue #347 owns the artifact property, and its current state is that the flag
-  does not keep `Local` out of the binary either.
-- If you want the real thing, it is a separate PR: exclude `LocalSpec` from
-  `other-modules` under the flag, add the second variant, and take it to #347.
+### So: make the variant buildable
+
+There is exactly one correct mechanism, and it is a small cabal change, not a test trick.
+Under the flag, `Seal.Tools.Exec.LocalSpec` must be **excluded from the `tests` stanza's
+`other-modules`** (`seal-harness.cabal:647`) instead of importing a module that is not
+exposed, and `cpp-options: -DREMOTE_ONLY_UNTRUSTED` added to the stanza. Then:
+
+- a second `cabal test -f remote-only-untrusted` run is a real, buildable variant;
+- `SecuritySpec` can assert `allowLocalhostFrom Nothing == False` and that an explicit
+  `allow_localhost = true` in the file is overridden — genuinely under the macro;
+- `LocalSpec` simply does not exist in that build, which is correct: the module it tests
+  does not exist either.
+
+**If the cabal change is judged too invasive for a same-tree variant**, the honest fallback
+is to move the coercion into a *pure, macro-free* function that the CPP branch merely
+selects:
+
+```haskell
+-- macro-free, always compiles, always testable:
+allowLocalhostFromWith :: Bool -> Maybe UntrustedExecFileConfig -> Bool
+allowLocalhostFrom =                     -- the only CPP in the module
+#ifdef REMOTE_ONLY_UNTRUSTED
+  allowLocalhostFromWith False
+#else
+  allowLocalhostFromWith True
+#endif
+```
+
+Then `allowLocalhostFromWith False …` is testable in the **normal** build with no variant
+at all, and the CPP line is one line that either selects `True` or `False`. This is the
+approach to take: it gives real coverage, costs no cabal change, and the untested residue
+is a single constant. **Prefer this.** The cabal variant is the belt-and-braces option, not
+the requirement.
+
+### Not in scope
+The hardened *artifact* property — that `-f remote-only-untrusted` keeps `Local` out of the
+binary at all — belongs to issue #347 and its current state is that it does not. Do **not**
+claim in the PR body that "the hardened build is verified". Claim this: the coercion is a
+one-line constant, and `allowLocalhostFromWith` is unit-tested for both values.
+
+### Tests
+`allowLocalhostFromWith False _ == False` regardless of the file's contents, including
+`Nothing`; `allowLocalhostFromWith True Nothing == True`; `allowLocalhostFromWith True
+(Just [untrusted_execution] allow_localhost=false) == False`; `mode = "remote"` derives
+`False`, `mode = "local"` derives `True`, an explicit `allow_localhost` wins over both.
 
 ### Done when
-`make check` green; the accessor's function-level test passes under the macro; and the PR
-body states plainly that the hardened *artifact* is #347's, not this PR's.
+`make check` green; both values of the macro-free function are unit-tested in the normal
+build; and the PR body makes the #347 boundary explicit rather than implying more.
 
 ---
-
 
 ## WU-11 — docs: the two templates and the CHANGELOG
 
@@ -944,6 +1001,11 @@ because a setting nobody documents is a setting nobody uses).
 - **`test/Seal/Config/TemplatesSpec.hs:237`** — asserts
   `created \`shouldBe\` [configFilePath paths, securityFilePath paths]`; it becomes a
   three-element list.
+- `README.md` — **the repo declares it the spec** (`AGENTS.md:280`,
+  `CONTRIBUTING.md:8-9`), it says *"The first run writes two documented files"*
+  (`README.md:289`) which becomes three, and `README.md:298-300` describes `security.toml`
+  as holding *"where untrusted code runs"* — a description WU-2/WU-9 split. No test pins
+  the README, so this drift ships silently unless a unit owns it.
 - `CHANGELOG.md`
 
 ### Deliverables
