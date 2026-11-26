@@ -33,6 +33,31 @@ If no — it is design detail or someone else's bug. It does not go here.
 
 ---
 
+## When this applies: complex tasks only
+
+**Run requirements capture for tasks assessed as Complex. Skip it for Simple.**
+
+| Assessment (from `start-task`) | Requirements phase? |
+| --- | --- |
+| Complex — new feature, multi-file, new surface, behaviour changes | **Yes** |
+| Simple — bug fix, single-file change, copy edit, config tweak | No |
+
+The gate is the complexity assessment, not your optimism about the task. A
+feature that "feels simple" but introduces a new user-facing command is Complex
+by the assessment; a genuinely one-line fix is not, and writing a requirements
+doc for it is the *same* over-process this phase exists to prevent, just aimed
+the other way.
+
+**If the assessment is genuinely ambiguous, ask the operator** — one line: what
+you would build and whether they want the requirements step. Do not default to
+Complex "to be safe"; that is how a one-line fix acquires a review gate.
+
+Simple tasks still get a brief statement of intent — the existing `start-task`
+flow already asks for one. They just do not get a frozen document and a human
+approval gate.
+
+---
+
 ## Two rules
 
 ### 1. Completely user-facing

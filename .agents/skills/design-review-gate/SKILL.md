@@ -39,6 +39,13 @@ say so.
 `requirements-capture`). Reviewing a design with no baseline is the defect this
 section exists to prevent.
 
+**This applies to Complex tasks.** A Simple task does not run this gate at all,
+so it needs no baseline: bug fixes, single-file changes and copy edits go
+through the normal PR flow. The complexity assessment from `start-task` decides
+which path applies — and the gate only ever sees work that already qualified as
+Complex, so a missing requirements doc here is a real omission, not a
+Simple-task byproduct.
+
 ### Give reviewers the requirements as FIXED PREMISES
 
 Every reviewer prompt MUST include the requirements document and this

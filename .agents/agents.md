@@ -59,17 +59,23 @@ orchestration pipeline is followed regardless of which skill initiated the work.
 
 **The pipeline, in order:**
 ```
-requirements capture -> HUMAN APPROVES (the only doc they read) -> freeze
-  -> brainstorm? -> design -> Design Review Gate -> plan -> Plan Review Gate
-  -> execution -> self-reflect -> PR
+[complex tasks only] requirements capture -> HUMAN APPROVES (the only doc
+  they read) -> freeze -> brainstorm? -> design -> Design Review Gate
+  -> plan -> Plan Review Gate -> execution -> self-reflect -> PR
 ```
 
-- **Before design**: WRITE the requirements document
+- **Complex tasks only — before design**: WRITE the requirements document
   (`docs/superpowers/requirements/<date>-<slug>-requirements.md`) —
   user-facing behaviour only, no implementation detail. Present flagged issues
   CONCISELY (one line each, every one with a default) and get human approval,
   or record an explicit auto-approval and list the defaults taken in the PR.
   Then FREEZE it. Load `requirements-capture`.
+
+  Skip it for Simple tasks (bug fixes, single-file changes, copy edits, config
+  tweaks). A requirements doc for a one-line fix is the same over-process this
+  phase exists to prevent, pointed the other way. Use the `start-task`
+  complexity assessment as the gate; if the assessment is genuinely ambiguous,
+  ask the operator rather than defaulting to Complex.
 - **Scope is frozen after approval**: A reviewer finding may NEVER add scope on
   its own authority. Triage every finding into exactly one bucket — IN SCOPE
   (fix the design), CONSTRAINT CORRECTION (fix the prompt), PRE-EXISTING (file
