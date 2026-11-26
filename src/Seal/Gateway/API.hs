@@ -1503,9 +1503,20 @@ handleSessionNew deps v = do
         Just t  -> eitherToMaybe (mkAgentDefId t)
         Nothing -> mDefAgent
       channel = if lookupBodyBool "headless" then "bg" else fromMaybe "web" (lookupBodyStr "channel")
-  meta <- newSession paths provider model channel mAgent
-  triggerBroadcast deps
-  pure (jsonOk (object [ "session_id" .= sessionIdText (smId meta) ]))
+      mMachine = parseMachineField v
+  -- Validate BEFORE minting: a refused pin must not leave a session.json.
+  available <- availableMachines paths
+  case validateAgainst' available mMachine of
+    Left err -> pure (errJson status400 (renderNewMachineError err))
+    Right pin -> do
+      meta0 <- newSession paths provider model channel mAgent
+      -- `newSession` already persisted; a pin must be written as part of that
+      -- same file, so re-save with the machine set rather than leave a
+      -- session unpinned on disk and pinned in memory.
+      let meta = maybe meta0 (`setExecMachine` meta0) pin
+      when (isJust mMachine) (saveSessionMeta paths meta)
+      triggerBroadcast deps
+      pure (jsonOk (object [ "session_id" .= sessionIdText (smId meta) ]))
   where
     objOf (A.Object o) = Just o
     objOf _            = Nothing
@@ -1560,22 +1571,41 @@ handleSessionRebindNew deps sidTxt body =
               let provider = fromMaybe (smProvider oldMeta) (bodyStr "provider" body)
                   model    = fromMaybe (smModel oldMeta) (bodyStr "model" body)
                   channel  = fromMaybe "web" (bodyStr "channel" body)
-              meta <- newSession paths provider model channel mDefAgent
-              let newSid = smId meta
-                  newSidTxt = sessionIdText newSid
-              snap <- snapshotTabs (adTabsHandle deps)
-              case [ t | t <- tlTabs snap, tRef t == BoundSession oldSid ] of
-                []       -> do
-                  triggerBroadcast deps
-                  pure (jsonOk (rebindNewResponse
-                    newSidTxt Nothing False Nothing provider model))
-                (tab : _) -> do
-                  let idx = tabIndexToInt (tIndex tab)
-                  r <- rebindTabH (adTabsHandle deps) (tIndex tab) (BoundSession newSid)
-                  triggerBroadcast deps
-                  pure (jsonOk $ case r of
-                    Left e   -> rebindNewResponse newSidTxt (Just idx) False (Just e) provider model
-                    Right () -> rebindNewResponse newSidTxt (Just idx) True Nothing provider model)
+                  mMachine = parseMachineField body
+              available <- availableMachines paths
+              case validateAgainst' available mMachine of
+                Left err -> pure (errJson status400 (renderNewMachineError err))
+                Right pin -> do
+                  meta0 <- newSession paths provider model channel mDefAgent
+                  -- An explicit pin wins; otherwise the rebind INHERITS the
+                  -- old session's, exactly as a branch does. A dead inherited
+                  -- value then fails closed in the child rather than falling
+                  -- back to the effective default.
+                  let inherited = if isNothing mMachine then smExecMachine oldMeta else Nothing
+                      meta = case (pin, inherited) of
+                        (Just n, _)       -> setExecMachine n meta0
+                        (Nothing, Just n) -> setExecMachine n meta0
+                        (Nothing, Nothing) -> meta0
+                      newSid = smId meta
+                      newSidTxt = sessionIdText newSid
+                  -- `newSession` already wrote session.json; re-save so the
+                  -- pin lands in that same file rather than leaving the disk
+                  -- copy unpinned while memory says otherwise.
+                  when (isJust pin || isJust inherited)
+                       (saveSessionMeta paths meta)
+                  snap <- snapshotTabs (adTabsHandle deps)
+                  case [ t | t <- tlTabs snap, tRef t == BoundSession oldSid ] of
+                    []       -> do
+                      triggerBroadcast deps
+                      pure (jsonOk (rebindNewResponse
+                        newSidTxt Nothing False Nothing provider model))
+                    (tab : _) -> do
+                      let idx = tabIndexToInt (tIndex tab)
+                      r <- rebindTabH (adTabsHandle deps) (tIndex tab) (BoundSession newSid)
+                      triggerBroadcast deps
+                      pure (jsonOk $ case r of
+                        Left e   -> rebindNewResponse newSidTxt (Just idx) False (Just e) provider model
+                        Right () -> rebindNewResponse newSidTxt (Just idx) True Nothing provider model)
 
 -- | The response body of @POST \/api\/sessions\/:id\/new@. Pure, so the
 -- rebind-failure branch (reachable only via an out-of-range race or a

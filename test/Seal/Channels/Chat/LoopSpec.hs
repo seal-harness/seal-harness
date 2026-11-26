@@ -11,6 +11,8 @@ import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO, T
 import Data.IORef
 import Data.Aeson ((.=))
 import Data.Aeson qualified as A
+import Data.Aeson.Key qualified as Key
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
@@ -481,6 +483,35 @@ spec = do
       handleInboundWithSource cfg chan sessions wsConns pendingAsks bg tabTracker
         watchState thinkingTabs key (Just src) "hello"
       readIORef recorded `shouldReturn` Just src
+    it "relays  --machine builder  through to the mint body (WU-6b)" $ do
+      -- The bug this closes: /new --machine parsed the flag and then dropped
+      -- it, so a chat user's pin silently became the default machine.
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      let cfg = stubCfg mgr seams
+          src = mkSourceFor "sig:+15551234567"
+          key = convKeyFromSource src
+      handleInboundWithSource cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs key (Just src) "/new --machine builder"
+      mints <- getMints seams
+      -- The mint body carries the machine (and the channel label); whether
+      -- the gateway accepts it is the API's test, not this one's.
+      -- Assert on the MACHINE only: the channel label belongs to whichever
+      -- channel ran the test, and pinning it here would make this test about
+      -- the mock rather than about --machine reaching the wire.
+      mints `shouldSatisfy` any (\case
+        A.Object o -> KeyMap.lookup (Key.fromText "machine") o
+                        == Just (A.String "builder")
+        _          -> False)
+
     it "mints a new session on the inbound channel" $ do
       chan <- mkMockChan
       mgr <- newManager defaultManagerSettings

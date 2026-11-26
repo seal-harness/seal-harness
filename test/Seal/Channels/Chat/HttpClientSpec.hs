@@ -127,28 +127,38 @@ spec = do
   -- ── /new wire shapes (WU-7) ────────────────────────────────────────────
   describe "rebindBody" $ do
     it "sends every present override and omits absent ones (never null)" $
-      rebindBody (Just "anthropic") (Just "claude") (Just "telegram")
+      rebindBody (Just "anthropic") (Just "claude") (Just "telegram") Nothing
         `shouldBe` A.object
           [ "provider" .= ("anthropic" :: Text)
           , "model" .= ("claude" :: Text)
           , "channel" .= ("telegram" :: Text) ]
-    it "omits all three keys when there are no overrides" $
-      rebindBody Nothing Nothing Nothing `shouldBe` A.object []
+    it "omits all four keys when there are no overrides" $
+      rebindBody Nothing Nothing Nothing Nothing `shouldBe` A.object []
+    it "carries the machine when one was requested (WU-6b)" $
+      rebindBody Nothing Nothing (Just "telegram") (Just "builder")
+        `shouldBe` A.object
+          [ "channel" .= ("telegram" :: Text)
+          , "machine" .= ("builder" :: Text) ]
 
   describe "mintBody" $ do
     it "carries provider/model/channel" $
-      mintBody (Just "anthropic") (Just "claude") (Just "telegram")
+      mintBody (Just "anthropic") (Just "claude") (Just "telegram") Nothing
         `shouldBe` A.object
           [ "provider" .= ("anthropic" :: Text)
           , "model" .= ("claude" :: Text)
           , "channel" .= ("telegram" :: Text) ]
     it "omits the channel when not provided" $
-      mintBody (Just "anthropic") (Just "claude") Nothing
+      mintBody (Just "anthropic") (Just "claude") Nothing Nothing
         `shouldBe` A.object
           [ "provider" .= ("anthropic" :: Text)
           , "model" .= ("claude" :: Text) ]
     it "is the empty object without overrides" $
-      mintBody Nothing Nothing Nothing `shouldBe` A.object []
+      mintBody Nothing Nothing Nothing Nothing `shouldBe` A.object []
+    it "carries the machine when one was requested (WU-6b)" $
+      mintBody Nothing Nothing (Just "tg") (Just "builder")
+        `shouldBe` A.object
+          [ "channel" .= ("tg" :: Text)
+          , "machine" .= ("builder" :: Text) ]
 
   describe "setupRepoBody" $ do
     it "is {url} with no branch — the body chat sent before -b existed" $

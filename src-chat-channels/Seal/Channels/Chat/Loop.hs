@@ -1732,7 +1732,7 @@ handleNewSession cfg chan sessions wsConns pendingAsks bgSessions tabTracker wat
       -- that); the channel is this channel's label, so the new session stays
       -- attributable to the medium it was created from.
       eRes <- cccRebindNew cfg mgr apiBase oldSid
-        (rebindBody (naProvider na) (naModel na) (Just (ccLabel chan)))
+        (rebindBody (naProvider na) (naModel na) (Just (ccLabel chan)) (naMachine na))
       pure $ fmap (\res -> NewOutcome
         { noSid         = nsrSessionId res
         , noRebindError = nsrRebindError res
@@ -1741,7 +1741,8 @@ handleNewSession cfg chan sessions wsConns pendingAsks bgSessions tabTracker wat
         , noModel       = Just (nsrModel res)
         }) eRes
     Nothing -> do
-      eSid <- cccNewSession cfg mgr apiBase (mintBody (naProvider na) (naModel na) (Just (ccLabel chan)))
+      eSid <- cccNewSession cfg mgr apiBase
+                (mintBody (naProvider na) (naModel na) (Just (ccLabel chan)) (naMachine na))
       pure $ fmap (\sidText -> NewOutcome
         { noSid         = sidText
         , noRebindError = Nothing

@@ -220,21 +220,25 @@ httpRebindNew mgr apiBase sid body = do
 
 -- | The request body for @POST \/api\/sessions\/:id\/new@. Absent overrides
 -- are omitted entirely — never sent as JSON @null@.
-rebindBody :: Maybe Text -> Maybe Text -> Maybe Text -> Value
-rebindBody mProvider mModel mChannel = A.object (catMaybes
+rebindBody :: Maybe Text -> Maybe Text -> Maybe Text -> Maybe Text -> Value
+rebindBody mProvider mModel mChannel mMachine = A.object (catMaybes
   [ ("provider" .=) <$> mProvider
   , ("model" .=) <$> mModel
   , ("channel" .=) <$> mChannel
+  -- Omitted entirely when absent, like every other override here: a null
+  -- would pin the child to a machine name of "null".
+  , ("machine" .=) <$> mMachine
   ])
 
 -- | The request body for @POST \/api\/sessions\/new@ on the @\/new@ path
 -- (no prior session): provider\/model overrides only. The gateway labels
 -- such a session @"web"@.
-mintBody :: Maybe Text -> Maybe Text -> Maybe Text -> Value
-mintBody mProvider mModel mChannel = A.object (catMaybes
+mintBody :: Maybe Text -> Maybe Text -> Maybe Text -> Maybe Text -> Value
+mintBody mProvider mModel mChannel mMachine = A.object (catMaybes
   [ ("provider" .=) <$> mProvider
   , ("model" .=) <$> mModel
   , ("channel" .=) <$> mChannel
+  , ("machine" .=) <$> mMachine
   ])
 
 -- | The request body of @POST \/api\/sessions\/:id\/setup-repo@:
