@@ -220,6 +220,7 @@ library
          Seal.Security.Crypto
           Seal.Execution.Types
          Seal.Config.Execution
+         Seal.Execution.Resolve
          Seal.Security.DaemonLock
          Seal.Security.EnrollmentGrant
          Seal.Security.Path
@@ -615,6 +616,7 @@ test-suite tests
         Seal.ConfigSpec
         Seal.Execution.TypesSpec
         Seal.Config.ExecutionSpec
+        Seal.Execution.ResolveSpec
         Seal.IngestSpec
         Seal.Security.CommandSpec
         Seal.Security.EnrollmentGrantSpec
