@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { useConfiguredProviders, fetchProviderModels, useDiscoverableWindows, useRepos, type CreateTabBody, fetchUiState, putUiState, addCustomModel, addRepo, type LastOptions } from './useApi'
+import { useConfiguredProviders, fetchProviderModels, useDiscoverableWindows, useRepos, useMachines, type CreateTabBody, type MachinesResponse, fetchUiState, putUiState, addCustomModel, addRepo, type LastOptions } from './useApi'
 import type { DiscoverableWindow, ProviderInfo } from '../types'
 
 export type NewTabKind = 'provider' | 'harness' | 'attach'
@@ -83,6 +83,18 @@ export interface NewTabSpec {
   discoveryError: boolean
   scanDiscoverable: () => Promise<void>
 
+  // Execution machine (WU-7b). The picker renders only when the inventory
+  // has >= 2 rows, and it is read-only in branch mode (the backend copies the
+  // parent's pin).
+  machineChoice: string
+  setMachineChoice: (v: string) => void
+  /** The inventory, or null while unloaded. `resolvable: false` disables
+   *  Start; a non-null `error` with `resolvable: true` is the persistent
+   *  malformed-file condition the Machines screen surfaces. */
+  machines: MachinesResponse | null
+  /** Whether to render the picker at all: >= 2 machines AND not branch mode. */
+  showMachinePicker: boolean
+
   // Computed
   validationError: string | null
   /** Build the flat POST /api/tabs/new body (T10's CreateTabBody shape). */
@@ -114,6 +126,12 @@ export function useNewTabSpec(
   const { providers: configuredProviders, loaded: providersLoaded } = useConfiguredProviders()
   const [provider, setProvider] = useState<string>('')
   const [model, setModel] = useState<string>('')
+  // The machine picker's selection. '' is the SENTINEL — "Default (<name>)" —
+  // whose value is omitted from the body. Without the sentinel the select
+  // would render preselected and every web session would record a pin,
+  // making the usage metric false on exactly its own population.
+  const [machineChoice, setMachineChoice] = useState<string>('')
+  const { data: machines } = useMachines()
   const [useCustomModel, setUseCustomModel] = useState(false)
   const [models, setModels] = useState<{ name: string; contextWindow: number }[]>([])
   const [modelsLoading, setModelsLoading] = useState(false)
@@ -300,9 +318,17 @@ export function useNewTabSpec(
     return null
   })()
 
+  // The >= 2 rule, one predicate: an ssh-only count would fire while the
+  // picker was already rendered, because `local` counts toward the total.
+  const showMachinePicker = (machines?.machines?.length ?? 0) >= 2 && !inBranchMode()
+
   const buildBody = useCallback((): CreateTabBody => {
+    // One rule for both omissions: the picker sends nothing when it is not
+    // rendered, and nothing when the user left it on the sentinel.
+    const machineField =
+      !inBranchMode() && machineChoice !== '' ? { machine: machineChoice } : {}
     if (kind === 'provider') {
-      return { kind: 'provider', provider, model: model.trim() }
+      return { kind: 'provider', provider, model: model.trim(), ...machineField }
     }
     if (kind === 'harness') {
       // Seal's T10 takes a flat `kind: 'harness'` + harness_id. The harness
@@ -317,7 +343,7 @@ export function useNewTabSpec(
     // adoptWindow directly with the session/window/windowIndex). Return a
     // sentinel the caller will not send.
     return { kind: 'attach', harness_id: attachSession }
-  }, [kind, provider, model, flavour, customBinary, attachSession])
+  }, [kind, provider, model, flavour, customBinary, attachSession, machineChoice])
 
   // Persist the current form selection + record the custom model (if any).
   // Best-effort; failures are swallowed (the UI still works within the
@@ -380,6 +406,10 @@ export function useNewTabSpec(
     attachManual, setAttachManual,
     discoverableWindows, discoveryError, scanDiscoverable,
     validationError,
+    machineChoice,
+    setMachineChoice,
+    machines,
+    showMachinePicker,
     buildBody,
     persistOnSubmit,
   }

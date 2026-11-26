@@ -80,6 +80,7 @@ class StreamClientImpl implements StreamClient {
   private agentDefsChangedListeners = new Set<() => void>()
   private skillsChangedListeners = new Set<() => void>()
   private reposChangedListeners = new Set<() => void>()
+  private machinesChangedListeners = new Set<() => void>()
   private entriesChunkListeners = new Set<(sessionId: string, chunk: EntriesChunkPayload) => void>()
 
   constructor(urlOrPromise: string | Promise<string>) {
@@ -180,6 +181,13 @@ class StreamClientImpl implements StreamClient {
     this.reposChangedListeners.add(cb)
     return () => {
       this.reposChangedListeners.delete(cb)
+    }
+  }
+
+  onMachinesChanged(cb: () => void): () => void {
+    this.machinesChangedListeners.add(cb)
+    return () => {
+      this.machinesChangedListeners.delete(cb)
     }
   }
 
@@ -405,6 +413,9 @@ class StreamClientImpl implements StreamClient {
         break
       case 'repos-changed':
         for (const cb of this.reposChangedListeners) cb()
+        break
+      case 'machines-changed':
+        for (const cb of this.machinesChangedListeners) cb()
         break
       case 'entries-chunk': {
         const chunk: EntriesChunkPayload = {

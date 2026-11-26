@@ -2093,3 +2093,132 @@ export async function fetchFileChunk(path: string, index: number, size: number, 
     return { ok: false, status: 0 }
   }
 }
+
+// ── Execution machines (WU-7b) ──────────────────────────────────────────
+
+/** One row of GET /api/machines. The six ssh-only fields are OMITTED when
+ *  `kind === 'local'`, so the client never hardcodes the reserved literal. */
+export interface MachineInfo {
+  name: string
+  kind: 'local' | 'ssh'
+  default: boolean
+  host?: string
+  user?: string
+  port?: number
+  identity?: string
+  known_hosts?: string
+  workspace?: string
+}
+
+/** GET /api/machines. Degraded shapes are 200, never 500: a composer must
+ *  always be able to render something.
+ *
+ *  `resolvable: false` means no session can run at all (allow_localhost =
+ *  false with an empty inventory) and the composer disables Start. `error`
+ *  non-null with `resolvable: true` means the file is malformed but local
+ *  execution still works — a PERSISTENT condition the Machines screen
+ *  surfaces, not a transient composer message. */
+export interface MachinesResponse {
+  default: string | null
+  machines: MachineInfo[]
+  resolvable: boolean
+  error: string | null
+}
+
+export async function fetchMachines(): Promise<MachinesResponse | null> {
+  return fetchJson<MachinesResponse>('/api/machines')
+}
+
+/** Fetch-and-subscribe view of the machine inventory, mirroring useRepos. */
+export function useMachines() {
+  const [data, setData] = useState<MachinesResponse | null>(null)
+  const [loaded, setLoaded] = useState(false)
+  const [refreshCount, setRefreshCount] = useState(0)
+
+  const refresh = useCallback(() => setRefreshCount((c) => c + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    fetchMachines().then((res) => {
+      if (cancelled) return
+      setData(res)
+      setLoaded(true)
+    })
+    return () => { cancelled = true }
+  }, [refreshCount])
+
+  // Re-fetch when the WS signals the inventory changed, so adding a machine
+  // updates every open form without a reload.
+  //
+  // Guarded: several tests stub streamClient() with a partial object, and an
+  // unguarded call would throw inside an effect and blank the whole tree.
+  useEffect(() => {
+    const client = streamClient() as { onMachinesChanged?: (cb: () => void) => () => void }
+    if (typeof client.onMachinesChanged !== 'function') return
+    return client.onMachinesChanged(() => refresh())
+  }, [refresh])
+
+  return { data, loaded, refresh }
+}
+
+/** The outcome of a machine write. `warning` is the server's loopback notice
+ *  (transient, from POST); `pinned`/`unpinned`/`fallback` come from a 409 and
+ *  drive the ?force confirmation. */
+export type MachineMutationResult =
+  | { ok: true; warning: string | null }
+  | { ok: false; error: string; pinned?: number; unpinned?: number; fallback?: string | null }
+
+async function machineMutation(
+  path: string, method: 'POST' | 'DELETE', body?: unknown,
+): Promise<MachineMutationResult> {
+  try {
+    const res = await fetch(path, {
+      method,
+      headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    })
+    if (res.status === 204) return { ok: true, warning: null }
+    const text = await res.text().catch(() => '')
+    if (!res.ok) {
+      try {
+        const parsed = JSON.parse(text) as
+          { error?: string; pinned?: number; unpinned?: number; fallback?: string | null }
+        return {
+          ok: false,
+          error: parsed.error ?? `request failed (${res.status})`,
+          pinned: parsed.pinned,
+          unpinned: parsed.unpinned,
+          fallback: parsed.fallback,
+        }
+      } catch {
+        return { ok: false, error: text || `request failed (${res.status})` }
+      }
+    }
+    try {
+      const parsed = JSON.parse(text) as { warning?: string | null }
+      return { ok: true, warning: parsed.warning ?? null }
+    } catch {
+      return { ok: true, warning: null }
+    }
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'request failed' }
+  }
+}
+
+/** Create or replace a machine. `force` retries a guarded replace. */
+export async function saveMachine(
+  body: {
+    name: string; host: string; user: string; known_hosts: string; workspace: string
+    port?: number; identity?: string; default?: boolean; force?: boolean
+  },
+): Promise<MachineMutationResult> {
+  return machineMutation('/api/machines', 'POST', body)
+}
+
+/** Delete a machine. `?force` retries a 409. */
+export async function deleteMachine(name: string, force = false): Promise<MachineMutationResult> {
+  return machineMutation(
+    `/api/machines/${encodeURIComponent(name)}${force ? '?force=true' : ''}`,
+    'DELETE',
+  )
+}

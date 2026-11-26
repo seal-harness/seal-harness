@@ -27,6 +27,7 @@ function fakeClient(): StreamClient & {
   const agentDefsChangedCbs = new Set<() => void>()
   const skillsChangedCbs = new Set<() => void>()
   const reposChangedCbs = new Set<() => void>()
+  const machinesChangedCbs = new Set<() => void>()
   const requestEntriesCalls: { sessionId: string; before: string | null; limit: number }[] = []
   const entriesChunkCbs = new Set<(sessionId: string, chunk: { entries: TranscriptEntry[]; hasMore: boolean; totalCount?: number; requestBefore: string | null }) => void>()
   let lastError: string | null = null
@@ -44,6 +45,7 @@ function fakeClient(): StreamClient & {
     onAgentDefsChanged: (cb) => { agentDefsChangedCbs.add(cb); return () => { agentDefsChangedCbs.delete(cb) } },
     onSkillsChanged: (cb) => { skillsChangedCbs.add(cb); return () => { skillsChangedCbs.delete(cb) } },
     onReposChanged: (cb) => { reposChangedCbs.add(cb); return () => { reposChangedCbs.delete(cb) } },
+    onMachinesChanged: (cb) => { machinesChangedCbs.add(cb); return () => { machinesChangedCbs.delete(cb) } },
     lastError: () => lastError,
     reconnectAttempts: () => reconnectAttempts,
     reconnectNow: () => { reconnectNowCalls += 1 },

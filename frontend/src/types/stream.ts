@@ -151,6 +151,13 @@ export interface ReposChangedEvent {
   type: 'repos-changed'
 }
 
+/** The execution-machine inventory was mutated. Every open New Tab form
+ *  refetches its picker on this frame, so adding the first machine updates
+ *  the composer without a reload. */
+export interface MachinesChangedEvent {
+  type: 'machines-changed'
+}
+
 /** A chunk of transcript entries delivered in response to a `request-entries`
  *  op. `totalCount` is optional — it is omitted in the error path so the
  *  client can preserve the last known value. */
@@ -201,6 +208,7 @@ export type ServerEvent =
   | AgentDefsChangedEvent
   | SkillsChangedEvent
   | ReposChangedEvent
+  | MachinesChangedEvent
   | EntriesChunkEvent
 
 // ── Client → Server ────────────────────────────────────────────────────
@@ -257,6 +265,9 @@ export interface StreamClient {
   onSkillsChanged(cb: () => void): () => void
   /** Subscribe to repos-changed invalidation signals (re-fetch /api/repos). */
   onReposChanged(cb: () => void): () => void
+  /** Subscribe to machines-changed invalidation signals (re-fetch
+   *  /api/machines). */
+  onMachinesChanged(cb: () => void): () => void
   /** Last error message, or null when no terminal error has occurred. */
   lastError(): string | null
   /** The number of consecutive failed connection attempts since the last

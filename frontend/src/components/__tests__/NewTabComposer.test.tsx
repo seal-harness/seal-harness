@@ -62,6 +62,12 @@ function makeSpec(overrides: Partial<NewTabSpec> = {}): NewTabSpec {
     discoverableWindows: [],
     discoveryError: false,
     scanDiscoverable: vi.fn(async () => {}),
+    machineChoice: '',
+    setMachineChoice: vi.fn(),
+    // A single machine means the picker is NOT rendered (the >= 2 rule), so
+    // the default fixture sends no `machine` field.
+    machines: { default: 'local', machines: [{ name: 'local', kind: 'local', default: true }], resolvable: true, error: null },
+    showMachinePicker: false,
     validationError: null,
     buildBody: vi.fn(() => ({ kind: 'provider', provider: 'anthropic', model: 'claude-sonnet-4' })),
     persistOnSubmit: vi.fn(),
@@ -549,5 +555,79 @@ describe('NewTabComposer — repo branch', () => {
     await waitFor(() => {
       expect(screen.getByLabelText('Submit new tab')).toBeTruthy()
     })
+  })
+
+  it('does NOT call onSubmit when createTab returns {ok:false} (a rejected machine pin)', async () => {
+    vi.mocked(createTab).mockResolvedValueOnce({
+      ok: false,
+      error: 'No execution machine named "ghost"; available: local.',
+    })
+    const onSubmit = vi.fn()
+    render(<NewTabComposer spec={makeSpec()} onSubmit={onSubmit} onCancel={() => {}} />)
+    fireEvent.click(screen.getByLabelText('Submit new tab'))
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-submit-error')).toBeTruthy()
+    })
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
+})
+
+describe('NewTabComposer — the machine picker (WU-7b)', () => {
+  const twoMachines = {
+    default: 'local',
+    machines: [
+      { name: 'local', kind: 'local' as const, default: true },
+      { name: 'builder', kind: 'ssh' as const, default: false, host: 'b.example.com' },
+    ],
+    resolvable: true,
+    error: null,
+  }
+
+  it('renders the <select> only at >= 2 machines', () => {
+    const one = {
+      default: 'local',
+      machines: [{ name: 'local', kind: 'local' as const, default: true }],
+      resolvable: true,
+      error: null,
+    }
+    const spec = makeSpec({ machines: one, showMachinePicker: false })
+    const { rerender } = render(<NewTabComposer spec={spec} onSubmit={() => {}} onCancel={() => {}} />)
+    expect(screen.queryByTestId('machine-select')).toBeNull()
+
+    rerender(
+      <NewTabComposer
+        spec={makeSpec({ machines: twoMachines, showMachinePicker: true })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('machine-select')).toBeTruthy()
+  })
+
+  it('renders the local option with the same string the badge uses', () => {
+    render(
+      <NewTabComposer
+        spec={makeSpec({ machines: twoMachines, showMachinePicker: true })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    expect(screen.getByText('This machine (where Seal runs)')).toBeTruthy()
+  })
+
+  it('leaves the body machine-less when the sentinel is untouched', () => {
+    // The falsification metric rests on this: a present pin means the user
+    // deliberately changed the select.
+    const buildBody = vi.fn(() => ({ kind: 'provider' as const, provider: 'anthropic', model: 'x' }))
+    render(
+      <NewTabComposer
+        spec={makeSpec({ machines: twoMachines, showMachinePicker: true, machineChoice: '', buildBody })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    fireEvent.click(screen.getByLabelText('Submit new tab'))
+    expect(buildBody).toHaveBeenCalled()
+    expect(buildBody.mock.results[0]!.value).not.toHaveProperty('machine')
   })
 })

@@ -192,6 +192,33 @@ export function NewTabComposer({
             />
           </Row>
 
+          {spec.showMachinePicker && (
+            <Row label="Run on" htmlFor="machine-select">
+              <select
+                id="machine-select"
+                aria-label="Run on"
+                data-testid="machine-select"
+                value={spec.machineChoice}
+                onChange={(e) => spec.setMachineChoice(e.target.value)}
+                style={inputStyle}
+              >
+                {/* Sentinel: its value is omitted from the body, so an
+                    untouched picker records no pin. Without it the select
+                    would render preselected and every web session would
+                    record a pin, making the usage metric false on its own
+                    population. */}
+                <option value="">
+                  Default ({spec.machines?.default ?? 'local'})
+                </option>
+                {(spec.machines?.machines ?? []).map((m) => (
+                  <option key={m.name} value={m.name}>
+                    {m.kind === 'local' ? 'This machine (where Seal runs)' : m.name}
+                  </option>
+                ))}
+              </select>
+            </Row>
+          )}
+
           <Row label="Model" htmlFor="provider-model">
             <CustomModelCombobox
               id="provider-model"
