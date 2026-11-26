@@ -14,7 +14,7 @@ import Seal.Logging.Logger (SealLogger)
 import Seal.Command.Channel
   ( ChannelRuntime (..), channelCommandSpec, mkRealSignalCli
   , mkRealTelegramBotApi, mkRealVaultStore )
-import Seal.Command.New (NewDeps (..), newCommandSpec)
+import Seal.Command.New (NewDeps (..), availableMachines, newCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Model (mkModelTranscriptWriter)
 import Seal.Command.Stop (mkStopTranscriptWriter)
@@ -198,6 +198,7 @@ runTui autonomy logger = do
             pure oldSid
         , ndSetupRepo = Nothing
         , ndRepoReg = Just repoReg
+        , ndMachines = availableMachines paths
         }
   let coreDeps = CoreCommandDeps
         { ccdVault       = rt

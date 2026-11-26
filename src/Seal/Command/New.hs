@@ -34,9 +34,17 @@ module Seal.Command.New
   , parseNewArgs
   , emptyNewArgs
   , resolveRepoUrl
+  , NewMachineError (..)
+  , renderNewMachineError
+  , validateNewMachine
+  , validateNewMachineUnavailable
+  , availableMachines
   ) where
 
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, listToMaybe)
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Options.Applicative
@@ -49,9 +57,13 @@ import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
   , CommandName (..), CommandSpec (..) )
 import Seal.Config.File (RuntimeConfig)
-import Seal.Config.Paths (SealPaths)
+import Seal.Config.Execution (ExecutionConfig (..), loadExecutionConfigWith)
+import Seal.Config.Paths (SealPaths, securityFilePath)
+import Seal.Config.Security
+  ( SecurityConfig (..), allowLocalhostFrom, loadSecurityConfig )
 import Seal.Core.Types (SessionId, sessionIdText)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Execution.Types (MachineName, machineNameText, mkMachineName)
+import Seal.Session.Meta (SessionMeta (..), setExecMachine)
 import Seal.Session.Store
   ( defaultSessionSelection, newSession, resolveDefaultAgent )
 import Seal.SourceControl.Repo (SourceRepo (..), mkRepoId, srUrl)
@@ -108,7 +120,45 @@ data NewDeps = NewDeps
     -- ^ Optional repo-registry handle for resolving @-r@ repo IDs to URLs.
     -- 'Nothing' in contexts without a registry (tests); the @-r@ value is
     -- then treated as a raw URL.
+  , ndMachines     :: IO (Maybe (Set Text))
+    -- ^ The machine names a session may be pinned to, or 'Nothing' when the
+    -- inventory cannot be read. Supplied as an action so @/new@ validates
+    -- BEFORE minting: an unknown machine must not create a session.json.
+    --
+    -- 'Nothing' (unreadable inventory) means "accept any name": refusing a
+    -- good pin because the file is momentarily unreadable would be worse
+    -- than letting resolution fail closed later, which it does.
+    --
+    -- Tests and contexts with no inventory pass
+    -- @pure (Just Set.empty)@, which refuses every pin — the correct answer
+    -- when there is provably no machine to pin to.
   }
+
+-- | Why a requested machine was refused.
+data NewMachineError
+  = UnknownMachine Text [Text]
+    -- ^ requested, available (sorted)
+  deriving stock (Eq, Show)
+
+-- | Render for the @ccSend@ failure path, in the same shape as the resolver's
+-- own message so a user meets one vocabulary, not two.
+renderNewMachineError :: NewMachineError -> Text
+renderNewMachineError (UnknownMachine requested avail) =
+  "No execution machine named \"" <> requested <> "\"; available: "
+    <> (if null avail then "none" else T.intercalate ", " avail)
+    <> ". Add one on the Machines screen, or omit --machine to use the default."
+
+-- | Accept a requested machine iff the inventory lists it.
+validateNewMachine :: Set Text -> Maybe Text -> Either NewMachineError (Maybe Text)
+validateNewMachine available = \case
+  Nothing -> Right Nothing
+  Just requested
+    | requested `Set.member` available -> Right (Just requested)
+    | otherwise -> Left (UnknownMachine requested (Set.toAscList available))
+
+-- | Accept any well-formed request when the inventory could not be read.
+validateNewMachineUnavailable :: Maybe Text -> Either NewMachineError (Maybe Text)
+validateNewMachineUnavailable = Right
 
 -- | The @/new@ command spec. Grouped under Sessions in @/help@. Always
 -- available (the operator typed it; no autonomy gate).
@@ -117,7 +167,7 @@ newCommandSpec deps = CommandSpec
   { csName         = CommandName "new"
   , csAliases      = []
   , csGroup        = GroupSession
-  , csSynopsis     = "Start a new tab with a fresh session (optional -p/-m/-r/-b overrides)"
+  , csSynopsis     = "Start a new tab with a fresh session (optional -p/-m/-r/-b/-M overrides)"
   , csParserInfo   = newParserInfo deps
   , csAvailability = AlwaysAvailable
   }
@@ -130,8 +180,9 @@ newParserInfo deps =
         <*> optional modelOpt
         <*> optional repoOpt
         <*> optional branchOpt
+        <*> optional machineOpt
         <**> helper )
-    (  progDesc "Start a new tab with a fresh session (optional -p/-m/-r/-b overrides)"
+    (  progDesc "Start a new tab with a fresh session (optional -p/-m/-r/-b/-M overrides)"
     <> header   "new — start a new tab with a fresh session (old session kept in /session list)"
     )
 
@@ -159,6 +210,14 @@ repoOpt = strOption
   <> help "Repo ID (from /repo list) or git URL to clone into the session (default: none)"
   )
 
+machineOpt :: Parser Text
+machineOpt = strOption
+  (  long "machine"
+  <> short 'M'
+  <> metavar "MACHINE"
+  <> help "Execution machine to pin this session to (default: the effective default)"
+  )
+
 branchOpt :: Parser Text
 branchOpt = strOption
   (  long "branch"
@@ -170,29 +229,76 @@ branchOpt = strOption
 -- | The @/new@ action: read the old session, mint a fresh session using
 -- the given args (or config defaults when not specified), insert a new
 -- tab, optionally clone a repo, and send the confirmation line.
-newCmd :: NewDeps -> Maybe Text -> Maybe Text -> Maybe Text -> Maybe Text -> CommandAction
-newCmd deps mProvider mModel mRepo mBranch = commandAction $ \caps -> do
+newCmd :: NewDeps -> Maybe Text -> Maybe Text -> Maybe Text -> Maybe Text -> Maybe Text
+       -> CommandAction
+newCmd deps mProvider mModel mRepo mBranch mMachine = commandAction $ \caps -> do
   oldMeta <- ndOldMeta deps
   let args = NewArgs
         { naProvider = mProvider
         , naModel    = mModel
         , naRepo     = mRepo
         , naBranch   = mBranch
+        , naMachine  = mMachine
         }
-  meta <- mintNewSessionWith args oldMeta deps
-  oldSid <- ndInsertTab deps caps meta
-  case (naRepo args, ndSetupRepo deps) of
-    (Just repoVal, Just setupFn) -> do
-      repoUrl <- resolveRepoUrlMaybe deps repoVal
-      -- @-b\/--branch@ is passed through as-is: 'Nothing' asks for the
-      -- remote's default branch. @-b@ without @-r@ never reaches here (the
-      -- 'naRepo' guard above skips setup entirely).
-      eRes <- setupFn (smId meta) repoUrl (naBranch args)
-      case eRes of
-        Left err -> ccSend caps ("repo setup failed: " <> err)
-        Right _  -> pure ()
-    _ -> pure ()
-  ccSend caps (renderNewConfirmation meta oldSid)
+  -- Validate BEFORE minting: a refusal must not leave a session.json behind.
+  available <- ndMachines deps
+  case validateAgainst available (naMachine args) >>= toPin of
+    Left err -> ccSend caps (renderNewMachineError err)
+    Right pin -> do
+      meta0 <- mintNewSessionWith args oldMeta deps
+      let meta = maybe meta0 (`setExecMachine` meta0) pin
+      oldSid <- ndInsertTab deps caps meta
+      case (naRepo args, ndSetupRepo deps) of
+        (Just repoVal, Just setupFn) -> do
+          repoUrl <- resolveRepoUrlMaybe deps repoVal
+          -- @-b\/--branch@ is passed through as-is: 'Nothing' asks for the
+          -- remote's default branch. @-b@ without @-r@ never reaches here (the
+          -- 'naRepo' guard above skips setup entirely).
+          eRes <- setupFn (smId meta) repoUrl (naBranch args)
+          case eRes of
+            Left err -> ccSend caps ("repo setup failed: " <> err)
+            Right _  -> pure ()
+        _ -> pure ()
+      ccSend caps (renderNewConfirmation meta oldSid)
+
+-- | The machine names a @/new@ may pin to, read from the inventory.
+--
+-- @local@ is included when @allow_localhost@ permits it, because it is a
+-- pinnable name (§5 row 1) and refusing it here would make the CLI unable to
+-- express a choice the picker offers.
+--
+-- Returns 'Nothing' when the inventory cannot be read: the caller then accepts
+-- any name, and resolution fails closed later.
+availableMachines :: SealPaths -> IO (Maybe (Set Text))
+availableMachines paths = do
+  eSec <- loadSecurityConfig (securityFilePath paths)
+  case eSec of
+    -- An unreadable security.toml is exactly the "inventory unavailable"
+    -- case: accept any name and let resolution fail closed.
+    Left _ -> pure Nothing
+    Right sec -> do
+      let legacy = scUntrustedExec sec
+          allowLocalhost = allowLocalhostFrom legacy
+      eCfg <- loadExecutionConfigWith allowLocalhost legacy paths
+      pure $ case eCfg of
+        Left _ -> Nothing
+        Right (ec, _) ->
+          let names = map machineNameText (Map.keys (ecMachines ec))
+              localName = ["local" | allowLocalhost]
+          in Just (Set.fromList (names <> localName))
+
+-- | A validated name as the typed pin the session carries.
+toPin :: Maybe Text -> Either NewMachineError (Maybe MachineName)
+toPin Nothing  = Right Nothing
+toPin (Just t) = case mkMachineName t of
+  Left why  -> Left (UnknownMachine t ["(" <> why <> ")"])
+  Right n   -> Right (Just n)
+
+-- | Validate a requested machine against the (possibly unavailable)
+-- inventory. 'Nothing' availability means "accept any name".
+validateAgainst :: Maybe (Set Text) -> Maybe Text -> Either NewMachineError (Maybe Text)
+validateAgainst (Just available) requested = validateNewMachine available requested
+validateAgainst Nothing          requested = validateNewMachineUnavailable requested
 
 -- | Resolve the @-r@ value to a URL using the repo registry (if wired),
 -- falling back to the raw value.

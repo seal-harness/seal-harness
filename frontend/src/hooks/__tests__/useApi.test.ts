@@ -468,10 +468,28 @@ describe('tab mutators', () => {
   it('createTab POSTs /api/tabs/new with the flat {kind, provider?, model?, agent?} body', async () => {
     setNextResponse({ tab_index: 0, session_id: 's1', kind: 'session:anthropic' })
     const res = await createTab({ kind: 'provider', provider: 'anthropic', model: 'claude-sonnet-4' })
-    expect(res).toEqual({ tab_index: 0, session_id: 's1', kind: 'session:anthropic' })
+    expect(res).toEqual({ ok: true, tab: { tab_index: 0, session_id: 's1', kind: 'session:anthropic' } })
     const call = fetchCalls.find((c) => c.url === '/api/tabs/new')!
     expect(call.init!.method).toBe('POST')
     expect(JSON.parse(call.init!.body as string)).toEqual({ kind: 'provider', provider: 'anthropic', model: 'claude-sonnet-4' })
+  })
+
+  it('createTab returns {ok:false,error} on a 4xx instead of a bare null', async () => {
+    // A machine pin the gateway refused is a 400 carrying the available set.
+    // Returning null discarded the body, so the composer could not show why.
+    setNextResponse({ error: 'No execution machine named "ghost"; available: local.' }, 400)
+    const res = await createTab({ kind: 'provider', provider: 'anthropic', machine: 'ghost' })
+    expect(res).toEqual({
+      ok: false,
+      error: 'No execution machine named "ghost"; available: local.',
+    })
+  })
+
+  it('createTab omits machine when the caller does not send one', async () => {
+    setNextResponse({ tab_index: 0, session_id: 's1', kind: 'session:anthropic' })
+    await createTab({ kind: 'provider', provider: 'anthropic' })
+    const call = fetchCalls.find((c) => c.url === '/api/tabs/new')!
+    expect(JSON.parse(call.init!.body as string)).not.toHaveProperty('machine')
   })
 
   it('createTab includes branch_from when provided', async () => {

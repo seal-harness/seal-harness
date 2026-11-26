@@ -4,6 +4,7 @@ module Seal.Command.NewSpec (spec) where
 import Control.Monad (void)
 import Data.Default (def)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import Options.Applicative (ParserResult (..), defaultPrefs, execParserPure)
@@ -15,7 +16,8 @@ import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Command.Help (renderHelpIndex)
 import Seal.Command.New
   ( NewDeps (..), newCommandSpec, renderNewConfirmation
-  , NewArgs (..), parseNewArgs, emptyNewArgs, resolveRepoUrl )
+  , NewArgs (..), parseNewArgs, emptyNewArgs, resolveRepoUrl
+  , NewMachineError (..), validateNewMachine, validateNewMachineUnavailable )
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Gateway.Types.NewArgs (renderNewSessionConfirmation)
 import Seal.Command.Parse (ParseOutcome (..), parseSlash)
@@ -64,6 +66,7 @@ stubDeps =
     , ndInsertTab = \_caps _newMeta -> pure (mkSid "20260701-000000-000")
     , ndSetupRepo = Nothing
     , ndRepoReg = Nothing
+    , ndMachines = pure (Just Set.empty)
     }
 
 -- | A throwaway 'SealPaths' under the system temp dir. The @\/new@ happy path
@@ -159,6 +162,7 @@ spec = describe "Seal.Command.New" $ do
           , naModel = Just "claude-sonnet-4"
           , naRepo = Just "https://github.com/foo/bar.git"
           , naBranch = Nothing
+          , naMachine = Nothing
           }
     it "parses long-form all three" $
       parseNewArgs "--provider anthropic --model claude-sonnet-4 --repo https://github.com/foo/bar.git"
@@ -167,6 +171,7 @@ spec = describe "Seal.Command.New" $ do
           , naModel = Just "claude-sonnet-4"
           , naRepo = Just "https://github.com/foo/bar.git"
           , naBranch = Nothing
+          , naMachine = Nothing
           }
     it "parses -b branch alongside -r repo" $
       parseNewArgs "-r seal -b dev" `shouldBe`
@@ -184,10 +189,58 @@ spec = describe "Seal.Command.New" $ do
           , naModel = Just "claude-sonnet-4"
           , naRepo = Just "seal"
           , naBranch = Just "dev"
+          , naMachine = Nothing
           }
     it "ignores unknown flags" $
       parseNewArgs "--unknown foo -p anthropic" `shouldBe`
         emptyNewArgs { naProvider = Just "anthropic" }
+
+  describe "--machine (WU-6)" $ do
+
+    it "parses -M machine" $
+      parseNewArgs "-M builder" `shouldBe`
+        emptyNewArgs { naMachine = Just "builder" }
+
+    it "parses --machine machine" $
+      parseNewArgs "--machine builder" `shouldBe`
+        emptyNewArgs { naMachine = Just "builder" }
+
+    it "parses --machine alongside the other flags" $
+      parseNewArgs "-p anthropic -M builder -r seal"
+        `shouldBe` emptyNewArgs
+          { naProvider = Just "anthropic"
+          , naMachine  = Just "builder"
+          , naRepo     = Just "seal"
+          }
+
+    it "leaves naMachine as Nothing when --machine is absent" $
+      parseNewArgs "-p anthropic" `shouldBe`
+        emptyNewArgs { naProvider = Just "anthropic" }
+
+  describe "validateNewArgs" $ do
+
+    -- A value-less flag is silently dropped by the parser (go (_flag : rest)),
+    -- which for -p/-m/-r is benign but for --machine would start the session
+    -- on the DEFAULT machine when the user asked for a named one. That is the
+    -- silent-authority-change shape this feature exists to forbid, so a
+    -- machine request that does not parse is an ERROR, reported inline with
+    -- the available set (the /new -r failure path already does this).
+    it "an unknown machine is rejected with the available set" $
+      validateNewMachine (Set.fromList ["builder", "tester"]) (Just "ghost")
+        `shouldBe` Left (UnknownMachine "ghost" ["builder", "tester"])
+
+    it "a known machine is accepted" $
+      validateNewMachine (Set.fromList ["builder"]) (Just "builder")
+        `shouldBe` Right (Just "builder")
+
+    it "no machine requested is accepted (the caller uses the default)" $
+      validateNewMachine (Set.fromList ["builder"]) Nothing
+        `shouldBe` Right Nothing
+
+    it "any machine is accepted when the inventory could not be read" $
+      -- The route must not refuse a perfectly good pin because the inventory
+      -- was temporarily unreadable; resolution fails closed later.
+      validateNewMachineUnavailable (Just "builder") `shouldBe` Right (Just "builder")
 
   describe "resolveRepoUrl" $ do
     let repos =

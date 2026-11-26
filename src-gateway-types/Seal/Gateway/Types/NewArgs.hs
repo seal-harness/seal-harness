@@ -32,6 +32,15 @@ data NewArgs = NewArgs
   , naBranch   :: Maybe Text
     -- ^ The branch or tag to check out when @-r@ clones a repo. 'Nothing'
     -- means the remote's default branch.
+  , naMachine  :: Maybe Text
+    -- ^ The execution machine the new session is pinned to. 'Nothing' means
+    -- "the effective default", which is what a user who did not ask for a
+    -- machine gets — and what keeps the metric's "a present pin means a
+    -- deliberate choice" true.
+    --
+    -- 'Text' and not 'MachineName': this module is in @seal-gateway-types@,
+    -- which cannot depend on the main library. Validation happens in
+    -- 'Seal.Command.New', where the inventory is available.
   } deriving stock (Eq, Show)
 
 -- | The empty 'NewArgs' — no overrides, use all config defaults.
@@ -41,14 +50,17 @@ emptyNewArgs = NewArgs
   , naModel    = Nothing
   , naRepo     = Nothing
   , naBranch   = Nothing
+  , naMachine  = Nothing
   }
 
 -- | Parse the raw argument text from the routing layer into 'NewArgs'.
 -- This is a simple manual parse used by the inbox-channel loop path
 -- ('Seal.Channels.Chat.Loop'), which doesn't go through
 -- optparse-applicative. Supports @-p@\/@--provider@, @-m@\/@--model@,
--- @-r@\/@--repo@, and @-b@\/@--branch@ with a single value each. Unknown
--- flags are ignored.
+-- @-r@\/@--repo@, @-b@\/@--branch@ and @-M@\/@--machine@ with a single value
+-- each. Unknown flags are ignored; a machine that does not validate is an
+-- error reported by the CALLER ('Seal.Command.New'), not here — this module
+-- has no inventory to check against.
 parseNewArgs :: Text -> NewArgs
 parseNewArgs raw =
   go (splitArgs raw) emptyNewArgs
@@ -59,6 +71,7 @@ parseNewArgs raw =
       | flag `elem` ["-m", "--model"]    = go rest acc { naModel    = Just val }
       | flag `elem` ["-r", "--repo"]     = go rest acc { naRepo     = Just val }
       | flag `elem` ["-b", "--branch"]   = go rest acc { naBranch   = Just val }
+      | flag `elem` ["-M", "--machine"]  = go rest acc { naMachine  = Just val }
       | otherwise                        = go (val : rest) acc
     go (_flag : rest) acc = go rest acc
 

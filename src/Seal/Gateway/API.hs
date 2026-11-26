@@ -75,6 +75,9 @@ import Seal.Skills.Backend (SkillBackend (..))
 import Seal.Skills.Types (Skill (..), SkillId (..), mkSkillId, skillIdText)
 -- SealLogger/logIO removed: audit logging deferred (design §4.4 is SHOULD not MUST)
 import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerBaseUrl, providerDefaultModel, providerModels, updateRuntimeConfig, upsertProvider, deleteProvider, deleteChannel)
+import Seal.Command.New
+  ( NewMachineError (..), availableMachines, renderNewMachineError
+  , validateNewMachine, validateNewMachineUnavailable )
 import Seal.Config.Paths
   ( SealPaths (..), repoKeysDir, securityFilePath, sessionMetaPath, sessionWorkdir
   , workdirsRoot )
@@ -82,7 +85,8 @@ import Seal.Config.Security
   ( SecurityConfig (..) )
 import Seal.Execution.Resolve (loadAndResolveTargetIO)
 import Seal.Execution.Types
-  ( ResolvedTarget (..), TargetError, machineNameText )
+  ( MachineName, ResolvedTarget (..), TargetError (..), machineNameText
+  , mkMachineName )
 import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
 import Seal.Session.ExecCache (cachedSessionExec, cachedWorkdirScan)
@@ -140,7 +144,7 @@ import Seal.Providers.OllamaReadiness
   ( OllamaReadiness (..), readinessWire )
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
-import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
+import Seal.Session.Meta (SessionMeta (..), readSessionMeta, setExecMachine)
 import Seal.SourceControl.Repo
   ( RepoCredential (..), RepoId, SourceRepo (..), hostAllowed, mkRepoId
   , parseCredentialKind, parseRepoHost, parseVcsKind, repoCredentialKindText
@@ -1310,34 +1314,42 @@ handleTabNew deps v =
           mAgent = parseAgentField v
           mBranchFrom = parseBranchFrom v
           mBranchLen  = parseBranchConvLen v
-      case (mBranchFrom, mBranchLen) of
-        -- A client that sends branch_from IS branching. Silently handing
-        -- it an empty session is the exact bug this feature fixes, so a
-        -- missing anchor is a loud error — reachable from a stale cached
-        -- bundle, since a render index like "12" is a valid SessionId.
-        (Just _, Nothing) ->
-          pure (errJson status400
-                 "branch_from requires branch_conv_len (the conversation \
-                 \length to inherit from the parent session)")
-        (Nothing, _) -> plainProviderSession deps paths provider model mAgent
-        (Just parentSid, Just n) -> do
-          parentExists <- doesFileExist (sessionMetaPath paths parentSid)
-          if not parentExists
-            then pure (errJson status404 "session not found")
-            else do
-              meta <- newSessionMeta paths provider model "web" mAgent
-              let sid = smId meta
-              eSeed <- branchSession paths parentSid sid n
-              case eSeed of
-                Left err -> pure (errJson status400 err)
-                Right () -> do
-                  res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
-                  case res of
-                    Left e -> pure (errJson status400 e)
-                    Right _ -> do
-                      saveSessionMeta paths meta
-                      triggerBroadcast deps
-                      pure (tabInsertResponse res (Just sid) "session:provider")
+          mMachine    = parseMachineField v
+      -- Validate BEFORE minting: a refusal must not create a session.json, or
+      -- the orphan would surface in Recent Sessions with no tab behind it.
+      available <- availableMachines paths
+      case validateAgainst' available mMachine of
+        Left err -> pure (errJson status400 (renderNewMachineError err))
+        Right pin -> case (mBranchFrom, mBranchLen) of
+          -- A client that sends branch_from IS branching. Silently handing
+          -- it an empty session is the exact bug this feature fixes, so a
+          -- missing anchor is a loud error — reachable from a stale cached
+          -- bundle, since a render index like "12" is a valid SessionId.
+          (Just _, Nothing) ->
+            pure (errJson status400
+                   "branch_from requires branch_conv_len (the conversation \
+                   \length to inherit from the parent session)")
+          (Nothing, _) ->
+            plainProviderSession deps paths provider model mAgent pin
+          (Just parentSid, Just n) -> do
+            parentExists <- doesFileExist (sessionMetaPath paths parentSid)
+            if not parentExists
+              then pure (errJson status404 "session not found")
+              else do
+                meta0 <- newSessionMeta paths provider model "web" mAgent
+                let meta = maybe meta0 (`setExecMachine` meta0) pin
+                    sid = smId meta
+                eSeed <- branchSession paths parentSid sid n
+                case eSeed of
+                  Left err -> pure (errJson status400 err)
+                  Right () -> do
+                    res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
+                    case res of
+                      Left e -> pure (errJson status400 e)
+                      Right _ -> do
+                        saveSessionMeta paths meta
+                        triggerBroadcast deps
+                        pure (tabInsertResponse res (Just sid) "session:provider")
     Just "harness" -> do
       hid <- newHarnessId
       let label = parseHarnessLabel v
@@ -1368,10 +1380,12 @@ handleTabNew deps v =
 -- stay readable. Mints, inserts the tab, then persists — the original
 -- ordering, unchanged.
 plainProviderSession
-  :: ApiDeps -> SealPaths -> Text -> Text -> Maybe AgentDefId -> IO Response
-plainProviderSession deps paths provider model mAgent = do
-  meta <- newSessionMeta paths provider model "web" mAgent
-  let sid = smId meta
+  :: ApiDeps -> SealPaths -> Text -> Text -> Maybe AgentDefId
+  -> Maybe MachineName -> IO Response
+plainProviderSession deps paths provider model mAgent pin = do
+  meta0 <- newSessionMeta paths provider model "web" mAgent
+  let meta = maybe meta0 (`setExecMachine` meta0) pin
+      sid = smId meta
   res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
   case res of
     Left e   -> pure (errJson status400 e)
@@ -1379,6 +1393,30 @@ plainProviderSession deps paths provider model mAgent = do
       saveSessionMeta paths meta
       triggerBroadcast deps
       pure (tabInsertResponse res (Just sid) "session:provider")
+
+-- | The API's view of machine validation. Same two cases as the command
+-- path: an unreadable inventory accepts any name (resolution fails closed
+-- later); a readable one refuses an unknown name with the available set.
+validateAgainst'
+  :: Maybe (Set.Set Text) -> Maybe Text -> Either NewMachineError (Maybe MachineName)
+validateAgainst' available requested = do
+  validated <- case available of
+    Just avail -> validateNewMachine avail requested
+    Nothing    -> validateNewMachineUnavailable requested
+  case validated of
+    Nothing  -> Right Nothing
+    Just txt -> case mkMachineName txt of
+      Left why -> Left (UnknownMachine txt ["(" <> why <> ")"])
+      Right n  -> Right (Just n)
+
+-- | Parse the optional @machine@ field of a @POST /api/tabs/new@ body.
+-- A flat string, matching @branch_from@ / @harness_id@.
+parseMachineField :: A.Value -> Maybe Text
+parseMachineField v = case v of
+  A.Object o -> case KeyMap.lookup (Key.fromText "machine") o of
+    Just (A.String t) | not (T.null (T.strip t)) -> Just (T.strip t)
+    _                                           -> Nothing
+  _ -> Nothing
 
 -- | Parse the optional @branch_from@ field (a PARENT SESSION id).
 parseBranchFrom :: A.Value -> Maybe SessionId

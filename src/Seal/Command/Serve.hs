@@ -64,7 +64,7 @@ import Seal.Command.Call (callCommandSpec)
 import Seal.Command.Skill (skillCommandSpec)
 import Seal.Core.Types (OpName (..), sessionIdText)
 import Seal.ISA.Dispatch (DispatchError (OpNotFound))
-import Seal.Command.New (NewDeps (..), newCommandSpec)
+import Seal.Command.New (NewDeps (..), availableMachines, newCommandSpec)
 import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Model (mkModelTranscriptWriter)
 import Seal.Command.Registry (CoreCommandDeps (..), coreCommandSpecs)
@@ -568,6 +568,7 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
             pure oldSid
         , ndSetupRepo = Just (handleSetupRepo sendDeps)
         , ndRepoReg = Just repoRegH
+        , ndMachines = availableMachines paths
         }
       -- The slash-command registry is built from the shared
       -- 'coreCommandSpecs' (the channel-agnostic core: vault, provider,

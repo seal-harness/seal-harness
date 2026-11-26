@@ -2,13 +2,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import { NewTabComposer } from '../NewTabComposer'
 import { adoptWindow, createTab, setupRepo } from '../../hooks/useApi'
+import type { NewTabResult } from '../../hooks/useApi'
 import type { NewTabSpec } from '../../hooks/useNewTabSpec'
-import type { NewTabResponse } from '../../hooks/useApi'
+import type { } from '../../hooks/useApi'
 import type { DiscoverableWindow, ProviderInfo } from '../../types'
 
 vi.mock('../../hooks/useApi', () => ({
   adoptWindow: vi.fn(async () => ({ ok: true, sessionId: 'adopted-1' })),
-  createTab: vi.fn(async () => ({ tab_index: 1, session_id: 's2', kind: 'provider' })),
+  createTab: vi.fn(async () => ({ ok: true, tab: { tab_index: 1, session_id: 's2', kind: 'provider' } })),
   setupRepo: vi.fn(async () => ({ ok: true })),
 }))
 
@@ -402,7 +403,7 @@ describe('NewTabComposer — branding', () => {
 describe('NewTabComposer — submit spinner', () => {
   it('shows a spinner while the createTab round-trip is in flight', async () => {
     // Pause createTab so we can assert the spinner before it resolves.
-    let resolveCreate: (v: NewTabResponse | null) => void = () => {}
+    let resolveCreate: (v: NewTabResult) => void = () => {}
     vi.mocked(createTab).mockImplementationOnce(() => new Promise((resolve) => { resolveCreate = resolve }))
     const onSubmit = vi.fn()
     render(<NewTabComposer spec={makeSpec()} onSubmit={onSubmit} onCancel={() => {}} />)
@@ -422,7 +423,7 @@ describe('NewTabComposer — submit spinner', () => {
     expect(onSubmit).not.toHaveBeenCalled()
 
     // Resolve the promise → onSubmit fires, spinner disappears, form is gone.
-    resolveCreate({ tab_index: 1, session_id: 's2', kind: 'provider' })
+    resolveCreate({ ok: true, tab: { tab_index: 1, session_id: 's2', kind: 'provider' } })
     await waitFor(() => expect(onSubmit).toHaveBeenCalled())
   })
 
@@ -450,7 +451,7 @@ describe('NewTabComposer — submit spinner', () => {
   })
 
   it('restores the form if createTab fails', async () => {
-    vi.mocked(createTab).mockResolvedValueOnce(null)
+    vi.mocked(createTab).mockResolvedValueOnce({ ok: false, error: 'boom' })
     render(<NewTabComposer spec={makeSpec()} onSubmit={() => {}} onCancel={() => {}} />)
     fireEvent.click(screen.getByLabelText('Submit new tab'))
     await waitFor(() => {
@@ -521,5 +522,32 @@ describe('NewTabComposer — repo branch', () => {
     )
     fireEvent.change(screen.getByLabelText('Repo Branch'), { target: { value: 'dev' } })
     expect(setRepoBranch).toHaveBeenCalledWith('dev')
+  })
+
+  it('does NOT call onSubmit when createTab returns {ok:false} (a rejected machine pin)', async () => {
+    // The inversion this guards: `if (res)` treated {ok:false} as success and
+    // still called onSubmit + persistOnSubmit, so a 400 from an unknown
+    // machine looked like a started session.
+    vi.mocked(createTab).mockResolvedValueOnce({
+      ok: false,
+      error: 'No execution machine named "ghost"; available: local.',
+    })
+    const onSubmit = vi.fn()
+    render(<NewTabComposer spec={makeSpec()} onSubmit={onSubmit} onCancel={() => {}} />)
+    fireEvent.click(screen.getByLabelText('Submit new tab'))
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-submit-error')).toBeTruthy()
+    })
+    expect(screen.getByTestId('composer-submit-error').textContent).toContain('ghost')
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('restores the form after {ok:false} so the user can retry', async () => {
+    vi.mocked(createTab).mockResolvedValueOnce({ ok: false, error: 'nope' })
+    render(<NewTabComposer spec={makeSpec()} onSubmit={() => {}} onCancel={() => {}} />)
+    fireEvent.click(screen.getByLabelText('Submit new tab'))
+    await waitFor(() => {
+      expect(screen.getByLabelText('Submit new tab')).toBeTruthy()
+    })
   })
 })

@@ -17,6 +17,7 @@ import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as Map
+import Data.List (isPrefixOf)
 import Data.Maybe (fromJust, fromMaybe, isJust, listToMaybe, mapMaybe)
 import Data.Set qualified as Set
 import Data.Text qualified as T
@@ -31,7 +32,7 @@ import Network.Wai
 import Network.Wai.Internal (Response (..), ResponseReceived (..))
 import System.Directory
   ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist, findExecutable
-  , removeDirectoryRecursive )
+  , listDirectory, removeDirectoryRecursive )
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.IO.Unsafe (unsafePerformIO)
@@ -51,7 +52,7 @@ import Seal.Command.Skill (skillCommandSpec)
 import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntimeConfig, loadRuntimeConfig, providerModels, saveRuntimeConfig)
 import Seal.Config.Paths
   ( SealPaths (..), sessionConversationPath, sessionDir, sessionMetaPath
-  , sessionWorkdir, sshAgentsDir )
+  , sessionWorkdir, sessionsRoot, sshAgentsDir )
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types
@@ -86,6 +87,7 @@ import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub)
 import Seal.Tools.Exec.WorkdirFs (StubEntry (..), mkInMemWorkdirFs)
 import Seal.Security.Vault (VaultHandle (vhGet))
 import Seal.TestHelpers.FakeVault (fakeLockedVaultRuntime, makeFakeVaultRuntime, makeLockedVaultRuntime)
+import Seal.Execution.Types (machineNameText)
 import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Session.Store
   ( SessionRuntime (..), listSessions, newSession, saveSessionMeta )
@@ -598,6 +600,9 @@ spec = describe "Seal.Gateway.API" $ do
 
   let mkPaths = fakePaths { spState = sharedStateDir }
       mkApp = apiApp <$> mkDepsFor mkPaths
+      -- The sessions tree the mkApp fixtures write into, so a test can assert
+      -- on session.json directly (WU-6's "no session minted on refusal").
+      countSessions p = length . filter (not . isPrefixOf ".") <$> listDirectory (sessionsRoot p)
       mkAppWithHealth health = apiApp <$> mkDepsWithHealth mkPaths health
       -- An app whose Ollama readiness seam reports a chosen state, so the
       -- wire shape can be asserted (tests 9/10/11/31/32).
@@ -652,6 +657,88 @@ spec = describe "Seal.Gateway.API" $ do
       (A.encode (A.object [ "kind" .= ("provider" :: T.Text), "provider" .= ("anthropic" :: T.Text), "model" .= ("claude-sonnet-4" :: T.Text) ]))
     status <- runAppStatus app req
     status `shouldBe` 200
+
+  it "POST /api/tabs/new {machine} unknown machine ⇒ 400 carrying the available set" $ do
+    -- The mkApp fixture's SEAL_HOME has no execution.toml, so the inventory is
+    -- empty (and allow_localhost is true, so `local` is the only pinnable
+    -- name). Naming anything else must be refused with the set, not silently
+    -- defaulted.
+    app <- mkApp
+    req <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("provider" :: T.Text)
+        , "provider" .= ("anthropic" :: T.Text)
+        , "model" .= ("claude-sonnet-4" :: T.Text)
+        , "machine" .= ("ghost" :: T.Text) ]))
+    (status, body) <- runAppBody app req
+    status `shouldBe` 400
+    case A.decode body :: Maybe A.Value of
+      Just (A.Object o) -> case KeyMap.lookup (Key.fromText "error") o of
+        Just (A.String msg) -> do
+          msg `shouldSatisfy` T.isInfixOf "ghost"
+          msg `shouldSatisfy` T.isInfixOf "local"
+          msg `shouldSatisfy` T.isInfixOf "Machines screen"
+        other -> expectationFailure ("expected an error string, got " <> show other)
+      other -> expectationFailure ("expected an error object, got " <> show other)
+
+  it "POST /api/tabs/new {machine} refusal mints NO session.json" $ do
+    -- The whole point of validating before minting: an orphan would surface in
+    -- Recent Sessions with no tab behind it.
+    app <- mkApp
+    priorCount <- countSessions mkPaths
+    req <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("provider" :: T.Text)
+        , "provider" .= ("anthropic" :: T.Text)
+        , "model" .= ("claude-sonnet-4" :: T.Text)
+        , "machine" .= ("ghost" :: T.Text) ]))
+    status <- runAppStatus app req
+    status `shouldBe` 400
+    postCount <- countSessions mkPaths
+    postCount `shouldBe` priorCount
+
+  it "POST /api/tabs/new {machine: \"local\"} pins the session to local" $ do
+    app <- mkApp
+    req <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("provider" :: T.Text)
+        , "provider" .= ("anthropic" :: T.Text)
+        , "model" .= ("claude-sonnet-4" :: T.Text)
+        , "machine" .= ("local" :: T.Text) ]))
+    (status, body) <- runAppBody app req
+    status `shouldBe` 200
+    sid <- case A.decode body of
+      Just (A.Object o) -> case KeyMap.lookup (Key.fromText "session_id") o of
+        Just (A.String t) -> case mkSessionId t of
+          Right x -> pure x
+          Left e  -> expectationFailure (T.unpack e) >> error "unreachable"
+        _ -> expectationFailure "no session_id in response" >> error "unreachable"
+      _ -> expectationFailure "unexpected body" >> error "unreachable"
+    meta <- readSessionMeta mkPaths sid
+    fmap machineNameText (smExecMachine meta) `shouldBe` Just "local"
+
+  it "POST /api/tabs/new with NO machine field mints an UNPINNED session" $ do
+    -- The sentinel rule: an untouched picker must omit the field, and an
+    -- omitted field must not become a pin — otherwise every web session would
+    -- record a pin and the falsification metric would be false on its own
+    -- population.
+    app <- mkApp
+    req <- testPost ["api", "tabs", "new"]
+      (A.encode (A.object
+        [ "kind" .= ("provider" :: T.Text)
+        , "provider" .= ("anthropic" :: T.Text)
+        , "model" .= ("claude-sonnet-4" :: T.Text) ]))
+    (status, body) <- runAppBody app req
+    status `shouldBe` 200
+    sid <- case A.decode body of
+      Just (A.Object o) -> case KeyMap.lookup (Key.fromText "session_id") o of
+        Just (A.String t) -> case mkSessionId t of
+          Right x -> pure x
+          Left e  -> expectationFailure (T.unpack e) >> error "unreachable"
+        _ -> expectationFailure "no session_id" >> error "unreachable"
+      _ -> expectationFailure "unexpected body" >> error "unreachable"
+    meta <- readSessionMeta mkPaths sid
+    smExecMachine meta `shouldBe` Nothing
 
   it "POST /api/tabs/new with kind=provider does NOT leave an orphan session when the tab insert fails (full tab list)" $ do
     -- Use a FRESH temp dir so sessions from other tests don't leak in and

@@ -1028,12 +1028,28 @@ export interface CreateTabBody {
    *  id). Sent only alongside `branch_from`. */
   branch_conv_len?: number
   harness_id?: string
+  /** The execution machine to pin this session to. OMITTED when the picker
+   *  is left on its sentinel option, and omitted whenever `branch_from` is
+   *  set (the backend copies the parent's pin) — one rule, not two.
+   *
+   *  Omitting it matters beyond tidiness: a present pin means "the user
+   *  deliberately chose this machine". If an untouched picker sent the
+   *  preselected default, every web session would record a pin and the
+   *  feature's own usage metric would be false on its own population. */
+  machine?: string
 }
+
+/** The result of POST /api/tabs/new. `ok: false` carries the gateway's error
+ *  text so the caller can show it — a bare `null` made a 400 invisible, which
+ *  is how a rejected machine pin silently looked like success. */
+export type NewTabResult =
+  | { ok: true; tab: NewTabResponse }
+  | { ok: false; error: string }
 
 /** Create a new tab via the unified POST /api/tabs/new endpoint. For
  *  provider-backed sessions the response includes a `session_id` usable to
  *  load the transcript; for raw shell tabs it is null. */
-export async function createTab(body: CreateTabBody, timeoutMs = 20_000): Promise<NewTabResponse | null> {
+export async function createTab(body: CreateTabBody, timeoutMs = 20_000): Promise<NewTabResult> {
   const ctrl = new AbortController()
   const t = setTimeout(() => ctrl.abort(), timeoutMs)
   try {
@@ -1043,13 +1059,28 @@ export async function createTab(body: CreateTabBody, timeoutMs = 20_000): Promis
       body: JSON.stringify(body),
       signal: ctrl.signal,
     })
-    if (!res.ok) return null
-    return await res.json() as NewTabResponse
-  } catch {
-    return null
+    if (!res.ok) {
+      // Read the error body rather than discarding it: a 400 from a rejected
+      // machine pin carries the available set, and the composer shows it.
+      const text = await res.text().catch(() => '')
+      return { ok: false, error: extractErrorText(text, res.status) }
+    }
+    return { ok: true, tab: await res.json() as NewTabResponse }
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'request failed' }
   } finally {
     clearTimeout(t)
   }
+}
+
+/** The gateway's error envelope is `{"error": "..."}`; fall back to the raw
+ *  body, then to the status, so the caller always has something to show. */
+function extractErrorText(body: string, status: number): string {
+  try {
+    const parsed = JSON.parse(body) as { error?: unknown }
+    if (typeof parsed.error === 'string' && parsed.error) return parsed.error
+  } catch { /* not JSON */ }
+  return body || `request failed (${status})`
 }
 
 /** Response from POST /api/sessions/new (bare new session, no tab). */

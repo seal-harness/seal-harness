@@ -47,6 +47,7 @@ export function NewTabComposer({
   const selectableProviders = spec.configuredProviders.filter((p) => p.configured !== false)
   const lockedToProvider = branchFrom !== undefined
   const [repoWarning, setRepoWarning] = useState<string | null>(null)
+  const [submitError, setSubmitError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
   // Lock the kind to provider whenever a branchFrom is supplied. The hook's
@@ -62,6 +63,7 @@ export function NewTabComposer({
     if (spec.validationError) return
     setSubmitting(true)
     setRepoWarning(null)
+    setSubmitError(null)
     if (spec.kind === 'attach') {
       const res = await adoptWindow(spec.attachSession, spec.attachWindow, spec.attachWindowIndex)
       if (res.ok) {
@@ -78,7 +80,16 @@ export function NewTabComposer({
       body.branch_conv_len = branchConvLen
     }
     const res = await createTab(body)
-    if (res) {
+    if (!res || !res.ok) {
+      // A rejected machine pin (400) used to look like success here, because
+      // createTab discarded the body and returned null. Surface the gateway's
+      // text and DO NOT call onSubmit/persistOnSubmit — the session was never
+      // created.
+      setSubmitError(res && !res.ok ? res.error : 'could not start the session')
+      setSubmitting(false)
+      return
+    }
+    {
       // If the user entered a repo URL and the new tab has a session id
       // (provider kind), dispatch SETUP_REPO into the session's
       // transcript (audited — visible in the chat, not a silent side
@@ -86,18 +97,15 @@ export function NewTabComposer({
       // recorded in the transcript. The repo is recorded to history via
       // persistOnSubmit regardless of clone success.
       const repoUrl = spec.repo.trim()
-      if (repoUrl && res.session_id) {
-        const result = await setupRepo(res.session_id, repoUrl, spec.repoBranch.trim() || undefined)
+      if (repoUrl && res.tab.session_id) {
+        const result = await setupRepo(res.tab.session_id, repoUrl, spec.repoBranch.trim() || undefined)
         if (!result || !result.ok) {
           const reason = result?.error ?? 'network error'
           setRepoWarning(`Could not set up repo "${repoUrl}": ${reason}. See the SETUP_REPO entry in the transcript for details; try https:// instead of git@.`)
         }
       }
       spec.persistOnSubmit()
-      onSubmit(res)
-    } else {
-      // createTab failed — re-enable the form so the user can retry.
-      setSubmitting(false)
+      onSubmit(res.tab)
     }
   }
 
@@ -301,6 +309,15 @@ export function NewTabComposer({
           style={{ fontSize: 12, color: 'var(--needs-input)' }}
         >
           {repoWarning}
+        </div>
+      )}
+
+      {submitError && (
+        <div
+          data-testid="composer-submit-error"
+          style={{ fontSize: 12, color: 'var(--error, #dc2626)' }}
+        >
+          {submitError}
         </div>
       )}
 
