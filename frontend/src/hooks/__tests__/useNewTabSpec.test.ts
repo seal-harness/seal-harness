@@ -192,4 +192,71 @@ describe('useNewTabSpec', () => {
       }
     })
   })
+
+  // A provider the picker refuses to offer must not be auto-selected either:
+  // the form would then submit a session bound to a provider that cannot
+  // answer, with the choice invisible in the dropdown.
+  it('never auto-selects an Ollama that is not installed', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url === '/api/providers') {
+        return new Response(JSON.stringify([
+          // The default is the unavailable one; a usable provider exists.
+          { name: 'ollama', isDefault: true, configured: true, readiness: 'not-installed' },
+          { name: 'anthropic', configured: true, defaultModel: 'claude-sonnet-4' },
+        ]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url === '/api/ui/state') {
+        return new Response(JSON.stringify({ last_options: null, custom_models: [], repo_history: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    const { result } = renderHook(() => useNewTabSpec())
+    await waitFor(() => expect(result.current.providersLoaded).toBe(true))
+    await waitFor(() => expect(result.current.provider).toBe('anthropic'))
+  })
+
+  // With nothing usable, the provider stays empty rather than naming the
+  // unavailable one, and validation explains why Submit is disabled.
+  it('reports a validation error when the only configured provider is not installed', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url === '/api/providers') {
+        return new Response(JSON.stringify([
+          { name: 'ollama', isDefault: true, configured: true, readiness: 'not-installed' },
+        ]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url === '/api/ui/state') {
+        return new Response(JSON.stringify({ last_options: null, custom_models: [], repo_history: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    const { result } = renderHook(() => useNewTabSpec())
+    await waitFor(() => expect(result.current.providersLoaded).toBe(true))
+    await waitFor(() => expect(result.current.validationError).not.toBeNull())
+    expect(result.current.validationError).toContain('No usable provider')
+  })
+
+  // A remembered provider that has since been uninstalled is replaced, not
+  // submitted: the same rule as the auto-default above, from the restore path.
+  it('does not restore a last-used provider that is not installed', async () => {
+    uiStateResponse = {
+      last_options: { kind: 'provider', provider: 'ollama', model: 'llama3.2', useCustomModel: false, flavour: 'claude-code', customBinary: '', attachSession: '', attachWindow: '', attachManual: false, repo: '' },
+      custom_models: [],
+      repo_history: [],
+    }
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url === '/api/providers') {
+        return new Response(JSON.stringify([
+          { name: 'ollama', isDefault: true, configured: true, readiness: 'not-installed' },
+          { name: 'anthropic', configured: true, defaultModel: 'claude-sonnet-4' },
+        ]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url === '/api/ui/state') {
+        return new Response(JSON.stringify(uiStateResponse), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    const { result } = renderHook(() => useNewTabSpec())
+    await waitFor(() => expect(result.current.providersLoaded).toBe(true))
+    await waitFor(() => expect(result.current.provider).toBe('anthropic'))
+  })
 })

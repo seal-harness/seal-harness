@@ -366,6 +366,56 @@ describe('CronView provider + model', () => {
     expect(opts.find((o) => o.value === 'ollama')!.textContent).toBe('Ollama')
   })
 
+  // A provider that is not installed at all is not an option: offering
+  // "Ollama (Ollama Not Found)" in a picker asks the operator to choose
+  // something that cannot answer. `configured` is config-only by design, so a
+  // keyless local Ollama is configured even when nothing is installed — this
+  // filter is the observed axis's only gate.
+  it('43: hides an Ollama that is not installed', () => {
+    providersState = [
+      { name: 'anthropic', isDefault: true, configured: true },
+      { name: 'ollama', configured: true, readiness: 'not-installed' },
+    ]
+    render(<CronView />)
+    fireEvent.click(screen.getByLabelText('New cron job'))
+    expect(optionValues(providerSelect())).toEqual(['', 'anthropic'])
+  })
+
+  // The other absence states are NOT hidden: installed-but-stopped and
+  // installed-with-no-models are both one command away, and hiding them would
+  // remove the very annotation that says which command. Pinned so a later
+  // "hide anything not ready" change has to argue with a test.
+  it.each(['not-running', 'no-models', 'no-fitting-model', 'unknown', 'pending', 'ready', 'cloud'] as const)(
+    '43b: keeps an Ollama whose readiness is %s',
+    (readiness) => {
+      providersState = [{ name: 'ollama', configured: true, readiness }]
+      render(<CronView />)
+      fireEvent.click(screen.getByLabelText('New cron job'))
+      expect(optionValues(providerSelect())).toEqual(['', 'ollama'])
+    },
+  )
+
+  // A stored provider the operator chose must never vanish from the picker:
+  // CronView appends it as `missing` exactly so opening and saving a job
+  // cannot silently clear it. That guard outranks the readiness filter.
+  it('43c: a stored provider still shows when it is not installed', () => {
+    providersState = [
+      { name: 'anthropic', isDefault: true, configured: true },
+      { name: 'ollama', configured: true, readiness: 'not-installed' },
+    ]
+    cronJobsState = [makeJob({ id: 'daily', provider: 'ollama', model: 'llama3.2' })]
+    render(<CronView />)
+    fireEvent.click(screen.getByText('Daily'))
+    const sel = providerSelect()
+    expect(optionValues(sel)).toContain('ollama')
+    expect(sel.value).toBe('ollama')
+    // It survives, and its label still says why it is not usable — the
+    // readiness annotation, not ` (missing)`, which would claim the id does
+    // not resolve at all.
+    expect(Array.from(sel.options).find((o) => o.value === 'ollama')!.textContent)
+      .toBe('Ollama (Ollama Not Found)')
+  })
+
   it('42d: missing wins over readiness when both apply', () => {
     // `missing` lives on ProviderOption (the shared select's input), not on
     // ProviderInfo, so this case is asserted on the component directly rather
@@ -380,6 +430,22 @@ describe('CronView provider + model', () => {
       />,
     )
     const opts = Array.from((document.getElementById('missing-wins') as HTMLSelectElement).options)
+    expect(opts.find((o) => o.value === 'ollama')!.textContent).toBe('Ollama (missing)')
+  })
+
+  // Same precedence, but for the state that is *hidden*: `missing` must win
+  // over the absence filter too, or the stored value disappears entirely.
+  it('43d: missing wins over a not-installed readiness (the option survives)', () => {
+    render(
+      <ProviderSelect
+        id="missing-survives"
+        value="ollama"
+        onChange={() => {}}
+        providers={[{ name: 'ollama', configured: true, missing: true, readiness: 'not-installed' }]}
+        loading={false}
+      />,
+    )
+    const opts = Array.from((document.getElementById('missing-survives') as HTMLSelectElement).options)
     expect(opts.find((o) => o.value === 'ollama')!.textContent).toBe('Ollama (missing)')
   })
 
