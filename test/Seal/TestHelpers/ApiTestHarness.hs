@@ -122,9 +122,11 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
 import Seal.ISA.RepeatDetect (newSessionRepeatRegistry)
 import Seal.Tools.Exec.Remote (RemoteRunner (..))
-import Seal.Tools.Exec.Types (ExecError (..))
+import Seal.Tools.Exec.Types
+  ( ExecError (..), SshConfig (..), mkRemotePath, mkSshHost, mkSshUser )
 import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
-import Seal.Tools.Exec.Untrusted (UntrustedExecMode (..))
+import Seal.Execution.Types
+  ( MachineName, ResolvedTarget (..), machineNameText, mkMachineName )
 import Seal.Tabs (newTabsHandle)
 import Seal.Web.UiState (newUiStateHandle)
 import Seal.Memory.Embedding (nullEmbeddingBackend)
@@ -164,9 +166,9 @@ data ApiTestEnv = ApiTestEnv
   { ateApp         :: Application
   , ateDeps        :: ApiDeps
   , atePaths       :: SealPaths
-  , ateMode        :: UntrustedExecMode
-    -- ^ Which untrusted executor wiring this environment uses. The test
-    -- body must NOT branch on this for assertions — both modes must assert
+  , ateTarget      :: ResolvedTarget
+    -- ^ Which execution target this environment resolves to. The test
+    -- body must NOT branch on this for assertions — both targets must assert
     -- the same contract. It exists so fixtures can observe the executor's
     -- own boundary (local: process env; remote: composed ssh command) and
     -- so diagnostics can label output.
@@ -179,10 +181,40 @@ data ApiTestEnv = ApiTestEnv
     -- the contract itself is asserted via the shared gh-env marker file.
   }
 
--- | Human-readable label for a mode (diagnostics output only).
-uemLabel :: UntrustedExecMode -> Text
-uemLabel UemLocal  = "local"
-uemLabel UemRemote = "remote"
+-- | Which untrusted executor wiring a fixture asks for. A local type rather
+-- than 'ResolvedTarget' so the fixture states its INTENT and the environment
+-- builds the target from the coordinates it writes — the two cannot drift.
+data TargetKind = TkLocal | TkRemote
+  deriving stock (Eq, Show)
+
+isRemoteKind :: TargetKind -> Bool
+isRemoteKind TkRemote = True
+isRemoteKind TkLocal  = False
+
+-- | The machine name the harness pins remote sessions to.
+harnessMachine :: MachineName
+harnessMachine = either (error "harness: MachineName") id (mkMachineName "harness-remote")
+
+-- | Turn the security.toml remote block into the 'SshConfig' the target
+-- carries. Every field is present in a fixture written by
+-- 'buildRemoteSecurityConfig', so a failure here is a broken fixture.
+specToSsh :: UntrustedExecRemoteFileConfig -> SshConfig
+specToSsh r = SshConfig
+  { scHost = fromMaybe (error "harness fixture: host")
+               (uerfcHost r >>= either (const Nothing) Just . mkSshHost)
+  , scUser = fromMaybe (error "harness fixture: user")
+               (uerfcUser r >>= either (const Nothing) Just . mkSshUser)
+  , scPort = fromMaybe 22 (uerfcPort r)
+  , scIdentity = uerfcIdentity r
+  , scKnownHosts = fromMaybe (error "harness fixture: known_hosts") (uerfcKnownHosts r)
+  , scWorkspace = fromMaybe (error "harness fixture: workspace")
+                    (uerfcWorkspace r >>= either (const Nothing) Just . mkRemotePath)
+  }
+
+-- | Human-readable label for a target (diagnostics output only).
+uemLabel :: ResolvedTarget -> Text
+uemLabel WhereLocal     = "local"
+uemLabel (WhereSsh n _) = machineNameText n
 
 -- | The PAT token seeded into the fake vault for @CredPat@ dummy repos.
 -- Tests assert this exact value reaches the composed untrusted command's
@@ -362,7 +394,7 @@ runApiTestLocal
 runApiTestLocal mRepoCfg opts body = it "local" $ do
   withSystemTempDirectory "seal-api-test" $ \tmp -> do
     mRepo <- traverse (setupDummyRepo tmp) mRepoCfg
-    env <- buildTestEnv tmp UemLocal mRepo opts
+    env <- buildTestEnv tmp TkLocal mRepo opts
     body env
 
 -- | Run the test body in remote mode only. Guards with 'pendingWith' when
@@ -375,7 +407,7 @@ runApiTestRemote
 runApiTestRemote mRepoCfg opts body = it "remote" $ do
   let runBody = withSystemTempDirectory "seal-api-test" $ \tmp -> do
           mRepo <- traverse (setupDummyRepo tmp) mRepoCfg
-          env <- buildTestEnv tmp UemRemote mRepo opts
+          env <- buildTestEnv tmp TkRemote mRepo opts
           body env
   keygenExe <- findExecutable "ssh-keygen"
   case keygenExe of
@@ -410,7 +442,12 @@ runApiTestRemote mRepoCfg opts body = it "remote" $ do
 -- ---------------------------------------------------------------------------
 
 buildTestEnv
-  :: FilePath -> UntrustedExecMode -> Maybe DummyRepo -> ApiTestOptions
+  :: FilePath
+  -> TargetKind
+     -- ^ 'TkLocal' or 'TkRemote'. A small local type rather than
+     -- 'ResolvedTarget', because the fixture must build the remote target
+     -- from the SSH coordinates it is about to write, not carry one in.
+  -> Maybe DummyRepo -> ApiTestOptions
   -> IO ApiTestEnv
 buildTestEnv tmp mode mRepo opts = do
   let stateRoot  = tmp </> "state"
@@ -494,12 +531,19 @@ buildTestEnv tmp mode mRepo opts = do
   -- Security config: remote mode needs untrusted_execution.remote.
   -- Write it to security.toml so runTurnBody picks it up (the turn
   -- engine loads SecurityConfig from disk, not from ApiDeps).
-  currentUser <- if mode == UemRemote then whoami else pure ""
+  currentUser <- if isRemoteKind mode then whoami else pure ""
   let mKeyfilePath = mRepo >>= drKeyfilePath
-      secCfg = if mode == UemRemote
+      secCfg = if isRemoteKind mode
         then buildRemoteSecurityConfig tmp currentUser mKeyfilePath
         else defaultSecurityConfig
   _ <- saveSecurityConfig (securityFilePath paths) secCfg PreserveCredentials
+  -- The target the harness hands to the exec cache. In remote mode it is the
+  -- machine the security.toml above describes; in local mode, this host.
+  -- Built from the SAME coordinates as that file, so the fixture cannot drift
+  -- from what the resolver would produce.
+  let target = case scUntrustedExec secCfg >>= uefcRemote of
+        Just r | isRemoteKind mode -> WhereSsh harnessMachine (specToSsh r)
+        _ -> WhereLocal
 
   logger <- testSealLogger
   execCache <- newSessionExecCache
@@ -509,7 +553,7 @@ buildTestEnv tmp mode mRepo opts = do
   -- gh command of the composed remote string. Both fixtures append what
   -- the gh invocation actually saw to the same marker file, so the test
   -- body asserts one contract with no mode branching.
-  mCaptureRef <- if mode == UemRemote && atoFakeRemoteRunner opts
+  mCaptureRef <- if isRemoteKind mode && atoFakeRemoteRunner opts
     then Just <$> newIORef []
     else pure Nothing
   mRunner <- case mCaptureRef of
@@ -540,7 +584,7 @@ buildTestEnv tmp mode mRepo opts = do
         , sdRepeatReg = testRepeatReg
         , sdTabsHandle = tabsH
         , sdLogger = logger
-        , sdIsRemote = mode == UemRemote
+        , sdIsRemote = isRemoteKind mode
         , sdExecCache = execCache
         , sdRemoteRunner = mRunner
         , sdHostKeyAdoption = Nothing
@@ -592,7 +636,7 @@ buildTestEnv tmp mode mRepo opts = do
     { ateApp = app
     , ateDeps = deps
     , atePaths = paths
-    , ateMode = mode
+    , ateTarget = target
     , ateProviderRef = providerRef
     , ateDummyRepo = mRepo
     , ateCapturedSshArgv = mCaptureRef

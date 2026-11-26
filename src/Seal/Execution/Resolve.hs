@@ -19,18 +19,22 @@
 module Seal.Execution.Resolve
   ( resolveTarget
   , loadAndResolveTargetIO
+  , resolveBootTarget
   ) where
 
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
+import Data.String (fromString)
 import Data.Text qualified as T
 
 import Seal.Config.Execution (ExecutionConfig (..), loadExecutionConfigWith)
-import Seal.Config.Paths (SealPaths)
+import Seal.Config.Paths (SealPaths, executionFilePath, securityFilePath)
 import Seal.Config.Security (UntrustedExecFileConfig, allowLocalhostFrom)
+import Seal.Logging.Global (globalLogIO)
+import Katip (Severity (..))
 import Seal.Execution.Types
-  ( MachineName, ResolvedTarget (..), TargetError (..), machineNameText
-  , sshConfigFromMachine )
+  ( MachineName, ResolvedTarget (..), TargetError (..), TargetPaths (..)
+  , machineNameText, renderTargetError, sshConfigFromMachine )
 
 -- | Resolve a session's target. Seven rows, first match wins.
 resolveTarget
@@ -94,6 +98,34 @@ resolveTarget ec allowLocalhost pin = case pin of
     fallback
       | allowLocalhost = Right WhereLocal
       | otherwise      = Left TargetNoMachine
+
+-- | Resolve a target for a BOOT-TIME surface — one that exists before (or
+-- without) a session, so it has no pin to honour: the CLI's @isRemote@ flag,
+-- the @serve@ file explorer.
+--
+-- Always called with 'Nothing' as the pin. A failure is logged at warn with
+-- the full rendered message and then propagated, because the two callers want
+-- different fallbacks: @serve@'s explorer fails closed, and CLI boot treats
+-- "nothing may run" as "nothing is remote".
+--
+-- Takes a 'TargetPaths' so the warning names the operator's real files even
+-- when @SEAL_HOME@ is not the default.
+resolveBootTarget
+  :: SealPaths
+  -> Maybe UntrustedExecFileConfig
+  -> IO (Either TargetError ResolvedTarget)
+resolveBootTarget paths legacy = do
+  e <- loadAndResolveTargetIO paths legacy Nothing
+  case e of
+    Left err -> globalLogIO WarningS
+      (fromString (T.unpack (renderTargetError bootPaths err)))
+    Right _  -> pure ()
+  pure e
+  where
+    bootPaths = TargetPaths
+      { tpExecution = T.pack (executionFilePath paths)
+      , tpSecurity  = T.pack (securityFilePath paths)
+      }
 
 -- | Load the inventory and resolve in one step. The @Maybe
 -- UntrustedExecFileConfig@ is threaded through so legacy synthesis can apply;

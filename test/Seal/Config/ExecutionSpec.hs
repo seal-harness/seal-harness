@@ -13,6 +13,8 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
+import Seal.Execution.Resolve (resolveTarget)
+import Seal.Tools.Exec.Remote (sshExecArgv)
 import Seal.Config.Execution
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Config.Security
@@ -381,6 +383,50 @@ spec = describe "Seal.Config.Execution" $ do
         case loaded of
           Left e -> expectationFailure (T.unpack (render e))
           Right ec -> Map.lookup (mn "b") (ecMachines ec) `shouldBe` Just spec'
+
+  describe "additivity: the two definitions of one machine agree" $ do
+    -- Design §8: this cannot be tested on the unmodified tree, because WU-1b
+    -- deliberately changes the ssh argv. Its referent is TWO DERIVATIONS
+    -- COMPARED IN THE SAME TREE: a legacy [untrusted_execution.remote] block
+    -- and the equivalent execution.toml entry must resolve to the same
+    -- target.
+    it "a legacy block and an execution.toml entry yield the same ssh argv" $
+      withSystemTempDirectory "seal-exec-additive" $ \dir -> do
+        let paths = pathsAt dir
+            spec' = machine "legacy.example.com" 22 Nothing
+            -- `default` is the machine name the legacy synthesis produces, and
+            -- it is also a reserved TOML KEY — so the equivalent execution.toml
+            -- form spells it as an ordinary name and points `default` at it.
+            ec = ExecutionConfig (Just (mn "legacy"))
+                   (Map.fromList [(mn "legacy", spec')])
+        -- The execution.toml form, encoded by the production writer.
+        saveExecutionConfig (executionFilePath paths) ec
+        fromToml <- loadExecutionConfig False paths
+        -- The legacy form, synthesised by the production loader.
+        fromLegacy <- loadExecutionConfigWith False (Just legacyRemoteFull) paths
+        case (fromToml, fromLegacy) of
+          (Right ecA, Right (ecB, _)) -> do
+            let nameA = ecDefault ecA
+                nameB = ecDefault ecB
+                specA = nameA >>= (`Map.lookup` ecMachines ecA)
+                specB = nameB >>= (`Map.lookup` ecMachines ecB)
+            case (specA, specB) of
+              (Just a, Just b) -> do
+                -- The ssh argv is the observable that matters: same machine
+                -- must mean same command line.
+                sshExecArgv (sshConfigFromMachine a) "echo hi"
+                  `shouldBe` sshExecArgv (sshConfigFromMachine b) "echo hi"
+              _ -> expectationFailure "one of the two forms produced no machine"
+          (Left e, _) -> expectationFailure ("execution.toml form failed: " <> T.unpack (render e))
+          (_, Left e) -> expectationFailure ("legacy form failed: " <> T.unpack (render e))
+
+  describe "additivity: a local install issues no ssh at all" $
+    it "an empty inventory + allow_localhost resolves WhereLocal, so no argv" $
+      withSystemTempDirectory "seal-exec-nossh" $ \dir -> do
+        result <- loadExecutionConfig True (pathsAt dir)
+        case result of
+          Left e -> expectationFailure ("load failed: " <> T.unpack (render e))
+          Right ec -> resolveTarget ec True Nothing `shouldBe` Right WhereLocal
 
 -- ---------------------------------------------------------------------------
 -- helpers

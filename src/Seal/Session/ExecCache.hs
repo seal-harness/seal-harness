@@ -7,9 +7,15 @@
 --   1. __Session exec__ ('cachedSessionExec') — 'mkSessionExec' runs a
 --      remote @mkdir -p@ bootstrap on every construction; in remote mode
 --      that is one SSH round trip per turn / per API call. The cache keys
---      the built 'SessionExec' by 'SessionId' and rebuilds only when the
---      security config's untrusted-exec fingerprint changes (a local↔remote
---      or workspace switch) or after an explicit 'invalidateExec'.
+--      the built 'SessionExec' by @('SessionId', 'ResolvedTarget')@ and
+--      rebuilds when that target changes, or after an explicit
+--      'invalidateExec'.
+--
+--      Keying on the RESOLVED TARGET is the fix for a real bug: the old key
+--      was a fingerprint of 'SecurityConfig', so editing a machine's host in
+--      @security.toml@ changed nothing until restart, and a re-pinned session
+--      kept serving its old exec. The value that decides where code runs is
+--      the target, so the target is what the key names.
 --      Fail-closed builds are NEVER cached (a later retry must be able to
 --      succeed).
 --
@@ -44,7 +50,7 @@ import Data.Time (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
 import Seal.Agent.Def.Types (AgentDef)
 import Seal.Agent.Def.Workdir (listWorkdirAgentDefsSnap)
 import Seal.Config.Paths (SealPaths)
-import Seal.Config.Security (SecurityConfig, untrustedExecConfigFromSecurity)
+import Seal.Execution.Types (ResolvedTarget)
 import Seal.Core.Types (SessionId)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Session.AgentMetaCache (MetaCacheEnv, buildRoutingWorkdirFs)
@@ -61,15 +67,14 @@ import Seal.Tools.Exec.WorkdirFs (WorkdirFs, snapTopDirs, wfsSnapshot)
 -- | The shared cache handle. Create ONE per process (per gateway /
 -- channel loop / CLI invocation) via 'newSessionExecCache'.
 data SessionExecCache = SessionExecCache
-  { sceExecs :: IORef (Map SessionId CachedExec)
+  { sceExecs :: IORef (Map (SessionId, ResolvedTarget) CachedExec)
   , sceScans :: IORef (Map SessionId CachedScan)
   , sceNow   :: IO UTCTime
     -- ^ The clock seam (tests inject a fake).
   }
 
-data CachedExec = CachedExec
-  { ceFingerprint :: !Text       -- ^ Untrusted-exec config fingerprint at build time
-  , ceExec        :: !SessionExec
+newtype CachedExec = CachedExec
+  { ceExec :: SessionExec
   }
 
 data CachedScan = CachedScan
@@ -92,36 +97,34 @@ newSessionExecCacheWith :: IO UTCTime -> IO SessionExecCache
 newSessionExecCacheWith now =
   SessionExecCache <$> newIORef Map.empty <*> newIORef Map.empty <*> pure now
 
--- | A stable fingerprint of the part of the security config that determines
--- session-exec behavior (mode local/remote + SSH coordinates). 'Show'-based:
--- the config types are small, pure records with 'Eq'/'Show' pinned for tests.
-execFingerprint :: SecurityConfig -> Text
-execFingerprint = T.pack . show . untrustedExecConfigFromSecurity
-
 -- | Fetch-or-build the session's 'SessionExec'. Successes are memoized by
--- 'SessionId'; rebuilt on a fingerprint mismatch or explicit
--- 'invalidateExec'. Fail-closed builds are never stored.
+-- @('SessionId', 'ResolvedTarget')@ — so two sessions on two machines in one
+-- cache get two distinct execs, which is the headline feature — and rebuilt
+-- when the target changes or after an explicit 'invalidateExec'. Fail-closed
+-- builds are never stored.
 cachedSessionExec
-  :: SessionExecCache -> SealPaths -> SecurityConfig -> SessionId
+  :: SessionExecCache -> SealPaths -> ResolvedTarget -> SessionId
   -> CloneDeps -> RemoteRunner -> Maybe HostKeyAdoption -> IO SessionExec
-cachedSessionExec cache paths secCfg sid cloneDeps runner mAdoption = do
+cachedSessionExec cache paths target sid cloneDeps runner mAdoption = do
   execs <- readIORef (sceExecs cache)
-  let fp = execFingerprint secCfg
-  case Map.lookup sid execs of
-    Just ce | ceFingerprint ce == fp -> pure (ceExec ce)
-    _ -> do
-      exec <- mkSessionExec paths secCfg sid cloneDeps runner mAdoption
+  let key = (sid, target)
+  case Map.lookup key execs of
+    Just ce -> pure (ceExec ce)
+    Nothing -> do
+      exec <- mkSessionExec paths target sid cloneDeps runner mAdoption
       if isFailClosedSessionExec exec
         then pure exec   -- never cache failures: a later retry must succeed
         else do
-          modifyIORef' (sceExecs cache) (Map.insert sid (CachedExec fp exec))
+          modifyIORef' (sceExecs cache) (Map.insert key (CachedExec exec))
           pure exec
 
 -- | Drop one session's memoized exec (the next 'cachedSessionExec' call
 -- rebuilds it). Used when the workdir is known to have been recreated.
 invalidateExec :: SessionExecCache -> SessionId -> IO ()
 invalidateExec cache sid =
-  modifyIORef' (sceExecs cache) (Map.delete sid)
+  -- Drop EVERY target for this session: a re-pin must not leave the old
+  -- machine's exec reachable through a stale key.
+  modifyIORef' (sceExecs cache) (Map.filterWithKey (\(s, _) _ -> s /= sid))
 
 -- | Fetch-or-scan the session's workdir discovery results: the agent defs
 -- + skills, computed together from ONE 'wfsSnapshot' so a cache miss costs

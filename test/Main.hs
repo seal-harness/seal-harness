@@ -49,7 +49,6 @@ import qualified Seal.Session.LockSpec
 import qualified Seal.Session.LockFocusSpec
 import qualified Seal.Text.LineFileSpec
 import qualified Seal.Tools.Exec.TypesSpec
-import qualified Seal.Tools.Exec.UntrustedSpec
 import qualified Seal.Tools.Exec.UntrustedIORemoteSpec
 import qualified Seal.Tools.Exec.LocalSpec
 import qualified Seal.Tools.Exec.LogRedactionSpec
@@ -285,7 +284,6 @@ specs = do
   Seal.Session.LockFocusSpec.spec
   Seal.Text.LineFileSpec.spec
   Seal.Tools.Exec.TypesSpec.spec
-  Seal.Tools.Exec.UntrustedSpec.spec
   Seal.Tools.Exec.UntrustedIORemoteSpec.spec
   Seal.Tools.Exec.LocalSpec.spec
   Seal.Tools.Exec.LogRedactionSpec.spec

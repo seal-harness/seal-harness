@@ -70,7 +70,9 @@ import Seal.Config.Paths
    sessionLogPath, sessionRequestsPath, sessionResponsesPath, sessionWorkdir)
 import qualified Katip as K2 (Severity (..), ls)
 import Seal.Config.Security
-  ( SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity )
+  ( SecurityConfig (..), loadSecurityConfig )
+import Seal.Execution.Resolve (loadAndResolveTargetIO)
+import Seal.Execution.Types (ResolvedTarget (..), TargetError (..))
 import Seal.Logging.Global (globalLogIO)
 import Seal.Core.Backends (Backends (..))
 import Seal.Core.MessageSource (MessageSource)
@@ -153,7 +155,6 @@ import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption)
 import Seal.Tools.Exec.Remote (RemoteRunner, mkRealRemoteRunner)
-import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
 import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs (..), snapIsDirectoryAt, snapTopDirs )
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
@@ -644,32 +645,43 @@ runSessionTurn td adapter meta mSrc t = do
 -- security-config load failure). Remote-only by design: in local mode the
 -- workdir IS local, so the per-file crawl has no SSH round trips to
 -- amortize. Logs its decision at debug so fallbacks are diagnosable.
+
+-- | Resolve THIS session's target, or fail closed.
+--
+-- The one place the turn engine decides where a session's untrusted code
+-- runs. Every site below goes through it, so the pin, the legacy block and
+-- @allow_localhost@ are consulted once and in one order.
+resolveSessionTarget
+  :: SealPaths -> SessionMeta
+  -> IO (Either TargetError ResolvedTarget)
+resolveSessionTarget paths meta = do
+  eSecCfg <- loadSecurityConfig (securityFilePath paths)
+  case eSecCfg of
+    Left err -> pure (Left (TargetConfigLoadError err))
+    Right secCfg -> do
+      let legacy = scUntrustedExec secCfg
+      loadAndResolveTargetIO paths legacy (smExecMachine meta)
+
 metaCacheEnvFor
-  :: TurnDeps -> SealPaths -> Either Text SecurityConfig
+  :: TurnDeps -> SealPaths -> Either TargetError ResolvedTarget
   -> IO (Maybe MetaCacheEnv)
-metaCacheEnvFor td paths eSecCfg = do
-  let mEnv = case (tdIsRemote td, eSecCfg) of
-        (True, Right secCfg) ->
-          case untrustedExecConfigFromSecurity secCfg of
-            Just (UntrustedExecConfig UemRemote (Just sshCfg)) -> Just MetaCacheEnv
-              { mceRunner       = fromMaybe mkRealRemoteRunner (tdRemoteRunner td)
-              , mceSshCfg       = sshCfg
-              , mceCacheRoot    = agentMetaCacheDir paths
-              , mceRunTransfer  = rsyncTransferIO sshCfg
-              }
-            _ -> Nothing
+metaCacheEnvFor td paths eTarget = do
+  let mEnv = case eTarget of
+        Right (WhereSsh _ sshCfg) -> Just MetaCacheEnv
+          { mceRunner       = fromMaybe mkRealRemoteRunner (tdRemoteRunner td)
+          , mceSshCfg       = sshCfg
+          , mceCacheRoot    = agentMetaCacheDir paths
+          , mceRunTransfer  = rsyncTransferIO sshCfg
+          }
+        -- Local sessions have a local workdir, so the per-file crawl costs
+        -- nothing and has no SSH round trips to amortize.
         _ -> Nothing
       reason = case mEnv of
         Just _  -> "Just (snapshot routing active)"
-        Nothing -> case (tdIsRemote td, eSecCfg) of
-          (False, _) -> "Nothing (local mode)"
-          (_, Left err) ->
-            "Nothing (security config load failed: " ++ T.unpack err ++ ")"
-          (_, Right secCfg) ->
-            case untrustedExecConfigFromSecurity secCfg of
-              Just uec | uecMode uec == UemRemote ->
-                "Nothing (mode=remote but ssh config missing/incomplete)"
-              _ -> "Nothing (mode is not remote)"
+        Nothing -> case eTarget of
+          Right WhereLocal -> "Nothing (local session)"
+          Left _           -> "Nothing (target did not resolve)"
+          Right (WhereSsh _ _) -> "Nothing (unreachable)"
   globalLogIO K2.DebugS (K2.ls (T.pack ("[agent-meta] env=" <> reason)))
   pure mEnv
 
@@ -681,19 +693,21 @@ runTurnBody
 runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandle = do
   appEnv <- mkEnv (tdLogger td) defaultConfig
   eCfg <- loadRuntimeConfig (prConfigPath (tdProvider td))
-  eSecCfg <- loadSecurityConfig (securityFilePath paths)
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
   cloneDeps <- mkCloneDepsTurn td
-  exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
-                 (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
-                 eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
+  eTarget <- resolveSessionTarget paths meta
+  exec <- case eTarget of
+    Left _        -> pure (failClosedSessionExec cloneDeps)
+    Right target  -> cachedSessionExec (tdExecCache td) paths target sid cloneDeps
+                       (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
+                       (tdHostKeyAdoption td)
   let wfs    = seWorkdirFs exec
       wsRoot = seWorkspaceRoot exec
       uioEnv = seUIOEnv exec
   -- [engine] One discovery scan per session (cache-backed): the result
   -- feeds autoBindRepoAgent AND both per-turn workdir backends, so a turn
   -- costs zero extra scans after the first (or after SETUP_REPO).
-  metaEnv <- metaCacheEnvFor td paths eSecCfg
+  metaEnv <- metaCacheEnvFor td paths eTarget
   (workdirDefs, workdirSkillsList) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot metaEnv
   workdirSkills <- Skill.staticSkillBackend workdirSkillsList
   workdirAgentDefs <- Def.staticAgentDefBackend workdirDefs
@@ -1053,14 +1067,19 @@ loadChannelLabel paths sid = do
 sessionSkillBackend :: TurnDeps -> SessionId -> IO Skill.SkillBackend
 sessionSkillBackend td sid = do
   let paths = tdPaths td
-  eSecCfg <- loadSecurityConfig (securityFilePath paths)
   cloneDeps <- mkCloneDepsTurn td
-  exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
-                 (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
-                 eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
+  mMeta <- loadSessionMeta paths sid
+  eTarget <- case mMeta of
+    Just meta' -> resolveSessionTarget paths meta'
+    Nothing    -> pure (Left TargetNoMachine)
+  exec <- case eTarget of
+    Left _       -> pure (failClosedSessionExec cloneDeps)
+    Right target -> cachedSessionExec (tdExecCache td) paths target sid cloneDeps
+                      (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
+                      (tdHostKeyAdoption td)
   let wfs = seWorkdirFs exec
       wsRoot = seWorkspaceRoot exec
-  metaEnv <- metaCacheEnvFor td paths eSecCfg
+  metaEnv <- metaCacheEnvFor td paths eTarget
   (_, workdirSkillsList) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot metaEnv
   workdirSkills <- Skill.staticSkillBackend workdirSkillsList
   pure (Skill.tripleUnionSkillBackend workdirSkills (bSkills (tdBaseBackends td)))
@@ -1089,16 +1108,22 @@ callDispatcher td caps sid channelLabel callOpName val = do
   withIndexedTranscript sessionDirPath $ \tHandle -> do
     appEnv <- mkEnv (tdLogger td) defaultConfig
     eCfg <- loadRuntimeConfig (prConfigPath (tdProvider td))
-    eSecCfg <- loadSecurityConfig (securityFilePath paths)
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
     cloneDeps <- mkCloneDepsTurn td
-    exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
-                   (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
-                   eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
+    eTarget <- case mMeta of
+      -- No session.json yet: fail closed rather than guessing a machine. The
+      -- opcode still runs; its untrusted half does not.
+      Nothing    -> pure (Left TargetNoMachine)
+      Just meta' -> resolveSessionTarget paths meta'
+    exec <- case eTarget of
+      Left _       -> pure (failClosedSessionExec cloneDeps)
+      Right target -> cachedSessionExec (tdExecCache td) paths target sid cloneDeps
+                        (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
+                        (tdHostKeyAdoption td)
     let wfs = seWorkdirFs exec
         wsRoot = seWorkspaceRoot exec
         uioEnv = seUIOEnv exec
-    metaEnv <- metaCacheEnvFor td paths eSecCfg
+    metaEnv <- metaCacheEnvFor td paths eTarget
     (workdirDefs, workdirSkillsList) <- cachedWorkdirScan (tdExecCache td) sid wfs wsRoot metaEnv
     workdirAgentDefs <- Def.staticAgentDefBackend workdirDefs
     workdirSkills <- Skill.staticSkillBackend workdirSkillsList
@@ -1139,7 +1164,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
                   void (updateSessionRepo paths sid
                           (Just repoUrl) (branchNameText <$> mBranch))
               invalidateWorkdirScan (tdExecCache td) sid
-              freshMetaEnv <- metaCacheEnvFor td paths eSecCfg
+              freshMetaEnv <- metaCacheEnvFor td paths eTarget
               (freshDefs, freshSkillsList) <-
                 cachedWorkdirScan (tdExecCache td) sid wfs wsRoot freshMetaEnv
               autoBindRepoAgentWith freshDefs paths sid
@@ -1281,17 +1306,29 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
     , dwdAppEnv = appEnv
     , dwdMkUIOEnv = \mAnchor childSid -> do
         childCloneDeps <- mkCloneDepsTurn td
-        eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
-        -- WU-4: when anchoring (mAnchor = Just _), reuse the PARENT's
-        -- cached SessionExec (same workdir, same UIOEnv) so the child
-        -- sees the parent's repo clones + plan files. When isolated
-        -- (Nothing), build a fresh child workdir keyed by the child sid.
-        let execSid = case mAnchor of
-              Just _  -> parentSid
-              Nothing -> childSid
-        seUIOEnv <$> either (\_ _ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
-                            (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) (tdPaths td) sc execSid childCloneDeps runner mAdopt)
-                            eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
+        -- The child INHERITS the parent's pin (WU-4 copies the value into the
+        -- child's session.json), so the target is resolved from the PARENT's
+        -- metadata. That makes a dead pin fail closed in the child too,
+        -- rather than letting it fall back to the effective default.
+        mMeta <- loadSessionMeta (tdPaths td) parentSid
+        case mMeta of
+          Nothing -> pure (seUIOEnv (failClosedSessionExec childCloneDeps))
+          Just parentMeta -> do
+            -- WU-4: when anchoring (mAnchor = Just _), reuse the PARENT's
+            -- cached SessionExec (same workdir, same UIOEnv) so the child
+            -- sees the parent's repo clones + plan files. When isolated
+            -- (Nothing), build a fresh child workdir keyed by the child sid.
+            let execSid = case mAnchor of
+                  Just _  -> parentSid
+                  Nothing -> childSid
+            eTarget <- resolveSessionTarget (tdPaths td) parentMeta
+            case eTarget of
+              -- A dead pin fails closed here too (design §5 row 0).
+              Left _ -> pure (seUIOEnv (failClosedSessionExec childCloneDeps))
+              Right target -> seUIOEnv <$> cachedSessionExec (tdExecCache td)
+                (tdPaths td) target execSid childCloneDeps
+                (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
+                (tdHostKeyAdoption td)
     , dwdParentWorkdir = Just (sessionWorkdir (tdPaths td) parentSid)
     , dwdAutonomy = tdAutonomy td
     , dwdApprovals = tdApprovals td
@@ -1301,7 +1338,8 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
     , dwdResolveProviderOverride = tdResolveProviderOverride td
     , dwdUnionDefBackend = bAgentDefs sessionBackends
     , dwdChildRegistry = \childLineage ->
-        buildChildRegistryAdapter childLineage td sessionBackends eCfg operatorCeiling appEnv channel
+        buildChildRegistryAdapter childLineage td sessionBackends eCfg operatorCeiling
+                                  parentSid appEnv channel
     , dwdChildSystemPrompt =
         let (_, _, _, orch) = resolveDelegationConfig
                                 (fromFileConfig (either (const Nothing) rcDelegation eCfg))
@@ -1354,15 +1392,27 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
 -- ops (the read guards) and into the nested wiring, never looked up at
 -- op-run time.
 buildChildRegistryAdapter
-  :: [SessionId] -> TurnDeps -> Backends -> Either a RuntimeConfig -> Int -> Env -> Text
+  :: [SessionId] -> TurnDeps -> Backends -> Either a RuntimeConfig -> Int
+  -> SessionId
+     -- ^ the PARENT's session id. The child inherits the parent's pin (WU-4),
+     -- so the target is resolved from the parent's metadata.
+  -> Env -> Text
   -> AgentDef -> Int -> Maybe Text -> SessionId -> ChannelCaps -> IO ISA.Registry
-buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapterAppEnv adapterChannel
+buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling parentSid
+                          adapterAppEnv adapterChannel
                           def childDepth mRole childSid childCaps = do
   childCloneDeps <- mkCloneDepsTurn td
-  eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
-  childExec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
-                      (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner mAdopt)
-                      eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
+  mMeta <- loadSessionMeta (tdPaths td) parentSid
+  childExec <- case mMeta of
+    Nothing -> pure (failClosedSessionExec childCloneDeps)
+    Just parentMeta -> do
+      eTarget <- resolveSessionTarget (tdPaths td) parentMeta
+      case eTarget of
+        Left _ -> pure (failClosedSessionExec childCloneDeps)
+        Right target -> cachedSessionExec (tdExecCache td) (tdPaths td) target
+                          childSid childCloneDeps
+                          (fromMaybe mkRealRemoteRunner (tdRemoteRunner td))
+                          (tdHostKeyAdoption td)
   let childWsRoot = seWorkspaceRoot childExec
       childWebCfg = either (const Nothing) rcWeb eCfg
       (_, _, _, orchEnabled) =

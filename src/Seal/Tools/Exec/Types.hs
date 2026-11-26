@@ -180,7 +180,7 @@ getRemotePath (RemotePath t) = t
 -- 'Seal.Tools.Exec.Local'.
 data ExecError
   = ExecNotAllowed                -- ^ the operator policy denies the call
-  | ExecLocalNotPermittedForUntrusted -- ^ 'selectUntrustedBackend' got a non-Ssh backend
+  | ExecLocalNotPermittedForUntrusted -- ^ a remote-only path got a non-Ssh backend
   | ExecRemoteRequired            -- ^ mode=remote but no remote configured/reachable
   | ExecRemoteUnreachable         -- ^ SSH connect failed (not a host-key mismatch)
   | ExecHostKeyMismatch           -- ^ hard security failure; never bypassed
@@ -230,9 +230,10 @@ mkLocalExecHandlePlaceholder = LocalExecHandle
 
 -- | The execution backend the dispatcher consumes. The 'EbLocal' arm is
 -- the untrusted local executor (absent under @-f remote-only-untrusted@);
--- the 'EbRemote' arm is the SSH executor. 'selectExecBackend' (4a-T2)
--- returns this; 'selectUntrustedBackend' (4a-T2) returns ONLY the remote
--- arm (the spec's 'UntrustedExecBackend' is Ssh-only by construction).
+-- the 'EbRemote' arm is the SSH executor. Selection now lives in
+-- 'Seal.Execution.Resolve': a 'ResolvedTarget' is either "this host" or a
+-- named machine carrying an 'SshConfig', so there is exactly one place that
+-- decides, and the local arm cannot be produced from a remote-only path.
 --
 -- No 'Eq' is derived: 'LocalExecHandle' carries IO actions which have no
 -- 'Eq' instances. A custom 'Show' is provided (the 'LocalExecHandle' shows

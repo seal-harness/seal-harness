@@ -10,7 +10,6 @@ module Seal.Channel.Cli
   , resolveSessionProvider
   , mkSessionAgentEnv
   , TurnEnv (..)
-  , untrustedIOFromSecurity
   , Backends (..)
   , newBackends
   ) where
@@ -22,7 +21,7 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value)
 import Data.Either (fromRight)
 import Data.IORef (readIORef)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.Console.Haskeline
@@ -50,28 +49,24 @@ import Seal.Command.Registry (mintTabSession)
 import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
 import Seal.Config.File (defaultRuntimeConfig, loadRuntimeConfig)
-import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
-import Seal.Config.Paths (SealPaths (..), securityFilePath)
+import Seal.Execution.Resolve (resolveBootTarget)
+import Seal.Execution.Types (ResolvedTarget (..))
+import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Backends (Backends (..), newBackends)
 import Seal.Core.TurnEngine (TurnDeps (..), TurnAdapter (..), TurnOutcome (..), runSessionTurn)
 import qualified Seal.Core.TurnEngine as TurnEngine
 import Seal.Core.Types (SessionId, OpName (..))
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 #if !defined(REMOTE_ONLY_UNTRUSTED)
-import Seal.Tools.Exec.UntrustedIO ( mkLocalUntrustedIO, mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
 #else
-import Seal.Tools.Exec.UntrustedIO ( mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
 #endif
-import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption, mkHostKeyAdoption)
-import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, setSessionAbort)
 import Seal.ISA.RepeatDetect (SessionRepeatRegistry)
 import Seal.Agent.Def.Types (agentDefIdText)
 import Seal.Routing.Route qualified
 import Seal.Session.ExecCache (newSessionExecCache)
 import Seal.Session.Lock (newReplyRegistry, newSessionLocks)
-import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.Security.Policy (AutonomyLevel (..))
 import Seal.Tabs (TabsHandle, focusTabH, insertTabH, removeTabH, renameTabH, snapshotTabs)
@@ -154,8 +149,14 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
   locks <- newSessionLocks
   execCache <- newSessionExecCache
   active0 <- readIORef (srActive sr)
-  eSecCfg <- loadSecurityConfig (securityFilePath paths)
-  let isRemote = either (const False) (isJust . untrustedExecConfigFromSecurity) eSecCfg
+  eTarget <- resolveBootTarget paths Nothing
+  let isRemote = case eTarget of
+        Right (WhereSsh _ _) -> True
+        Right WhereLocal     -> False
+        -- Boot has no session, so it resolves unpinned. A failure here means
+        -- nothing may run at all, so `False` is the honest answer: nothing is
+        -- reachable to be remote.
+        Left _               -> False
       histFile       = spState paths </> "history"
       innerSettings  = (defaultSettings :: Settings IO) { complete = noCompletion }
       hlSettings     = innerSettings { historyFile = Just histFile }
@@ -461,33 +462,6 @@ renderTab :: Tab -> Text
 renderTab t =
   T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
     <> maybe "" ("  " <>) (tLabel t)
-
--- | Resolve the untrusted-execution 'UntrustedIO' capability handle from the
--- 'SecurityConfig'. Absent section / mode=local → the local arm (real local
--- executor wired to the workspace root). mode=remote + remote fully
--- configured → the remote arm (the SSH executor; the opcodes run remotely
--- via 'mkRemoteUntrustedIO'). mode=remote + remote absent/incomplete → the
--- fail-closed stub so untrusted opcodes fail at call time (the
--- 'UeExec ExecNotImplemented' error surfaces).
-untrustedIOFromSecurity :: WorkspaceRoot -> SecurityConfig -> UntrustedIO
-untrustedIOFromSecurity wsRoot cfg =
-  case untrustedExecConfigFromSecurity cfg of
-    Nothing -> defaultHandle
-    Just uec ->
-      case uecRemote uec of
-        Nothing -> mkRemoteUntrustedIOStub  -- mode=remote, no remote configured
-        Just sshCfg ->
-          -- The remote SSH arm. The RemoteRunner is the real
-          -- 'mkRealRemoteRunner' (System.Process-backed); the SSH argv +
-          -- host-key pinning are inherited from 'Seal.Tools.Exec.Remote'.
-          mkRemoteUntrustedIO sshCfg mkRealRemoteRunner
-  where
-#if !defined(REMOTE_ONLY_UNTRUSTED)
-    defaultHandle = mkLocalUntrustedIO wsRoot
-#else
-    defaultHandle = mkRemoteUntrustedIOStub  -- local executor absent; fail-closed
-    _ = wsRoot  -- keep wsRoot referenced under the flag (unused when local absent)
-#endif
 
 -- The CLI security policy and bin allow-list are now centralized in
 -- 'Seal.Core.TurnEngine.buildSessionRegistry' (the unified ISA registry

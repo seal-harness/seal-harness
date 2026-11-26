@@ -13,10 +13,9 @@ import Test.Hspec
 
 import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText)
 import Seal.Config.Paths (SealPaths (..))
-import Seal.Config.Security
-  ( SecurityConfig (..), UntrustedExecFileConfig (..)
-  , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig
-  )
+import Seal.Execution.Types
+  ( MachineName, ResolvedTarget (..), SshMachineSpec (..), mkMachineName
+  , mkSshLocalPath, sshConfigFromMachine )
 import Seal.Core.Types (SessionId, mkSystemSessionId, sessionIdText)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Session.ExecCache
@@ -25,7 +24,8 @@ import Seal.Session.ExecCache
   )
 import Seal.Session.Workdir (SessionExec (..))
 import Seal.Tools.Exec.Remote (RemoteRunner (..))
-import Seal.Tools.Exec.Types (ExecError (..), RemotePath, mkRemotePath)
+import Seal.Tools.Exec.Types
+  ( ExecError (..), RemotePath, mkRemotePath, mkSshHost, mkSshUser )
 import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs (..), mkInMemWorkdirFs, StubEntry (..)
   )
@@ -45,9 +45,9 @@ spec = describe "Seal.Session.ExecCache" $ do
       cache <- newSessionExecCacheWith (pure fakeNow)
       deps <- stubCloneDeps
       let paths = tmpPaths "/tmp/seal-exec-cache-build-once"
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
+      _ <- cachedSessionExec cache paths targetA sidA deps (recordingRunner calls) Nothing
       n1 <- length <$> readIORef calls
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
+      _ <- cachedSessionExec cache paths targetA sidA deps (recordingRunner calls) Nothing
       n2 <- length <$> readIORef calls
       -- The first build runs the remote mkdir -p bootstrap; the cached hit
       -- must not run anything.
@@ -58,9 +58,9 @@ spec = describe "Seal.Session.ExecCache" $ do
       cache <- newSessionExecCacheWith (pure fakeNow)
       deps <- stubCloneDeps
       let paths = tmpPaths "/tmp/seal-exec-cache-fingerprint"
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
+      _ <- cachedSessionExec cache paths targetA sidA deps (recordingRunner calls) Nothing
       n1 <- length <$> readIORef calls
-      _ <- cachedSessionExec cache paths otherRemoteSecCfg sidA deps (recordingRunner calls) Nothing
+      _ <- cachedSessionExec cache paths targetB sidA deps (recordingRunner calls) Nothing
       n2 <- length <$> readIORef calls
       (n1, n2) `shouldBe` (1 :: Int, 2 :: Int)
 
@@ -69,9 +69,9 @@ spec = describe "Seal.Session.ExecCache" $ do
       cache <- newSessionExecCacheWith (pure fakeNow)
       deps <- stubCloneDeps
       let paths = tmpPaths "/tmp/seal-exec-cache-invalidate"
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
+      _ <- cachedSessionExec cache paths targetA sidA deps (recordingRunner calls) Nothing
       invalidateExec cache sidA
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
+      _ <- cachedSessionExec cache paths targetA sidA deps (recordingRunner calls) Nothing
       n <- length <$> readIORef calls
       n `shouldBe` (2 :: Int)
 
@@ -80,8 +80,8 @@ spec = describe "Seal.Session.ExecCache" $ do
       cache <- newSessionExecCacheWith (pure fakeNow)
       deps <- stubCloneDeps
       let paths = tmpPaths "/tmp/seal-exec-cache-persid"
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
-      _ <- cachedSessionExec cache paths remoteSecCfg sidB deps (recordingRunner calls) Nothing
+      _ <- cachedSessionExec cache paths targetA sidA deps (recordingRunner calls) Nothing
+      _ <- cachedSessionExec cache paths targetA sidB deps (recordingRunner calls) Nothing
       n <- length <$> readIORef calls
       n `shouldBe` (2 :: Int)
 
@@ -90,14 +90,32 @@ spec = describe "Seal.Session.ExecCache" $ do
       cache <- newSessionExecCacheWith (pure fakeNow)
       deps <- stubCloneDeps
       let paths = tmpPaths "/tmp/seal-exec-cache-failclosed"
-          -- mode=remote with NO remote block → fail-closed at build time.
-          brokenCfg = defaultSecurityConfig
-            { scUntrustedExec = Just (UntrustedExecFileConfig (Just "remote") Nothing Nothing) }
-      e1 <- cachedSessionExec cache paths brokenCfg sidA deps (recordingRunner calls) Nothing
+      -- A fail-closed build happens when the workdir bootstrap itself fails:
+      -- the fake runner reports a transport error for every call.
+      let failing = RemoteRunner
+            { runRemote = \_ -> pure (Left ExecRemoteUnreachable)
+            , runRemoteStdin = \_ _ -> pure (Left ExecRemoteUnreachable)
+            , runRemoteEnv = \_ _ -> pure (Left ExecRemoteUnreachable)
+            , runRemoteStream = \_ _ -> pure (Left ExecRemoteUnreachable)
+            , runRemoteBytes = \_ -> pure (Left ExecRemoteUnreachable)
+            }
+      e1 <- cachedSessionExec cache paths targetA sidA deps failing Nothing
       execRoot e1 `shouldBe` "/nonexistent-workdir-fail-closed"
-      -- The failed build was NOT cached; a later VALID config builds fresh.
-      e2 <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
+      -- The failed build was NOT cached; a later working runner builds fresh.
+      e2 <- cachedSessionExec cache paths targetA sidA deps (recordingRunner calls) Nothing
       execRoot e2 `shouldBe` "/srv/agent-workspace/workdirs/" <> sessionIdText sidA
+
+    it "TWO sessions on TWO machines in one cache get distinct execs" $ do
+      -- The headline feature, and the only test that proves the key change
+      -- works. Under the old `execFingerprint` key this reused one exec.
+      calls <- newIORef []
+      cache <- newSessionExecCacheWith (pure fakeNow)
+      deps <- stubCloneDeps
+      let paths = tmpPaths "/tmp/seal-exec-cache-two-machines"
+      e1 <- cachedSessionExec cache paths targetA sidA deps (recordingRunner calls) Nothing
+      e2 <- cachedSessionExec cache paths targetB sidA deps (recordingRunner calls) Nothing
+      execRoot e1 `shouldBe` "/srv/agent-workspace/workdirs/" <> sessionIdText sidA
+      execRoot e2 `shouldBe` "/srv/other-workspace/workdirs/" <> sessionIdText sidA
 
   --------------------------------------------------------------------------
   -- cachedWorkdirScan (fetch-or-scan agent defs + skills per session)
@@ -165,24 +183,29 @@ fakeNow = UTCTime (fromGregorian 2026 8 22) (secondsToDiffTime (12 * 3600))
 wsRoot :: WorkspaceRoot
 wsRoot = WorkspaceRoot "/srv/agent-workspace"
 
-remoteBlock :: UntrustedExecRemoteFileConfig
-remoteBlock = UntrustedExecRemoteFileConfig
-  { uerfcHost       = Just "exec.internal"
-  , uerfcUser       = Just "agent"
-  , uerfcPort       = Nothing
-  , uerfcIdentity   = Nothing
-  , uerfcKnownHosts = Just "/home/agent/.seal/exec-known-hosts"
-  , uerfcWorkspace  = Just "/srv/agent-workspace"
+-- | A resolved SSH target. The cache keys on THIS, so the test exercises the
+-- real decision value rather than a fingerprint of the config that produced
+-- it — which is exactly the bug the old `execFingerprint` had.
+targetA :: ResolvedTarget
+targetA = WhereSsh (mn "builder") (sshConfigFromMachine (machineAt "/srv/agent-workspace"))
+
+-- | The same machine, different workspace: a distinct target.
+targetB :: ResolvedTarget
+targetB = WhereSsh (mn "builder") (sshConfigFromMachine (machineAt "/srv/other-workspace"))
+
+mn :: Text -> MachineName
+mn = either (error "fixture: MachineName") id . mkMachineName
+
+machineAt :: Text -> SshMachineSpec
+machineAt ws = SshMachineSpec
+  { smsHost = either (error "fixture: host") id (mkSshHost "exec.internal")
+  , smsUser = either (error "fixture: user") id (mkSshUser "agent")
+  , smsPort = 22
+  , smsIdentity = Nothing
+  , smsKnownHosts = either (error "fixture: known_hosts") id
+                      (mkSshLocalPath "/home/agent/.seal/exec-known-hosts")
+  , smsWorkspace = either (error "fixture: workspace") id (mkRemotePath ws)
   }
-
-remoteSecCfg :: SecurityConfig
-remoteSecCfg = defaultSecurityConfig
-  { scUntrustedExec = Just (UntrustedExecFileConfig (Just "remote") Nothing (Just remoteBlock)) }
-
-otherRemoteSecCfg :: SecurityConfig
-otherRemoteSecCfg = defaultSecurityConfig
-  { scUntrustedExec = Just (UntrustedExecFileConfig (Just "remote") Nothing (Just remoteBlock
-      { uerfcWorkspace = Just "/srv/other-workspace" })) }
 
 -- | A 'RemoteRunner' that records every invocation's argv and always
 -- returns empty stdout (enough for the mkdir -p workdir bootstrap).

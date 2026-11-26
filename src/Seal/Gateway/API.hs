@@ -79,11 +79,12 @@ import Seal.Config.Paths
   ( SealPaths (..), repoKeysDir, securityFilePath, sessionMetaPath, sessionWorkdir
   , workdirsRoot )
 import Seal.Config.Security
-  ( SecurityConfig, untrustedExecConfigFromSecurity )
+  ( SecurityConfig (..) )
+import Seal.Execution.Resolve (loadAndResolveTargetIO)
+import Seal.Execution.Types
+  ( ResolvedTarget (..), TargetError, machineNameText )
 import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
-import Seal.Tools.Exec.Untrusted
-  ( UntrustedExecConfig (..), UntrustedExecMode (..) )
 import Seal.Session.ExecCache (cachedSessionExec, cachedWorkdirScan)
 import Seal.Session.Workdir (mkSessionExec, remoteSessionWorkdirPath, SessionExec (..))
 import Seal.SourceControl.Clone (CloneDeps (..))
@@ -139,7 +140,7 @@ import Seal.Providers.OllamaReadiness
   ( OllamaReadiness (..), readinessWire )
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
 import Seal.SourceControl.Repo
   ( RepoCredential (..), RepoId, SourceRepo (..), hostAllowed, mkRepoId
   , parseCredentialKind, parseRepoHost, parseVcsKind, repoCredentialKindText
@@ -1202,22 +1203,32 @@ parseSetupRepoBody body =
       Just (A.String b) | not (T.null (T.strip b)) -> Just b
       _ -> Nothing
 
+-- | Resolve a session's target from the gateway's security config and the
+-- session's own pin. The one place this module decides where a session runs;
+-- every site below goes through it.
+apiSessionTarget :: ApiDeps -> SessionId -> IO (Either TargetError ResolvedTarget)
+apiSessionTarget deps sid = do
+  let paths = srPaths (adSessionRuntime deps)
+  mMeta <- readSessionMeta paths sid
+  loadAndResolveTargetIO paths
+    (scUntrustedExec (adSecurityConfig deps))
+    (mMeta >>= smExecMachine)
+
 -- | Agent-metadata cache env for API-driven scans. Remote mode only —
 -- in local mode the workdir is local and the legacy crawl costs nothing.
 -- Prefers the SendDeps runner seam so remote-mode integration tests stay
 -- hermetic; production passes Nothing there and gets the real runner.
-metaCacheEnvForApi :: ApiDeps -> Maybe MetaCacheEnv
-metaCacheEnvForApi deps = case adSend deps of
-  Just sendDeps | sdIsRemote sendDeps ->
-    case untrustedExecConfigFromSecurity (adSecurityConfig deps) of
-      Just (UntrustedExecConfig UemRemote (Just sshCfg)) ->
-        Just MetaCacheEnv
-          { mceRunner    = fromMaybe mkRealRemoteRunner (sdRemoteRunner sendDeps)
-          , mceSshCfg    = sshCfg
-          , mceCacheRoot = agentMetaCacheDir (adPaths deps)
-          , mceRunTransfer = rsyncTransferIO sshCfg
-          }
-      _ -> Nothing
+metaCacheEnvForApi :: ApiDeps -> Maybe ResolvedTarget -> Maybe MetaCacheEnv
+metaCacheEnvForApi deps mTarget = case adSend deps of
+  Just sendDeps | sdIsRemote sendDeps -> case mTarget of
+    Just (WhereSsh _ sshCfg) ->
+      Just MetaCacheEnv
+        { mceRunner    = fromMaybe mkRealRemoteRunner (sdRemoteRunner sendDeps)
+        , mceSshCfg    = sshCfg
+        , mceCacheRoot = agentMetaCacheDir (adPaths deps)
+        , mceRunTransfer = rsyncTransferIO sshCfg
+        }
+    _ -> Nothing
   _ -> Nothing
 
 -- | Build the @POST /api/sessions/:id/setup-repo@ response from the
@@ -1638,6 +1649,7 @@ handleSessionAgents deps sid = do
   if not exists
     then pure (errJson status404 "session not found")
     else do
+      eTarget <- apiSessionTarget deps sid
       -- Production: build the session exec through the SHARED cache (same
       -- instance the turn engine uses) so the remote mkdir -p bootstrap and
       -- the workdir discovery scan each run once per session, not once per
@@ -1646,17 +1658,24 @@ handleSessionAgents deps sid = do
         Just mk -> do
           e <- mk sid
           pure (e, Nothing)
-        Nothing -> case adSend deps of
-          Just sendDeps -> do
+        Nothing -> case (eTarget, adSend deps) of
+          -- A resolution failure (dead pin, malformed inventory, no machine
+          -- under allow_localhost = false) fails closed rather than guessing.
+          (Left _, _) -> do
             cloneDeps <- cloneDepsForApiDeps deps
-            e <- cachedSessionExec (sdExecCache sendDeps) paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner (sdHostKeyAdoption sendDeps)
+            e <- mkSessionExec paths WhereLocal sid cloneDeps mkRealRemoteRunner Nothing
+            pure (e, Nothing)
+          (Right target, Just sendDeps) -> do
+            cloneDeps <- cloneDepsForApiDeps deps
+            e <- cachedSessionExec (sdExecCache sendDeps) paths target sid cloneDeps
+                   mkRealRemoteRunner (sdHostKeyAdoption sendDeps)
             pure (e, Just (sdExecCache sendDeps))
-          Nothing -> do
+          (Right target, Nothing) -> do
             cloneDeps <- cloneDepsForApiDeps deps
-            e <- mkSessionExec paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner Nothing
+            e <- mkSessionExec paths target sid cloneDeps mkRealRemoteRunner Nothing
             pure (e, Nothing)
       let wfs = seWorkdirFs exec
-          metaEnv = metaCacheEnvForApi deps
+          metaEnv = metaCacheEnvForApi deps (either (const Nothing) Just eTarget)
       workdirBackend <- case mCache of
         Just cache -> do
           -- One shared scan; serve the union from a static backend.
@@ -1707,22 +1726,22 @@ handleSessionWorkdir deps sid = do
   if not exists
     then pure (errJson status404 "session not found")
     else do
-      let wdPath = case untrustedExecConfigFromSecurity (adSecurityConfig deps) of
-            Nothing ->
-              -- Local mode: the workdir is on the same machine as the
-              -- gateway, so the absolute path is directly usable.
-              T.pack (sessionWorkdir paths sid)
-            Just uec -> case uecRemote uec of
-              Just sshCfg ->
-                -- Remote mode with a configured SSH workspace: the
-                -- workdir is on the remote machine.
-                remoteSessionWorkdirPath sshCfg sid
-              Nothing ->
-                -- Remote mode without a complete remote block
-                -- (fail-closed at the executor level): fall back to the
-                -- local path shape so the frontend has something to show.
-                T.pack (sessionWorkdir paths sid)
-      pure (jsonLBS status200 (A.encode (object ["path" .= wdPath])))
+      -- The session's OWN target, not the gateway's global config: a
+      -- `builder` session's workdir is on the builder box, and reporting a
+      -- local path for it would be a lie the frontend then acts on.
+      eTarget <- apiSessionTarget deps sid
+      let (machineLabel, wdPath) = case eTarget of
+            -- Any resolution failure (dead pin, malformed inventory, no
+            -- machine) reports `Nothing` for the machine rather than a
+            -- guess, so the frontend can tell "unknown" from "local".
+            Left _ -> (Nothing :: Maybe Text, T.pack (sessionWorkdir paths sid))
+            Right WhereLocal -> (Just "local", T.pack (sessionWorkdir paths sid))
+            Right (WhereSsh n sshCfg) ->
+              (Just (machineNameText n), remoteSessionWorkdirPath sshCfg sid)
+      pure (jsonLBS status200 (A.encode (object
+        [ "path" .= wdPath
+        , "machine" .= machineLabel
+        ])))
 
 -- | Parse the @archived@ boolean field from a PUT /api/sessions/:id/archived
 -- body. Returns 'Nothing' when the body is invalid JSON or the field is

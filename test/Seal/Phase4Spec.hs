@@ -3,7 +3,7 @@
 -- then FILE_WRITE, with a fake 'UntrustedIO' that records calls. Asserts:
 -- both invocations recorded in the transcript, orRecorded secret-free,
 -- no local fallback under mode=remote with a fake-unreachable remote,
--- UntrustedExecBackend is Ssh-only by construction.
+-- the remote arm is Ssh-only by construction.
 module Seal.Phase4Spec (spec) where
 
 import Data.Aeson (Value (..), object, (.=))
@@ -29,10 +29,7 @@ import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Tools.Exec.UntrustedIO
   ( UntrustedIO (..), mkRemoteUntrustedIOStub )
-import Seal.Tools.Exec.Types (TerminalBackend (..))
-import Seal.Tools.Exec.Untrusted
-  ( UntrustedExecConfig (..), UntrustedExecMode (..), selectExecBackend
-  , mkUntrustedExecBackend, enforceRemoteOnly )
+import Seal.Execution.Types (ResolvedTarget (..), targetSshConfig)
 import Seal.Types.App
 import Seal.Types.Config
 import Seal.Types.Env
@@ -87,22 +84,24 @@ spec = describe "Seal.Phase4Spec (capstone)" $ do
     -- The executor was actually called
     readIORef seen `shouldNotReturn` []
 
-  it "mode=remote with no remote configured: selectExecBackend never yields EbLocal" $ do
-    let cfg = UntrustedExecConfig UemRemote Nothing
-    selectExecBackend cfg TbLocal `shouldSatisfy` \case
-      Left _  -> True   -- mode=remote + TbLocal -> Left (no local fallback)
-      Right _ -> True   -- selectExecBackend still uses ExecBackend internally
-
-  it "UntrustedExecBackend is only constructible from Ssh (never Local)" $ do
-    case mkUntrustedExecBackend TbLocal of
-      Left _ -> pure ()
-      Right _ -> expectationFailure "mkUntrustedExecBackend accepted Local"
-
-  it "enforceRemoteOnly rejects mode=local (Cabal flag startup check)" $ do
-    let cfg = UntrustedExecConfig UemLocal Nothing
-    case enforceRemoteOnly cfg of
-      Left _ -> pure ()
-      Right _ -> expectationFailure "enforceRemoteOnly accepted mode=local"
+  -- WU-5 deleted 'selectExecBackend', 'selectUntrustedBackend',
+  -- 'enforceRemoteOnly' and the 'UntrustedExecMode' type: they were a SECOND
+  -- authority-decider alongside the resolver, and half-migrating them is how
+  -- two decision paths appear. The properties these three tests protected are
+  -- now guaranteed by construction, so they are asserted structurally:
+  --
+  --   * "no local fallback under a remote-only build" — impossible, because
+  --     'WhereLocal' is reachable only when allow_localhost is true, and a
+  --     hardened build forces it false (WU-9). Pinned by the resolver's
+  --     invariant property.
+  --   * "'UntrustedExecBackend' is Ssh-only" — the type is gone; 'WhereSsh'
+  --     carries an 'SshConfig' by construction and nothing else does.
+  --   * "the Cabal flag rejects mode=local at startup" — replaced by the
+  --     allow_localhost coercion, which is the same decision expressed once.
+  it "the remote arm can only carry an SshConfig (no local fallback by construction)" $ do
+    -- 'targetSshConfig' is Total-and-Nothing for WhereLocal: there is no
+    -- constructor that yields a local executor and an SshConfig together.
+    targetSshConfig WhereLocal `shouldBe` Nothing
 
 rightOf :: Either a b -> Maybe b
 rightOf (Right b) = Just b

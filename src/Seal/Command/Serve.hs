@@ -82,8 +82,9 @@ import Seal.Config.BootPlan
 import Seal.Security.EnrollmentGrant (GrantSource (..))
 import Seal.Config.Security
   ( AccessControlFileConfig (..), SecurityConfig (..), loadSecurityConfig
-  , gatewayConfigFromSecurity, untrustedExecConfigFromSecurity )
-import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
+  , gatewayConfigFromSecurity )
+import Seal.Execution.Resolve (resolveBootTarget)
+import Seal.Execution.Types (ResolvedTarget (..))
 import Seal.Config.Paths (SealPaths (..), auditDir, configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, serveLockPath, sessionMetaPath, sshAgentsDir, tabListPath, tlsCertPath, tlsKeyPath, vaultFilePath, watchMapPath)
 import Seal.Security.DaemonLock (ServeLock, acquireServeLock)
 import Seal.Gateway.AccessControl
@@ -534,10 +535,13 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
   -- Build the shared ChannelDeps early so the reply registry + write locks
   -- can be shared with the web send handler (SendDeps). The cursor store,
   -- reply registry, and write locks are created inside newChannelDeps.
+  eBootTarget <- resolveBootTarget paths (scUntrustedExec secCfg)
   let loadCfg = fromRight defaultRuntimeConfig <$> loadRuntimeConfig cfgPath
-      isRemoteExec = case untrustedExecConfigFromSecurity secCfg of
-        Just uec -> uecMode uec == UemRemote
-        Nothing  -> False
+      -- Boot has no session, so this resolves unpinned. Nothing may run at
+      -- all (row 4) means nothing is reachable to be remote, so False.
+      isRemoteExec = case eBootTarget of
+        Right (WhereSsh _ _) -> True
+        _                    -> False
   chanDeps <- newChannelDeps
         paths rt repoRegH agentRegH pr backends autonomy (Just broker)
         reg tmuxR (Just mgr) approvals loadCfg isRemoteExec tabsH logger cursorsH
@@ -674,13 +678,16 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
       -- camera and phone photos while bounding gateway memory and the
       -- per-file remote transport.
       mediaPreviewBytes = 33554432
-  fileExplorer <- case untrustedExecConfigFromSecurity secCfg of
-    -- WU-1: split ceilings — viewer reads stay at maxScanBytes (128 KiB),
-    -- downloads use a 4 MiB chunk size (full config wiring comes in WU-2).
-    Nothing -> pure (mkLocalFileExplorer maxScanBytes downloadChunkBytes)
-    Just uec -> case uecRemote uec of
-      Nothing -> pure mkFailClosedFileExplorer
-      Just sshCfg -> mkRemoteFileExplorer sshCfg mkRealRemoteRunner maxScanBytes downloadChunkBytes
+  -- The explorer is a BOOT-TIME GLOBAL: it is built once, before any session
+  -- exists, so it cannot honour a per-session pin. A `builder` session's Files
+  -- link is therefore rendered inert by the frontend (WU-8) rather than
+  -- pointed at this machine's filesystem. A resolution failure keeps the
+  -- existing "remote without SSH ⇒ fail-closed" posture.
+  fileExplorer <- case eBootTarget of
+    Right WhereLocal -> pure (mkLocalFileExplorer maxScanBytes downloadChunkBytes)
+    Right (WhereSsh _ sshCfg) ->
+      mkRemoteFileExplorer sshCfg mkRealRemoteRunner maxScanBytes downloadChunkBytes
+    Left _ -> pure mkFailClosedFileExplorer
   iconCache <- newIconCache
   let deps = ApiDeps
         { adSessionRuntime  = sr

@@ -241,7 +241,6 @@ library
            Seal.Tools.Exec.Remote
           Seal.Tools.Exec.Timeout
           Seal.Tools.Exec.Types
-          Seal.Tools.Exec.Untrusted
           Seal.Tools.Exec.UntrustedIO
           Seal.Tools.Exec.FileExplorer
           Seal.Tools.Exec.UIO
@@ -647,7 +646,6 @@ test-suite tests
         Seal.Text.LineFileSpec
          Seal.Tools.Ssh.AgentSpec
          Seal.Tools.Exec.TypesSpec
-         Seal.Tools.Exec.UntrustedSpec
          Seal.Tools.Exec.UntrustedIORemoteSpec
          Seal.Web.UrlSafetySpec
          Seal.Config.WorkdirSpec

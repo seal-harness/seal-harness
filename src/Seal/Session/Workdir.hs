@@ -9,7 +9,6 @@ module Seal.Session.Workdir
   , cleanupSessionWorkdir
   , remoteSessionWorkdirPath
   , ensureRemoteSessionWorkdir
-  , mkSessionUntrustedIO
   , SessionExec (..)
   , mkSessionExec
   , failClosedSessionExec
@@ -26,20 +25,19 @@ import System.Directory
 import System.FilePath (splitDirectories)
 
 import Seal.Config.Paths (SealPaths (..), sessionWorkdir, workdirsRoot)
-import Seal.Config.Security (SecurityConfig, untrustedExecConfigFromSecurity)
-import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
+import Seal.Execution.Types (ResolvedTarget (..))
 import Seal.Core.Types (SessionId, sessionIdText, isValidSessionId)
 import Seal.Security.Path (WorkspaceRoot (..))
-import Seal.SourceControl.Clone (CloneDeps, stubCloneDeps)
+import Seal.SourceControl.Clone (CloneDeps)
 import Seal.Text.LineFile (maxScanBytes)
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption (..))
 import Seal.Tools.Exec.Remote
-  (RemoteRunner (..), mkRealRemoteRunner, runRemoteShell)
+  (RemoteRunner (..), runRemoteShell)
 import Seal.Tools.Args (mkShellCommand)
 import Seal.Tools.Exec.Types (SshConfig (..), getRemotePath, mkRemotePath)
 import Seal.Tools.Exec.UIO.Internal (UIOEnv (..), mkTestUIOEnv)
 import Seal.Tools.Exec.UntrustedIO
-  ( UntrustedIO, mkLocalUntrustedIO, mkRemoteUntrustedIO
+  ( mkLocalUntrustedIO, mkRemoteUntrustedIO
   , mkRemoteUntrustedIOStub, mkRemoteUntrustedIOStubWithReason )
 import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs, mkLocalWorkdirFs, mkRemoteWorkdirFs, mkWorkdirFsStub )
@@ -144,7 +142,7 @@ failClosedRoot = WorkspaceRoot "/nonexistent-workdir-fail-closed"
 -- | The per-session execution bundle: the 'UIOEnv' (carrying 'UntrustedIO'
 -- + 'CloneDeps'), the 'WorkdirFs' for discovery, and the shared
 -- 'WorkspaceRoot' used by UIO + WorkdirFs + the ISA registry. Constructed
--- by 'mkSessionExec' from the 'SecurityConfig'; the single 'RemoteRunner'
+-- by 'mkSessionExec' from a 'ResolvedTarget'; the single 'RemoteRunner'
 -- is shared between 'seUIOEnv' (UIO's 'UntrustedIO') and 'seWorkdirFs'
 -- (via 'runUIOWithEnv') — one SSH connection, not two. On ANY workdir-
 -- creation failure, ALL three fields are stubs (fail-closed) — never a
@@ -155,9 +153,10 @@ data SessionExec = SessionExec
   , seWorkspaceRoot :: WorkspaceRoot
   }
 
--- | Construct the per-session 'SessionExec' from the 'SecurityConfig'.
--- Mirrors 'mkSessionUntrustedIO' with the same three cases (local,
--- remote + configured, remote + absent/incomplete) but additionally
+-- | Construct the per-session 'SessionExec' from an already-resolved target.
+-- Takes 'ResolvedTarget' and not 'SecurityConfig': naming a type in a
+-- signature /is/ importing it, and the whole point of WU-5 is that exactly one
+-- place decides where code runs. Additionally
 -- builds the 'WorkdirFs' and the shared 'WorkspaceRoot'. The
 -- 'RemoteRunner' is passed explicitly so tests can inject
 -- 'mkFakeRemoteRunnerRecording' (no real SSH); production wiring passes
@@ -175,12 +174,12 @@ data SessionExec = SessionExec
 -- On ANY workdir-creation failure, returns a 'SessionExec' with both
 -- handles as stubs and 'seWorkspaceRoot' as 'failClosedRoot' — never mixed.
 mkSessionExec
-  :: SealPaths -> SecurityConfig -> SessionId
+  :: SealPaths -> ResolvedTarget -> SessionId
   -> CloneDeps -> RemoteRunner -> Maybe HostKeyAdoption
   -> IO SessionExec
-mkSessionExec paths secCfg sid cloneDeps runner mAdoption =
-  case untrustedExecConfigFromSecurity secCfg of
-    Nothing -> do
+mkSessionExec paths target sid cloneDeps runner mAdoption =
+  case target of
+    WhereLocal -> do
       eWd <- ensureSessionWorkdir paths sid
       case eWd of
         Right wd ->
@@ -196,40 +195,38 @@ mkSessionExec paths secCfg sid cloneDeps runner mAdoption =
         Left err -> pure (failClosedSessionExecWithReason cloneDeps
                             ("local workdir creation failed: " <> T.pack (show err)))
 
-    Just uec ->
-      case uecRemote uec of
-        Nothing -> pure (failClosedSessionExecWithReason cloneDeps
-                           "mode=remote but no remote SSH block configured (host/user/known_hosts/workspace required)")
-
-        Just sshCfg -> do
-          eRemoteWd <- ensureRemoteSessionWorkdir sshCfg runner sid
-          case eRemoteWd of
-            Left (WdRemoteMkdirFailed errText)
-              | "ExecHostKeyUnknown" `T.isInfixOf` errText
-                -> case mAdoption of
-                  Nothing ->
-                    pure (failClosedSessionExecWithReason cloneDeps
-                           ("remote host key not in known_hosts (TOFU adoption not available). "
-                            <> "Host: " <> T.pack (show (scHost sshCfg))
-                            <> ". Add the key manually with: ssh-keyscan -H "
-                            <> hostText sshCfg
-                            <> " >> " <> T.pack (scKnownHosts sshCfg)))
-                  Just hka -> do
-                    eAdopt <- hkaAdopt hka sshCfg
-                    case eAdopt of
-                      Left adoptErr -> pure (failClosedSessionExecWithReason cloneDeps
-                                              ("host-key adoption failed: " <> adoptErr))
-                      Right _ -> do
-                        -- Retry the workdir bootstrap after adoption.
-                        eRetry <- ensureRemoteSessionWorkdir sshCfg runner sid
-                        case eRetry of
-                          Left retryErr -> pure (failClosedSessionExecWithReason cloneDeps
-                                                  ("remote workdir creation failed after host-key adoption: "
-                                                   <> T.pack (show retryErr)))
-                          Right remoteWdText -> buildRemoteExec sshCfg remoteWdText cloneDeps runner
-            Left err -> pure (failClosedSessionExecWithReason cloneDeps
-                               ("remote workdir creation failed: " <> T.pack (show err)))
-            Right remoteWdText -> buildRemoteExec sshCfg remoteWdText cloneDeps runner
+    WhereSsh _ sshCfg -> do
+      -- No "remote but unconfigured" arm is reachable any more: 'WhereSsh' can
+      -- only be constructed from a machine that already carries every field,
+      -- so the old fail-closed branch has no input.
+      eRemoteWd <- ensureRemoteSessionWorkdir sshCfg runner sid
+      case eRemoteWd of
+        Left (WdRemoteMkdirFailed errText)
+          | "ExecHostKeyUnknown" `T.isInfixOf` errText
+            -> case mAdoption of
+              Nothing ->
+                pure (failClosedSessionExecWithReason cloneDeps
+                       ("remote host key not in known_hosts (TOFU adoption not available). "
+                        <> "Host: " <> T.pack (show (scHost sshCfg))
+                        <> ". Add the key manually with: ssh-keyscan -H "
+                        <> hostText sshCfg
+                        <> " >> " <> T.pack (scKnownHosts sshCfg)))
+              Just hka -> do
+                eAdopt <- hkaAdopt hka sshCfg
+                case eAdopt of
+                  Left adoptErr -> pure (failClosedSessionExecWithReason cloneDeps
+                                          ("host-key adoption failed: " <> adoptErr))
+                  Right _ -> do
+                    -- Retry the workdir bootstrap after adoption.
+                    eRetry <- ensureRemoteSessionWorkdir sshCfg runner sid
+                    case eRetry of
+                      Left retryErr -> pure (failClosedSessionExecWithReason cloneDeps
+                                              ("remote workdir creation failed after host-key adoption: "
+                                               <> T.pack (show retryErr)))
+                      Right remoteWdText -> buildRemoteExec sshCfg remoteWdText cloneDeps runner
+        Left err -> pure (failClosedSessionExecWithReason cloneDeps
+                           ("remote workdir creation failed: " <> T.pack (show err)))
+        Right remoteWdText -> buildRemoteExec sshCfg remoteWdText cloneDeps runner
 
   where
     hostText cfg = case scHost cfg of
@@ -281,32 +278,3 @@ failClosedSessionExecWithReason cloneDeps reason = SessionExec
 isFailClosedSessionExec :: SessionExec -> Bool
 isFailClosedSessionExec e = seWorkspaceRoot e == failClosedRoot
 
--- | Construct the per-session 'UntrustedIO' from the 'SecurityConfig':
---
---   * @mode=local@ (or absent): create the local workdir via
---     'ensureSessionWorkdir' and construct 'mkLocalUntrustedIO' with it
---     as the 'WorkspaceRoot'.
---
---   * @mode=remote@ + remote configured: create the remote workdir via
---     'ensureRemoteSessionWorkdir' (SSH @mkdir -p@), clone the
---     'SshConfig' with @scWorkspace@ = the per-session remote workdir,
---     and construct 'mkRemoteUntrustedIO' with the cloned config.
---
---   * @mode=remote@ + remote absent/incomplete: return the fail-closed
---     stub ('mkRemoteUntrustedIOStub').
---
--- This is the single entry point the wiring sites call — it handles
--- both local and remote, creates the workdir, and returns the handle.
--- On workdir creation failure, returns the fail-closed stub (the session
--- should surface the error and NOT proceed — the wiring site checks the
--- 'WorkdirError' via 'ensureSessionWorkdir' separately if it needs to
--- surface the error to the user).
---
--- Back-compat thin wrapper over 'mkSessionExec' (threads
--- 'mkRealRemoteRunner' and no host-key adoption, preserving EXACT current
--- semantics for callers that haven't been updated yet).
-mkSessionUntrustedIO
-  :: SealPaths -> SecurityConfig -> SessionId -> IO UntrustedIO
-mkSessionUntrustedIO paths secCfg sid =
-  uieUntrustedIO . seUIOEnv
-    <$> mkSessionExec paths secCfg sid stubCloneDeps mkRealRemoteRunner Nothing

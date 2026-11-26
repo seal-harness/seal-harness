@@ -1,8 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Config.WorkdirSpec (spec) where
 
-import Data.Either (isRight)
+import Data.Either (fromRight, isRight)
 import Data.IORef (newIORef, readIORef)
+import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Text qualified as T
 import System.Directory
   ( doesDirectoryExist, doesFileExist, createDirectoryIfMissing )
@@ -14,14 +16,18 @@ import Test.Hspec
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..)
-  , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig )
+  , UntrustedExecRemoteFileConfig (..), allowLocalhostFrom, defaultSecurityConfig )
 import Seal.Core.Types (mkSystemSessionId)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Session.Workdir
   ( WorkdirError (..), ensureSessionWorkdir, cleanupSessionWorkdir
   , remoteSessionWorkdirPath, ensureRemoteSessionWorkdir
-  , mkSessionUntrustedIO, mkSessionExec, seUIOEnv, seWorkdirFs
+  , mkSessionExec, seUIOEnv, seWorkdirFs
   , seWorkspaceRoot )
+import Seal.Config.Execution (ExecutionConfig (..))
+import Seal.Execution.Resolve (resolveTarget)
+import Seal.Execution.Types
+  ( ResolvedTarget (..), TargetError (..), mkMachineName )
 import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.Tools.Args (mkShellCommand)
 import Seal.Tools.Exec.Remote (mkFakeRemoteRunner, mkFakeRemoteRunnerRecording)
@@ -29,7 +35,7 @@ import Seal.Tools.Exec.Types
   ( SshConfig (..), ExecError (..), mkSshHost, mkSshUser, mkRemotePath )
 import Seal.Tools.Exec.UIO.Internal (uieUntrustedIO)
 import Seal.Tools.Exec.UntrustedIO
-  ( UntrustedIO (..), mkRemoteUntrustedIOStub )
+  ( UntrustedIO (..) )
 import Seal.Tools.Exec.WorkdirFs (WorkdirFs (..), WorkdirFsErr (..))
 
 spec :: Spec
@@ -172,7 +178,7 @@ spec = describe "Seal.Session.Workdir" $ do
             sid    = mkSystemSessionId "exec-local-001"
             secCfg = defaultSecurityConfig
         createDirectoryIfMissing True (spCache paths)
-        exec <- mkSessionExec paths secCfg sid stubCloneDeps
+        exec <- mkSessionExec paths (secTarget secCfg) sid stubCloneDeps
                    (mkFakeRemoteRunner (Right "")) Nothing
         -- The workspace root is the local per-session workdir.
         let expectedWd = tmp </> "cache" </> "workdirs" </> "exec-local-001"
@@ -197,7 +203,7 @@ spec = describe "Seal.Session.Workdir" $ do
       let runner  = mkFakeRemoteRunnerRecording callsRef (Right "")
           sid     = mkSystemSessionId "exec-remote-001"
           secCfg  = remoteSecurityConfig
-      exec <- mkSessionExec mkPathsRemote secCfg sid stubCloneDeps runner Nothing
+      exec <- mkSessionExec mkPathsRemote (secTarget secCfg) sid stubCloneDeps runner Nothing
       -- The workspace root is the remote per-session workdir path.
       let expectedRemoteWd =
             "/srv/agent-workspace/workdirs/exec-remote-001"
@@ -218,32 +224,24 @@ spec = describe "Seal.Session.Workdir" $ do
       recorded `shouldNotBe` []
       length recorded `shouldSatisfy` (> 1)
 
-    it "(c) remote mode + misconfigured (remote block absent) → both stubs, runner NOT invoked" $ do
-      callsRef <- newIORef []
-      let runner = mkFakeRemoteRunnerRecording callsRef (Right "")
-          sid    = mkSystemSessionId "exec-remote-misconfigured-001"
-          -- mode=remote but the [remote] sub-table is absent →
-          -- untrustedExecConfigFromSecurity yields Just (UemRemote, Nothing),
-          -- so mkSessionExec returns both stubs WITHOUT calling
-          -- ensureRemoteSessionWorkdir (the runner is never touched).
-          secCfg = defaultSecurityConfig
+    it "(c) a misconfigured remote is a RESOLUTION failure, not a stub exec" $ do
+      -- Before WU-5 this asserted that mkSessionExec returned stubs for
+      -- `mode=remote` with no [remote] block. That state is now unreachable by
+      -- construction: WhereSsh can only be built from a machine that carries
+      -- every field. The property it was protecting — "a half-configured
+      -- remote must not run anything" — moved to the resolver, so it is
+      -- asserted there.
+      let secCfg = defaultSecurityConfig
                      { scUntrustedExec = Just (UntrustedExecFileConfig (Just "remote") Nothing Nothing) }
-      exec <- mkSessionExec mkPathsRemote secCfg sid stubCloneDeps runner Nothing
-      -- The runner was NOT invoked (the misconfigured branch returns
-      -- both stubs before reaching ensureRemoteSessionWorkdir).
-      readIORef callsRef `shouldReturn` []
-      -- Both handles are stubs: WorkdirFs yields WfsStub.
-      let rp = either (error "fixture") id (mkRemotePath "anyfile.txt")
-      wfsReadFile (seWorkdirFs exec) rp `shouldReturn` Left WfsStub
-      -- The workspace root is fail-closed.
-      unWorkspaceRoot (seWorkspaceRoot exec) `shouldBe` "/nonexistent-workdir-fail-closed"
+      resolveTarget (ExecutionConfig Nothing Map.empty) (allowLocalhostFrom (scUntrustedExec secCfg)) Nothing
+        `shouldBe` Left TargetNoMachine
 
     it "(c') remote mode + unreachable (mkdir fails) → both stubs" $ do
       callsRef <- newIORef []
       let runner = mkFakeRemoteRunnerRecording callsRef (Left ExecRemoteUnreachable)
           sid    = mkSystemSessionId "exec-remote-unreachable-001"
           secCfg = remoteSecurityConfig
-      exec <- mkSessionExec mkPathsRemote secCfg sid stubCloneDeps runner Nothing
+      exec <- mkSessionExec mkPathsRemote (secTarget secCfg) sid stubCloneDeps runner Nothing
       -- The mkdir over SSH failed, so both handles are stubs.
       let rp = either (error "fixture") id (mkRemotePath "anyfile.txt")
       wfsReadFile (seWorkdirFs exec) rp `shouldReturn` Left WfsStub
@@ -256,7 +254,7 @@ spec = describe "Seal.Session.Workdir" $ do
             secCfg = defaultSecurityConfig
         createDirectoryIfMissing True (spCache paths)
         setFileMode (spCache paths) 0o444  -- read-only: mkdir inside fails
-        exec <- mkSessionExec paths secCfg sid stubCloneDeps
+        exec <- mkSessionExec paths (secTarget secCfg) sid stubCloneDeps
                    (mkFakeRemoteRunner (Right "")) Nothing
         setFileMode (spCache paths) 0o755  -- restore for cleanup
         -- Both handles are stubs.
@@ -264,32 +262,29 @@ spec = describe "Seal.Session.Workdir" $ do
         wfsReadFile (seWorkdirFs exec) rp `shouldReturn` Left WfsStub
         unWorkspaceRoot (seWorkspaceRoot exec) `shouldBe` "/nonexistent-workdir-fail-closed"
 
-    it "(e) mkSessionUntrustedIO ≡ uieUntrustedIO . seUIOEnv <$> mkSessionExec (back-compat)" $
-      withSystemTempDirectory "seal-wd-exec-bc" $ \tmp -> do
-        let paths  = mkPaths tmp
-            sid    = mkSystemSessionId "exec-bc-001"
-            secCfg = defaultSecurityConfig
-        createDirectoryIfMissing True (spCache paths)
-        uio1 <- mkSessionUntrustedIO paths secCfg sid
-        exec <- mkSessionExec paths secCfg sid stubCloneDeps
-                   (mkFakeRemoteRunner (Right "")) Nothing
-        let uio2 = uieUntrustedIO (seUIOEnv exec)
-        -- Both are local UntrustedIO handles (NOT the stub): they can
-        -- read a marker file. The stub would fail-closed.
-        let expectedWd = tmp </> "cache" </> "workdirs" </> "exec-bc-001"
-        writeFile (expectedWd </> "marker.txt") "hi"
-        let markerRp = either (error "fixture") id (mkRemotePath "marker.txt")
-        r1 <- uioReadFile uio1 markerRp 65536
-        r2 <- uioReadFile uio2 markerRp 65536
-        r1 `shouldSatisfy` isRight
-        r2 `shouldSatisfy` isRight
-        -- And the stub would NOT read it (proves they are not the stub).
-        rStub <- uioReadFile mkRemoteUntrustedIOStub markerRp 65536
-        rStub `shouldSatisfy` \case Left _ -> True; Right _ -> False
 
 -- ---------------------------------------------------------------------------
 -- Fixtures
 -- ---------------------------------------------------------------------------
+
+-- | The resolved target a 'SecurityConfig' denotes. mkSessionExec takes this
+-- now, so the test states where it wants the session to run directly.
+secTarget :: SecurityConfig -> ResolvedTarget
+secTarget cfg = case scUntrustedExec cfg >>= uefcRemote of
+  Just r -> case (uerfcHost r >>= rightToMaybe . mkSshHost,
+                  uerfcUser r >>= rightToMaybe . mkSshUser,
+                  uerfcKnownHosts r >>= Just,
+                  uerfcWorkspace r >>= rightToMaybe . mkRemotePath) of
+    (Just h, Just u, Just kh, Just w) -> WhereSsh (mnName "default")
+      SshConfig { scHost = h, scUser = u
+                , scPort = fromMaybe 22 (uerfcPort r)
+                , scIdentity = uerfcIdentity r
+                , scKnownHosts = kh, scWorkspace = w }
+    _ -> WhereLocal
+  Nothing -> WhereLocal
+  where
+    rightToMaybe = either (const Nothing) Just
+    mnName t = fromRight (error "fixture: MachineName") (mkMachineName t)
 
 sshCfg :: SshConfig
 sshCfg = SshConfig

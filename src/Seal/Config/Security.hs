@@ -70,7 +70,6 @@ module Seal.Config.Security
   , decodeSecurityConfig
   , saveSecurityConfig
   , updateSecurityConfig
-  , untrustedExecConfigFromSecurity
   ) where
 
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
@@ -103,10 +102,6 @@ import Toml qualified
 import Seal.Gateway.Config
   ( GatewayConfig, PartialGatewayConfig, defaultGatewayConfig, gatewayTableCodec
   , withGatewayDefaults )
-import Seal.Tools.Exec.Types
-  ( SshConfig (..), mkSshHost, mkSshUser, mkRemotePath )
-import Seal.Tools.Exec.Untrusted
-  ( UntrustedExecConfig (..), UntrustedExecMode (..) )
 
 -- | The boot-only, agent-immutable security configuration. Carries the
 -- @untrusted_execution@ section (remote-only enforcement) and the vault
@@ -758,59 +753,6 @@ emptyAccessControl = AccessControlFileConfig
   , acfcOrigin = Nothing
   , acfcRpId = Nothing
   }
-
--- | Resolve the 'SecurityConfig'\'s @[untrusted_execution]@ section to the
--- typed 'UntrustedExecConfig' the dispatcher consumes. Returns
--- 'Nothing' when the section is absent OR @mode=local@ (the default —
--- no remote needed, the local executor is wired by the call site).
--- Returns @Just (UemRemote, ...remote...)@ when @mode=remote@,
--- with the remote 'SshConfig' if the remote block is fully present
--- (host/user/known_hosts/workspace all set). A @mode=remote@ with a
--- missing/incomplete remote block returns @Just (UemRemote, Nothing)@
--- — fail-closed is at call time (spec §7 row 1), not at config resolution.
-untrustedExecConfigFromSecurity :: SecurityConfig -> Maybe UntrustedExecConfig
-untrustedExecConfigFromSecurity cfg =
-  resolveByMode =<< scUntrustedExec cfg
-
-resolveByMode :: UntrustedExecFileConfig -> Maybe UntrustedExecConfig
-resolveByMode uec =
-  let mode = if uefcMode uec == Just "remote" then UemRemote else UemLocal
-  in case mode of
-       UemRemote -> Just (UntrustedExecConfig UemRemote (resolveRemoteSsh uec))
-       UemLocal  -> localModeResult uec
-
--- | Resolve the [untrusted_execution.remote] sub-table to an 'SshConfig'.
--- Shared by both the UemRemote branch and the hardened-build localModeResult.
-resolveRemoteSsh :: UntrustedExecFileConfig -> Maybe SshConfig
-resolveRemoteSsh uec = uefcRemote uec >>= \r ->
-  uerfcHost r >>= \host ->
-  uerfcUser r >>= \user ->
-  uerfcKnownHosts r >>= \knownHosts ->
-  uerfcWorkspace r >>= \workspace ->
-  let port = fromMaybe 22 (uerfcPort r)
-      identity = uerfcIdentity r
-  in case ( mkSshHost host
-          , mkSshUser user
-          , mkRemotePath workspace
-          ) of
-       (Right h, Right u, Right w) -> Just SshConfig
-         { scHost       = h
-         , scUser       = u
-         , scPort       = port
-         , scIdentity   = identity
-         , scKnownHosts = knownHosts
-         , scWorkspace  = w
-         }
-       _ -> Nothing
-
-#if defined(REMOTE_ONLY_UNTRUSTED)
-localModeResult :: UntrustedExecFileConfig -> Maybe UntrustedExecConfig
-localModeResult uec =
-  Just (UntrustedExecConfig UemRemote (resolveRemoteSsh uec))
-#else
-localModeResult :: UntrustedExecFileConfig -> Maybe UntrustedExecConfig
-localModeResult _ = Nothing
-#endif
 
 --------------------------------------------------------------------------------
 -- allow_localhost: ONE producer (design §1.1, §1.4)
