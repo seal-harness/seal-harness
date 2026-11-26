@@ -46,9 +46,6 @@ for the full 4-phase loop: IMPLEMENT → VALIDATE → ADVERSARIAL REVIEW → COM
   drafted. Spawns 3 independent reviewers (Feasibility, Completeness, Scope
   & Alignment) — ALL must PASS before the plan is presented to the user.
   Load `plan-review-gate`.
-- **Requirements Baseline**: Written before design, reviewed by the human
-  (~2 min), then frozen. User-facing behaviour only. It is the baseline both
-  review gates measure scope against. Load `requirements-capture`.
 - **Coverage Gate**: Reads `.coverage-thresholds.json` and runs the
   enforcement command — BLOCKING gate before PR creation.
 
@@ -57,24 +54,6 @@ for the full 4-phase loop: IMPLEMENT → VALIDATE → ADVERSARIAL REVIEW → COM
 These rules override any conflicting instructions. They ensure the full
 orchestration pipeline is followed regardless of which skill initiated the work.
 
-**The pipeline, in order:**
-```
-requirements capture -> HUMAN APPROVES (the only doc they read) -> freeze
-  -> brainstorm? -> design -> Design Review Gate -> plan -> Plan Review Gate
-  -> execution -> self-reflect -> PR
-```
-
-- **Before design**: WRITE the requirements document
-  (`docs/superpowers/requirements/<date>-<slug>-requirements.md`) —
-  user-facing behaviour only, no implementation detail. Present flagged issues
-  CONCISELY (one line each, every one with a default) and get human approval,
-  or record an explicit auto-approval and list the defaults taken in the PR.
-  Then FREEZE it. Load `requirements-capture`.
-- **Scope is frozen after approval**: A reviewer finding may NEVER add scope on
-  its own authority. Triage every finding into exactly one bucket — IN SCOPE
-  (fix the design), CONSTRAINT CORRECTION (fix the prompt), PRE-EXISTING (file
-  an issue; one line in the design), or NEW REQUIREMENT (needs human sign-off;
-  default is decline).
 - **After brainstorming**: STOP — do NOT proceed to planning or
   implementation. RUN the Design Review Gate. WAIT for all 5 reviewers to
   approve. ONLY THEN proceed.
