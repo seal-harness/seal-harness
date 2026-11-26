@@ -1,0 +1,8 @@
+
+[machines]
+  [machines.emitter-test]
+    host = "emitter.example.com"
+    known_hosts = "/private/tmp/nix-shell.BrdUfA/nix-shell.CsB3po/seal-api-spec-997850bfdc324f1e/known_hosts"
+    port = 22
+    user = "seal"
+    workspace = "/srv/w"

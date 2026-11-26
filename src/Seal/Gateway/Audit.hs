@@ -70,6 +70,14 @@ data AuditEvent
   | GrantRefused
   | ModeEnabled
   | ModeDisabled
+  | MachineAdded
+    -- ^ A machine was created through the write route.
+  | MachineRemoved
+    -- ^ A machine was deleted. Carries the pin count: a refusal that reports
+    -- a count is auditable, a silent one is not.
+  | MachineReplaced
+    -- ^ An existing machine's coordinates changed (a @?force@ POST). Carries
+    -- the pin count for the same reason.
   deriving stock (Eq, Ord, Show)
 
 auditEventText :: AuditEvent -> Text
@@ -82,6 +90,9 @@ auditEventText event = case event of
   GrantRefused -> "grant_refused"
   ModeEnabled -> "mode_enabled"
   ModeDisabled -> "mode_disabled"
+  MachineAdded -> "machine_added"
+  MachineRemoved -> "machine_removed"
+  MachineReplaced -> "machine_replaced"
 
 -- | The closed field set.
 data AuditFields = AuditFields
@@ -92,6 +103,13 @@ data AuditFields = AuditFields
   , afOrigin           :: !(Maybe Text)
   , afVia              :: !(Maybe GrantSource)
   , afRemainingSeconds :: !(Maybe Int)
+  , afMachine          :: !(Maybe Text)
+    -- ^ The machine name a mutation touched.
+  , afPinnedSessions   :: !(Maybe Int)
+    -- ^ How many sessions were pinned to it at the moment of refusal, for
+    -- 'MachineRemoved' / 'MachineReplaced'. The number IS the audit value:
+    -- "removed a machine 3 sessions depended on" is a fact, "removed a
+    -- machine" is not.
   } deriving stock (Eq, Show)
 
 -- | A record with only the event set; every optional field absent.
@@ -104,6 +122,8 @@ emptyAuditFields event = AuditFields
   , afOrigin           = Nothing
   , afVia              = Nothing
   , afRemainingSeconds = Nothing
+  , afMachine          = Nothing
+  , afPinnedSessions   = Nothing
   }
 
 -- | Render one line.
@@ -124,6 +144,8 @@ auditLine now fields = T.intercalate " " (timestampPart : map renderField presen
       <> [ ("origin", sanitize 200 value) | Just value <- [afOrigin fields] ]
       <> [ ("via", grantSourceText source) | Just source <- [afVia fields] ]
       <> [ ("remaining_s", tshow value) | Just value <- [afRemainingSeconds fields] ]
+      <> [ ("machine", sanitize 64 value) | Just value <- [afMachine fields] ]
+      <> [ ("pinned", tshow value) | Just value <- [afPinnedSessions fields] ]
     renderField (key, value) = key <> "=" <> value
 
 -- | Percent-encode everything that could break the line format.

@@ -22,6 +22,7 @@ module Seal.Gateway.StreamBroker
   , broadcastAgentDefsChanged
   , broadcastSkillsChanged
   , broadcastReposChanged
+  , broadcastMachinesChanged
   , subscriberCount
   , thinkingSessions
   , setThinking
@@ -265,6 +266,7 @@ broadcast broker event = do
       BeAgentDefsChanged  -> pure True
       BeSkillsChanged     -> pure True
       BeReposChanged      -> pure True
+      BeMachinesChanged   -> pure True
       BeEntryRecorded sid _ -> matchSession s sid
       BeEntryUpdate sid _   -> matchSession s sid
       BeAsk sid _          -> matchSession s sid
@@ -290,6 +292,9 @@ eventSession = \case
   BeAgentDefsChanged    -> Nothing
   BeSkillsChanged       -> Nothing
   BeReposChanged        -> Nothing
+  -- Not session-scoped: the inventory is process-global, so every client
+  -- hears it. `shouldSend` above is what decides the frame is sent at all.
+  BeMachinesChanged     -> Nothing
 
 -- | Push a refreshed tab/session snapshot to every connection.
 broadcastLists :: StreamBroker -> Value -> IO ()
@@ -308,6 +313,13 @@ broadcastSkillsChanged broker = broadcast broker BeSkillsChanged
 -- All subscribers receive it (the repo registry is not session-scoped).
 broadcastReposChanged :: StreamBroker -> IO ()
 broadcastReposChanged broker = broadcast broker BeReposChanged
+
+-- | Announce a mutation of the execution-machine inventory. WU-7b's picker
+-- refetches on this frame; without the emitter calls in the write route, the
+-- headline flow ("add the first machine, open a New Tab") would show a stale
+-- picker until F5 while every planned test stayed green.
+broadcastMachinesChanged :: StreamBroker -> IO ()
+broadcastMachinesChanged broker = broadcast broker BeMachinesChanged
 
 -- | The current subscriber count (for diagnostics / the global cap check).
 subscriberCount :: StreamBroker -> IO Int

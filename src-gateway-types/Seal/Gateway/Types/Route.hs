@@ -136,6 +136,13 @@ data SealRoute :: [Type] -> [Param] -> Bodiedness -> Type -> Type where
   RouteRepoDelete    :: SealRoute '[RepoIdOrErr] '[] Bodyless Resp
   RouteRepoDeployKey :: SealRoute '[RepoIdOrErr] '[] Bodyless Resp
   RouteRepoDeployKeyGenerate :: SealRoute '[RepoIdOrErr] '[] (Body Req) Resp
+  -- Machines (the execution inventory)
+  RouteMachinesList   :: SealRoute '[] '[] Bodyless Resp
+  RouteMachineCreate  :: SealRoute '[] '[] (Body Req) Resp
+    -- ^ Upsert: 201 create / 200 replace. Refused without a passkey session.
+  RouteMachineDelete  :: SealRoute '[Text] '[] Bodyless Resp
+    -- ^ The capture is 'Text' here and validated in the handler: the machine
+    -- name type lives in the main library, which this module cannot import.
   -- Providers
   RouteProvidersList :: SealRoute '[] '[] Bodyless Resp
   RouteProviderModels :: SealRoute '[Text] '[] Bodyless Resp
@@ -237,6 +244,9 @@ routeMeta = \case
   RouteRepoDelete -> Meta (match "repos" ./ capture repoIdCapture ./ end) qend bodyless (resp (one respCodec)) M.delete
   RouteRepoDeployKey -> Meta (match "repos" ./ capture repoIdCapture ./ match "deploy-key" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteRepoDeployKeyGenerate -> Meta (match "repos" ./ capture repoIdCapture ./ match "deploy-key" ./ match "generate" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteMachinesList -> Meta (match "machines" ./ end) qend bodyless (resp (one respCodec)) M.get
+  RouteMachineCreate -> Meta (match "machines" ./ end) qend (body (one reqCodec)) (resp (one respCodec)) M.post
+  RouteMachineDelete -> Meta (match "machines" ./ capture textCapture ./ end) qend bodyless (resp (one respCodec)) M.delete
   RouteProvidersList -> Meta (match "providers" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteProviderModels -> Meta (match "providers" ./ capture textCapture ./ match "models" ./ end) qend bodyless (resp (one respCodec)) M.get
   RouteProviderModelContext -> Meta (match "providers" ./ capture textCapture ./ match "models" ./ capture textCapture ./ match "context" ./ end) qend bodyless (resp (one respCodec)) M.get
@@ -324,6 +334,9 @@ allRoutes =
   , Constructed RouteRepoDelete
   , Constructed RouteRepoDeployKey
   , Constructed RouteRepoDeployKeyGenerate
+  , Constructed RouteMachinesList
+  , Constructed RouteMachineCreate
+  , Constructed RouteMachineDelete
   , Constructed RouteProvidersList
   , Constructed RouteProviderModels
   , Constructed RouteProviderModelContext

@@ -21,6 +21,7 @@ module Seal.Gateway.Broadcast
   , broadcastAgentDefsChanged
   , broadcastSkillsChanged
   , broadcastReposChanged
+  , broadcastMachinesChanged
   , broadcastToolCall
   , wrapCapsForAskStatus
   ) where
@@ -43,7 +44,9 @@ import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (OpName (..), SessionId, sessionIdText)
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
-import Seal.Gateway.StreamBroker qualified as SB (broadcastAgentDefsChanged, broadcastSkillsChanged, broadcastReposChanged)
+import Seal.Gateway.StreamBroker qualified as SB
+  ( broadcastAgentDefsChanged, broadcastSkillsChanged, broadcastReposChanged
+  , broadcastMachinesChanged )
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast, broadcastLists, setThinking, thinkingSessions)
 import Seal.Gateway.Transcript (showIso)
 import Seal.Tabs (TabsHandle)
@@ -152,6 +155,14 @@ broadcastSkillsChanged mBroker =
 broadcastReposChanged :: Maybe StreamBroker -> IO ()
 broadcastReposChanged mBroker =
   for_ mBroker SB.broadcastReposChanged
+
+-- | Announce a mutation of the execution-machine inventory so every open
+-- New Tab form refetches its picker without a reload. Without this the
+-- headline flow — add the first machine, open a New Tab — shows a stale
+-- picker until F5.
+broadcastMachinesChanged :: Maybe StreamBroker -> IO ()
+broadcastMachinesChanged mBroker =
+  for_ mBroker SB.broadcastMachinesChanged
 
 -- | Wrap a 'ChannelCaps' so that 'ccPrompt' (the blocking ask primitive
 -- used by @ASK_HUMAN@ and the Untrusted confirmation gate) broadcasts a

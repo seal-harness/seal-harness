@@ -125,6 +125,9 @@ openApiMeta = \case
   RouteRepoDelete -> api (match "repos" ./ capture oaRepoId ./ end) qend bodyless (resp (one ffBody)) M.delete
   RouteRepoDeployKey -> api (match "repos" ./ capture oaRepoId ./ match "deploy-key" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteRepoDeployKeyGenerate -> api (match "repos" ./ capture oaRepoId ./ match "deploy-key" ./ match "generate" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteMachinesList -> api (match "machines" ./ end) qend bodyless (resp (one ffBody)) M.get
+  RouteMachineCreate -> api (match "machines" ./ end) qend (body (one ffBody)) (resp (one ffBody)) M.post
+  RouteMachineDelete -> api (match "machines" ./ capture oaText ./ end) qend bodyless (resp (one ffBody)) M.delete
   RouteProvidersList -> api (match "providers" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteProviderModels -> api (match "providers" ./ capture oaText ./ match "models" ./ end) qend bodyless (resp (one ffBody)) M.get
   RouteProviderModelContext -> api (match "providers" ./ capture oaText ./ match "models" ./ capture oaText ./ match "context" ./ end) qend bodyless (resp (one ffBody)) M.get
@@ -192,6 +195,9 @@ oaSkillId = openApiCaptureCodec skillIdCapture
 oaRepoId :: OpenApiCaptureCodec RepoIdOrErr
 oaRepoId = openApiCaptureCodec repoIdCapture
 
+oaText :: OpenApiCaptureCodec Text
+oaText = openApiCaptureCodec textCapture
+
 oaTabIndex :: OpenApiCaptureCodec TabIndexOrErr
 oaTabIndex = openApiCaptureCodec tabIndexCapture
 
@@ -201,8 +207,6 @@ oaAskId = openApiCaptureCodec askIdCapture
 oaCronJobId :: OpenApiCaptureCodec CronJobIdOrErr
 oaCronJobId = openApiCaptureCodec cronJobIdCapture
 
-oaText :: OpenApiCaptureCodec Text
-oaText = openApiCaptureCodec textCapture
 
 -- | The free-form JSON body codec for the opaque marker types ('Resp', 'Req',
 -- 'AnswerReq'). Wraps 'Seal.Gateway.Route.freeFormBodyCodec' (a dummy

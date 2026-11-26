@@ -62,7 +62,7 @@ import Seal.Gateway.API
 import Seal.Gateway.Setup (stubSetupDeps)
 import Seal.Gateway.Send (SendDeps (..), SendOutcome (..), sendOutcomeJson, webCallDispatcher, mkWebTurnDeps, newSessionWakeMutex)
 import Seal.Gateway.Stream (StreamHealth (..))
-import Seal.Gateway.StreamBroker (newStreamBroker, setThinking)
+import Seal.Gateway.StreamBroker (BrokerEvent (..), newStreamBroker, setThinking, subscribe)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Cron.Store (CronStore (..), memoryCronStore)
 import Seal.Harness.Registry (newHarnessRegistry)
@@ -657,6 +657,39 @@ spec = describe "Seal.Gateway.API" $ do
       (A.encode (A.object [ "kind" .= ("provider" :: T.Text), "provider" .= ("anthropic" :: T.Text), "model" .= ("claude-sonnet-4" :: T.Text) ]))
     status <- runAppStatus app req
     status `shouldBe` 200
+
+  it "a successful POST /api/machines broadcasts BeMachinesChanged (the emitter fires)" $
+    -- Its OWN temp dir: the shared one accumulates machines from every other
+    -- test in this process, and a leftover entry would make this a REPLACE
+    -- (409) instead of a create.
+    withSystemTempDirectory "seal-api-machines" $ \dir -> do
+      broker <- newStreamBroker 64
+      seen <- newIORef ([] :: [BrokerEvent])
+      _ <- subscribe broker
+             (case mkSessionId "listener" of Right x -> x; Left _ -> error "sid")
+             (\e -> modifyIORef' seen (e :)) (pure ())
+      let paths = fakePaths { spState = dir, spConfig = dir </> "config", spHome = dir }
+          khPath = dir </> "known_hosts"
+      createDirectoryIfMissing True (dir </> "config")
+      -- The write route STATs the key paths, so the fixture needs a real file.
+      writeFile khPath "example.com ssh-ed25519 AAAA\n"
+      deps <- mkDepsFor paths
+      let machineDeps = deps { adBroker = Just broker }
+      req <- testPost ["api", "machines"]
+        (A.encode (A.object
+          [ "name" .= ("emitter" :: T.Text)
+          , "host" .= ("emitter.example.com" :: T.Text)
+          , "user" .= ("seal" :: T.Text)
+          , "known_hosts" .= (T.pack khPath :: T.Text)
+          , "workspace" .= ("/srv/w" :: T.Text) ]))
+      (st, body) <- runAppBody (apiApp machineDeps) req
+      st `shouldBe` 201 `seq` case st of
+        _ | st == 201 -> pure ()
+          | otherwise -> expectationFailure ("status " <> show st <> "; body: " <> show body)
+      events <- readIORef seen
+      -- Assert on the BROKER, not on an injected frame: deleting the emitter
+      -- call in handleMachineCreate must turn this red.
+      events `shouldSatisfy` any (\case BeMachinesChanged -> True; _ -> False)
 
   it "POST /api/tabs/new {machine} unknown machine ⇒ 400 carrying the available set" $ do
     -- The mkApp fixture's SEAL_HOME has no execution.toml, so the inventory is

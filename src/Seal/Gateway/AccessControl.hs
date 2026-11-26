@@ -301,6 +301,17 @@ accessControlAuthorize h req = do
     decide now st
       | requestMethod req == methodOptions = AuthAllow
       | path == ["api", "health"] = AuthAllow
+      -- Machine mutation is refused unless the operator is passkey-authenticated,
+      -- EVEN under AccessOpen. `access_mode = "none"` means "anyone who can
+      -- reach the gateway has full control" — but granting execution authority
+      -- is not the same as waiving authentication, and under
+      -- allow_localhost = false a remote agent's SHELL_EXEC could otherwise
+      -- curl -XPOST /api/machines and add a machine pointing anywhere.
+      --
+      -- The predicate is METHOD + PATH, not a bare path match: a bare match
+      -- would 403 GET /api/machines on every `access_mode = "none"` install,
+      -- which is a documented supported choice.
+      | isMachinesMutation req && acsMode st /= AccessPasskey = AuthUnauthorized
       | otherwise = case acsMode st of
           AccessOpen -> AuthAllow
           AccessUnconfigured
@@ -313,6 +324,12 @@ accessControlAuthorize h req = do
             | hasServiceToken st req && not (isAuthPath path) -> AuthAllow
             | sessionValid now st (sessionKeyFromRequest req) -> AuthAllow
             | otherwise -> AuthUnauthorized
+
+-- | Is this request a machine MUTATION? Both parts are required: see the
+-- call site for why a bare path match is wrong.
+isMachinesMutation :: Request -> Bool
+isMachinesMutation req =
+  pathInfo req == ["api", "machines"] && requestMethod req `elem` [methodPost, methodDelete]
 
 unconfiguredAllow :: [[Text]]
 unconfiguredAllow =

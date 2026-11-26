@@ -228,6 +228,8 @@ streamApp guard broker pending = do
             sendTextData conn (A.encode (object
               [ "type" .= ("skills-changed" :: Text)
               ]))
+          sendEvent BeMachinesChanged =
+            sendTextData conn (A.encode (object [ "type" .= ("machines-changed" :: Text) ]))
           sendEvent BeReposChanged =
             sendTextData conn (A.encode (object
               [ "type" .= ("repos-changed" :: Text)

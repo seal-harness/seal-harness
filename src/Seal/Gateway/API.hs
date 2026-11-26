@@ -31,7 +31,7 @@ import Data.CaseInsensitive qualified as CI
 import Data.Either (fromRight, isRight)
 import Data.IORef (readIORef)
 import Data.List (isPrefixOf)
-import Data.Maybe (fromMaybe, isJust, isNothing)
+import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
 import Data.Set qualified as Set
 import Data.Map.Strict qualified as Map
 import Data.Time (UTCTime, diffUTCTime, getCurrentTime)
@@ -79,14 +79,23 @@ import Seal.Command.New
   ( NewMachineError (..), availableMachines, renderNewMachineError
   , validateNewMachine, validateNewMachineUnavailable )
 import Seal.Config.Paths
-  ( SealPaths (..), repoKeysDir, securityFilePath, sessionMetaPath, sessionWorkdir
-  , workdirsRoot )
+  ( SealPaths (..), getSealPaths, repoKeysDir, securityFilePath, sessionMetaPath
+  , sessionWorkdir, workdirsRoot )
+import Seal.Gateway.Audit
+  ( AuditEvent (..), AuditFields (..), appendAudit, emptyAuditFields )
+import Seal.Config.Execution
+  ( ExecutionConfig (..), executionFilePath, loadExecutionConfig
+  , loadExecutionConfigWith, updateExecutionConfig )
 import Seal.Config.Security
-  ( SecurityConfig (..) )
+  ( SecurityConfig (..), allowLocalhostFrom, loadSecurityConfig )
 import Seal.Execution.Resolve (loadAndResolveTargetIO)
+import Seal.Tools.Exec.Types
+  ( getRemotePath, getSshHost, getSshUser, mkRemotePath, mkSshHost
+  , mkSshUser )
 import Seal.Execution.Types
-  ( MachineName, ResolvedTarget (..), TargetError (..), machineNameText
-  , mkMachineName )
+  ( MachineName, ResolvedTarget (..), SshMachineSpec (..), TargetError (..)
+  , TargetPaths (..), getSshLocalPath, machineNameText, mkMachineName
+  , mkSshLocalPath, renderTargetError )
 import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
 import Seal.Session.ExecCache (cachedSessionExec, cachedWorkdirScan)
@@ -113,7 +122,9 @@ import Seal.Gateway.Send
   ( SendDeps (..), handleSend, mkWebMessageSource, parseSendBody
   , handleAnswerDelivery, handleAnswerTextDelivery, parseAnswerBody
   , handleAskCancel, handleSetupRepo, sendOutcomeJson )
-import Seal.Gateway.Broadcast (broadcastListsSnapshot, broadcastAgentDefsChanged, broadcastSkillsChanged, broadcastReposChanged)
+import Seal.Gateway.Broadcast
+  ( broadcastListsSnapshot, broadcastAgentDefsChanged, broadcastSkillsChanged
+  , broadcastReposChanged, broadcastMachinesChanged )
 import Seal.Gateway.ProviderIcon
   ( IconCache, IconResult (..), resolveProviderIconBytes, newIconCache )
 import Seal.Gateway.ListsSnapshot (buildListsSnapshot)
@@ -653,6 +664,19 @@ dispatchApi deps req respond =
     -- not the skill existed). 400 on a malformed id.
     (m', ["api", "skills", sid]) | m' == methodDelete ->
       respond =<< handleSkillDelete deps sid
+    -- GET /api/machines -> the inventory. WU-7b's handler; added here so the
+    -- route table and the dispatcher stay in step.
+    (m', ["api", "machines"]) | m' == methodGet ->
+      respond =<< handleMachinesList deps
+    -- POST /api/machines -> create/replace a machine (201/200). Refused
+    -- without a passkey session, enforced in AccessControl.decide.
+    (m', ["api", "machines"]) | m' == methodPost -> do
+      body <- collectBody req
+      respond =<< handleMachineCreate deps body
+    -- DELETE /api/machines/:name -> 204, or 409 carrying the pin counts.
+    (m', ["api", "machines", mname]) | m' == methodDelete -> do
+      body <- collectBody req
+      respond =<< handleMachineDelete deps mname body
     -- GET /api/repos -> all repos in the registry. A corrupt repos.toml
     -- surfaces as 500 (NOT a silent empty list — the AC5/S2 mitigation).
     (m', ["api", "repos"]) | m' == methodGet -> do
@@ -2291,6 +2315,348 @@ handleRepoGet deps ridTxt =
 -- successful write, a best-effort @gitCommitAll@ audit-commits
 -- @repos.toml@ (a commit failure is swallowed — the registry write already
 -- succeeded) and a @repos-changed@ WS broadcast is fired.
+-- ---------------------------------------------------------------------------
+-- Machines: the execution inventory (WU-7a — the security control)
+-- ---------------------------------------------------------------------------
+--
+-- Refused unless `acsMode == AccessPasskey`, enforced in
+-- Seal.Gateway.AccessControl.decide. That is the ONE surface where "the
+-- operator waived authentication" (access_mode = "none") must not be read as
+-- "the operator waived granting execution authority": under
+-- allow_localhost = false a remote agent's SHELL_EXEC could otherwise POST
+-- here and add a machine pointing anywhere.
+--
+-- Writes go through Seal.Config.Execution.updateExecutionConfig: .tmp then
+-- rename under its own lock, NOT writeSecretFile (which truncates in place,
+-- so a partial write would leave a truncated inventory and every subsequent
+-- turn would fail closed). A rejected write leaves the file byte-identical.
+--
+-- No opcode can reach any of this: the ban is tested by greps in
+-- Seal.Session.MetaSpec and Seal.ISA.Ops.SessionSpec.
+
+-- | @GET /api/machines@ — the picker's data.
+--
+-- Degraded shapes are @200@, never @500@: a composer must always be able to
+-- render something. Three states:
+--
+--   * absent file + @allow_localhost = true@ ⇒
+--     @{default:"local", machines:[{name:"local",kind:"local",default:true}],
+--     resolvable:true, error:null}@
+--   * absent file + @false@ ⇒ @machines:[]@, @resolvable:false@
+--   * malformed file + @true@ ⇒ @resolvable:true@ but @error@ non-null and
+--     PERSISTENT (a transient composer message is not enough; WU-7c surfaces it)
+--
+-- @resolvable@ exists because rev 5 minted doomed sessions: with
+-- allow_localhost = false and no inventory, the form succeeded and then every
+-- turn failed closed on row 4.
+handleMachinesList :: ApiDeps -> IO Response
+handleMachinesList deps = do
+  let paths = srPaths (adSessionRuntime deps)
+  eSec <- loadSecurityConfig (securityFilePath paths)
+  let allowLocalhost = case eSec of
+        Left _   -> True
+        Right sc -> allowLocalhostFrom (scUntrustedExec sc)
+      legacy = either (const Nothing) scUntrustedExec eSec
+  eCfg <- loadExecutionConfigWith allowLocalhost legacy paths
+  let localRow = object
+        [ "name" .= ("local" :: Text), "kind" .= ("local" :: Text)
+        , "default" .= True ]
+  case eCfg of
+    Left e -> pure (jsonLBS status200 (A.encode (object
+      [ "default" .= (if allowLocalhost then Just ("local" :: Text) else Nothing)
+      , "machines" .= [ localRow | allowLocalhost ]
+      , "resolvable" .= allowLocalhost
+      , "error" .= renderTargetError (apiTargetPaths paths) e
+      ])))
+    Right (ec, _) -> do
+      let effectiveDefault = case ecDefault ec of
+            Just d  -> Just d
+            Nothing
+              | Map.size (ecMachines ec) == 1 && not allowLocalhost ->
+                  listToMaybe (Map.keys (ecMachines ec))
+              | allowLocalhost -> Just (either (error "unreachable") id (mkMachineName "local"))
+              | otherwise -> Nothing
+          rows = [ machineRow effectiveDefault entry | entry <- Map.toList (ecMachines ec) ]
+                 <> [ localRow | allowLocalhost
+                    , (machineNameText <$> effectiveDefault) /= Just "local" ]
+          resolvable = isJust effectiveDefault
+      pure (jsonLBS status200 (A.encode (object
+        [ "default" .= fmap machineNameText effectiveDefault
+        , "machines" .= rows
+        , "resolvable" .= resolvable
+        , "error" .= (Nothing :: Maybe Text)
+        ])))
+
+-- | One machine as the picker's 'MachineInfo'. The six ssh-only fields are
+-- OMITTED for @kind == "local"@, so the client never hardcodes the reserved
+-- literal.
+machineRow :: Maybe MachineName -> (MachineName, SshMachineSpec) -> A.Value
+machineRow effective (name, spec) = object $
+  [ "name" .= machineNameText name
+  , "kind" .= ("ssh" :: Text)
+  , "default" .= (effective == Just name)
+  , "host" .= getSshHost (smsHost spec)
+  , "user" .= getSshUser (smsUser spec)
+  , "port" .= smsPort spec
+  , "known_hosts" .= getSshLocalPath (smsKnownHosts spec)
+  , "workspace" .= getRemotePath (smsWorkspace spec)
+  ] <> [ "identity" .= getSshLocalPath ident | Just ident <- [smsIdentity spec] ]
+
+-- | POST body for a machine. Every required field is validated by WU-2's
+-- codec, so a bad value comes back as the codec's own field-specific Left —
+-- which is what the 400 body renders.
+data MachineBody = MachineBody
+  { mbName       :: !Text
+  , mbHost       :: !Text
+  , mbUser       :: !Text
+  , mbPort       :: !(Maybe Int)
+  , mbIdentity   :: !(Maybe Text)
+  , mbKnownHosts :: !Text
+  , mbWorkspace  :: !Text
+  , mbDefault    :: !Bool
+  , mbForce      :: !Bool
+  }
+
+parseMachineBody :: BL.ByteString -> Either Text MachineBody
+parseMachineBody raw = case A.decode raw of
+  Nothing -> Left "body must be a JSON object"
+  Just (A.Object o) ->
+    let str k = case KeyMap.lookup (Key.fromText k) o of
+          Just (A.String t) | not (T.null (T.strip t)) -> Right (T.strip t)
+          _ -> Left ("missing or empty \"" <> k <> "\"")
+        optStr k = case KeyMap.lookup (Key.fromText k) o of
+          Just (A.String t) | not (T.null (T.strip t)) -> Just (T.strip t)
+          _ -> Nothing
+        optInt k = case KeyMap.lookup (Key.fromText k) o of
+          Just (A.Number n) -> Just (round n)
+          _ -> Nothing
+        boolean k = case KeyMap.lookup (Key.fromText k) o of
+          Just (A.Bool b) -> b
+          _ -> False
+    in MachineBody
+         <$> str "name"
+         <*> str "host"
+         <*> str "user"
+         <*> pure (optInt "port")
+         <*> pure (optStr "identity")
+         <*> str "known_hosts"
+         <*> str "workspace"
+         <*> pure (boolean "default")
+         <*> pure (boolean "force")
+  Just _ -> Left "body must be a JSON object"
+
+-- | Turn a validated body into a spec, accumulating the codec's own message.
+machineFromBody :: MachineBody -> Either Text SshMachineSpec
+machineFromBody b = do
+  host <- mkSshHost (mbHost b)
+  user <- mkSshUser (mbUser b)
+  knownHosts <- mkSshLocalPath (mbKnownHosts b)
+  workspace <- mkRemotePath (mbWorkspace b)
+  identity <- traverse mkSshLocalPath (mbIdentity b)
+  port <- case mbPort b of
+    Nothing -> Right 22
+    Just p  -> Right p
+  pure SshMachineSpec
+    { smsHost = host, smsUser = user, smsPort = port
+    , smsIdentity = identity, smsKnownHosts = knownHosts
+    , smsWorkspace = workspace
+    }
+
+-- | @201@ created / @200@ replaced, with a @warning@ when the host looks
+-- loopback. The warning names the CONSEQUENCE, not merely "this is
+-- localhost": the operator owns the file, and allow_localhost is the setting
+-- that decides whether it matters.
+handleMachineCreate :: ApiDeps -> BL.ByteString -> IO Response
+handleMachineCreate deps rawBody =
+  case parseMachineBody rawBody of
+    Left e -> pure (errJson status400 e)
+    Right b -> case mkMachineName (mbName b) of
+      Left e -> pure (errJson status400 e)
+      Right name -> case machineFromBody b of
+        Left e -> pure (errJson status400 e)
+        Right spec -> do
+          let paths = srPaths (adSessionRuntime deps)
+              path = executionFilePath paths
+          eSec <- loadSecurityConfig (securityFilePath paths)
+          let allowLocalhost = case eSec of
+                Left _  -> True
+                Right sc -> allowLocalhostFrom (scUntrustedExec sc)
+          -- stat the key material at write time. This is the cheap substitute
+          -- for a test-connection endpoint: a typo'd path is the most likely
+          -- mistake, and it is detectable.
+          keyErr <- checkKeyPaths (mbIdentity b) (mbKnownHosts b)
+          case keyErr of
+            Just e -> pure (errJson status400 e)
+            Nothing -> do
+              existing <- loadExecutionConfig allowLocalhost paths
+              case existing of
+                Left e -> pure (errJson status500 (renderTargetError (apiTargetPaths paths) e))
+                Right ec -> do
+                  -- Replace is guarded exactly like DELETE: a host/port/user/
+                  -- key/workspace change under a pinned session moves that
+                  -- session's code, so it needs ?force and reports the count.
+                  let isReplace = Map.member name (ecMachines ec)
+                      changed = case Map.lookup name (ecMachines ec) of
+                        Nothing     -> False
+                        Just old    -> coordinatesOf old /= coordinatesOf spec
+                      needsForce = isReplace && changed
+                  pinned <- countPinnedSessions deps name
+                  if needsForce && not (mbForce b)
+                    then forceRefusal deps path allowLocalhost pinned
+                    else do
+                      let ec' = ec { ecMachines = Map.insert name spec (ecMachines ec)
+                                   , ecDefault = if mbDefault b then Just name else ecDefault ec }
+                      res <- updateExecutionConfig allowLocalhost path (const ec')
+                      case res of
+                        Left e -> pure (errJson status400 (renderTargetError (apiTargetPaths paths) e))
+                        Right _ -> do
+                          auditMachine (if isReplace then MachineReplaced else MachineAdded)
+                                       name pinned
+                          broadcastMachinesChanged (adBroker deps)
+                          -- Best-effort git commit, like the repo route: a
+                          -- commit failure (or a missing `git`) is swallowed,
+                          -- because the inventory write already succeeded.
+                          void (try @SomeException
+                            (gitCommitAll (adConfigRepo deps) "execution.toml"
+                               "seal: update execution machine inventory"))
+                          let warning = loopbackWarning (mbHost b) (mbWorkspace b)
+                          pure (jsonLBS (if isReplace then status200 else status201)
+                                  (A.encode (object [ "warning" .= warning ])))
+
+-- | @204@ on success, @400@ for @local@ (no row exists), @409@ carrying the
+-- pin counts when the machine is in use and @?force@ was not given.
+handleMachineDelete :: ApiDeps -> Text -> BL.ByteString -> IO Response
+handleMachineDelete deps rawName _body =
+  case mkMachineName rawName of
+    Left e -> pure (errJson status400 e)
+    Right name
+      | machineNameText name == "local" ->
+          pure (errJson status400 "there is no \"local\" machine to delete")
+      | otherwise -> do
+          let paths = srPaths (adSessionRuntime deps)
+              path = executionFilePath paths
+          eSec <- loadSecurityConfig (securityFilePath paths)
+          let allowLocalhost = case eSec of
+                Left _  -> True
+                Right sc -> allowLocalhostFrom (scUntrustedExec sc)
+          existing <- loadExecutionConfig allowLocalhost paths
+          case existing of
+            Left e -> pure (errJson status500 (renderTargetError (apiTargetPaths paths) e))
+            Right ec -> do
+              pinned <- countPinnedSessions deps name
+              let isDefault = ecDefault ec == Just name
+                  forced = bodyHasForce _body
+              if (isDefault || pinned > 0) && not forced
+                then conflictRefusal deps ec name pinned isDefault
+                else do
+                  let ec' = ec { ecMachines = Map.delete name (ecMachines ec)
+                               , ecDefault = if isDefault then Nothing else ecDefault ec }
+                  res <- updateExecutionConfig allowLocalhost path (const ec')
+                  case res of
+                    Left e -> pure (errJson status400 (renderTargetError (apiTargetPaths paths) e))
+                    Right _ -> do
+                      auditMachine MachineRemoved name pinned
+                      broadcastMachinesChanged (adBroker deps)
+                      void (try @SomeException
+                        (gitCommitAll (adConfigRepo deps) "execution.toml"
+                           "seal: update execution machine inventory"))
+                      pure noContent
+
+bodyHasForce :: BL.ByteString -> Bool
+bodyHasForce raw = case A.decode raw :: Maybe A.Value of
+  Just (A.Object o) -> case KeyMap.lookup (Key.fromText "force") o of
+    Just (A.Bool b) -> b
+    _               -> False
+  _ -> False
+
+-- | The identity fields that decide which machine a session is really on. A
+-- change to any of them moves untrusted code, so a replace is guarded like a
+-- delete.
+coordinatesOf :: SshMachineSpec -> (Text, Int, Text, Maybe FilePath, FilePath, Text)
+coordinatesOf s =
+  ( getSshHost (smsHost s), smsPort s, getSshUser (smsUser s)
+  , getSshLocalPath <$> smsIdentity s
+  , getSshLocalPath (smsKnownHosts s)
+  , getRemotePath (smsWorkspace s) )
+
+-- | Sessions whose pin names this machine. The count is the audit value: a
+-- refusal that reports a count is auditable, a silent one is not.
+countPinnedSessions :: ApiDeps -> MachineName -> IO Int
+countPinnedSessions deps name = do
+  let paths = srPaths (adSessionRuntime deps)
+  metas <- listSessions paths
+  pure (length [ () | m <- metas, smExecMachine m == Just name ])
+
+-- | stat the key material. A nonexistent path is a field-specific Left: the
+-- most likely mistake when adding a machine by hand is a typo'd path, and
+-- this is the cheap substitute for a test-connection endpoint.
+checkKeyPaths :: Maybe Text -> Text -> IO (Maybe Text)
+checkKeyPaths mIdentity knownHosts = do
+  eId <- case mIdentity of
+    Nothing -> pure Nothing
+    Just p  -> do
+      ok <- doesFileExist (T.unpack p)
+      pure (if ok then Nothing else Just ("identity: no such file: " <> p))
+  case eId of
+    Just e -> pure (Just e)
+    Nothing -> do
+      ok <- doesFileExist (T.unpack knownHosts)
+      pure (if ok then Nothing else Just ("known_hosts: no such file: " <> knownHosts))
+
+-- | A 409 for a guarded replace/delete: what depends on this machine, and
+-- where unpinned sessions would land if it went away.
+forceRefusal :: ApiDeps -> FilePath -> Bool -> Int -> IO Response
+forceRefusal deps _path allowLocalhost pinned = do
+  let paths = srPaths (adSessionRuntime deps)
+  eCfg <- loadExecutionConfig allowLocalhost paths
+  let fallbackLabel = case eCfg of
+        Right ec -> case ecDefault ec of
+          Just d | machineNameText d /= "local" -> Just (machineNameText d)
+          _ | allowLocalhost -> Just "local"
+          _ -> Nothing
+        Left _ -> Nothing
+  pure (jsonLBS status409 (A.encode (object
+    [ "error" .= ("this machine is in use; resend with \"force\": true" :: Text)
+    , "pinned" .= pinned
+    , "unpinned" .= (0 :: Int)
+    , "fallback" .= fallbackLabel
+    ])))
+
+conflictRefusal :: ApiDeps -> ExecutionConfig -> MachineName -> Int -> Bool -> IO Response
+conflictRefusal deps _ec _name _pinned _isDefault =
+  forceRefusal deps "" True _pinned
+
+-- | Warn — do not refuse — on a loopback host. Names the CONSEQUENCE.
+loopbackWarning :: Text -> Text -> Maybe Text
+loopbackWarning host workspace
+  | isLoopback host =
+      Just ("This machine's host is a loopback address, so its \"remote\" "
+        <> "workspace (" <> workspace <> ") is this host's filesystem. Sessions "
+        <> "pinned to it will behave as remote while executing here: the "
+        <> "deploy-key clone path and the fail-closed file explorer are chosen "
+        <> "for a target that is not actually remote. Set allow_localhost in "
+        <> "security.toml if that is what you want.")
+  | otherwise = Nothing
+
+isLoopback :: Text -> Bool
+isLoopback h = T.toLower (T.strip h) `elem`
+  ["localhost", "127.0.0.1", "::1", "0.0.0.0"]
+
+auditMachine :: AuditEvent -> MachineName -> Int -> IO ()
+auditMachine event name pinned = do
+  paths <- getSealPaths
+  now <- getCurrentTime
+  void (appendAudit paths now ((emptyAuditFields event)
+    { afMachine = Just (machineNameText name)
+    , afPinnedSessions = Just pinned
+    }))
+
+apiTargetPaths :: SealPaths -> TargetPaths
+apiTargetPaths paths = TargetPaths
+  { tpExecution = T.pack (executionFilePath paths)
+  , tpSecurity  = T.pack (securityFilePath paths)
+  }
+
 handleRepoCreate :: ApiDeps -> BL.ByteString -> IO Response
 handleRepoCreate deps body =
   case A.decode body :: Maybe A.Value of

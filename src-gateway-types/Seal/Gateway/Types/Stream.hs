@@ -46,6 +46,7 @@ data BrokerEvent
   | BeAgentDefsChanged                 -- ^ agent defs were created/updated/deleted; clients should re-fetch
   | BeSkillsChanged                    -- ^ skills were created/updated/deleted; clients should re-fetch
   | BeReposChanged                     -- ^ the source-control repo registry was mutated; clients should re-fetch /api/repos
+  | BeMachinesChanged                 -- ^ the execution-machine inventory was mutated; clients should re-fetch /api/machines
   deriving stock (Eq, Show)
 
 -- | The focus op the client sends to change its focused session. Accepts
