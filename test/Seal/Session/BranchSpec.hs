@@ -20,7 +20,7 @@ import Seal.Config.Paths
   , sessionMetaPath )
 import Seal.Core.Types (SessionId, mkSessionId)
 import Seal.Session.Branch
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Session.Store (saveSessionMeta)
 import Seal.Transcript.Entries
   ( EntryKind (..), EntryRecord (..), encodeEntryRecordRaw )
@@ -61,22 +61,9 @@ seedParent :: SealPaths -> [BS.ByteString] -> [EntryRecord] -> IO ()
 seedParent paths convLines entries = do
   let dir = sessionDir paths parentId
   createDirectoryIfMissing True dir
-  saveSessionMeta paths SessionMeta
-    { smId = parentId
-    , smProvider = "ollama"
+  saveSessionMeta paths (let base = defaultSessionMeta parentId sampleTime in base) { smProvider = "ollama"
     , smModel = "llama3"
-    , smChannel = "web"
-    , smParent = Nothing
-    , smAgent = Nothing
-    , smSystemOverride = Nothing
-    , smAgentName = Nothing
-    , smDescription = Nothing
-    , smSealFrontMatter = True
-    , smRepoUrl = Nothing
-    , smRepoBranch = Nothing
-    , smCreatedAt = sampleTime
-    , smLastActive = sampleTime
-    }
+    , smChannel = "web" }
   BS.writeFile (sessionConversationPath paths parentId) (BS.concat convLines)
   BS.writeFile (sessionEntriesPath paths parentId)
     (BS.concat (map (\e -> encodeEntryRecordRaw e <> "\n") entries))
@@ -164,14 +151,9 @@ spec = describe "Seal.Session.Branch" $ do
         let paths = mkPaths root
             dir = sessionDir paths parentId
         createDirectoryIfMissing True dir
-        saveSessionMeta paths SessionMeta
-          { smId = parentId, smProvider = "ollama", smModel = "llama3"
-          , smChannel = "web", smParent = Nothing, smAgent = Nothing
-          , smSystemOverride = Nothing, smAgentName = Nothing
-          , smDescription = Nothing, smSealFrontMatter = True
-          , smRepoUrl = Nothing, smRepoBranch = Nothing
-          , smCreatedAt = sampleTime, smLastActive = sampleTime
-          }
+        saveSessionMeta paths (let base = defaultSessionMeta parentId sampleTime in base) { smProvider = "ollama"
+          , smModel = "llama3"
+          , smChannel = "web" }
         r <- branchSession paths parentId childId 5
         r `shouldBe` Right ()
 
@@ -180,14 +162,9 @@ spec = describe "Seal.Session.Branch" $ do
         let paths = mkPaths root
             dir = sessionDir paths parentId
         createDirectoryIfMissing True dir
-        saveSessionMeta paths SessionMeta
-          { smId = parentId, smProvider = "ollama", smModel = "llama3"
-          , smChannel = "web", smParent = Nothing, smAgent = Nothing
-          , smSystemOverride = Nothing, smAgentName = Nothing
-          , smDescription = Nothing, smSealFrontMatter = True
-          , smRepoUrl = Nothing, smRepoBranch = Nothing
-          , smCreatedAt = sampleTime, smLastActive = sampleTime
-          }
+        saveSessionMeta paths (let base = defaultSessionMeta parentId sampleTime in base) { smProvider = "ollama"
+          , smModel = "llama3"
+          , smChannel = "web" }
         -- two complete lines plus a partial third with no newline
         BS.writeFile (sessionConversationPath paths parentId)
           (BS.concat [convLine "a", convLine "b", "{\"role\":\"user\",\"conte"])

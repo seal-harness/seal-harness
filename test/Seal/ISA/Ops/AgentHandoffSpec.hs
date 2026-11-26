@@ -36,7 +36,7 @@ import Seal.ISA.Ops.Agent
   , agentManageOp
   )
 import Seal.Providers.Class (ToolResultPart (..))
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Session.Store (saveSessionMeta)
 import Seal.Types.App (App, runApp)
 import Seal.Types.Config (defaultConfig)
@@ -267,22 +267,10 @@ mkWiringAt paths backend rt pauseFlag =
 
 -- | A caller session meta carrying the given repo.
 callerMetaWithRepo :: Maybe Text -> SessionMeta
-callerMetaWithRepo mRepo = SessionMeta
-  { smId = sampleSession
-  , smProvider = "ollama"
+callerMetaWithRepo mRepo = (let base = defaultSessionMeta sampleSession t in base) { smProvider = "ollama"
   , smModel = "llama3"
   , smChannel = "web"
-  , smParent = Nothing
-  , smAgent = Nothing
-  , smSystemOverride = Nothing
-  , smAgentName = Nothing
-  , smDescription = Nothing
-  , smSealFrontMatter = True
-  , smRepoUrl = mRepo
-  , smRepoBranch = Nothing
-  , smCreatedAt = t
-  , smLastActive = t
-  }
+  , smRepoUrl = mRepo }
   where
     t = read "1970-01-01 00:00:00 UTC"
 

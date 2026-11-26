@@ -108,7 +108,7 @@ import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Policy qualified as Policy (AutonomyLevel (Full))
 import Seal.Session.Lock (newSessionLocks, newReplyRegistry, sessionTurnInFlight)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.SourceControl.Repo
   ( RepoCredential (..), SourceRepo (..), VcsKind (..), mkRepoId )
@@ -461,9 +461,10 @@ buildTestEnv tmp mode mRepo opts = do
   vaultRt <- makeFakeVaultRuntime (maybeToList mVaultSeed)
 
   -- Session runtime.
-  let meta0 = SessionMeta
-        (case mkSessionId "test" of Right s -> s; Left _ -> error "sid") "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
-        (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+  let meta0 = (defaultSessionMeta
+        (case mkSessionId "test" of Right s -> s; Left _ -> error "sid")
+        (UTCTime (fromGregorian 2026 1 1) 0))
+        { smProvider = "ollama", smModel = "llama3.2", smChannel = "web" }
   activeRef <- newIORef meta0
   let sr = SessionRuntime
         { srPaths = paths, srConfigPath = configRoot </> "config.toml"

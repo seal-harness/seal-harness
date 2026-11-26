@@ -14,7 +14,7 @@ import Test.Hspec
 import Seal.Core.ChannelKind (ChannelKind (..))
 import Seal.Logging.ChannelContext (ChannelContext (..), ctxFromSession)
 import Seal.Logging.Logger
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Core.Types (mkSessionId)
 
 import Katip (Severity (..), Scribe (..), permitItem, jsonFormat, Verbosity (V2))
@@ -129,9 +129,7 @@ spec = describe "Seal.Logging.Logger" $ do
         let sid = case mkSessionId "test-session-123" of
               Right s -> s
               Left _ -> error "invalid session id"
-            meta = SessionMeta
-              { smId = sid
-              , smProvider = "ollama"
+            meta = (let base = defaultSessionMeta sid (error "unused") in base) { smProvider = "ollama"
               , smModel = "llama3.2"
               , smChannel = "telegram"
               , smParent = Nothing
@@ -142,8 +140,6 @@ spec = describe "Seal.Logging.Logger" $ do
               , smSealFrontMatter = True
               , smRepoUrl = Nothing
               , smRepoBranch = Nothing
-              , smCreatedAt = error "unused"
-              , smLastActive = error "unused"
               }
             ctx = ctxFromSession meta
         let logger' = withChannelContext logger ctx
@@ -157,9 +153,7 @@ spec = describe "Seal.Logging.Logger" $ do
         let sid = case mkSessionId "merge-test" of
               Right s -> s
               Left _ -> error "invalid session id"
-            meta = SessionMeta
-              { smId = sid
-              , smProvider = "ollama"
+            meta = (let base = defaultSessionMeta sid (error "unused") in base) { smProvider = "ollama"
               , smModel = "llama3.2"
               , smChannel = "signal"
               , smParent = Nothing
@@ -170,8 +164,6 @@ spec = describe "Seal.Logging.Logger" $ do
               , smSealFrontMatter = True
               , smRepoUrl = Nothing
               , smRepoBranch = Nothing
-              , smCreatedAt = error "unused"
-              , smLastActive = error "unused"
               }
             ctx = ctxFromSession meta
         let logger' = withChannelContext logger ctx
@@ -190,9 +182,7 @@ spec = describe "Seal.Logging.Logger" $ do
       let sid = case mkSessionId "ctx-test" of
             Right s -> s
             Left _ -> error "invalid session id"
-          meta = SessionMeta
-            { smId = sid
-            , smProvider = "ollama"
+          meta = (let base = defaultSessionMeta sid (error "unused") in base) { smProvider = "ollama"
             , smModel = "llama3.2"
             , smChannel = "telegram"
             , smParent = Nothing
@@ -203,8 +193,6 @@ spec = describe "Seal.Logging.Logger" $ do
             , smSealFrontMatter = True
             , smRepoUrl = Nothing
             , smRepoBranch = Nothing
-            , smCreatedAt = error "unused"
-            , smLastActive = error "unused"
             }
           ctx = ctxFromSession meta
       ccChannelKind ctx `shouldBe` Just Telegram
@@ -217,9 +205,7 @@ spec = describe "Seal.Logging.Logger" $ do
       let sid = case mkSessionId "hash-test" of
             Right s -> s
             Left _ -> error "invalid session id"
-          meta = SessionMeta
-            { smId = sid
-            , smProvider = "ollama"
+          meta = (let base = defaultSessionMeta sid (error "unused") in base) { smProvider = "ollama"
             , smModel = "llama3.2"
             , smChannel = "signal"
             , smParent = Nothing
@@ -230,8 +216,6 @@ spec = describe "Seal.Logging.Logger" $ do
             , smSealFrontMatter = True
             , smRepoUrl = Nothing
             , smRepoBranch = Nothing
-            , smCreatedAt = error "unused"
-            , smLastActive = error "unused"
             }
           ctx = ctxFromSession meta
       ccConversationIdHash ctx `shouldBe` Nothing

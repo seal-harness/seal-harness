@@ -67,7 +67,7 @@ import Seal.Security.Vault
   ( UnlockMode (UnlockOnDemand), VaultConfig (..), VaultHandle (..), openVault )
 import Seal.Security.Vault.Age (mkMockEncryptor)
 import Seal.Security.WebAuthn.Types (AccessMode (..), Credential)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Skills.Backend qualified as Skill (noneBackend)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
@@ -690,6 +690,6 @@ fakeMeta =
   let sid' = case mkSessionId "test" of
         Right s -> s
         Left e  -> error ("test session id: " <> show e)
-  in SessionMeta sid' "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True
-       Nothing Nothing
-       (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+  in (defaultSessionMeta sid' (UTCTime (fromGregorian 2026 1 1) 0))
+  { smProvider = "ollama"
+    , smModel = "llama3" }

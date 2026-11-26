@@ -37,7 +37,7 @@ import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText, isValidAgentDefId, m
 import Seal.Security.Policy (AllowList (..))
 import Seal.Config.Paths (SealPaths (..), sessionMetaPath)
 import Seal.Security.Path (WorkspaceRoot (..))
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Session.Store (saveSessionMeta, autoBindRepoAgent)
 import Seal.Text.LineFile (maxScanBytes)
 import Seal.Tools.Exec.Types
@@ -715,15 +715,11 @@ spec = do
           let sidTxt = "20260817-131404-504"
               sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "bad sid"
               zoe = case mkAgentDefId "zoe" of Right a -> a; Left _ -> error "bad zoe id"
-              meta = SessionMeta
-                { smId = sid, smProvider = "ollama", smModel = "glm-5.2:cloud"
-                , smChannel = "web", smParent = Nothing, smAgent = Just zoe
-                , smSystemOverride = Nothing, smAgentName = Just "zoe"
-                , smDescription = Nothing
-                , smSealFrontMatter = True
-                , smRepoUrl = Nothing
-                , smRepoBranch = Nothing
-                , smCreatedAt = aTime, smLastActive = aTime }
+              meta = (let base = defaultSessionMeta sid aTime in base) { smProvider = "ollama"
+                , smModel = "glm-5.2:cloud"
+                , smChannel = "web"
+                , smAgent = Just zoe
+                , smAgentName = Just "zoe" }
           saveSessionMeta paths meta
           pure meta
         statePaths :: FilePath -> SealPaths
@@ -761,15 +757,11 @@ spec = do
           pickedId = case mkAgentDefId "my-repo--foo-agent" of Right a -> Just a; Left _ -> Nothing
       createDirectoryIfMissing True (tmp </> "state" </> "sessions")
       let sid = case mkSessionId "20260817-131404-504" of Right s -> s; Left _ -> error "bad sid"
-          meta = SessionMeta
-            { smId = sid, smProvider = "ollama", smModel = "glm-5.2:cloud"
-            , smChannel = "web", smParent = Nothing, smAgent = pickedId
-            , smSystemOverride = Nothing, smAgentName = Just "my-repo--foo-agent"
-            , smDescription = Nothing
-            , smSealFrontMatter = True
-            , smRepoUrl = Nothing
-            , smRepoBranch = Nothing
-            , smCreatedAt = aTime, smLastActive = aTime }
+          meta = (let base = defaultSessionMeta sid aTime in base) { smProvider = "ollama"
+            , smModel = "glm-5.2:cloud"
+            , smChannel = "web"
+            , smAgent = pickedId
+            , smAgentName = Just "my-repo--foo-agent" }
       saveSessionMeta paths meta
       fs <- mkFs tmp
       autoBindRepoAgent fs paths sid

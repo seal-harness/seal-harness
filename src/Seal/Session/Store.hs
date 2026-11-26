@@ -57,7 +57,7 @@ import Seal.Config.Paths
   , sessionMetaPath, sessionsRoot )
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Providers.Registry (resolveDefaultModelForName)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Store.Markdown (decodeDoc, fmLookup)
 import Seal.Tools.Exec.WorkdirFs (WorkdirFs)
 import Seal.Util.StrictIO (decodeFileStrict)
@@ -89,15 +89,9 @@ newSessionMeta _paths provider model channel mAgent = do
   sid <- case mkSessionId (formatSessionId now) of
     Right s -> pure s
     Left e  -> ioError (userError ("session id generation failed: " <> T.unpack e))
-  pure SessionMeta
-    { smId = sid, smProvider = provider, smModel = model
-    , smChannel = channel, smParent = Nothing, smAgent = mAgent
-    , smSystemOverride = Nothing, smAgentName = Nothing
-    , smDescription = Nothing
-    , smSealFrontMatter = True
-    , smRepoUrl = Nothing
-    , smRepoBranch = Nothing
-    , smCreatedAt = now, smLastActive = now }
+  pure (defaultSessionMeta sid now)
+    { smProvider = provider, smModel = model
+    , smChannel = channel, smAgent = mAgent }
 
 -- | Create a fresh session directory + session.json for the given selection.
 newSession :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> IO SessionMeta

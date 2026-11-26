@@ -22,6 +22,7 @@ import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (sessionIdText)
 import Seal.Gateway.Transcript (firstUserMessageSnippetFast, lastUserMessageAtFast)
 import Seal.Handles.Tab (TabKind (..), tabIndexToInt)
+import Seal.Execution.Types (machineNameText)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Tabs.Types (Tab (..), TabRef (..), TabStatus (..))
 
@@ -93,6 +94,7 @@ sessionInfoJson mSnippet mLastUserMessageAt m = object
   , "channelUserId" .= (Nothing :: Maybe Text)
   , "lastUserMessageAt" .= mLastUserMessageAt
   , "sealFrontMatter" .= smSealFrontMatter m
+  , "execMachine" .= (machineNameText <$> smExecMachine m)
   ]
 
 -- | Build the 'SessionInfo' JSON for a session, reading the first user

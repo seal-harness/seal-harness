@@ -130,7 +130,7 @@ import Seal.Session.Kind (HarnessFlavour (..))
 import Seal.Session.Lock
   (ReplyRegistry, replyFanout, replySubscriberCount,
    SessionLocks, withSessionLock)
-import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta, readSessionMeta)
 import Seal.Session.Store
   ( autoBindRepoAgentWith, formatSessionId, saveSessionMeta
   , updateSessionRepo )
@@ -1336,14 +1336,11 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
             ModelId m | T.null m -> smModel parent
                       | otherwise -> m
       resolveDefProvider (tdProvider td) fallBackProvider (ModelId fallBackModel)
-    fallbackMeta tnow = SessionMeta
-      { smId = parentSid, smProvider = "ollama", smModel = "glm-5.2:cloud"
-      , smChannel = "cli", smParent = Nothing, smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
-      , smDescription = Nothing
-      , smSealFrontMatter = True
-      , smRepoUrl = Nothing
-      , smRepoBranch = Nothing
-      , smCreatedAt = tnow, smLastActive = tnow }
+    -- A last-resort stand-in when the parent's session.json is unreadable.
+    -- It inherits nothing, including no pin: the child then resolves
+    -- unpinned rather than claiming the parent's machine.
+    fallbackMeta tnow = (defaultSessionMeta parentSid tnow)
+      { smProvider = "ollama", smModel = "glm-5.2:cloud" }
 
 -- | Build a narrowed child registry (issue #154 §3.2/§3.3): the def's
 -- @adTools@ allow-list is ENFORCED (intersection with the base ops), the

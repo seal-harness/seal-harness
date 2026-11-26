@@ -21,7 +21,7 @@ import Seal.Config.Paths (SealPaths (..), agentSessionDir, sessionDir, sessionMe
 import Seal.Core.Types (isValidSessionId, sessionIdText)
 import Seal.Git.Repo (ensureConfigRepo, openConfigRepo)
 import Seal.Core.TurnEngine (loadSessionMeta)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Session.Store
   ( defaultSessionSelection, formatSessionId, initSession, listSessions
   , newSession, saveSessionMeta, saveChildSessionMeta
@@ -68,14 +68,9 @@ spec = describe "Seal.Session.Store" $ do
         let paths = mkPaths root
             mk idText la = do
               let sid = fromRight (error "invalid sid") (Seal.Core.Types.mkSessionId idText)
-              saveSessionMeta paths SessionMeta
-                { smId = sid, smProvider = "anthropic", smModel = "m"
-                , smChannel = "cli", smParent = Nothing, smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
-                , smDescription = Nothing
-                , smSealFrontMatter = True
-                , smRepoUrl = Nothing
-                , smRepoBranch = Nothing
-                , smCreatedAt = aTime, smLastActive = la }
+              saveSessionMeta paths
+                ((defaultSessionMeta sid aTime) { smModel = "m"
+                                                , smLastActive = la })
         mk "20260701-120000-001" aTime
         mk "20260701-120000-002" (aTime { utctDay = fromGregorian 2026 7 2 })
         -- a corrupt session dir is skipped
@@ -92,15 +87,9 @@ spec = describe "Seal.Session.Store" $ do
         let paths = mkPaths root
             parent = fromRight (error "bad parent") (Seal.Core.Types.mkSessionId "20260701-120000-010")
             child = fromRight (error "bad child") (Seal.Core.Types.mkSessionId "20260701-120000-011")
-            childMeta = SessionMeta
-              { smId = child, smProvider = "anthropic", smModel = "m"
-              , smChannel = "agent", smParent = Just parent, smAgent = Nothing
-              , smSystemOverride = Nothing, smAgentName = Nothing
-              , smDescription = Nothing
-              , smSealFrontMatter = True
-              , smRepoUrl = Nothing
-              , smRepoBranch = Nothing
-              , smCreatedAt = aTime, smLastActive = aTime }
+            childMeta = (let base = defaultSessionMeta child aTime in base) { smModel = "m"
+              , smChannel = "agent"
+              , smParent = Just parent }
         saveChildSessionMeta paths parent child childMeta
         let childMetaPath = agentSessionDir paths parent child </> "session.json"
         exists <- doesFileExist childMetaPath
@@ -115,15 +104,9 @@ spec = describe "Seal.Session.Store" $ do
         let paths = mkPaths root
             parent = fromRight (error "bad parent") (Seal.Core.Types.mkSessionId "20260701-120000-012")
             child = fromRight (error "bad child") (Seal.Core.Types.mkSessionId "20260701-120000-013")
-            childMeta = SessionMeta
-              { smId = child, smProvider = "anthropic", smModel = "m"
-              , smChannel = "agent", smParent = Just parent, smAgent = Nothing
-              , smSystemOverride = Nothing, smAgentName = Nothing
-              , smDescription = Nothing
-              , smSealFrontMatter = True
-              , smRepoUrl = Nothing
-              , smRepoBranch = Nothing
-              , smCreatedAt = aTime, smLastActive = aTime }
+            childMeta = (let base = defaultSessionMeta child aTime in base) { smModel = "m"
+              , smChannel = "agent"
+              , smParent = Just parent }
         saveChildSessionMeta paths parent child childMeta
         metas <- listSessions paths
         any ((== child) . smId) metas `shouldBe` False

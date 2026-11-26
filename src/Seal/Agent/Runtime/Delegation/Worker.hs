@@ -60,7 +60,7 @@ import Seal.ISA.RepeatDetect (RepeatTrack)
 import Seal.Logging.Global (globalLogIO)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AllowList (..), AutonomyLevel)
-import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta, readSessionMeta)
 import Seal.Session.Store (saveChildSessionMeta, saveSessionMeta)
 import Seal.SourceControl.Clone (CloneDeps)
 import Seal.Tools.Args (branchNameText, mkBranchName)
@@ -401,22 +401,19 @@ writeChildMeta deps childSid = do
   let (provider, model) = case mParent of
         Just pm -> (smProvider pm, smModel pm)
         Nothing -> ("unknown", "unknown")
-  saveChildSessionMeta (dwdPaths deps) (dwdParentSid deps) childSid SessionMeta
-    { smId = childSid
-    , smProvider = provider
-    , smModel = model
-    , smChannel = "agent"
-    , smParent = Just (dwdParentSid deps)
-    , smAgent = Nothing
-    , smSystemOverride = Nothing
-    , smAgentName = Nothing
-    , smDescription = Nothing
-    , smSealFrontMatter = True
-    , smRepoUrl = Nothing
-    , smRepoBranch = Nothing
-    , smCreatedAt = now
-    , smLastActive = now
-    }
+  -- The child COPIES the parent's pin. A dead value fails closed at
+  -- resolution (§5 row 0) rather than falling back to the effective default:
+  -- falling back can land WhereLocal, i.e. untrusted subagent code on the
+  -- harness kernel with only a warning to show for it. Parent and child are
+  -- repaired the same way — a fresh session.
+  saveChildSessionMeta (dwdPaths deps) (dwdParentSid deps) childSid
+    (defaultSessionMeta childSid now)
+      { smProvider = provider
+      , smModel = model
+      , smChannel = "agent"
+      , smParent = Just (dwdParentSid deps)
+      , smExecMachine = mParent >>= smExecMachine
+      }
 
 -- | Load the calling session's 'SessionMeta' through the shared leaf reader
 -- ("Seal.Session.Meta"), if readable.
@@ -525,20 +522,17 @@ writeHandoffMeta deps childSid agentDef taskRepo = do
       repo = handoffRepo (rsUrl <$> taskRepo) (taskRepo >>= rsBranch) mParent
       agentName = let n = T.strip (adName agentDef)
                   in if T.null n then Nothing else Just n
-  saveSessionMeta (dwdPaths deps) SessionMeta
-    { smId = childSid
-    , smProvider = provider
-    , smModel = model
-    , smChannel = "agent"
-    , smParent = Nothing
-    , smAgent = Just (adId agentDef)
-    , smSystemOverride = Nothing
-    , smAgentName = agentName
-    , smDescription = Nothing
-    , smSealFrontMatter = True
-    , smRepoUrl = rsUrl <$> repo
-    , smRepoBranch = repo >>= rsBranch
-    , smCreatedAt = now
-    , smLastActive = now
-    }
+  saveSessionMeta (dwdPaths deps)
+    (defaultSessionMeta childSid now)
+      { smProvider = provider
+      , smModel = model
+      , smChannel = "agent"
+      , smAgent = Just (adId agentDef)
+      , smAgentName = agentName
+      , smRepoUrl = rsUrl <$> repo
+      , smRepoBranch = repo >>= rsBranch
+      -- Same rule as 'writeChildMeta': copy the parent's pin, and let a dead
+      -- value fail closed rather than fall back.
+      , smExecMachine = mParent >>= smExecMachine
+      }
   pure repo

@@ -34,7 +34,7 @@ import Seal.Core.Types (mkSessionId)
 import Seal.Gateway.API (ApiDeps (..), apiApp)
 import Seal.Gateway.Setup (stubSetupDeps)
 import Seal.Gateway.Stream (StreamHealth (..))
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Tools.Exec.Abort (newSessionAbortRegistry)
 import Seal.Tools.Exec.FileExplorer
@@ -441,10 +441,10 @@ mkDepsWithCache cacheRoot fe enabled = do
         { spHome = "/tmp", spState = "/tmp", spConfig = "/tmp"
         , spKeys = "/tmp", spCache = cacheRoot
         }
-      meta0 = SessionMeta
+      meta0 = (defaultSessionMeta
         (case mkSessionId "test" of Right s -> s; Left _ -> error "sid")
-        "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
-        (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+        (UTCTime (fromGregorian 2026 1 1) 0))
+        { smProvider = "ollama", smModel = "llama3.2", smChannel = "web" }
   activeRef <- newIORef meta0
   let sr = SessionRuntime
         { srPaths = paths, srConfigPath = "/tmp/config.toml"

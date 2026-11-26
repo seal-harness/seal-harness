@@ -38,7 +38,7 @@ import Seal.Cron.Store (CronStore (..))
 import Seal.Harness.Registry (newHarnessRegistry)
 import Seal.Providers.Registry (knownProviders)
 import Seal.Security.Adoption (ConsentChannel (..))
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, newSessionAbortRegistry)
 import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
@@ -66,8 +66,9 @@ fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "", s
 fakeMeta :: SessionMeta
 fakeMeta =
   let sid = case mkSessionId "capstone" of Right s -> s; Left _ -> error "sid"
-  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
-       (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+  in (defaultSessionMeta sid (UTCTime (fromGregorian 2026 1 1) 0))
+       { smProvider = "ollama"
+       , smModel = "llama3" }
 
 runAppStatus :: Application -> Request -> IO Int
 runAppStatus app req = do

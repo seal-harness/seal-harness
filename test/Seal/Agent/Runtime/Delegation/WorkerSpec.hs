@@ -19,6 +19,7 @@ import Data.Text qualified as T
 import Data.Time (getCurrentTime)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.IO.Temp (withSystemTempDirectory)
+import Data.Either (fromRight)
 import Test.Hspec
 import Test.QuickCheck
 
@@ -43,7 +44,9 @@ import Seal.ISA.RepeatDetect (newSessionRepeatRegistry, lookupOrCreateRepeatTrac
 import Seal.Logging.Logger (testSealLogger)
 import Seal.Providers.Class (SomeProvider (..), ToolResultPart (..))
 import Seal.Security.Policy (AllowList (..), AutonomyLevel (..))
-import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
+import Seal.Execution.Types (mkMachineName)
+import Seal.Session.Meta
+  (SessionMeta (..), defaultSessionMeta, readSessionMeta, setExecMachine)
 import Seal.Session.Store (saveSessionMeta)
 import Seal.SourceControl.Clone (stubCloneDeps)
 import Seal.TestHelpers.Arbitrary ()
@@ -183,16 +186,8 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
         -- Seed a parent session.json so the child meta inherits its
         -- provider/model.
         now <- getCurrentTime
-        let parentMeta = SessionMeta
-              { smId = sampleSession, smProvider = "anthropic"
-              , smModel = "claude-opus-4", smChannel = "web"
-              , smParent = Nothing
-              , smAgent = Nothing, smSystemOverride = Nothing, smAgentName = Nothing
-              , smDescription = Nothing
-              , smSealFrontMatter = True
-              , smRepoUrl = Nothing
-              , smRepoBranch = Nothing
-              , smCreatedAt = now, smLastActive = now }
+        let parentMeta = (let base = defaultSessionMeta sampleSession now in base) { smModel = "claude-opus-4"
+              , smChannel = "web" }
         saveSessionMeta paths parentMeta
         anchorRef <- newIORef (Nothing :: Maybe (Maybe FilePath))
         deps <- mkWorkerDepsIO tmp anchorRef =<< newIORef Nothing
@@ -329,6 +324,39 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
         runHandoffWorkerWith (sampleAgentDef { adName = "   " }) tmp childSid Nothing
         mMeta <- readSessionMeta paths childSid
         fmap smAgentName mMeta `shouldBe` Just Nothing
+
+    it "inherits the caller's exec_machine pin (a value copy, not a resolution)" $
+      withSystemTempDirectory "seal-handoff-pin" $ \tmp -> do
+        let paths = samplePaths tmp
+            childSid = mkSystemSessionId "handoff"
+            builder = fromRight (error "bad machine name") (mkMachineName "builder")
+        saveSessionMeta paths
+          (setExecMachine builder (callerMeta Nothing Nothing))
+        runHandoffWorker tmp childSid Nothing
+        mMeta <- readSessionMeta paths childSid
+        fmap smExecMachine mMeta `shouldBe` Just (Just builder)
+
+    it "copies a DEAD pin rather than dropping it, so the child fails closed" $
+      withSystemTempDirectory "seal-handoff-deadpin" $ \tmp -> do
+        let paths = samplePaths tmp
+            childSid = mkSystemSessionId "handoff"
+            -- a machine that no longer exists in any inventory
+            gone = fromRight (error "bad machine name") (mkMachineName "gone")
+        saveSessionMeta paths (setExecMachine gone (callerMeta Nothing Nothing))
+        runHandoffWorker tmp childSid Nothing
+        mMeta <- readSessionMeta paths childSid
+        -- If this fell back to the effective default instead, an untrusted
+        -- subagent could execute on the harness kernel with only a warning.
+        fmap smExecMachine mMeta `shouldBe` Just (Just gone)
+
+    it "an unpinned caller yields an unpinned child (no key in the JSON)" $
+      withSystemTempDirectory "seal-handoff-nopin" $ \tmp -> do
+        let paths = samplePaths tmp
+            childSid = mkSystemSessionId "handoff"
+        saveSessionMeta paths (callerMeta Nothing Nothing)
+        runHandoffWorker tmp childSid Nothing
+        mMeta <- readSessionMeta paths childSid
+        fmap smExecMachine mMeta `shouldBe` Just Nothing
 
   describe "handoffRepoRegistry" $ do
     it "always contains SETUP_REPO (a def allow-list cannot drop it)" $
@@ -501,22 +529,8 @@ mkHooks = do
 
 -- | A minimal 'SessionMeta' for @parent@ carrying the given repo.
 sampleMetaWithRepo :: Maybe Text -> SessionMeta
-sampleMetaWithRepo mRepo = SessionMeta
-  { smId = sampleSession
-  , smProvider = "anthropic"
-  , smModel = "claude-opus-4"
-  , smChannel = "cli"
-  , smParent = Nothing
-  , smAgent = Nothing
-  , smSystemOverride = Nothing
-  , smAgentName = Nothing
-  , smDescription = Nothing
-  , smSealFrontMatter = True
-  , smRepoUrl = mRepo
-  , smRepoBranch = Nothing
-  , smCreatedAt = t
-  , smLastActive = t
-  }
+sampleMetaWithRepo mRepo = (let base = defaultSessionMeta sampleSession t in base) { smModel = "claude-opus-4"
+  , smRepoUrl = mRepo }
   where
     t = read "1970-01-01 00:00:00 UTC"
 

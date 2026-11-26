@@ -10,7 +10,7 @@ import Test.Hspec
 import Seal.Core.Types (mkSessionId, SessionId)
 import Seal.Handles.Tab (TabKind (..))
 import Seal.Harness.Id (HarnessId, parseHarnessId)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Tabs.Partition (PartitionedSessions (..), partitionSessions)
 import Seal.Tabs.Types (TabList (..), TabRef (..), emptyTabList, insertTab)
 
@@ -25,22 +25,8 @@ mkHid s = fromRight (error "bad hid") (parseHarnessId (T.pack s))
 
 mkMeta :: String -> SessionMeta
 mkMeta s =
-  SessionMeta
-    { smId = mkSid s
-    , smProvider = "ollama"
-    , smModel = "llama3.2"
-    , smChannel = "cli"
-    , smParent = Nothing
-    , smAgent = Nothing
-    , smSystemOverride = Nothing
-    , smAgentName = Nothing
-    , smDescription = Nothing
-    , smSealFrontMatter = True
-    , smRepoUrl = Nothing
-    , smRepoBranch = Nothing
-    , smCreatedAt = sampleTime
-    , smLastActive = sampleTime
-    }
+  (let base = defaultSessionMeta (mkSid s) sampleTime in base) { smProvider = "ollama"
+    , smModel = "llama3.2" }
 
 insert :: TabRef -> TabKind -> TabList -> TabList
 insert ref kind tl = fromRight (error "insert failed") (insertTab ref kind Nothing tl)

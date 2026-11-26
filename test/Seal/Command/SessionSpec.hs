@@ -20,7 +20,7 @@ import Seal.Command.Session (renderSessionInfo, renderSessionLine, sessionComman
 import Seal.Command.Spec (CommandSpec (..), mkRegistry, runCommandAction)
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Core.Types (mkSessionId)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Session.Store (SessionRuntime (..), newSession)
 import Seal.TestHelpers.FakeCaps (getSent, makeFakeCaps)
 import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
@@ -32,7 +32,7 @@ aTime = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 43200)
 meta :: T.Text -> SessionMeta
 meta idText =
   let sid = fromRight (error $ "invalid session id: " <> show idText) (mkSessionId idText)
-  in SessionMeta sid "anthropic" "claude-opus-4-8" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing aTime aTime
+  in (defaultSessionMeta sid aTime) { smModel = "claude-opus-4-8" }
 
 mkSR :: FilePath -> SessionMeta -> IO SessionRuntime
 mkSR root active = do

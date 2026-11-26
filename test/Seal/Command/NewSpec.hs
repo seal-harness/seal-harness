@@ -21,7 +21,7 @@ import Seal.Gateway.Types.NewArgs (renderNewSessionConfirmation)
 import Seal.Command.Parse (ParseOutcome (..), parseSlash)
 import Seal.Command.Spec (CommandSpec (csParserInfo), mkRegistry, runCommandAction)
 import Seal.Core.Types (SessionId, mkSessionId)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.SourceControl.Repo
   ( SourceRepo (..), RepoCredential (CredPat), VcsKind (VcsGitHub)
   , mkRepoId )
@@ -107,22 +107,7 @@ runNewAction deps caps argv =
 
 spec :: Spec
 spec = describe "Seal.Command.New" $ do
-  let newMeta = SessionMeta
-        { smId = mkSid "20260719-120000-001"
-        , smProvider = "anthropic"
-        , smModel = "claude-sonnet-4-20250514"
-        , smChannel = "cli"
-        , smParent = Nothing
-        , smAgent = Nothing
-        , smSystemOverride = Nothing
-        , smAgentName = Nothing
-        , smDescription = Nothing
-        , smSealFrontMatter = True
-        , smRepoUrl = Nothing
-        , smRepoBranch = Nothing
-        , smCreatedAt = error "unused"
-        , smLastActive = error "unused"
-        }
+  let newMeta = (let base = defaultSessionMeta (mkSid "20260719-120000-001") (error "unused") in base) { smModel = "claude-sonnet-4-20250514" }
       oldSid = mkSid "20260701-000000-000"
       line = renderNewConfirmation newMeta oldSid
   describe "renderNewConfirmation" $ do

@@ -18,7 +18,7 @@ import Seal.Agent.Def.Types
 import Seal.Core.TurnEngine (resolveSystemPrompt)
 import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Security.Policy (AllowList (..))
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Skills.Backend qualified as Skill
 import Seal.Skills.Types
   ( Skill (..), mkSkillId )
@@ -39,14 +39,11 @@ metaWith :: Bool -> SessionMeta
 metaWith frontMatter =
   let sid = fromRight (error "bad sid") (mkSessionId "20260701-120000-001")
       aid = fromRight (error "bad agent id") (mkAgentDefId "zoe")
-  in SessionMeta
-       { smId = sid, smProvider = "anthropic", smModel = "claude-opus-4-8"
-       , smChannel = "web", smParent = Nothing, smAgent = Just aid, smSystemOverride = Nothing
-       , smAgentName = Just "zoe", smDescription = Nothing
-       , smSealFrontMatter = frontMatter
-       , smRepoUrl = Nothing
-       , smRepoBranch = Nothing
-       , smCreatedAt = sampleTime, smLastActive = sampleTime }
+  in (let base = defaultSessionMeta sid sampleTime in base) { smModel = "claude-opus-4-8"
+       , smChannel = "web"
+       , smAgent = Just aid
+       , smAgentName = Just "zoe"
+       , smSealFrontMatter = frontMatter }
 
 -- | An agent def whose system prompt is a distinctive marker, so the test
 -- can assert the agent's prompt IS (and IS ONLY) in the result.

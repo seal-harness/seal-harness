@@ -23,7 +23,7 @@ import Seal.Command.Tab (tabCommandSpec, noTabCloseNotifier, terseGrammarSpec, T
 import Seal.Config.Paths (SealPaths (..), sessionMetaPath)
 import Seal.Core.Types (mkSessionId, SessionId)
 import Seal.Handles.Tab (tabIndexToChar, TabKind(..), mkTabIndex, TabIndex)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Session.Store (saveSessionMeta)
 import Seal.Tabs (insertTabH, newTabsHandle, snapshotTabs)
 import Seal.Tabs.Types (Tab (..), TabList(..), TabRef(..), tabCount)
@@ -33,22 +33,12 @@ import Seal.Tabs.Types (Tab (..), TabList(..), TabRef(..), tabCount)
 -- 'SessionMeta' that the mint itself does /not/ persist (the command persists
 -- it only after the tab insert succeeds).
 stubMeta :: SessionMeta
-stubMeta = SessionMeta
-  { smId = either (error "stubMint: bad sid") id (mkSessionId "20260719-120000-001")
-  , smProvider = "ollama"
-  , smModel = "llama3.2"
-  , smChannel = "web"
-  , smParent = Nothing
-  , smAgent = Nothing
-  , smSystemOverride = Nothing
-  , smAgentName = Nothing
-  , smDescription = Nothing
-  , smSealFrontMatter = True
-  , smRepoUrl = Nothing
-  , smRepoBranch = Nothing
-  , smCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
-  , smLastActive = UTCTime (fromGregorian 2026 1 1) 0
-  }
+stubMeta = (defaultSessionMeta
+  (either (error "stubMint: bad sid") id (mkSessionId "20260719-120000-001"))
+  (UTCTime (fromGregorian 2026 1 1) 0))
+    { smProvider = "ollama"
+    , smModel = "llama3.2"
+    , smChannel = "web" }
 
 stubMint :: IO SessionMeta
 stubMint = pure stubMeta
@@ -383,15 +373,8 @@ mkIdx n = case mkTabIndex n of
   Left _  -> error "bad index"
 
 metaWithDescription :: SessionId -> Maybe Text -> SessionMeta
-metaWithDescription sid mDesc = SessionMeta
-  { smId = sid, smProvider = "ollama", smModel = "llama3.2"
-  , smChannel = "cli", smParent = Nothing, smAgent = Nothing
-  , smSystemOverride = Nothing, smAgentName = Nothing
-  , smDescription = mDesc
-  , smSealFrontMatter = True
-  , smRepoUrl = Nothing
-  , smRepoBranch = Nothing
-  , smCreatedAt = testTime, smLastActive = testTime
-  }
+metaWithDescription sid mDesc = (let base = defaultSessionMeta sid testTime in base) { smProvider = "ollama"
+  , smModel = "llama3.2"
+  , smDescription = mDesc }
   where
     testTime = UTCTime (fromGregorian 2026 1 1) 0

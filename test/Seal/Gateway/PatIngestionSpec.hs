@@ -70,7 +70,7 @@ import Seal.Security.Adoption (ConsentChannel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Security.Policy (AutonomyLevel (..), SecurityPolicy (..))
 import Seal.Security.Vault (VaultHandle (vhGet))
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Session.Store (SessionRuntime (..))
 import Seal.Skills.Backend qualified as Skill (noneBackend)
 import Seal.SourceControl.AgentRegistry (mkAgentRegistryHandle)
@@ -236,8 +236,9 @@ fakePaths = SealPaths
 fakeMeta :: SessionMeta
 fakeMeta =
   let sid = case mkSessionId "test" of Right s -> s; Left _ -> error "sid"
-  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
-       (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+  in (defaultSessionMeta sid (UTCTime (fromGregorian 2026 1 1) 0))
+       { smProvider = "ollama"
+       , smModel = "llama3" }
 
 -- | Build 'ApiDeps' with a REAL 'mkRepoRegistryHandle' (writing to a real
 -- @repos.toml@ in the temp dir) + an UNLOCKED fake in-memory vault. The

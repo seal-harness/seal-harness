@@ -14,6 +14,8 @@ import Data.Time (UTCTime, getCurrentTime)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.Exit (ExitCode (..))
+import System.Process (readProcessWithExitCode)
 import Test.Hspec
 
 import Seal.Config.Paths
@@ -24,7 +26,7 @@ import Seal.Core.Types
 import Seal.ISA.Opcode
 import Seal.ISA.Ops.Session
 import Seal.Providers.Class (ContentBlock (..), pattern Message, Role (..), ToolResultPart (..))
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.Session.Store (newSession, saveSessionMeta)
 import Seal.Session.Search (inMemorySessionSearchBackend)
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine)
@@ -116,15 +118,8 @@ testLineage = [lineageChildSid, lineageParentSid, lineageRootSid]
 -- | A minimal 'SessionMeta' for seeding search fixtures without minting
 -- (deterministic ids, no millisecond-collision risk).
 seedMeta :: SessionId -> UTCTime -> Maybe Text -> SessionMeta
-seedMeta sid t mDesc = SessionMeta
-  { smId = sid, smProvider = "anthropic", smModel = "claude-opus-4"
-  , smChannel = "cli", smParent = Nothing, smAgent = Nothing
-  , smSystemOverride = Nothing, smAgentName = Nothing
-  , smDescription = mDesc
-  , smSealFrontMatter = True
-  , smRepoUrl = Nothing
-  , smRepoBranch = Nothing
-  , smCreatedAt = t, smLastActive = t }
+seedMeta sid t mDesc = (let base = defaultSessionMeta sid t in base) { smModel = "claude-opus-4"
+  , smDescription = mDesc }
 
 -- | The snippet content of every rendered @  snippet: @ line in a search
 -- result.
@@ -1767,3 +1762,29 @@ spec = describe "Seal.ISA.Ops.Session" $ do
         let recorded = TE.decodeUtf8 (BL.toStrict (encode (orRecorded r)))
         T.isInfixOf "\"offset\":3" recorded `shouldBe` True
         T.isInfixOf "\"around_index\":4" recorded `shouldBe` True
+
+  describe "the opcode ban (design §4.3)" $ do
+
+    -- A grep test, deliberately: the property is about what code exists, not
+    -- about what a function returns. If this ever fails, an agent-reachable
+    -- path can write the machine inventory, and under allow_localhost =
+    -- false that is an escalation.
+    it "no ISA opcode module mentions the execution inventory" $ do
+      hits <- grepSources "src/Seal/ISA" "executionFilePath"
+      hits `shouldBe` []
+
+    it "no ISA opcode module imports the execution config module" $ do
+      hits <- grepSources "src/Seal/ISA" "Seal.Config.Execution"
+      hits `shouldBe` []
+
+    it "no ISA opcode module calls the inventory writer" $ do
+      hits <- grepSources "src/Seal/ISA" "updateExecutionConfig"
+      hits `shouldBe` []
+
+-- | @rg -l@ over a source directory; empty when nothing matches.
+grepSources :: FilePath -> String -> IO [FilePath]
+grepSources dir needle = do
+  (code, out, _err) <- readProcessWithExitCode "rg" ["-l", "--fixed-strings", needle, dir] ""
+  pure (case code of
+          ExitSuccess -> filter (not . null) (lines out)
+          _           -> [])

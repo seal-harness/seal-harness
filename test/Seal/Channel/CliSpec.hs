@@ -32,7 +32,7 @@ import Seal.Security.Policy (AutonomyLevel (..))
 import qualified Seal.ISA.Registry as ISA
 import Seal.Providers.Class (Provider (..), SomeProvider (..))
 import Seal.Security.Vault (VaultHandle)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), defaultSessionMeta)
 import Seal.TestHelpers.FakeCaps (makeFakeCaps)
 import Seal.TestHelpers.ApiTestHarness (noOllamaReadiness)
 import Seal.Vault.Commands (VaultRuntime (..))
@@ -61,7 +61,7 @@ metaWith p m =
   let sid = fromRight (error "unreachable: literal session id")
               (mkSessionId "20260701-120000-002")
       t   = UTCTime (fromGregorian 2026 7 1) (secondsToDiffTime 43200)
-  in SessionMeta sid p m "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing t t
+  in (defaultSessionMeta sid t) { smProvider = p, smModel = m, smChannel = "cli" }
 
 -- | A 'ChannelCaps' that records every 'ccSend' call into @ref@ (prepended;
 -- reverse for chronological order).  Prompt functions return the empty string.
