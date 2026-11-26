@@ -277,6 +277,9 @@ Read and follow: ./rubrics/plan-review-rubric-adversarial.md (Scope & Alignment 
 ## User's Original Request
 ${userRequest}
 
+## Requirements Baseline (frozen — the authority on scope)
+${requirementsDoc}
+
 ## Plan Under Review
 ${planText}
 
@@ -285,6 +288,18 @@ Determine whether this plan is right-sized for what the user actually asked. Che
 
 1. **Matches user request** — Does the plan solve what was asked? Or does it solve something the planner found more interesting? Divergence = BLOCKING FAIL.
 2. **No scope creep** — Are there features, abstractions, or refactoring beyond what was requested? Unnecessary additions = BLOCKING FAIL.
+
+**Measure both against the Requirements Baseline, not against your reading of
+the request.** "Beyond what was requested" means beyond the baseline's stated
+behaviour and constraints. Two consequences:
+
+- A plan item that implements something the baseline lists under **Out of
+  scope** is scope creep = BLOCKING FAIL, even if it is a real improvement.
+- A plan item the baseline's **Done when** list depends on is in scope even if
+  the original request did not spell it out — under-scoping = BLOCKING FAIL.
+
+Do not flag baseline items as creep. The baseline is frozen; reopening it is a
+scope change for the human, not a review finding.
 3. **No under-scoping** — Are obvious implications of the request omitted? Missing obvious work = BLOCKING FAIL.
 4. **Complexity proportional** — Is the solution complexity proportional to the problem complexity?
 5. **Simpler alternative** — Is there a significantly simpler approach that achieves the same outcome?
