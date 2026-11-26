@@ -154,12 +154,19 @@ transferSpec = describe "Seal.Session.AgentMetaCache (transfer)" $ do
     it "carries host/user in the destination arg; rsh holds only pinned options" $ do
       case rsyncArgv sshCfg "/srv/ws/repo" "/cache/e.tmp" of
         [_rsync, _r, _max, "-e", rsh, src, dst] -> do
-          rsh `shouldSatisfy` ("ssh -o 'StrictHostKeyChecking=yes'" `isPrefixOfS`)
+          rsh `shouldSatisfy` ("ssh -F '/dev/null' -o 'ProxyCommand=none'" `isPrefixOfS`)
+          rsh `shouldSatisfy` ("-o 'StrictHostKeyChecking=yes'" `isInfixOfS`)
           rsh `shouldSatisfy` ("'UserKnownHostsFile=/home/agent/.ssh/known_hosts'" `isInfixOfS`)
           rsh `shouldNotSatisfy` ("agent@" `isInfixOfS`)
           src `shouldBe` "agent@exec.internal:/srv/ws/repo"
           dst `shouldBe` "/cache/e.tmp/"
         _ -> expectationFailure "unexpected argv shape"
+
+    it "ignores ~/.ssh/config and disables ProxyCommand/ProxyJump" $ do
+      let rsh = rsyncRshString sshCfg
+      ("-F '/dev/null'" `isInfixOfS` rsh) `shouldBe` True
+      ("-o 'ProxyCommand=none'" `isInfixOfS` rsh) `shouldBe` True
+      ("-o 'ProxyJump=none'" `isInfixOfS` rsh) `shouldBe` True
 
     it "adds -p/-i only when configured" $ do
       let cfg = sshCfg { scPort = 2222, scIdentity = Just "/keys/id" }

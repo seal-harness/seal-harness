@@ -186,6 +186,9 @@ rsyncRshString :: SshConfig -> String
 rsyncRshString cfg =
   unwords
     ( [ "ssh"
+      , "-F", shq "/dev/null"
+      , "-o", shq "ProxyCommand=none"
+      , "-o", shq "ProxyJump=none"
       , "-o", shq "StrictHostKeyChecking=yes"
       , "-o", shq "BatchMode=yes"
       , "-o", shq ("UserKnownHostsFile=" <> scKnownHosts cfg)

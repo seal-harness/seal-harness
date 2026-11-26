@@ -45,10 +45,12 @@ module Seal.Tools.Exec.Remote
   ) where
 
 import Control.Exception (try)
+import Crypto.Hash (Digest, SHA256, hash)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.IORef
 import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -93,11 +95,14 @@ import Katip (Severity (..))
 sshExecArgv :: SshConfig -> Text -> [String]
 sshExecArgv cfg cmd =
   [ "ssh"
+  , "-F", "/dev/null"
+  , "-o", "ProxyCommand=none"
+  , "-o", "ProxyJump=none"
   , "-o", "StrictHostKeyChecking=yes"
   , "-o", "BatchMode=yes"
   , "-o", "UserKnownHostsFile=" <> scKnownHosts cfg
   ]
-  <> muxArgs "m"
+  <> muxArgs "m" cfg
   <> portArg
   <> identityArg
   <> [ userAtHost
@@ -130,11 +135,14 @@ sshExecArgv cfg cmd =
 sshExecArgvForwarding :: SshConfig -> Text -> [String]
 sshExecArgvForwarding cfg cmd =
   [ "ssh", "-A"
+  , "-F", "/dev/null"
+  , "-o", "ProxyCommand=none"
+  , "-o", "ProxyJump=none"
   , "-o", "StrictHostKeyChecking=yes"
   , "-o", "BatchMode=yes"
   , "-o", "UserKnownHostsFile=" <> scKnownHosts cfg
   ]
-  <> muxArgs "a"
+  <> muxArgs "a" cfg
   <> portArg
   <> identityArg
   <> [ userAtHost
@@ -153,14 +161,36 @@ sshExecArgvForwarding cfg cmd =
 
 -- | The multiplexing options for one master pool. @pool@ is @\"m\"@ (plain)
 -- or @\"a\"@ (agent-forwarding); the ControlPath suffix keeps the pools
--- disjoint. @%C@ is ssh's hash of |local host|local port|remote host|remote
--- port, so each target gets its own master even within one pool.
-muxArgs :: String -> [String]
-muxArgs pool =
+-- disjoint.
+--
+-- @%C@ is a hash of @%l%h%p%r%j@ — local host, remote host, remote port,
+-- remote /user/ and jump host. The user /is/ included (an earlier comment
+-- here claimed otherwise and was wrong), so two entries differing in user
+-- already get distinct masters.
+--
+-- What @%C@ does not cover is @identity@ and @known_hosts@: with one global
+-- 'SshConfig' that was unobservable, but an inventory makes two entries with
+-- the same host/port/user and different keys reachable, and they would share
+-- one master — the first connection's key and pinned host key would serve
+-- both. So a truncated hash of those two fields is folded in explicitly.
+muxArgs :: String -> SshConfig -> [String]
+muxArgs pool cfg =
   [ "-o", "ControlMaster=auto"
-  , "-o", "ControlPath=" <> sshMuxBaseDir </> (pool <> "-%C")
+  , "-o", "ControlPath=" <> sshMuxBaseDir </> (pool <> "-" <> muxKeyDigest cfg <> "-%C")
   , "-o", "ControlPersist=600"
   ]
+
+-- | A short, stable digest of the two inputs @%C@ omits: @identity@ and
+-- @known_hosts@. Absent identity hashes as the empty string, so \"no @-i@\"
+-- is its own bucket rather than colliding with a named key path.
+muxKeyDigest :: SshConfig -> String
+muxKeyDigest cfg =
+  take 8 (show (hash material :: Digest SHA256))
+  where
+    material =
+      TE.encodeUtf8 (T.pack (fromMaybe "" (scIdentity cfg)))
+        <> "\NUL"
+        <> TE.encodeUtf8 (T.pack (scKnownHosts cfg))
 
 -- | The absolute mux socket directory, @~/.seal/ssh-mux@ (mode 0700),
 -- created once at first use. An absolute path (not a @~@-form) so the argv

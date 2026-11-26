@@ -478,6 +478,9 @@ resolveCloneTarget deps repo =
                     let authEnv = sahGetAuthEnv (cdSshAgent deps) agentEnv
                         sshCmd = T.pack
                           ( "ssh"
+                          <> " -F /dev/null"
+                          <> " -o ProxyCommand=none"
+                          <> " -o ProxyJump=none"
                           <> " -o StrictHostKeyChecking=yes"
                           <> " -o BatchMode=yes"
                           <> " -o UserKnownHostsFile=" <> knownHostsPath

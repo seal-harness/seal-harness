@@ -2,7 +2,7 @@
 module Seal.Tools.Exec.RemoteSpec (spec) where
 
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.List (isSuffixOf)
+import Data.List (isInfixOf, isPrefixOf, isSuffixOf)
 import Data.Text (Text)
 import Data.Text qualified as T
 import System.Directory (getHomeDirectory)
@@ -233,29 +233,74 @@ spec = describe "Seal.Tools.Exec.Remote" $ do
     it "plain argv uses the plain mux pool under ~/.seal/ssh-mux" $ do
       home <- getHomeDirectory
       let argv = sshExecArgv sshCfg "echo hi"
-      checkAdjacentPair argv "ControlPath" (home </> ".seal/ssh-mux/m-%C")
+      controlPath argv `shouldSatisfy`
+        (\p -> (home </> ".seal/ssh-mux" </> "m-") `isPrefixOf` p && "-%C" `isSuffixOf` p)
 
     it "forwarding argv uses the agent mux pool (never the plain one)" $ do
       home <- getHomeDirectory
       let argv = sshExecArgvForwarding sshCfg "git fetch"
-      checkAdjacentPair argv "ControlPath" (home </> ".seal/ssh-mux/a-%C")
+      controlPath argv `shouldSatisfy`
+        (\p -> (home </> ".seal/ssh-mux" </> "a-") `isPrefixOf` p && "-%C" `isSuffixOf` p)
       (home </> ".seal/ssh-mux/m-%C") `shouldNotSatisfy` (`elem` argv)
 
     it "plain argv never joins the agent pool" $ do
       home <- getHomeDirectory
       let argv = sshExecArgv sshCfg "echo hi"
-      (home </> ".seal/ssh-mux/a-%C") `shouldNotSatisfy` (`elem` argv)
+      controlPath argv `shouldSatisfy`
+        (\p -> (home </> ".seal/ssh-mux" </> "m-") `isPrefixOf` p)
+
+    it "the two pools stay disjoint even with the same identity" $ do
+      let withKey = sshCfg { scIdentity = Just "/home/agent/.ssh/id_ed25519" }
+      controlPath (sshExecArgv withKey "x") `shouldNotBe`
+        controlPath (sshExecArgvForwarding withKey "x")
+
+    it "two configs differing only in identity get different ControlPaths" $ do
+      let k1 = sshCfg { scIdentity = Just "/home/agent/.ssh/key1" }
+          k2 = sshCfg { scIdentity = Just "/home/agent/.ssh/key2" }
+      controlPath (sshExecArgv k1 "x") `shouldNotBe` controlPath (sshExecArgv k2 "x")
+
+    it "two configs differing only in known_hosts get different ControlPaths" $ do
+      let h1 = sshCfg { scKnownHosts = "/home/agent/.ssh/known_hosts_a" }
+          h2 = sshCfg { scKnownHosts = "/home/agent/.ssh/known_hosts_b" }
+      controlPath (sshExecArgv h1 "x") `shouldNotBe` controlPath (sshExecArgv h2 "x")
+
+    it "the same config gets a stable ControlPath" $
+      controlPath (sshExecArgv sshCfg "x") `shouldBe` controlPath (sshExecArgv sshCfg "other")
 
     prop "the two mux pools stay disjoint for any command" $ \cmd -> do
       let a = sshExecArgv sshCfg (cmd :: Text)
           b = sshExecArgvForwarding sshCfg cmd
-      not (any ("-a-%C" `isSuffixOf`) a) && not (any ("-m-%C" `isSuffixOf`) b)
+      not (any ("/a-" `isInfixOf`) a) && not (any ("/m-" `isInfixOf`) b)
+
+    it "plain argv ignores ~/.ssh/config (-F /dev/null)" $
+      checkAdjacentPair (sshExecArgv sshCfg "echo hi") "-F" "/dev/null"
+
+    it "forwarding argv ignores ~/.ssh/config (-F /dev/null)" $
+      checkAdjacentPair (sshExecArgvForwarding sshCfg "git fetch") "-F" "/dev/null"
+
+    it "plain argv disables ProxyCommand and ProxyJump" $ do
+      let argv = sshExecArgv sshCfg "echo hi"
+      checkAdjacentPair argv "ProxyCommand" "none"
+      checkAdjacentPair argv "ProxyJump" "none"
+
+    it "forwarding argv disables ProxyCommand and ProxyJump" $ do
+      let argv = sshExecArgvForwarding sshCfg "git fetch"
+      checkAdjacentPair argv "ProxyCommand" "none"
+      checkAdjacentPair argv "ProxyJump" "none"
 
     it "multiplexing does not weaken host-key pinning" $ do
       let argv = sshExecArgv sshCfg "echo hi"
       checkAdjacentPair argv "StrictHostKeyChecking" "yes"
       checkAdjacentPair argv "UserKnownHostsFile" (scKnownHosts sshCfg)
       checkAdjacentPair argv "BatchMode" "yes"
+
+-- | The @ControlPath@ value in an argv, or a failure if absent.
+controlPath :: [String] -> String
+controlPath argv =
+  case [ drop (length ("ControlPath=" :: String)) a
+       | a <- argv, "ControlPath=" `isPrefixOf` a ] of
+    (p:_) -> p
+    []    -> error ("no ControlPath in argv: " <> show argv)
 
 -- | Assert two argv entries are present, either as @key=value@ (joined)
 -- or as adjacent @key value@ (separate args).
@@ -266,13 +311,6 @@ checkAdjacentPair argv key value =
         adjacent = [key, value]
     in joined `elem` xs
        || adjacent `isInfixOf` xs
-  where
-    isInfixOf needle haystack = any (isPrefixOf needle) (tails haystack)
-    isPrefixOf (x:xs) (y:ys) = x == y && isPrefixOf xs ys
-    isPrefixOf [] _ = True
-    isPrefixOf _ [] = False
-    tails [] = [[]]
-    tails xs@(_:rest) = xs : tails rest
 
 sshCfg :: SshConfig
 sshCfg = SshConfig
