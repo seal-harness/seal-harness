@@ -92,7 +92,7 @@ spec = describe "Seal.Session.ExecCache" $ do
       let paths = tmpPaths "/tmp/seal-exec-cache-failclosed"
           -- mode=remote with NO remote block → fail-closed at build time.
           brokenCfg = defaultSecurityConfig
-            { scUntrustedExec = Just (UntrustedExecFileConfig "remote" Nothing) }
+            { scUntrustedExec = Just (UntrustedExecFileConfig (Just "remote") Nothing Nothing) }
       e1 <- cachedSessionExec cache paths brokenCfg sidA deps (recordingRunner calls) Nothing
       execRoot e1 `shouldBe` "/nonexistent-workdir-fail-closed"
       -- The failed build was NOT cached; a later VALID config builds fresh.
@@ -177,11 +177,11 @@ remoteBlock = UntrustedExecRemoteFileConfig
 
 remoteSecCfg :: SecurityConfig
 remoteSecCfg = defaultSecurityConfig
-  { scUntrustedExec = Just (UntrustedExecFileConfig "remote" (Just remoteBlock)) }
+  { scUntrustedExec = Just (UntrustedExecFileConfig (Just "remote") Nothing (Just remoteBlock)) }
 
 otherRemoteSecCfg :: SecurityConfig
 otherRemoteSecCfg = defaultSecurityConfig
-  { scUntrustedExec = Just (UntrustedExecFileConfig "remote" (Just remoteBlock
+  { scUntrustedExec = Just (UntrustedExecFileConfig (Just "remote") Nothing (Just remoteBlock
       { uerfcWorkspace = Just "/srv/other-workspace" })) }
 
 -- | A 'RemoteRunner' that records every invocation's argv and always

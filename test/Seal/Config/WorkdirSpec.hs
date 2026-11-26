@@ -227,7 +227,7 @@ spec = describe "Seal.Session.Workdir" $ do
           -- so mkSessionExec returns both stubs WITHOUT calling
           -- ensureRemoteSessionWorkdir (the runner is never touched).
           secCfg = defaultSecurityConfig
-                     { scUntrustedExec = Just (UntrustedExecFileConfig "remote" Nothing) }
+                     { scUntrustedExec = Just (UntrustedExecFileConfig (Just "remote") Nothing Nothing) }
       exec <- mkSessionExec mkPathsRemote secCfg sid stubCloneDeps runner Nothing
       -- The runner was NOT invoked (the misconfigured branch returns
       -- both stubs before reaching ensureRemoteSessionWorkdir).
@@ -326,7 +326,8 @@ mkPathsRemote = SealPaths
 remoteSecurityConfig :: SecurityConfig
 remoteSecurityConfig = defaultSecurityConfig
   { scUntrustedExec = Just UntrustedExecFileConfig
-      { uefcMode = "remote"
+      { uefcMode = Just "remote"
+          , uefcAllowLocalhost = Nothing
       , uefcRemote = Just UntrustedExecRemoteFileConfig
           { uerfcHost       = Just "exec.internal"
           , uerfcUser       = Just "agent"

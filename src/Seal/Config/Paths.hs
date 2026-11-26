@@ -13,6 +13,7 @@ module Seal.Config.Paths
   , enrollmentTokenPath
   , serveLockPath
   , reposFilePath
+  , executionFilePath
   , repoCloneStateDir
   , repoKeysDir
   , sshAgentsDir
@@ -192,6 +193,18 @@ serveLockPath paths = spState paths </> "serve.lock"
 -- @\<config\>\/repos.toml@.
 reposFilePath :: SealPaths -> FilePath
 reposFilePath paths = spConfig paths </> "repos.toml"
+
+-- | Absolute path to the execution-machine inventory:
+-- @\<config\>\/execution.toml@.
+--
+-- In @config\/@ (not a sibling of it) because it is /provisioning data/, like
+-- @repos.toml@, not a security /decision/ like @security.toml@. You want the
+-- machine list in your dotfiles so @builder@ is defined everywhere; what must
+-- never be git-reconstructible is the decision file (design V8). The control
+-- is that no agent-reachable path can write this file — a passkey-gated route
+-- can, and nothing else.
+executionFilePath :: SealPaths -> FilePath
+executionFilePath paths = spConfig paths </> "execution.toml"
 
 -- | Private state dir for clone-time temp files (GIT_ASKPASS helper scripts,
 -- deploy-key keyfiles, managed known_hosts). Security invariants: created

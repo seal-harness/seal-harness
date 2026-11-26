@@ -4,6 +4,7 @@ extra-source-files:
     -- makes a source distribution buildable.
     config/templates/config.toml
     config/templates/security.toml
+    config/templates/execution.toml
 
 name: seal-harness
 version: 0.1.0.0
@@ -218,6 +219,7 @@ library
          Seal.Security.Command
          Seal.Security.Crypto
           Seal.Execution.Types
+         Seal.Config.Execution
          Seal.Security.DaemonLock
          Seal.Security.EnrollmentGrant
          Seal.Security.Path
@@ -612,6 +614,7 @@ test-suite tests
         Seal.Config.TemplatesSpec
         Seal.ConfigSpec
         Seal.Execution.TypesSpec
+        Seal.Config.ExecutionSpec
         Seal.IngestSpec
         Seal.Security.CommandSpec
         Seal.Security.EnrollmentGrantSpec

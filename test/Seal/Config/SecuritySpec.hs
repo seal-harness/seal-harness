@@ -23,6 +23,7 @@ import Seal.Config.Security
   , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig
   , VaultKeyFields (..), WriteMode (..), hasLegacyLayout, loadSecurityConfig
   , gatewayConfigFromSecurity, openUniqueTemp, saveSecurityConfig, tomlKeyPaths
+  , allowLocalhostFrom, allowLocalhostFromWith
   , untrustedExecConfigFromSecurity, updateAccessControlSection
   , updateSecurityConfig, updateVaultKeySection )
 import Seal.Gateway.Config
@@ -136,7 +137,8 @@ spec = describe "Seal.Config.Security" $ do
           ]
         Right cfg <- loadSecurityConfig path
         scUntrustedExec cfg `shouldBe` Just (UntrustedExecFileConfig
-          { uefcMode = "local"
+          { uefcMode = Just "local"
+          , uefcAllowLocalhost = Nothing
           , uefcRemote = Nothing
           })
 
@@ -155,7 +157,8 @@ spec = describe "Seal.Config.Security" $ do
           ]
         Right cfg <- loadSecurityConfig path
         scUntrustedExec cfg `shouldBe` Just (UntrustedExecFileConfig
-          { uefcMode = "remote"
+          { uefcMode = Just "remote"
+          , uefcAllowLocalhost = Nothing
           , uefcRemote = Just (UntrustedExecRemoteFileConfig
               { uerfcHost = Just "exec.internal"
               , uerfcUser = Just "agent"
@@ -175,7 +178,8 @@ spec = describe "Seal.Config.Security" $ do
           ]
         Right cfg <- loadSecurityConfig path
         scUntrustedExec cfg `shouldBe` Just (UntrustedExecFileConfig
-          { uefcMode = "remote"
+          { uefcMode = Just "remote"
+          , uefcAllowLocalhost = Nothing
           , uefcRemote = Nothing
           })
 
@@ -184,7 +188,8 @@ spec = describe "Seal.Config.Security" $ do
         let path = dir </> "security.toml"
         let cfg = defaultSecurityConfig
               { scUntrustedExec = Just (UntrustedExecFileConfig
-                  { uefcMode = "remote"
+                  { uefcMode = Just "remote"
+          , uefcAllowLocalhost = Nothing
                   , uefcRemote = Just (UntrustedExecRemoteFileConfig
                       { uerfcHost = Just "exec.internal"
                       , uerfcUser = Just "agent"
@@ -289,6 +294,46 @@ spec = describe "Seal.Config.Security" $ do
         pathsAfter <- valuePaths path
         (pathsBefore == pathsAfter) `shouldBe` False
 
+  describe "allowLocalhostFromWith (the one producer)" $ do
+
+    it "a hardened build forces False even with no security.toml at all" $
+      allowLocalhostFromWith False Nothing `shouldBe` False
+
+    it "a hardened build overrides an explicit allow_localhost = true" $
+      allowLocalhostFromWith False (Just (baseUefc { uefcAllowLocalhost = Just True }))
+        `shouldBe` False
+
+    it "a normal build with no section allows localhost" $
+      allowLocalhostFromWith True Nothing `shouldBe` True
+
+    it "an explicit allow_localhost = false wins over mode = local" $
+      allowLocalhostFromWith True (Just (baseUefc { uefcMode = Just "local"
+                                              , uefcAllowLocalhost = Just False }))
+        `shouldBe` False
+
+    it "an explicit allow_localhost = true wins over mode = remote" $
+      allowLocalhostFromWith True (Just (baseUefc { uefcMode = Just "remote"
+                                              , uefcAllowLocalhost = Just True }))
+        `shouldBe` True
+
+    it "derives False from mode = remote when allow_localhost is absent" $
+      allowLocalhostFromWith True (Just (baseUefc { uefcMode = Just "remote"
+                                              , uefcAllowLocalhost = Nothing }))
+        `shouldBe` False
+
+    it "derives True from mode = local when allow_localhost is absent" $
+      allowLocalhostFromWith True (Just (baseUefc { uefcMode = Just "local"
+                                              , uefcAllowLocalhost = Nothing }))
+        `shouldBe` True
+
+    it "defaults to True when both keys are absent" $
+      allowLocalhostFromWith True (Just (baseUefc { uefcMode = Nothing
+                                              , uefcAllowLocalhost = Nothing }))
+        `shouldBe` True
+
+    it "allowLocalhostFrom delegates to the compiled-in constant" $
+      allowLocalhostFrom Nothing `shouldBe` True
+
   describe "untrustedExecConfigFromSecurity" $ do
 
     it "returns Nothing when the section is absent" $ do
@@ -296,7 +341,7 @@ spec = describe "Seal.Config.Security" $ do
 
     it "returns Nothing when mode=local (no remote needed)" $ do
       let cfg = defaultSecurityConfig
-            { scUntrustedExec = Just (UntrustedExecFileConfig "local" Nothing) }
+            { scUntrustedExec = Just (UntrustedExecFileConfig (Just "local") Nothing Nothing) }
       untrustedExecConfigFromSecurity cfg `shouldBe` Nothing
 
   -- Plan WU1 tests 26–28. The plan names 'updateSecurityConfigEither'; the
@@ -431,9 +476,8 @@ genSecurityConfig :: Gen SecurityConfig
 genSecurityConfig = do
   uefc <- oneof
        [ pure Nothing
-       , Just <$> (UntrustedExecFileConfig
-           <$> elements ["local", "remote"]
-           <*> pure Nothing)
+       , do m <- elements ["local", "remote"]
+            pure (Just (UntrustedExecFileConfig (Just m) Nothing Nothing))
        ]
   pure SecurityConfig
     { scVaultPath      = Nothing
@@ -445,6 +489,14 @@ genSecurityConfig = do
     , scAccessControl  = Nothing
     , scGateway        = Nothing
     }
+
+-- | A minimal @[untrusted_execution]@ section for the allowLocalhost tests.
+baseUefc :: UntrustedExecFileConfig
+baseUefc = UntrustedExecFileConfig
+  { uefcMode = Nothing
+  , uefcAllowLocalhost = Nothing
+  , uefcRemote = Nothing
+  }
 
 -- | One legacy credential, in the shape the pre-split file used.
 legacyCredentialLines :: Text -> [Text]

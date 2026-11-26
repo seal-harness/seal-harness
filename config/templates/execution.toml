@@ -1,0 +1,58 @@
+# ~/.seal/config/execution.toml — execution machine inventory
+#
+# Where untrusted tool calls (shell, files, web, browser) may run. An empty or
+# absent file is valid: nothing is enabled below, so every session runs on this
+# machine (see allow_localhost in security.toml).
+#
+# This file is provisioning data, so it belongs in your dotfiles next to
+# repos.toml. It is NOT a security decision — that is security.toml, which is
+# intentionally a sibling of config/ so a git remote cannot resurrect a
+# lower-security version of it.
+#
+# Hand-editable, but the supported path is the Machines screen in the web UI,
+# which posts to /api/machines. That route is passkey-gated, and **no agent
+# opcode can read or write this file**. That is the control the whole feature
+# rests on: an agent that could add a machine under allow_localhost = false
+# could point your untrusted code anywhere.
+#
+# ---------------------------------------------------------------------------
+# A worked example. Uncomment to enable.
+# ---------------------------------------------------------------------------
+#
+# default = "builder"
+#
+# [machines.builder]
+# host        = "builder.example.com"
+# user        = "seal"
+# port        = 22                                  # optional, default 22
+# identity    = "/home/you/.ssh/id_ed25519"          # optional, default ssh-agent
+# known_hosts = "/home/you/.ssh/known_hosts"        # required
+# workspace   = "/srv/seal/workspace"                # required
+#
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
+#
+# name         [A-Za-z0-9_-], starts with a letter or digit, <= 64 characters.
+#              "local" and "default" are RESERVED table names and are refused.
+# host         no spaces, no colon, no leading '-'.
+# user         same rule.
+# port         1..65535.
+# identity,
+# known_hosts  absolute; no ".."; no whitespace; no "=". A path containing a
+#              space would smuggle a second -o directive into the ssh argv.
+#              .ssh and .seal directories are allowed (keys live there).
+# workspace    the remote root that anchors every path an agent touches.
+#
+# One machine  `default` is optional; if absent and allow_localhost = true,
+#              `local` stays the default so adding your first machine moves
+#              nobody. With allow_localhost = false the single machine becomes
+#              the default.
+# Two or more  `default` is required and must name one of them.
+#
+# Two entries may not share host:port:user — they would share one multiplexed
+# ssh connection, so the first connection's key and pinned host key would serve
+# both.
+#
+# Unknown keys produce a warning, not an error. A typo'd `identity` silently
+# falling back to ssh-agent is exactly what that warning is for.

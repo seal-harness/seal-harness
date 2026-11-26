@@ -372,7 +372,7 @@ sampleSecurityConfig = SecurityConfig
   , scVaultIdentity  = Just "/identity.txt"
   , scVaultUnlock    = Just "startup"
   , scVaultKeyType   = Just "x25519"
-  , scUntrustedExec  = Just (UntrustedExecFileConfig "remote" (Just
+  , scUntrustedExec  = Just (UntrustedExecFileConfig (Just "remote") Nothing (Just
       (UntrustedExecRemoteFileConfig (Just "builder.example.com") (Just "seal")
         (Just 22) (Just "/id_ed25519") (Just "/known_hosts") (Just "/workspace"))))
   , scAccessControl  = Just (AccessControlFileConfig (Just "passkey")

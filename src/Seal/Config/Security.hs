@@ -41,6 +41,8 @@ module Seal.Config.Security
   ( SecurityConfig (..)
   , UntrustedExecFileConfig (..)
   , UntrustedExecRemoteFileConfig (..)
+  , allowLocalhostFrom
+  , allowLocalhostFromWith
   , AccessControlFileConfig (..)
   , CredentialFileConfig (..)
   , accessControlCodec
@@ -147,8 +149,15 @@ data SecurityConfig = SecurityConfig
 -- OK without it (fail-closed is at call time, not parse time — spec §7
 -- row 1).
 data UntrustedExecFileConfig = UntrustedExecFileConfig
-  { uefcMode   :: Text
-    -- ^ @\"local\"@ | @\"remote\"@
+  { uefcMode   :: Maybe Text
+    -- ^ @\"local\"@ | @\"remote\"@. /Deprecated/ and still accepted: the
+    -- setting it expressed is now @allow_localhost@. Kept as a 'Maybe' so a
+    -- @[untrusted_execution.remote]@ block written without it (a load error
+    -- before this change) decodes, and so nothing is ever rewritten.
+  , uefcAllowLocalhost :: Maybe Bool
+    -- ^ @true@ — untrusted code may run on this host; @false@ — it may not,
+    -- and a session must name a machine. Absent means \"derive from
+    -- @mode@, else default @true@\"; see 'allowLocalhostFrom'.
   , uefcRemote :: Maybe UntrustedExecRemoteFileConfig
   } deriving stock (Eq, Show)
 
@@ -450,7 +459,8 @@ securityConfigCodec = SecurityConfig
 -- | Bidirectional tomland codec for the @[untrusted_execution]@ section.
 untrustedExecConfigCodec :: Toml.TomlCodec UntrustedExecFileConfig
 untrustedExecConfigCodec = UntrustedExecFileConfig
-  <$> Toml.text "mode" .= uefcMode
+  <$> Toml.dioptional (Toml.text "mode") .= uefcMode
+  <*> Toml.dioptional (Toml.bool "allow_localhost") .= uefcAllowLocalhost
   <*> Toml.dioptional (Toml.table untrustedExecRemoteConfigCodec "remote") .= uefcRemote
 
 -- | Bidirectional tomland codec for the @[untrusted_execution.remote]@
@@ -764,7 +774,7 @@ untrustedExecConfigFromSecurity cfg =
 
 resolveByMode :: UntrustedExecFileConfig -> Maybe UntrustedExecConfig
 resolveByMode uec =
-  let mode = if uefcMode uec == "remote" then UemRemote else UemLocal
+  let mode = if uefcMode uec == Just "remote" then UemRemote else UemLocal
   in case mode of
        UemRemote -> Just (UntrustedExecConfig UemRemote (resolveRemoteSsh uec))
        UemLocal  -> localModeResult uec
@@ -801,6 +811,58 @@ localModeResult uec =
 localModeResult :: UntrustedExecFileConfig -> Maybe UntrustedExecConfig
 localModeResult _ = Nothing
 #endif
+
+--------------------------------------------------------------------------------
+-- allow_localhost: ONE producer (design §1.1, §1.4)
+--------------------------------------------------------------------------------
+
+-- | Resolve the @[untrusted_execution]@ section to the single security
+-- decision the resolver needs: /may untrusted code execute on this kernel?/
+--
+-- This is the **only** producer of that value. 'Seal.Execution.Resolve' takes
+-- the resolved 'Bool', never the 'Maybe' section, because
+-- @maybe True uefcAllowLocalhost@ type-checks, passes every non-CPP test, and
+-- silently reintroduces the hardened-build bug this function exists to prevent.
+--
+-- Precedence, and why each rung exists:
+--
+--   1. an explicit @allow_localhost@ wins outright;
+--   2. otherwise it is /derived/ from the deprecated @mode@ (@\"remote\"@
+--      gives @False@; @\"local\"@ or absent gives @True@), so an install that
+--      only ever edited @mode@ cannot change posture by being read;
+--   3. otherwise @True@, which is today's behaviour.
+--
+-- Under @-DREMOTE_ONLY_UNTRUSTED@ the answer is @False@ unconditionally — see
+-- 'allowLocalhostFromWith'. That must hold for an install with **no**
+-- @security.toml@ at all, which is why the coercion lives here and not in the
+-- codec: forcing it inside the codec would cover only installs that have the
+-- section, and a hardened build with no file keeps the field absent.
+allowLocalhostFrom :: Maybe UntrustedExecFileConfig -> Bool
+allowLocalhostFrom = allowLocalhostFromWith allowLocalhostCompiledIn
+
+-- | The compile-time constant, isolated so that WU-9's CPP is one line
+-- selecting a value rather than a second implementation.
+allowLocalhostCompiledIn :: Bool
+allowLocalhostCompiledIn = True
+
+-- | The macro-free implementation: always compiled, always testable.
+--
+-- CPP is processed per file, so a @#define@ in a spec cannot influence how
+-- the library was compiled; a @cpp-options@ variant instead defines the macro
+-- for every module in the suite, which fails to build because @LocalSpec@
+-- imports the local executor unconditionally while the flag removes it from
+-- @exposed-modules@. Isolating the constant gives real coverage in the normal
+-- build and leaves exactly one constant untested.
+allowLocalhostFromWith :: Bool -> Maybe UntrustedExecFileConfig -> Bool
+allowLocalhostFromWith compiledIn = \case
+  _ | not compiledIn        -> False
+  Nothing                   -> True
+  Just uec                  -> case uefcAllowLocalhost uec of
+    Just explicit -> explicit
+    Nothing       -> case uefcMode uec of
+      Just "remote" -> False
+      Just "local"  -> True
+      _             -> True
 
 --------------------------------------------------------------------------------
 -- The one-way mode writer (design §6.1)

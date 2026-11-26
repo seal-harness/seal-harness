@@ -71,6 +71,7 @@ import qualified Seal.Media.ImageSpec
 import qualified Seal.Media.TtsSpec
 import qualified Seal.ConfigSpec
 import qualified Seal.Execution.TypesSpec
+import qualified Seal.Config.ExecutionSpec
 import qualified Seal.Config.PathsSpec
 import qualified Seal.Config.TemplatesSpec
 import qualified Seal.Security.CryptoSpec
@@ -305,6 +306,7 @@ specs = do
   Seal.Media.TtsSpec.spec
   Seal.ConfigSpec.spec
   Seal.Execution.TypesSpec.spec
+  Seal.Config.ExecutionSpec.spec
   Seal.Config.PathsSpec.spec
   Seal.Config.TemplatesSpec.spec
   Seal.Security.CryptoSpec.spec

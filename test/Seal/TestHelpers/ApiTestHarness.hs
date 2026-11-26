@@ -763,7 +763,8 @@ buildRemoteSecurityConfig :: FilePath -> String -> Maybe FilePath -> SecurityCon
 buildRemoteSecurityConfig tmp user mKeyfilePath =
   defaultSecurityConfig
     { scUntrustedExec = Just UntrustedExecFileConfig
-        { uefcMode = "remote"
+        { uefcMode = Just "remote"
+          , uefcAllowLocalhost = Nothing
         , uefcRemote = Just UntrustedExecRemoteFileConfig
             { uerfcHost = Just "localhost"
             , uerfcUser = Just (T.pack user)

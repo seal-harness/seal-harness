@@ -134,7 +134,7 @@ spec = describe "Seal.Config.Migrate" $ do
         migrateSecurityConfig paths
         Right sec <- loadSecurityConfig secPath
         case scUntrustedExec sec of
-          Just uefc -> uefcMode uefc `shouldBe` "local"
+          Just uefc -> uefcMode uefc `shouldBe` Just "local"
           Nothing -> expectationFailure "expected untrusted_execution to be migrated"
 
   describe "[gateway] moves like the other boot-only sections" $ do
