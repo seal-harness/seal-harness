@@ -1,5 +1,15 @@
 # Milestone A — machine inventory and per-session pin
 
+<!-- superseded-by: docs/superpowers/plans/2026-11-25-multiple-execution-machines-plan.md -->
+
+> **SUPERSEDED (2026-11-25).** This document describes a two-milestone split (A ends at
+> "Checkpoint A"; B is gated on A's answer). **That split has been abolished.** The
+> authoritative plan is a single PR: `docs/superpowers/plans/2026-11-25-multiple-execution-machines-plan.md`,
+> against design `docs/superpowers/specs/2026-11-25-multiple-execution-machines-design-rev10.md`.
+> `mode` is deleted (replaced by `allow_localhost`), the localhost denylist is not
+> implemented, and the trust model is a passkey-gated write route. Do not execute this
+> document.
+
 <!-- branch: exec/multiple-machines -->
 <!-- design: docs/superpowers/specs/2026-11-23-multiple-execution-machines-design.md (rev 3c) -->
 <!-- handoff: docs/handoffs/2026-11-23-multiple-execution-machines-handoff.md -->
