@@ -436,13 +436,30 @@ Do not treat "the long tail" as discoverable: run the script, and tick each file
 find-and-replace.** `-Werror` will find every one, but the *order* of arguments is yours to
 get right.
 
-**Note on the verification command:** `count-sessionmeta-sites.py` classifies a site as
-positional by "`SessionMeta` followed by ≥ 3 argument tokens", so a *rewritten* positional
-application that still passes 14 arguments **still counts as positional**. The script
-therefore cannot be the gate for "all rewritten"; it is a measurement of *shape*, not of
-correctness. Use it to prove the total is unchanged (77 → 77) and the classification is
-unchanged, and rely on `-Werror` for completeness. Do **not** put "0 positional" in the
-DoD — it is unsatisfiable by the prescribed fix.
+**Note on the verification command — measured, and it does not work the way an earlier
+draft of this plan claimed.** `count-sessionmeta-sites.py` matches with
+`\bSessionMeta\b`, and there is **no word boundary inside `defaultSessionMeta`** — the `S`
+is preceded by a `t`. Verified:
+
+```python
+>>> re.findall(r"\bSessionMeta\b", "  in defaultSessionMeta sid now { smProvider = p }")
+[]
+```
+
+So the prescribed fix for the **27 record sites** makes them **disappear from the count**:
+the expected post-sweep output is **50 sites (0 record / 50 positional)**, not "77 → 77".
+Two further consequences:
+
+- the **50 positional** sites keep counting after rewriting, because the classifier keys on
+  arity, not correctness;
+- therefore **the script cannot be the gate for this unit at all** — it measures *shape*,
+  and both a correct and an incorrect rewrite score the same.
+
+**`-Werror` is the gate.** It catches every site (missing field for record literals, arity
+for positional) and the *order* of inserted arguments is caught by review, not tooling.
+Use the script only to *plan* the work: run it **before** starting to get the per-file
+list, and record that number in the PR body as the pre-sweep baseline. Do **not** assert a
+post-sweep total.
 
 ### Inheritance
 Children copy the parent's **value**; a **dead** value fails closed (§5 row 0) — it does
@@ -463,7 +480,7 @@ default.
 in the child and never yields `WhereLocal`; `execMachine` present on the wire.
 
 ### Done when
-`make check` green. The PR body states 77 → 77: the sweep rewrites sites, it does not remove them.
+`make check` green. The PR body states the pre-sweep baseline (77, 27 record / 50 positional) and does **not** claim a post-sweep count.
 
 ---
 
@@ -486,6 +503,13 @@ old exec.
 - `src/Seal/Command/Serve.hs` (`:538`, `:677`)
 - `src/Seal/Tools/Exec/Untrusted.hs` (delete `selectExecBackend`,
   `selectUntrustedBackend`, `enforceRemoteOnly`)
+- **`src/Seal/Config/Security.hs`** — it *imports* `UntrustedExecMode (..)` (`:107`) and
+  **constructs `UemRemote`/`UemLocal`** in `resolveByMode` (`:765-771`) and
+  `localModeResult` (`:796-802`). Deleting the type makes this module fail to compile;
+  without it in the file list WU-5 cannot reach `make check` green. Also
+  `untrustedExecConfigFromSecurity` (`:761`) loses its mode branch here.
+- **`test/Seal/Config/SecuritySpec.hs`** — `:26`, `:292-300`, `:425-427` exercise
+  `untrustedExecConfigFromSecurity`, which this unit reshapes.
 - `test/Seal/TestHelpers/ApiTestHarness.hs` (32 `UntrustedExecMode` references)
 - `test/Seal/Session/ExecCacheSpec.hs`, `WorkdirSpec.hs`, `UntrustedSpec.hs`,
   `Phase4Spec.hs`
@@ -897,12 +921,16 @@ nonexistent local path, and the `null` (`FeDisabled`) case is equally inert.
 **Design:** §1.4, §7 WU-9.
 
 ### Files
-- `src/Seal/Config/Security.hs` (`allowLocalhostFrom` CPP branch)
-- `seal-harness.cabal` (`cpp-options` on the `tests` stanza, plus the `LocalSpec`
-  exclusion — see below)
-- `test/Seal/Tools/Exec/LocalSpec.hs` (guard the import) and the `tests` stanza's
-  `other-modules` entry for it
+- `src/Seal/Config/Security.hs` — add `allowLocalhostFromWith` (macro-free) and reduce
+  `allowLocalhostFrom` to one CPP selection. The module already has `{-# LANGUAGE CPP #-}`
+  and already uses this exact `#if defined(REMOTE_ONLY_UNTRUSTED)` shape at `:796-802`
+  (which WU-5 deletes), so no new extension or flag is needed.
 - `test/Seal/Config/SecuritySpec.hs`
+
+**No cabal change.** An earlier draft of this unit listed `cpp-options` on the `tests`
+stanza plus a `LocalSpec` exclusion. Both are **dropped**: per the analysis below they are
+unnecessary for the mechanism this unit actually uses, and one of them breaks the build.
+The file list is the binding scope (ground rule 5), so it now names exactly two files.
 
 ### Deliverables
 Under `-DREMOTE_ONLY_UNTRUSTED`, `allowLocalhostFrom` returns `False` **unconditionally**,
@@ -1006,6 +1034,18 @@ because a setting nobody documents is a setting nobody uses).
   (`README.md:289`) which becomes three, and `README.md:298-300` describes `security.toml`
   as holding *"where untrusted code runs"* — a description WU-2/WU-9 split. No test pins
   the README, so this drift ships silently unless a unit owns it.
+- **`docs/superpowers/plans/2026-11-24-multiple-execution-machines-plan.md`**,
+  **`…-A-inventory-and-pin.md`**, **`…-B-destructive-cutover.md`** — the superseded
+  two-milestone set. The index still says *"the executable plans are A and B"*, *"A ends at
+  **Checkpoint A**"*, *"**B is gated on A's answer**"*; A says *"the executable plan for
+  now"*; B's header says `milestone: B of 2`. All three are superseded by this plan, which
+  abolishes that seam — and a fresh session is still told to read them
+  (`docs/handoffs/handoff-2026-11-25-0320.md:64-66`: *"3 … **Do not start**"*). Add the
+  `<!-- superseded-by: … -->` header to each and a one-line note at the top, matching the
+  `<!-- supersedes: … -->` convention those files already use.
+- **`docs/handoffs/handoff-2026-11-25-0320.md`** — its reading order and its "the blocker
+  is the gate, not the code" status are both stale; mark it superseded in place rather than
+  rewriting it (handoffs are historical records).
 - `CHANGELOG.md`
 
 ### Deliverables
@@ -1029,6 +1069,12 @@ deprecated. Rewrite that block to document `allow_localhost` as the one setting:
 Keep the `[untrusted_execution.remote]` sub-table block (it still works, by presence — see
 WU-2's legacy synthesis), and mark `mode` as **deprecated, still accepted**.
 
+Each superseded document gets a `<!-- superseded-by: 2026-11-25-multiple-execution-machines-plan.md -->`
+header and one sentence at the top; the handoff gets the same treatment (it is a historical
+record — do not rewrite its content). A one-PR plan that leaves three documents telling the
+next reader to run a two-milestone process with a Checkpoint A gate has not abolished the
+seam, only ignored it.
+
 `CHANGELOG.md` gains one entry under the unreleased section naming: the new
 `execution.toml`, the `allow_localhost` setting with its default, the two deliberate
 behaviour changes (a leading-`-` host now fail-closes; `[untrusted_execution.remote]`
@@ -1036,9 +1082,12 @@ without `mode` now decodes), and the bug fix in WU-5 (`execFingerprint` made a h
 invisible until restart).
 
 ### Tests
-`test/Seal/Config/TemplatesSpec.hs` asserts both templates are seeded and that the
+`test/Seal/Config/TemplatesSpec.hs` asserts all three templates are seeded and that the
 `security.toml` template contains `allow_localhost` and no longer presents `mode` as the
-way to choose. (The existing template tests already pin the seeded bytes; extend them.)
+way to choose. (The existing tests pin the seeded bytes and the created-file list
+(`:238`); extend both.) Supersession is prose — no test, but the grep
+`rg 'Checkpoint A|gated on A' docs/superpowers/plans/2026-11-24-*` must come back empty
+after the edit.
 
 ### Done when
 `make check` green. A reader who has never seen the design can set up two machines from
@@ -1062,7 +1111,10 @@ complete.
    the list as a net simplification *and* see that the read-compat surface is deliberate —
    an earlier draft of this plan listed `uefcMode` among the deletions while WU-2 kept it,
    which is exactly the kind of contradiction that turns a revert into an outage.
-3. The **77-site sweep** count before and after (77, 27 record / 50 positional).
+3. The **pre-sweep baseline** from `count-sessionmeta-sites.py`: **77 sites across 25 files,
+   27 record / 50 positional**. (A post-sweep number is *not* reported: the counter's
+   `\bSessionMeta\b` does not match `defaultSessionMeta`, so the record sites vanish from
+   the count and a "77 → 77" claim would be false.)
 4. The **two behaviour changes** to existing installs, both hardenings:
    a `security.toml` host beginning with `-` now fail-closes; and
    `[untrusted_execution.remote]` without `mode` now decodes instead of being a load error.
@@ -1108,7 +1160,10 @@ substrate), or WU-7a (the security control).
 - [ ] The pre-WU-1b additivity test (a local install yields no ssh argv) passed **on the
       unmodified tree** before any change.
 - [ ] `python3 scripts/check-spec-counts.py <design>` prints `all checks passed`.
-- [ ] `python3 scripts/count-sessionmeta-sites.py` still shows **77 sites** (the sweep is a rewrite, not a reduction), and `make check` is green.
+- [ ] `make check` is green, which is the only gate that proves every construction site
+      was handled. (The counting script is a *planning* tool here — see WU-4: its
+      `\bSessionMeta\b` regex stops matching once a record literal becomes
+      `defaultSessionMeta`, so it cannot verify the sweep.)
 - [ ] `hlint src/ test/` reports "No hints".
 - [ ] The demo is recorded in the PR body.
 - [ ] The two behaviour changes are called out and justified, in the PR body *and* the
