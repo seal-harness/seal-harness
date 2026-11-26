@@ -72,6 +72,14 @@ spec = describe "Seal.Tools.Exec.Types" $ do
     it "rejects empty" $
       mkSshHost "" `shouldSatisfy` isLeft
 
+    it "rejects a leading dash (option injection)" $
+      mkSshHost "-oProxyCommand=/bin/echo PWNED@host.invalid" `shouldSatisfy` isLeft
+
+    prop "never yields a Right value beginning with dash" $ \(t :: Text) ->
+      case mkSshHost t of
+        Right h -> T.head (getSshHost h) /= '-'
+        Left _  -> True
+
   describe "mkSshUser" $ do
 
     prop "rejects control, space, and colon characters" $ \(t :: Text) ->
@@ -81,6 +89,20 @@ spec = describe "Seal.Tools.Exec.Types" $ do
 
     it "rejects empty" $
       mkSshUser "" `shouldSatisfy` isLeft
+
+    it "rejects a leading dash (option injection)" $
+      mkSshUser "-oProxyCommand=x" `shouldSatisfy` isLeft
+
+    prop "never yields a Right value beginning with dash" $ \(t :: Text) ->
+      case mkSshUser t of
+        Right u -> T.head (getSshUser u) /= '-'
+        Left _  -> True
+
+    it "still accepts the existing fixtures" $ do
+      mkSshHost "exec.internal" `shouldSatisfy` isRight
+      mkSshHost "192.168.0.104" `shouldSatisfy` isRight
+      mkSshUser "agent" `shouldSatisfy` isRight
+      mkSshUser "zoe" `shouldSatisfy` isRight
 
   describe "TerminalBackend" $ do
 

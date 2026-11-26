@@ -88,7 +88,7 @@ data SshConfig = SshConfig
   , scKnownHosts :: FilePath       -- ^ pinned; StrictHostKeyChecking=yes
   , scWorkspace  :: RemotePath     -- ^ remote workspace root (validated)
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Ord, Show)
 
 data ContainerSpec = ContainerSpec
   { csTarget :: ContainerTarget
@@ -120,13 +120,15 @@ getContainerTarget (ContainerTarget t) = t
 
 -- | An SSH host. Smart-constructed: rejects control chars, space, colon
 -- (the colon guards against @host:port@ being parsed as two argv tokens
--- by some tooling).
+-- by some tooling), and a leading @-@ (option injection: @ssh@ parses
+-- @\"-oProxyCommand=...\@host\"@ as an option, not a destination).
 newtype SshHost = SshHost Text
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Ord, Show)
 
 mkSshHost :: Text -> Either Text SshHost
 mkSshHost t
   | T.null t        = Left "ssh host is empty"
+  | T.head t == '-' = Left "ssh host must not start with '-'"
   | T.any isBad t   = Left "ssh host has invalid characters"
   | otherwise       = Right (SshHost t)
   where
@@ -137,11 +139,12 @@ getSshHost (SshHost t) = t
 
 -- | An SSH user. Same validation as 'SshHost'.
 newtype SshUser = SshUser Text
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Ord, Show)
 
 mkSshUser :: Text -> Either Text SshUser
 mkSshUser t
   | T.null t        = Left "ssh user is empty"
+  | T.head t == '-' = Left "ssh user must not start with '-'"
   | T.any isBad t   = Left "ssh user has invalid characters"
   | otherwise       = Right (SshUser t)
   where

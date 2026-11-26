@@ -217,6 +217,7 @@ library
          Seal.Channels.Config
          Seal.Security.Command
          Seal.Security.Crypto
+          Seal.Execution.Types
          Seal.Security.DaemonLock
          Seal.Security.EnrollmentGrant
          Seal.Security.Path
@@ -610,6 +611,7 @@ test-suite tests
         Seal.Config.PathsSpec
         Seal.Config.TemplatesSpec
         Seal.ConfigSpec
+        Seal.Execution.TypesSpec
         Seal.IngestSpec
         Seal.Security.CommandSpec
         Seal.Security.EnrollmentGrantSpec
