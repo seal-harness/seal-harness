@@ -1364,6 +1364,61 @@ spec = describe "Seal.Gateway.API" $ do
             _ -> error "first session not an object"
       lookupK "lastUserMessageAt" o `shouldBe` Just A.Null
 
+  it "GET /api/sessions surfaces tokensUsed = last response's input+output" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      -- Two completed responses; the LAST one's occupancy (400+50) is what the
+      -- status bar must show. A cumulative sum (or a per-window reduce) would
+      -- give a different number.
+      BC.writeFile (sdir </> "entries.jsonl") $ BC.pack $ unlines
+        [ "{\"id\":\"\",\"ts\":\"2026-07-01T12:00:00.100Z\",\"kind\":\"request\",\"convLen\":1}"
+        , "{\"id\":\"\",\"ts\":\"2026-07-01T12:00:01.234Z\",\"kind\":\"response\",\"convLen\":2,\"usage\":{\"input\":100,\"output\":20}}"
+        , "{\"id\":\"\",\"ts\":\"2026-07-01T12:00:02.000Z\",\"kind\":\"request\",\"convLen\":3}"
+        , "{\"id\":\"\",\"ts\":\"2026-07-01T12:00:03.000Z\",\"kind\":\"response\",\"convLen\":4,\"usage\":{\"input\":400,\"output\":50}}"
+        ]
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode sessions body: " ++ show body)
+      let o = case arr of
+            (A.Object m : _) -> m
+            _ -> error "first session not an object"
+      lookupK "tokensUsed" o `shouldBe` Just (A.Number 450)
+
+  it "GET /api/sessions returns null tokensUsed when no response reported usage" $
+    withSystemTempDirectory "seal-api" $ \stateDir -> do
+      let paths = fakePaths { spState = stateDir }
+          sidTxt = "20260701-120000-042"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+                  (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions"])
+      status `shouldBe` 200
+      let arr = case A.decode body :: Maybe [A.Value] of
+            Just xs -> xs
+            Nothing -> error ("could not decode sessions body: " ++ show body)
+      let o = case arr of
+            (A.Object m : _) -> m
+            _ -> error "first session not an object"
+      lookupK "tokensUsed" o `shouldBe` Just A.Null
+
   it "GET /api/sessions/archived returns 200 with [] when none archived" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "sessions", "archived"])

@@ -1871,13 +1871,6 @@ export function tryParsePayload(p: TranscriptEntry['payload']): Record<string, u
   return null
 }
 
-/** The string length of a `payload` value — used for token estimation when
- *  the payload can't be parsed. Handles both the string and object shapes. */
-function payloadStrLen(p: TranscriptEntry['payload']): number {
-  if (typeof p === 'string') return p.length
-  try { return JSON.stringify(p).length } catch { return 0 }
-}
-
 export function extractTextFromContent(content: Array<{ type: string; text?: string }> | undefined): string | null {
   if (!content) return null
   const texts = content
@@ -2285,62 +2278,6 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
 
   done({ count: entries.length })
   return messages
-}
-
-// ── Session stats (tokens used / context window) ──────────────────────────
-
-/** Compute the tokensUsed stat from the transcript. Prefers real usage
- *  numbers from response payloads (last input_tokens + cumulative
- *  output_tokens); falls back to a ~4-char-per-token estimate from payload
- *  text when the backend doesn't emit usage. The contextWindow denominator
- *  is fetched separately via `fetchModelContext` (the `useModelContext`
- *  effect inside ChatArea); this helper returns 0 for contextWindow so the
- *  caller can layer in the fetched value. */
-export function computeTokensUsed(entries: TranscriptEntry[]): number {
-  let hasRealUsage = false
-  let lastInputTokens = 0
-  let totalOutputTokens = 0
-  let estimatedTokens = 0
-
-  for (const e of entries) {
-    const parsed = tryParsePayload(e.payload)
-    if (!parsed) {
-      estimatedTokens += Math.ceil(payloadStrLen(e.payload) / 4)
-      continue
-    }
-    if (e.direction === 'response') {
-      const usage = parsed.usage as { input_tokens?: number; output_tokens?: number } | undefined
-      if (usage && (usage.input_tokens != null || usage.output_tokens != null)) {
-        hasRealUsage = true
-        lastInputTokens = usage.input_tokens ?? lastInputTokens
-        totalOutputTokens += usage.output_tokens ?? 0
-      } else {
-        const content = parsed.content as Array<{ type: string; text?: string }> | undefined
-        if (content) {
-          for (const block of content) {
-            if (block.type === 'text' && block.text) {
-              estimatedTokens += Math.ceil(block.text.length / 4)
-            }
-          }
-        }
-      }
-    }
-  }
-
-  if (hasRealUsage) {
-    return lastInputTokens + totalOutputTokens
-  }
-
-  // Fallback: estimate from the last request's payload size (~4 chars/token)
-  // plus accumulated response text estimates.
-  let lastRequestTextLen = 0
-  for (let i = entries.length - 1; i >= 0; i--) {
-    if (entries[i]!.direction === 'request') {
-      lastRequestTextLen = payloadStrLen(entries[i]!.payload)
-      break
-    }
-  }
-  return Math.ceil(lastRequestTextLen / 4) + estimatedTokens
 }
 
 /** Synthesize `PendingQuestion` objects from the transcript for ASK_HUMAN

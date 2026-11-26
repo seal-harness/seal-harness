@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { TopBar, type TopSection } from './components/TopBar'
 import { Sidebar } from './components/Sidebar'
-import { ChatArea, computeTokensUsed } from './components/ChatArea'
+import { ChatArea } from './components/ChatArea'
 import { HarnessControls } from './components/HarnessControls'
 import { NewTabComposer } from './components/NewTabComposer'
 import { AgentsView } from './components/AgentsView'
@@ -198,6 +198,7 @@ export default function App() {
   //      hooks (useTabs/useRecentSessions/useArchivedSessions) are the
   //      final fallback.
   const wsLists = useListsStream()
+  const refreshLists = wsLists.refresh
   // wsLive tracks whether the WS `lists` frame is delivering data. The hook's
   // `received` flag flips on the first frame regardless of content (a quiet
   // server sends empty arrays), so REST polling stops the moment WS connects.
@@ -670,6 +671,22 @@ export default function App() {
     && (sessionActivity?.[currentSessionId]?.harness === 'thinking'
         || (sending && pendingQuestions.length === 0))
 
+  // Refresh the server-derived session list when a turn COMPLETES, so values
+  // the client can't compute itself stay current — notably `tokensUsed`, which
+  // is derived server-side from the whole transcript. The turn may have been
+  // started from any channel (web, Telegram, cron, ...), so this cannot rely on
+  // the web send path's own broadcast. Keying on the existing thinking→idle
+  // transition reuses a signal the transcript view already depends on, rather
+  // than adding a second activity subscription.
+  const wasThinkingRef = useRef(false)
+  useEffect(() => {
+    const nowThinking = sessionIsThinking
+    if (wasThinkingRef.current && !nowThinking && currentSessionId !== null) {
+      refreshLists()
+    }
+    wasThinkingRef.current = nowThinking
+  }, [sessionIsThinking, currentSessionId, refreshLists])
+
   // The tool currently being executed (if any). Broadcast by the backend
   // as a `tool-call` activity event before each tool dispatch. Shown in the
   // thinking indicator so the user can see what the agent is doing during
@@ -1058,7 +1075,11 @@ export default function App() {
     return null
   })()
 
-  const tokensUsed = useMemo(() => computeTokensUsed(entries), [entries])
+  // The session's token count comes from the server (SessionInfo.tokensUsed),
+  // NOT from `entries`. `entries` is the loaded chunk window, which the
+  // transcript reducer replaces wholesale on scroll — deriving the count from
+  // it made scrolling change the number. See sessionEntryFactsFast.
+  const tokensUsed = selectedSession?.tokensUsed ?? 0
 
   // ── Render ────────────────────────────────────────────────────────────
   // The top-level section switches the entire body. "Sessions" is the
