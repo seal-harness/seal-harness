@@ -79,6 +79,7 @@ import Seal.Agent.Runtime.Delegation
   , AgentCompletionCallback
   , SpawnCallback
   , ChildResult (..)
+  , ChildExitReason (..)
   , ChildTask (..)
   , RepoSpec (..)
   , DelegationConfig
@@ -778,6 +779,12 @@ handleInstances runtime = do
         [] -> "(no agents running)"
         _  -> T.intercalate "\n"
                 [ subagentIdText (aiSubagentId i) <> ": " <> agentDefIdText (aiId i) <> " — " <> renderStatus (aiStatus i)
+                    -- WU-3: a completed child shows WHY it ended — the
+                    -- exit reason from the stored aiResult (the same
+                    -- field handleStatus enriches from), so a timed-out
+                    -- child is distinguishable from a normally-stopped
+                    -- one at a glance in AGENT_INSTANCES.
+                    <> maybe "" (\r -> " (" <> exitReasonText (crExitReason r) <> ")") (nonCompletionReason i)
                 | i <- insts ]
       recorded = object
         [ "count" .= length insts
@@ -946,6 +953,9 @@ handleHandoff wiring handoffDeps v = do
           cfg <- liftIO (aswConfig wiring)
           let (_, _, _, orchEnabled) = resolveDelegationConfig cfg
               runtime = aswRuntime wiring
+              -- WU-4: the caller is the parent session — the parent for
+              -- the sidecar append and the lineage registration.
+              parentSid = aswParentSession wiring
               -- Handoff sessions are top-level peers: their own workdir
               -- (ctIsolateWorkdir) and their own repo checkout.
               task = ChildTask defId goal (textFieldMaybe "context" v) Nothing True effectiveRepo
@@ -954,9 +964,26 @@ handleHandoff wiring handoffDeps v = do
                 registerCompletedAgentResult runtime (crSubagentId result) result
                 globalLogIO DebugS (ls ("[handoff] completion registered: subagent=" <> subagentIdText (crSubagentId result)
                   <> " session=" <> maybe "none" sessionIdText (crChildSession result)))
+                -- WU-4: the handoff's caller is the parent session —
+                -- deliver the completion the same way background
+                -- children do: append to the caller's sidecar (drained
+                -- at the parent's next turn start) and wake an idle
+                -- parent. Pre-WU-4 the result was registered but never
+                -- delivered: the parent never saw the handoff finish.
+                appendCompletionToSidecar (aswPaths wiring) parentSid (completionMessage result)
+                globalLogIO DebugS (ls ("[handoff] completion appended to sidecar: subagent=" <> subagentIdText (crSubagentId result)
+                  <> " parentSid=" <> sessionIdText parentSid
+                  <> " childSession=" <> maybe "none" sessionIdText (crChildSession result)
+                  <> " messageChars=" <> T.pack (show (T.length (completionMessage result)))))
+                globalLogIO DebugS (ls ("[handoff] firing onIdleCompletion hook: subagent=" <> subagentIdText (crSubagentId result)))
+                forM_ (aswOnIdleCompletion wiring) id
               spawnCb :: SpawnCallback
+              -- WU-4: register the SPAWNING session as the parent — the
+              -- registry's aiParentSession is what hasRunningChildren
+              -- filters, so a self-parented registration lied about the
+              -- lineage and broke idle gating for the caller.
               spawnCb sid def childSid =
-                registerRunningAgent runtime (adId def) sid childSid childSid 0
+                registerRunningAgent runtime (adId def) sid parentSid childSid 0
           eSpawnInfos <- liftIO (runDelegateAsync
                                    cfg
                                    (aswPauseFlag wiring)
@@ -1271,6 +1298,24 @@ renderStatus = \case
   Stopped      -> "stopped"
   Interrupted  -> "interrupted"
   Crashed m    -> "crashed: " <> m
+
+-- | The stored result of a child that did NOT complete normally, if any —
+-- 'Nothing' for running children and for children whose exit reason was
+-- CerCompleted (no suffix is wanted on those lines).
+nonCompletionReason :: AgentInstance -> Maybe ChildResult
+nonCompletionReason i = case aiResult i of
+  Just r | crExitReason r /= CerCompleted -> Just r
+  _ -> Nothing
+
+-- | A one-word human rendering of a non-completion exit reason for the
+-- AGENT_INSTANCES line suffix.
+exitReasonText :: ChildExitReason -> Text
+exitReasonText = \case
+  CerCompleted     -> "completed"
+  CerError         -> "error"
+  CerMaxIterations -> "max-iterations"
+  CerTimeout       -> "timeout"
+  CerInterrupted   -> "interrupted"
 
 -- | Extract the @subagent_id@ string field from a JSON object.
 subagentIdField :: Value -> Maybe SubagentId

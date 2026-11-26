@@ -26,6 +26,7 @@ module Seal.Core.TurnEngine
   , loadChannelLabel
   , broadcastNewEntries
   , loadSessionMeta
+  , broadcastSessionEntries
   ) where
 
 import Control.Exception (bracket, catch)
@@ -959,6 +960,25 @@ broadcastNewEntries mBroker paths sid model createdAt =
       new <- takeNewEntries broker sid (zip [0 ..] entries)
       mapM_ (broadcast broker . BeEntryRecorded sid . snd) new
 
+-- | Live-broadcast a session's transcript entries to the stream broker.
+-- The on-entry hook for any session whose meta and transcript live at the
+-- top level ('sessions/\<sid\>/'): top-level sessions and handoff child
+-- sessions (top-level peers — meta via 'saveSessionMeta', transcript at
+-- 'sessionDir').
+--
+-- A nested delegated child (meta + transcript under the parent's
+-- @agents\/\<sid\>@ dir) is NOT broadcast by this hook: the top-level
+-- meta\/transcript lookups miss by design. Its entries remain visible
+-- post-hoc via 'SESSION_GET' (the 'resolveChildSessionPath' fallback).
+-- Extending the broadcast to nested children is recorded as follow-up
+-- work (needs a directory-aware entry reader).
+broadcastSessionEntries
+  :: Maybe StreamBroker -> SealPaths -> SessionId -> IO ()
+broadcastSessionEntries mBroker paths sid = do
+  mMeta <- loadSessionMeta paths sid
+  for_ mMeta $ \meta ->
+    broadcastNewEntries mBroker paths sid (smModel meta) (smCreatedAt meta)
+
 -- | Fan out the last assistant reply to subscribed chat channels, and emit
 -- a @reply-delivered@ signal when ≥1 chat channel received it (so the web
 -- sidebar marks the tab Idle Read). No-op when the session has no
@@ -1308,7 +1328,10 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
         in \agentDef task -> do
              fm <- parentSealFrontMatter
              childSystemPrompt td eCfg (bAgentDefs sessionBackends) orch fm agentDef task
-    , dwdOnEntry = pure ()
+    , dwdOnEntry = broadcastSessionEntries (tdBroker td) (tdPaths td)
+      -- ^ WU-5: the child's entries are live-broadcast while it runs
+      -- (top-level/handoff children; see broadcastSessionEntries for the
+      -- nested-child limitation, recorded as follow-up work).
     , dwdChannel = channel
     , dwdAbortFlag = lookupOrCreateAbortFlag (tdAbortReg td)
     , dwdRepeatTrack = lookupOrCreateRepeatTrack (tdRepeatReg td)

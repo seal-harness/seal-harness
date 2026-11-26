@@ -2,7 +2,7 @@
 module Seal.ISA.Ops.AgentSpec (spec) where
 
 import Data.Time (UTCTime (..), fromGregorian, secondsToDiffTime)
-import Control.Concurrent (threadDelay)
+import Control.Concurrent (myThreadId, threadDelay)
 import Control.Concurrent.MVar
   ( MVar, newMVar, modifyMVar, withMVar, newEmptyMVar, takeMVar, putMVar )
 import Control.Exception (bracket)
@@ -20,6 +20,7 @@ import Seal.Agent.Runtime.Delegation qualified as Del
 import Seal.Agent.Runtime.Delegation
   ( ChildExitReason (..), ChildResult (..), ChildStatus (..)
   , ChildWorkerOutcome (..)
+  , SubagentId (..)
   , DelegateInput (..)
   , runDelegate
   , SpawnInfo (..)
@@ -650,6 +651,68 @@ spec = describe "Seal.ISA.Ops.Agent" $ do
         Nothing -> expectationFailure "worker did not receive a ChildTask"
 
   describe "AGENT_INSTANCES / STATUS / STOP / INTERRUPT (subagent-id keyed)" $ do
+    it "AGENT_INSTANCES shows a completed child's exit reason (WU-3: truthful status)" $ do
+      rt <- newAgentRuntime
+      let sid = SubagentId "sa-a1-slow-0001"
+      registerRunningAgent rt (AgentDefId "a1") sid (mkSystemSessionId "parent") (mkSystemSessionId "child") 0 =<< myThreadId
+      let result = ChildResult
+            { crTaskIndex = 0
+            , crStatus = CsTimeout
+            , crSummary = Just "done"
+            , crExitReason = CerTimeout
+            , crDurationSeconds = 600.0
+            , crSubagentId = sid
+            , crTokensInput = 0
+            , crTokensOutput = 0
+            , crToolTrace = []
+            , crError = Just "Subagent timed out after 600.0s."
+            , crFilesRead = []
+            , crFilesWritten = []
+            , crChildSession = Just (mkSystemSessionId "child")
+            }
+      registerCompletedAgentResult rt sid result
+      r <- runTestApp (opRun (agentInstancesOp rt) localBackend (object []))
+      orIsError r `shouldBe` False
+      case orParts r of
+        -- The truthful line: the registry maps CsTimeout to Interrupted
+        -- (not Stopped — that was the defect), and the reason suffix
+        -- names the timeout.
+        [TrpText t] -> do
+          "interrupted" `T.isInfixOf` t `shouldBe` True
+          "(timeout)" `T.isInfixOf` t `shouldBe` True
+          "stopped" `T.isInfixOf` t `shouldBe` False
+        _ -> expectationFailure "expected a single text part"
+    it "AGENT_INSTANCES shows a normally-completed child without a reason suffix" $ do
+      rt <- newAgentRuntime
+      let sid = SubagentId "sa-a1-done-0001"
+      registerRunningAgent rt (AgentDefId "a1") sid (mkSystemSessionId "parent") (mkSystemSessionId "child") 0 =<< myThreadId
+      let result = ChildResult
+            { crTaskIndex = 0
+            , crStatus = CsCompleted
+            , crSummary = Just "done"
+            , crExitReason = CerCompleted
+            , crDurationSeconds = 1.0
+            , crSubagentId = sid
+            , crTokensInput = 0
+            , crTokensOutput = 0
+            , crToolTrace = []
+            , crError = Nothing
+            , crFilesRead = []
+            , crFilesWritten = []
+            , crChildSession = Just (mkSystemSessionId "child")
+            }
+      registerCompletedAgentResult rt sid result
+      r <- runTestApp (opRun (agentInstancesOp rt) localBackend (object []))
+      orIsError r `shouldBe` False
+      case orParts r of
+        [TrpText t] -> do
+          -- The completed child shows a plain "stopped" line with NO
+          -- non-completion reason suffix (timeout/error/etc.).
+          "stopped" `T.isInfixOf` t `shouldBe` True
+          "timeout" `T.isInfixOf` t `shouldBe` False
+          "error" `T.isInfixOf` t `shouldBe` False
+        _ -> expectationFailure "expected a single text part"
+
     it "AGENT_INSTANCES reports (no agents running) when the synchronous model has finished" $ do
       rt <- newAgentRuntime
       r <- runTestApp (opRun (agentInstancesOp rt) localBackend (object []))

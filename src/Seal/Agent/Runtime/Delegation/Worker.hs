@@ -22,11 +22,12 @@ module Seal.Agent.Runtime.Delegation.Worker
   , handoffRepoRegistry
   , dispatchHandoffRepo
   , DelegationWorkerDeps (..)
+  , resolveExitReason
   ) where
 
-import Control.Exception (SomeException, catch)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (object, (.=))
+import Data.Maybe (fromMaybe)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -38,13 +39,14 @@ import System.Directory (createDirectoryIfMissing)
 import Seal.Agent.Def.Backend (AgentDefBackend)
 import Seal.Agent.Def.Types (AgentDef (..))
 import Seal.Agent.Env (AgentEnv (..))
-import Seal.Agent.Loop (runTurn)
+import Seal.Agent.Loop (ChildStopKind (..), childStopKind, runTurn)
 import Seal.Agent.Runtime.Delegation
   ( AgentWorkerBuilder
   , ChildExitReason (..)
   , ChildTask (..)
   , ChildWorkerOutcome (..)
   , RepoSpec (..)
+  , catchChildSync
   )
 import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
@@ -232,9 +234,10 @@ data DelegationWorkerDeps = DelegationWorkerDeps
     -- task's @ctContext@. Runs in 'IO' so the wiring layer can load the
     -- auto-injected skill (default @seal-usage@) from the skill backend and
     -- append it. 'Nothing' means no system prompt.
-  , dwdOnEntry :: IO ()
-    -- ^ The on-entry hook for the child's transcript (live broadcast).
-    -- 'pure ()' for the CLI; 'broadcastNewEntries' for web/channels.
+  , dwdOnEntry :: SessionId -> IO ()
+    -- ^ The on-entry hook for the child's transcript (live broadcast),
+    -- receiving the CHILD's own session id. @\\_ -> pure ()@ for the
+    -- CLI; the turn engine's entry broadcast for web/channels.
   , dwdChannel :: Text
     -- ^ The parent session's channel label (e.g. @\"telegram\"@, @\"web\"@,
     -- @\"cli\"@), inherited by the child so the child's request entries are
@@ -299,6 +302,11 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
         mRepo <- if topLevel
                    then writeHandoffMeta deps childSid agentDef (ctRepo task)
                    else writeChildMeta deps childSid >> pure Nothing
+        -- WU-2: the terminal reason is structural. The catch handler
+        -- records a crash reason here — never into summaryRef, which is
+        -- reserved for genuine final answers (the pre-WU-2 conflation a
+        -- textual marker taxonomy could never undo).
+        terminalReasonRef <- newIORef (Nothing :: Maybe ChildExitReason)
         summaryRef <- newIORef (Nothing :: Maybe Text)
         stopFanoutDoneRef <- newIORef False
         let capturingCaps = def
@@ -360,7 +368,7 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
                   , aeDebugResponsePath = Nothing
                   , aeMaxModelRetries = 3
                   , aeRetryBaseDelayMs = 1000
-              , aeOnEntry    = dwdOnEntry deps
+              , aeOnEntry    = dwdOnEntry deps childSid
               , aeOnUserMessage = Nothing
               , aeOnStop     = childEnvOnStop
               , aeStopFanoutDone = stopFanoutDoneRef
@@ -372,13 +380,12 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
                , aeRepeatTrack = childRepeatTrack
                , aeToolTimeout = dwdToolTimeout deps
               }
-        runApp (dwdAppEnv deps) (runTurn env (ctGoal task))
-          `catch` \e -> writeIORef summaryRef
-                       (Just ("child runTurn raised: " <> T.pack (show (e :: SomeException))))
+        catchChildSync (runApp (dwdAppEnv deps) (runTurn env (ctGoal task))) $ \_ ->
+          writeIORef terminalReasonRef (Just CerError)
         summary <- readIORef summaryRef
-        let exitReason = case summary of
-              Just _  -> CerCompleted
-              Nothing -> CerMaxIterations
+        fanoutDone <- readIORef stopFanoutDoneRef
+        terminalReason <- readIORef terminalReasonRef
+        let exitReason = resolveExitReason summary fanoutDone terminalReason
         -- Token counts: the child's per-turn usage is recorded in the
         -- transcript entries; we don't aggregate them here (would require
         -- reading entries.jsonl). Report 0 for now — a follow-up can sum
@@ -387,6 +394,35 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
   where
     providerLabel d = if T.null (adProvider d) then "ollama" else adProvider d
 
+-- | The structural exit reason. A crash reason recorded by the catch
+-- handler always wins (it cannot co-occur with a genuine final answer).
+-- Absent a crash, the fan-out having fired is THE completion signal:
+-- only 'deliverFinal' sets it. Non-completion returns still carry the
+-- loop's outcome text in the summary; classify it with 'childStopKind'.
+-- Anything else (loop returned with neither a fan-out nor a marker —
+-- e.g. a turn budget of zero) keeps the historical residual reason.
+resolveExitReason
+  :: Maybe Text          -- ^ the captured summary, if any
+  -> Bool               -- ^ aeStopFanoutDone: the final-answer fan-out fired
+  -> Maybe ChildExitReason -- ^ a crash reason recorded by the catch handler
+  -> ChildExitReason
+resolveExitReason summary fanoutDone terminalReason = fromMaybe fallback classified
+  where
+    fallback = CerMaxIterations
+    kindToReason = \case
+      CskMaxTurns       -> CerMaxIterations
+      CskProviderError  -> CerError
+      CskRetryExhausted -> CerError
+      CskTruncation     -> CerError
+      CskAbort          -> CerInterrupted
+    classified = case (terminalReason, fanoutDone) of
+      (Just reason, _) -> Just reason
+      (Nothing, True)   -> Just CerCompleted
+      (Nothing, False)  -> case summary of
+        Just s -> case childStopKind s of
+          Just kind -> Just (kindToReason kind)
+          Nothing  -> Nothing
+        Nothing -> Nothing
 -- | Write a minimal 'SessionMeta' for a spawned child session into its
 -- child dir (@\<parent\>\/agents\/\<child\>\/session.json@): the child's
 -- own id, the parent's provider/model (the audit trail records what the

@@ -169,6 +169,54 @@ spec = describe "Seal.Agent.Runtime.Registry" $ do
       registerCompletedAgentResult rt sid result
       hasRunningChildren rt sampleParentSession `shouldReturn` False
 
+  describe "registerCompletedAgentResult — truthful status (WU-3)" $ do
+    let mkResult sid status reason = ChildResult
+          { crTaskIndex = 0
+          , crStatus = status
+          , crSummary = Just "done"
+          , crExitReason = reason
+          , crDurationSeconds = 0.1
+          , crSubagentId = sid
+          , crTokensInput = 0
+          , crTokensOutput = 0
+          , crToolTrace = []
+          , crError = Nothing
+          , crFilesRead = []
+          , crFilesWritten = []
+          , crChildSession = Just sampleSession
+          }
+    it "maps CsCompleted to Stopped (unchanged)" $ do
+      rt <- newAgentRuntime
+      registerRunningAgent rt sampleDefId sampleSubagentId sampleParentSession sampleSession 0 =<< myThreadId
+      registerCompletedAgentResult rt sampleSubagentId (mkResult sampleSubagentId CsCompleted CerCompleted)
+      agentStatus rt sampleSubagentId `shouldReturn` Just Stopped
+    it "maps CsTimeout to Interrupted with the timeout reason in the status (not a bare Stopped)" $ do
+      rt <- newAgentRuntime
+      registerRunningAgent rt sampleDefId sampleSubagentId sampleParentSession sampleSession 0 =<< myThreadId
+      registerCompletedAgentResult rt sampleSubagentId (mkResult sampleSubagentId CsTimeout CerTimeout)
+      mStatus <- agentStatus rt sampleSubagentId
+      case mStatus of
+        Just (Crashed _) -> pure ()  -- would be wrong: not an error
+        Just Interrupted -> pure () -- acceptable truthful mapping
+        Just s -> expectationFailure ("timed-out child mapped to: " <> show s)
+        Nothing -> expectationFailure "instance vanished"
+    it "maps CsError to Crashed (unchanged)" $ do
+      rt <- newAgentRuntime
+      registerRunningAgent rt sampleDefId sampleSubagentId sampleParentSession sampleSession 0 =<< myThreadId
+      registerCompletedAgentResult rt sampleSubagentId (mkResult sampleSubagentId CsError CerError)
+      mStatus <- agentStatus rt sampleSubagentId
+      mStatus `shouldSatisfy` maybe False isCrashed
+    it "maps CsInterrupted to Interrupted (not Stopped)" $ do
+      rt <- newAgentRuntime
+      registerRunningAgent rt sampleDefId sampleSubagentId sampleParentSession sampleSession 0 =<< myThreadId
+      registerCompletedAgentResult rt sampleSubagentId (mkResult sampleSubagentId CsInterrupted CerInterrupted)
+      agentStatus rt sampleSubagentId `shouldReturn` Just Interrupted
+    it "maps CsFailed to Stopped (max-iterations is a bounded outcome, not a crash)" $ do
+      rt <- newAgentRuntime
+      registerRunningAgent rt sampleDefId sampleSubagentId sampleParentSession sampleSession 0 =<< myThreadId
+      registerCompletedAgentResult rt sampleSubagentId (mkResult sampleSubagentId CsFailed CerMaxIterations)
+      agentStatus rt sampleSubagentId `shouldReturn` Just Stopped
+
     it "returns False for a parent with no children even when another parent has running children" $ do
       rt <- newAgentRuntime
       ran <- newIORef False
