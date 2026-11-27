@@ -1,8 +1,16 @@
 # Handoff — Multiple Execution Machines
 
-**Status**: 5 of 18 work units complete. Branch `wu-1-machine-config`, PR #354 (draft).
-**Last commit**: `7083e84` — `feat(machines): WU-7 machines.toml IO, template, boot wiring`
-**`make check`**: green (build + test + lint "No hints" + frontend). 4979 examples, 0 failures.
+**Status**: 9 of 18 work units complete. Branch `wu-1-machine-config`, PR #354 (draft).
+**Last commit**: `b9c6001` — `feat(machines): WU-6b session workdir follows the recorded machine`
+**`make check`**: green (build + test + lint "No hints" + frontend). 5016 examples, 0 failures.
+
+> **The hardened build (`-f remote-only-untrusted`) does not link, and never did.**
+> Verified against the pre-WU-6 branch: `Remote.hs` and `AgentMetaCache.hs` import
+> `Seal.Tools.Exec.Local` unconditionally while the flag removes it from
+> `exposed-modules`. WU-16 owns the fix. WU-6 removed the *compile* errors (the
+> CPP'd-out local arm no longer leaves unused imports), so WU-16 is now the
+> import fix plus the Makefile/CI step — no longer "very likely fails to
+> compile", just "fails to link".
 
 > **Read this first.** This feature has been through 4 design revisions, 7 plan
 > revisions, and 3 rounds of both review gates. The documents below are the
@@ -30,16 +38,15 @@
 | WU-3 | Dispatcher-side resolution: `resolveMachineForCall`, per-call env swap (both `uieUntrustedIO` **and** `uieCloneDeps`), ACK entry records the resolved machine. | `f59097f` |
 | WU-4 | `Seal.ISA.Ops.Machine`: `machineField`, `renderMachineError`, `machinePropertySchema`, `renderUnusableReason`. | `f59097f` |
 | WU-7 | `loadMachinesConfig`/`saveMachinesConfig`, `resolveMachinesForBoot`, `config/templates/machines.toml`, template seeding. | `7083e84` |
+| WU-6 | `allow_localhost` replaces `mode`; `UntrustedExecRemoteFileConfig` deleted; `UntrustedExecMode` retired (operator decision — the `Bool` carries the same fact); corrected selector truth table; `enforceRemoteOnly` call sites in both boot paths; `mkSessionExec` resolves from the registry; `ExecCache` fingerprint covers the registry. | `d7feb62` |
 
 ## What remains
 
 | WU | Content | Notes |
 |---|---|---|
-| **WU-6** | `allow_localhost` replaces `mode`; delete `UntrustedExecRemoteFileConfig`; corrected selector truth table; `enforceRemoteOnly` call site. | **Do this next.** It touches ~10 `Maybe`-branching call sites and 5 test modules. Everything downstream depends on it. |
-| WU-8 | Migration (5 rows + the failure row). Requires WU-6 + WU-7. | Must **remove** `mode` on the migration boot — see P21. Do not "helpfully" retain it for rollback. |
-| WU-6b | `FileExplorer` + `AgentMetaCache` machine binding. | `Serve.hs:677` builds the explorer once at boot from one `SshConfig`. |
-| WU-5 | Per-machine workdirs, lazy bootstrap, `ExecCache` re-key. Requires WU-7. | |
-| WU-9 | `smMachine` on `SessionMeta` + `machineForSession` + `renderMachineConfigError`. | **~30 positional `SessionMeta` construction sites** across ~20 test files will break. Plan §WU-9 lists them; count them again before starting. |
+| WU-5 | Per-machine workdirs, lazy bootstrap, cache re-key. | WU-7 done. `ExecCache` already re-keys on the registry AND the recorded machine (done in WU-9), so part of this unit is already satisfied — read its RED block against current behaviour first. |
+| WU-12 | ACK record names the machine. | **Largely done in WU-3** — verify against its RED block; may only need tests. |
+| WU-13 | `SETUP_REPO` on a non-session machine. | Must read `uioCdCloneDeps` from the env — the closure is a default, not the source. Design §6.2.2. |
 | WU-10 | TUI prompt, `/new -x`, `/api/machines`, persistence into `smMachine`. | `/api/machines` needs **5** registration edits (see below). |
 | WU-11 | Five display surfaces. | `'machine'` must join `DEFAULT_TAB_LINE_FIELDS` or the sidebar won't show it. |
 | WU-12 | ACK record — **already largely done in WU-3**. | Verify against its RED block; may only need tests. |
@@ -102,3 +109,46 @@ Start **WU-6**. It is the pivot: every later unit assumes `UntrustedExecFileConf
 carries `uefcAllowLocalhost :: !Bool` instead of `uefcMode`, and that
 `untrustedExecConfigFromSecurity` returns `UntrustedExecConfig` (no `Maybe`).
 Its RED block is in plan §WU-6, and its 10 call sites are enumerated there.
+
+## Traps this round added
+
+8. **`decodeMachinesConfig` silently decoded every `machines.toml` to an empty
+   machine list.** `Toml.tableMap` needs the `machines` node to carry an
+   explicit value in tomland's AST, but the idiomatic hand-written shape
+   (`[machines.<n>]` sub-tables, no bare header) leaves it implicit. A file full
+   of correct machines read as "none configured" — which, with
+   `allow_localhost = false`, is the state that refuses to run anything.
+   `Seal.Config.File` already normalizes `providers` and `channels` for exactly
+   this reason. Fixed with `normalizeMachinesTable`. **Any new
+   `Toml.tableMap`-decoded section in this repo needs the same treatment.**
+
+9. **`Toml.dioptional (Toml.table …)` reports a table whose contents fail to
+   decode as `Nothing`** — indistinguishable from the table being absent. That
+   is precisely the silent-downgrade shape design §2.3 exists to prevent, so
+   section presence has to be checked at the AST level
+   (`decodeSecurityConfig`'s `sectionPresent`), covering both the dotted-key
+   spelling and a bare header with no keys.
+
+10. **`migrateSecurityConfig` picks its branch by asking whether
+    `security.toml` exists.** Any migration that *creates* that file must run
+    **after** it, or an upgraded install takes the "security.toml wins" path and
+    strands the vault fields in `config.toml`.
+
+11. **Positional `SessionMeta` construction is a trap for mechanical rewrites.**
+    A regex that added the new field also matched `resolveExitReason Nothing
+    True Nothing Nothing` (an unrelated three-argument function) and silently
+    made it four arguments. Count: **75** construction sites, not the "~30" the
+    plan estimated. Convert to named construction when you touch them.
+
+12. **Test fixtures must not use a shared `/tmp` path.** `ExecCacheSpec` and
+    `WorkdirSpec` both had fixed paths, so one test's `machines.toml` leaked into
+    the next and "no machine configured" tests passed or failed by order.
+
+## Not implementable as written
+
+`fileExplorerFollowsSessionMachine` (§6.7). The file-explorer routes take a
+`path` query parameter, not a session id, so there is no session in scope and
+"the session's machine" is undefined. Honouring it needs either session-scoped
+routes (a user-facing change §6.7 itself declines) or an `adFileExplorer` that is
+a resolver rather than a value (breaks ~50 `ApiDeps` literals under `-Werror`,
+and still has no session). Recorded rather than claimed done.
