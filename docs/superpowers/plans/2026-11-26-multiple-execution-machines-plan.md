@@ -93,8 +93,8 @@ loopbackBeforeHostValidation            -- "localhost" → RrLoopbackHost "local
 loopbackCarriesConfiguredHost           -- "127.0.0.1" → RrLoopbackHost "127.0.0.1"
 missingWorkspaceRejected                -- RrMissingField Workspace
 localInjectedIffAllowLocalhost          -- property + checkCoverage both arms
-localTableIgnoredWithWarning
-defaultNamingMissingMachineDropped      -- regDefault = Nothing + warning
+localTableIgnoredIsReported             -- regWarnings contains it; MtLocal still implicit
+defaultNamingMissingMachineIsReported   -- regDefault = Nothing; regWarnings non-empty
 malformedTomlIsLeft                     -- decode failure surfaces, not silent-empty
 ```
 
@@ -119,6 +119,11 @@ malformedTomlIsLeft                     -- decode failure surfaces, not silent-e
 - [ ] Pure resolver over a registry, independent of `SessionMeta` (so WU-3 does not
       forward-depend on WU-9):
       `resolveName :: MachineRouting -> Maybe MachineName -> Either MachineError MachineName`.
+- [ ] `resolveMachines` returns its diagnostics **in the value**, not as a side
+      effect: `MachineRegistry` gains `regWarnings :: [Text]`, so a pure function
+      can report "`[machines.local]` ignored" and "`default` names no resolved
+      machine" without logging. WU-7's boot path prints them; tests assert on the
+      list.
 - [ ] `MachineRouting { rtResolve, rtSession, rtSelectable }` — constructor and
       fields **not exported**.
 - [ ] `MachineSlot = SlotReady !UntrustedIO | SlotFailed !MachineError`.
@@ -230,6 +235,8 @@ renderUnusableText                        -- T-STR-2 exact
 renderGoneText                            -- T-STR-5 exact
 renderNoMachineText                       -- T-STR-6 exact
 rejectReasonNeverLeaksHost                -- negative: RrInvalidHost payload absent
+renderUnknownMachineText                  -- T-STR-1 FULL string incl. the choices
+                                          -- list, not just the separator
 ```
 
 ---
@@ -264,6 +271,10 @@ templateHasNoLiveMachine                  -- T-TPL-1: 1 selectable, no prompt
 templateNeverOverwrites
 malformedTomlFailsClosedAtBoot            -- names the file
 resolveMachinesForBootReturnsRegistry
+absentMachinesTomlYieldsOneSelectable     -- DW-3: no file ⇒ empty map + local,
+                                          -- and boot still succeeds
+templatesSeedBeforeResolution             -- seeding runs before the load, so a
+                                          -- fresh install never fail-closes
 ```
 
 ### WU-8: Migration (`mode` removed; revert hazard documented)
@@ -329,7 +340,7 @@ mtSshSelectableUnderDefault                            -- inverted-table regress
 enforceRemoteOnlyCalledInServeAndCli
 ```
 
-### WU-6b: FileExplorer and AgentMetaCache machine binding
+### WU-6b: FileExplorer and AgentMetaCache machine binding (+ their tests)
 
 **DoD (P17)**
 - [ ] `mkRemoteFileExplorer` built per **session machine**, not once at boot from
@@ -340,6 +351,8 @@ enforceRemoteOnlyCalledInServeAndCli
 **Files (edit)** `src/Seal/Tools/Exec/FileExplorer.hs`, `src/Seal/Command/Serve.hs:677`,
 `src/Seal/Session/AgentMetaCache.hs`, `src/Seal/Gateway/API.hs:1710`,
 `src/Seal/Core/TurnEngine.hs:655`
+**Files (edit — tests)** `test/Seal/Session/AgentMetaCacheSpec.hs:385`
+(constructs the `SshConfig`/env being changed), `test/Seal/Tools/Exec/FileExplorerSpec.hs`
 **Depends on** WU-6.
 
 **RED**
@@ -376,7 +389,7 @@ readOnBWrittenOnAIsNotFound
 
 ## Phase 5 — Session selection and display
 
-### WU-9: `SessionMeta`, `machineForSession`, config-error renderer
+### WU-9: `SessionMeta` (+ its ~30 construction sites), `machineForSession`, config-error renderer
 
 **DoD**
 - [ ] `smMachine`, `smRepoMachine` on `SessionMeta`, tolerant decode.
@@ -389,8 +402,23 @@ readOnBWrittenOnAIsNotFound
       `Worker.hs:440-455`, `:564-576`) — additive fields still break positional records.
 
 **Files (create)** `src/Seal/Session/Machine.hs`, `test/Seal/Session/MachineSpec.hs`
-**Files (edit)** `src/Seal/Session/Meta.hs`, `src/Seal/Session/Store.hs`,
-`src/Seal/Agent/Runtime/Delegation/Worker.hs`, `seal-harness.cabal`, `test/Main.hs`
+**Files (edit — production)** `src/Seal/Session/Meta.hs`,
+`src/Seal/Session/Store.hs`, `src/Seal/Agent/Runtime/Delegation/Worker.hs`,
+`src/Seal/Core/TurnEngine.hs:1362` (`fallbackMeta`), `seal-harness.cabal`,
+`test/Main.hs`
+
+**Files (edit — tests; ~30 positional `SessionMeta` sites)**
+`test/Seal/Session/{MetaSpec,StoreSpec,BranchSpec}.hs`,
+`test/Seal/Logging/LoggerSpec.hs`,
+`test/Seal/Core/SystemPromptSpec.hs`,
+`test/Seal/Tabs/PartitionSpec.hs`,
+`test/Seal/Channel/CliSpec.hs`,
+`test/Seal/Command/{TabSpec,SessionSpec,NewSpec}.hs`,
+`test/Seal/Agent/Runtime/Delegation/WorkerSpec.hs`,
+`test/Seal/RepoDiscoverySpec.hs`,
+`test/Seal/ISA/Ops/{SessionSpec,AgentHandoffSpec}.hs`,
+`test/Seal/Gateway/{ApiSpec,ApiFilesSpec,SendSpec,PatIngestionSpec,SetupApiSpec,ServerSpec,MutationGuardSpec}.hs`,
+`test/Seal/Phase7aSpec.hs`, `test/Seal/TestHelpers/ApiTestHarness.hs`
 **Depends on** WU-1, WU-6.
 
 **RED**
@@ -404,7 +432,13 @@ noDefaultFlagFalseEmptyIsNoMachineSelected -- T-STR-6 exact, not just the ctor
 noDefaultOtherwiseIsMachineDefaultUnset
 renderConfigErrorNamesConfiguredHost      -- T-STR-4 exact, 127.0.0.1 as written
 storeAndWorkerConstructMetaWithMachine
+allThirtySessionMetaSitesCompile         -- the ~30 positional sites above
 ```
+
+**Note on `SessionMeta` fan-out.** The field addition is additive for *decode*
+(`.:?`) but **breaking for *construction***: every `SessionMeta { … }` literal
+must gain the field. There are ~30 across the files listed above, all under
+`-Werror`. Budget this unit as a mechanical sweep, not a one-file edit.
 
 ### WU-10: Session selection plumbing, incl. persistence
 
@@ -531,7 +565,7 @@ setupRepoResultTextNamesSessionMachine
 setupRepoOnSessionMachineUnchanged
 ```
 
-### WU-14: `/machine list` and `seal machine pin`
+### WU-14: `/machine list`, `seal machine pin`, and the `~/.seal` guard
 
 **DoD**
 - [ ] `Seal.Command.Machine` with `/machine list` in `coreCommandSpecs` under
@@ -549,13 +583,21 @@ setupRepoOnSessionMachineUnchanged
       loopback refusal.
 
 **Files (create)** `src/Seal/Command/Machine.hs`, `test/Seal/Command/MachineSpec.hs`
+- [ ] **`machines.toml` joins the agent-immutable set.** `blockedNames`
+      (`Security/Path.hs:54`) already covers `.seal`; this change asserts the new
+      files are unreachable from an opcode path. Extend
+      `CapabilityScopingWorkdirFsFailSpec` (the existing guard): no
+      `src/Seal/ISA/Ops/` module imports `Seal.Config.Machines` or
+      `Seal.Config.Security`, and `FILE_READ`/`FILE_WRITE` of
+      `~/.seal/machines.toml` or `~/.seal/exec-known-hosts` is refused by
+      `mkSafePath`.
 **Files (edit)** `src/Seal/Command/Registry.hs`, `src/Seal/Types/Command.hs`,
 `src/Seal/AppMain.hs`, `seal-harness.cabal`, `test/Main.hs`
 **Depends on** WU-9.
 
 **RED**
 ```
-machineListExactOutput                    -- T-STR-11
+machineListExactOutput                    -- T-STR-10
 machineListOmitsEmptySections
 machineListReusesConfigErrorRenderer
 registeredUnderGroupGeneral                -- HelpSpec ordering intact
@@ -570,13 +612,20 @@ pinIdempotent / UnknownNameErrors / RefusesLoopback
 
 ## Phase 7 — Host keys and the hardened build
 
-### WU-15: Host-key pinning, guards, adoption copy
+### WU-15: Host-key pinning, guards (with injected seams), adoption copy
 
 **DoD (P8 — this section had no owner in revision 1)**
 - [ ] `scKnownHosts` filled from `execKnownHostsPath` at the single construction
       site (the machine resolver, WU-1).
-- [ ] Resolution-based loopback refusal at connect (`getaddrinfo`): refuse if any
-      address is loopback/unspecified/local-interface.
+- [ ] Resolution-based loopback refusal at connect, behind an **injected seam**
+      (the `mkHostKeyAdoptionWithProbe` precedent,
+      `HostKeyAdoption.hs:116`):
+      `mkAddressResolver :: (Text -> IO [SockAddr]) -> AddressResolver`. Production
+      passes `getaddrinfo`; tests pass a stub mapping `mybox.lan → 127.0.0.1`.
+      Refuses if any resolved address is loopback/unspecified/local-interface.
+- [ ] The self-key check reads its key paths from a value, not a constant:
+      `HostKeyPaths { hkpSystemKeys :: [FilePath] }` in the connect config, so a
+      test points it at a fixture instead of `/etc/ssh/`.
 - [ ] Self-key comparison at connect against `/etc/ssh/ssh_host_*_key.pub`
       (configurable); unreadable ⇒ skipped.
 - [ ] `hkaAdopt :: MachineName -> SshConfig -> IO (Either Text ())`;
@@ -624,11 +673,12 @@ hostPathNotRenderedToModel                -- negative: Workdir.hs:211 leak close
 
 **RED**
 ```
-cabal build all -f remote-only-untrusted   -- succeeds
-cabal test  -f remote-only-untrusted       -- succeeds
 hardenedBuildRefusesAbsentSection          -- allow_localhost default is rejected
 hardenedBuildCannotConstructLocalExecutor  -- the Workdir.hs:188 path is CPP'd out
 ```
+
+The two build/test commands are **gate steps, not RED assertions** — they must
+pass, not fail first. They live in the "Full suite gate" section below.
 
 ### WU-17: Docs and template copy
 
