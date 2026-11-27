@@ -39,6 +39,17 @@ in round 1; this batch is Scope round 1's findings):
 | P21 | **WU-8 retained `mode` for rollback**, contradicting "loses `[untrusted_execution] mode`" and making Done-when 2 unpassable | Scope | Retention removed; hazard documented in CHANGELOG instead |
 | P22 | **WU-10 added chat-channel `ASK_HUMAN`**, but the requirements say "no interactive prompt; the configured default is used" | Scope | Removed; unset ⇒ `MachineDefaultUnset` |
 
+**Round 3 of the plan gate** — all three FAIL. Two were substantive, and all three
+Scope findings were things I had *added* beyond the frozen requirements:
+
+| # | Finding | Reviewer | Fix |
+|---|---|---|---|
+| P23 | **`getaddrinfo` loopback refusal was a third mechanism I invented.** The requirements assign "a non-loopback name that still resolves to this machine" to the *host-key comparison* | Scope | Removed; DW-5 stays covered by the config-load check + self-key check |
+| P24 | **`smRepoMachine` was a second persisted field nothing consumes** | Scope | Removed; WU-13 computes the divergence at call time |
+| P25 | **Interactive `seal machine pin` was beyond "pre-pinned non-interactively"** | Scope | Removed; missing material is an error |
+| P26 | **`'machine'` was not added to `DEFAULT_TAB_LINE_FIELDS`** — the sidebar renders only configured fields, so a default install would not show it | Scope | Added to both arrays |
+| P27 | **`CloneDeps` swap was inert for `SETUP_REPO`** (it closes over its deps at `Repo.hs:107`) | Feasibility | Design §6.2.2 + WU-13 DoD |
+
 ## How to read this plan
 
 18 work units in 7 phases. Each has DoD, file scope, dependencies, and a RED
@@ -407,7 +418,9 @@ readOnBWrittenOnAIsNotFound
 ### WU-9: `SessionMeta` (+ its ~30 construction sites), `machineForSession`, config-error renderer
 
 **DoD**
-- [ ] `smMachine`, `smRepoMachine` on `SessionMeta`, tolerant decode.
+- [ ] `smMachine` on `SessionMeta`, tolerant decode. *(No `smRepoMachine`: the
+      requirements record only "the chosen machine", and no Done-when consumes a
+      clone-machine field — §0 P24.)*
 - [ ] `machineForSession` with the ordered 7-case table; case 5b → `NoMachineSelected`,
       5c → `MachineDefaultUnset`; case 2 → `MachineUnusable`; case 3 →
       `MachineNotPermitted`.
@@ -524,6 +537,10 @@ pickerHiddenAtOne / shownAtTwo                  -- vitest
       name for legacy sessions, never `null`).
 - [ ] `TabLineField` union gains `'machine'`; `ALL_TAB_LINE_FIELDS` /
       `DEFAULT_TAB_LINE_FIELDS` updated; `toHaveLength(5)` → 6.
+      **`'machine'` joins `DEFAULT_TAB_LINE_FIELDS`** (currently
+      `['provider','repo','channel']`, `tabLineConfig.ts:35`) — the requirements
+      say the machine is "shown on the session (sidebar)", and the sidebar renders
+      only the configured fields, so omitting it would under-deliver.
 - [ ] Sidebar renders it.
 
 **Files (edit)** `src/Seal/Channel/Cli.hs`, `src/Seal/Command/Session.hs`,
@@ -585,7 +602,8 @@ recordedNameEqualsExecutedMachine
       `runSetupRepo deps …` (`:534`) passes them to `cloneRepoIO` (`:537`), so the
       per-call `uieCloneDeps` swap is inert for this opcode without it.
 - [ ] When `machine ≠ session machine`: no auto-bind, no re-scan, no invalidation.
-- [ ] `smRepoMachine` recorded; result text states follow-up relative paths resolve
+- [ ] *(No `smRepoMachine` — §0 P24.)* The result text states follow-up relative
+      paths resolve
       on the **session** machine.
 
 **Files (edit)** `src/Seal/Core/TurnEngine.hs` (~1147-1197), `src/Seal/ISA/Ops/Repo.hs`,
@@ -595,7 +613,6 @@ recordedNameEqualsExecutedMachine
 **RED**
 ```
 setupRepoOnOtherMachineSkipsAutoBind
-setupRepoOnOtherMachineRecordsRepoMachine
 setupRepoResultTextNamesSessionMachine
 setupRepoUsesTargetMachineTransport       -- cloneDeps from env, not the closure:
                                           -- cdIsRemote/cdPinnedKnownHosts are B's
@@ -617,7 +634,10 @@ setupRepoOnSessionMachineUnchanged
 - [ ] `seal machine pin <name> [--key-file PATH | --fingerprint SHA256:…]`:
       verifies a probe against supplied material; `--yes` alone never appends an
       unverified key; idempotent; errors if the name is absent; never bypasses the
-      loopback refusal.
+      loopback refusal. **Non-interactive only** (§0 P25): supplying no
+      `--key-file`/`--fingerprint` is an error, not a confirmation prompt — the
+      requirements ask only for "pre-pinned non-interactively by supplying its
+      key", and interactive confirmation already exists at connect (DW-6).
 
 **Files (create)** `src/Seal/Command/Machine.hs`, `test/Seal/Command/MachineSpec.hs`
 **Files (edit)** `test/Seal/CapabilityScopingWorkdirFsFailSpec.hs` (the guard)
@@ -643,7 +663,7 @@ registeredUnderGroupGeneral                -- HelpSpec ordering intact
 reorderGlobalArgsKnowsMachine
 pinVerifiesAgainstFingerprint / MismatchFails
 pinKeyFileRequiresMatch
-pinWithoutMaterialRequiresConfirmation
+pinWithoutMaterialErrors                 -- no interactive mode; error is the answer
 pinIdempotent / UnknownNameErrors / RefusesLoopback
 ```
 
@@ -656,12 +676,9 @@ pinIdempotent / UnknownNameErrors / RefusesLoopback
 **DoD (P8 — this section had no owner in revision 1)**
 - [ ] `scKnownHosts` filled from `execKnownHostsPath` at the single construction
       site (the machine resolver, WU-1).
-- [ ] Resolution-based loopback refusal at connect, behind an **injected seam**
-      (the `mkHostKeyAdoptionWithProbe` precedent,
-      `HostKeyAdoption.hs:116`):
-      `mkAddressResolver :: (Text -> IO [SockAddr]) -> AddressResolver`. Production
-      passes `getaddrinfo`; tests pass a stub mapping `mybox.lan → 127.0.0.1`.
-      Refuses if any resolved address is loopback/unspecified/local-interface.
+- [ ] *(Removed — see §0 P23. A DNS-resolution refusal is a third mechanism the
+      requirements do not contain; they assign "a non-loopback name that still
+      resolves to this machine" to the host-key comparison below.)*
 - [ ] The self-key check reads its key paths from a value, not a constant:
       `HostKeyPaths { hkpSystemKeys :: [FilePath] }` in the connect config, so a
       test points it at a fixture instead of `/etc/ssh/`.
@@ -682,7 +699,6 @@ pinIdempotent / UnknownNameErrors / RefusesLoopback
 
 **RED**
 ```
-connectRefusesResolvedLoopback            -- mybox.lan → 127.0.0.1
 connectRefusesSelfHostKey
 selfKeyCheckSkippedWhenUnreadable
 adoptionPromptExactCopy                   -- T-STR-7
