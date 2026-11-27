@@ -31,6 +31,7 @@
 module Seal.Config.Templates
   ( configTomlTemplate
   , securityTomlTemplate
+  , machinesTomlTemplate
   , ensureConfigTemplates
   ) where
 
@@ -53,7 +54,7 @@ import System.Posix.Files (createLink, setFileMode)
 
 import Seal.Config.Migrate (configHasLegacySecurityFields)
 import Seal.Config.Paths
-  ( SealPaths, configFilePath, securityFilePath )
+  ( SealPaths, configFilePath, machinesFilePath, securityFilePath )
 import Seal.Config.Security (openUniqueTemp)
 
 -- | The bytes of @config\/templates\/config.toml@, embedded at compile time.
@@ -64,6 +65,12 @@ configTomlTemplate = TE.decodeUtf8 $(do
 
 -- | The bytes of @config\/templates\/security.toml@, embedded at compile time.
 securityTomlTemplate :: Text
+
+-- | The bytes of @config\/templates\/machines.toml@, embedded at compile time.
+machinesTomlTemplate :: Text
+machinesTomlTemplate = TE.decodeUtf8 $(do
+  qAddDependentFile "config/templates/machines.toml"
+  embedFile "config/templates/machines.toml")
 securityTomlTemplate = TE.decodeUtf8 $(do
   qAddDependentFile "config/templates/security.toml"
   embedFile "config/templates/security.toml")
@@ -87,8 +94,9 @@ ensureConfigTemplates :: SealPaths -> IO ([FilePath], [Text])
 ensureConfigTemplates paths = do
   cfgOutcome <- seedFile (configFilePath paths) configTomlTemplate PlainFile
   secOutcome <- seedSecurity paths
-  let created = catMaybes (rights [cfgOutcome, secOutcome])
-      problems = lefts [cfgOutcome, secOutcome]
+  machOutcome <- seedFile (machinesFilePath paths) machinesTomlTemplate SecretFile
+  let created = catMaybes (rights [cfgOutcome, secOutcome, machOutcome])
+      problems = lefts [cfgOutcome, secOutcome, machOutcome]
   pure (created, problems)
 
 -- | @security.toml@, unless a migration still owns the operator's settings.

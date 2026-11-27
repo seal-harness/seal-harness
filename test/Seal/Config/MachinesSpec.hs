@@ -3,15 +3,24 @@ module Seal.Config.MachinesSpec (spec) where
 
 import Data.Map.Strict qualified as Map
 import qualified Data.Text as T
+import System.Directory (doesFileExist)
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 import Test.QuickCheck
 
 import Seal.Config.Machines
 import Seal.Tools.Exec.Types (SshConfig (..), getSshHost)
-import Seal.Config.Paths (SealPaths (..))
+import Seal.Config.Paths (SealPaths (..), machinesFilePath)
+import Seal.Config.Templates (ensureConfigTemplates, machinesTomlTemplate)
 
 spec :: Spec
 spec = describe "Seal.Config.Machines" $ do
+  machinesSpec
+  specIO
+
+machinesSpec :: SpecWith ()
+machinesSpec = do
 
   describe "mkMachineName" $ do
     it "accepts a normal name" $
@@ -216,3 +225,87 @@ isLeft _        = False
 isMtSsh :: MachineTarget -> Bool
 isMtSsh (MtSsh _) = True
 isMtSsh MtLocal   = False
+
+-- WU-7: file IO, the template, and the boot entry point ---------------------
+
+specIO :: SpecWith ()
+specIO = describe "Seal.Config.Machines (file IO)" $ do
+
+  around withTempSealPaths $ do
+
+    describe "loadMachinesConfig" $ do
+
+      it "a missing file is an empty configuration, not an error" $ \paths -> do
+        loaded <- loadMachinesConfig paths
+        loaded `shouldBe` Right defaultMachinesConfig
+
+      it "a malformed file is Left naming the file" $ \paths -> do
+        writeFile (machinesFilePath paths) "default = 5\n[[["
+        loaded <- loadMachinesConfig paths
+        case loaded of
+          Left err -> err `shouldSatisfy` T.isInfixOf "machines.toml"
+          Right _  -> expectationFailure "expected Left for a malformed file"
+
+      it "round-trips through saveMachinesConfig" $ \paths -> do
+        let cfg = defaultMachinesConfig
+                    { mcDefault = Just "builder"
+                    , mcMachines = Map.fromList
+                        [ ("builder", MachineFileConfig (Just "b.example.com")
+                                        (Just "seal") (Just 22) Nothing (Just "/srv/w")) ]
+                    }
+        saved <- saveMachinesConfig paths cfg
+        saved `shouldBe` Right ()
+        loaded <- loadMachinesConfig paths
+        case loaded of
+          Right back -> Map.keys (mcMachines back) `shouldBe` ["builder"]
+          Left err   -> expectationFailure ("reload failed: " <> T.unpack err)
+
+    describe "resolveMachinesForBoot" $ do
+
+      it "an install with no machines.toml yields exactly one selectable machine" $ \paths -> do
+        resolved <- resolveMachinesForBoot paths True
+        case resolved of
+          Right reg -> do
+            Map.size (regMachines reg) `shouldBe` 1
+            Map.member localMachineName (regMachines reg) `shouldBe` True
+          Left err -> expectationFailure ("boot resolve failed: " <> T.unpack err)
+
+      it "a malformed machines.toml fail-closes the boot" $ \paths -> do
+        writeFile (machinesFilePath paths) "not = [valid"
+        resolved <- resolveMachinesForBoot paths True
+        case resolved of
+          Left err -> err `shouldSatisfy` T.isInfixOf "machines.toml"
+          Right _  -> expectationFailure "expected a boot failure for a malformed file"
+
+    describe "the shipped template" $ do
+
+      it "declares no live machine and no live default" $ \_ -> do
+        -- The template must ship commented out: a live example machine plus a
+        -- default would give a fresh install two selectable machines, a prompt,
+        -- and a default pointing at an example host.
+        let decoded = decodeMachinesConfig machinesTomlTemplate
+        case decoded of
+          Right cfg -> do
+            mcMachines cfg `shouldBe` Map.empty
+            mcDefault cfg `shouldBe` Nothing
+          Left err -> expectationFailure ("template does not parse: " <> show err)
+
+      it "is seeded on first run and never overwritten" $ \paths -> do
+        _ <- ensureConfigTemplates paths
+        exists <- doesFileExist (machinesFilePath paths)
+        exists `shouldBe` True
+        -- second call must not clobber
+        writeFile (machinesFilePath paths) "# operator edit\n"
+        _ <- ensureConfigTemplates paths
+        contents <- readFile (machinesFilePath paths)
+        contents `shouldBe` "# operator edit\n"
+
+withTempSealPaths :: (SealPaths -> IO ()) -> IO ()
+withTempSealPaths act = withSystemTempDirectory "seal-machines" $ \tmp ->
+  act SealPaths
+    { spHome = tmp
+    , spConfig = tmp </> "config"
+    , spState = tmp </> "state"
+    , spKeys = tmp </> "keys"
+    , spCache = tmp </> "cache"
+    }

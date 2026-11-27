@@ -1,0 +1,38 @@
+# Seal Harness execution machines — ~/.seal/machines.toml
+#
+# Which machines untrusted tool calls may run on. Boot-only and agent-immutable:
+# no opcode, tool or agent can read or write this file. It is a sibling of
+# security.toml (NOT inside ~/.seal/config, which is a git repository an agent
+# may commit to).
+#
+# Seal writes this file once, on first run, and never overwrites it: edit it
+# freely.
+#
+# No machine is configured here yet, and that is deliberate. An install with no
+# machines and the default security.toml behaves exactly as Seal always has:
+# untrusted code runs on this machine. Add a machine when you want it to run
+# somewhere else.
+#
+# Machine names are what you type and what the model passes. Names may contain
+# letters, digits, '-', '_' and '.', and must not start with '-' or '.'. The
+# name "local" is reserved for this machine and cannot be used.
+#
+# Every machine's host key is pinned in ~/.seal/exec-known-hosts, which Seal
+# fills itself: the first connection to a machine shows its fingerprint and asks
+# you to confirm. There is no known_hosts setting here — one harness-owned file
+# replaces it.
+
+# The machine used when a session does not choose one. Optional; without it, a
+# session with two or more machines asks which to use.
+# default = "linux-builder"
+
+# A remote machine, reached over SSH. 'local' is a separate command; it names
+# this machine itself and is available only when security.toml sets
+# allow_localhost = true.
+#
+# [machines.linux-builder]
+# host      = "builder.example.com"
+# user      = "seal"
+# port      = 22                                     # optional, default 22
+# identity  = "/home/you/.ssh/id_ed25519"             # optional; agent if absent
+# workspace = "/srv/seal/workspace"                  # required

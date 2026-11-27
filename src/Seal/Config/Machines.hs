@@ -33,6 +33,9 @@ module Seal.Config.Machines
   , defaultMachinesConfig
   , MachinesConfigError (..)
   , decodeMachinesConfig
+  , loadMachinesConfig
+  , saveMachinesConfig
+  , resolveMachinesForBoot
   , machinesConfigCodec
   , Selectable (..)
   , selectables
@@ -46,6 +49,7 @@ module Seal.Config.Machines
   , localMachineName
   ) where
 
+import Control.Exception (IOException, try)
 import Data.Char (isAscii, isAlphaNum, isControl, isDigit)
 import Data.Maybe (fromMaybe)
 import Data.Map.Strict (Map)
@@ -53,10 +57,13 @@ import Data.Map.Strict qualified as Map
 import Validation (Validation (..))
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
+import System.Directory (doesFileExist)
 import Toml (TomlCodec, (.=))
 import Toml qualified
 
-import Seal.Config.Paths (SealPaths, execKnownHostsPath)
+import Seal.Config.Paths (SealPaths, execKnownHostsPath, machinesFilePath)
+import Seal.Config.Security (writeSecretFile)
 import Seal.Tools.Exec.Types
   ( SshConfig (..), mkSshHost, mkSshUser, mkRemotePath )
 
@@ -383,3 +390,54 @@ isLoopbackHost raw =
         ("127" : rest) -> not (null rest) && all isOctet rest
         _              -> False
     isOctet o = not (T.null o) && T.all isDigit o
+
+-- ---------------------------------------------------------------------------
+-- File IO and the boot entry point
+-- ---------------------------------------------------------------------------
+
+-- | Read @machines.toml@. A missing file is an empty configuration (the
+-- documented "keeps working exactly as it does today" case), not an error; a
+-- malformed file is 'Left' naming it, so the operator gets a boot error instead
+-- of silently losing every machine.
+loadMachinesConfig :: SealPaths -> IO (Either Text MachinesConfig)
+loadMachinesConfig paths = do
+  let path = machinesFilePath paths
+  exists <- doesFileExist path
+  if not exists
+    then pure (Right defaultMachinesConfig)
+    else do
+      read' <- try (TIO.readFile path) :: IO (Either IOException Text)
+      pure $ case read' of
+        Left err -> Left (T.pack path <> ": could not read: " <> T.pack (show err))
+        Right contents -> case decodeMachinesConfig contents of
+          Left (MceParse why) -> Left (T.pack path <> ": " <> why)
+          Right cfg           -> Right cfg
+
+-- | Write @machines.toml@ through the same @0600@ / @O_NOFOLLOW@ primitive the
+-- other security-critical writers use.
+saveMachinesConfig :: SealPaths -> MachinesConfig -> IO (Either Text ())
+saveMachinesConfig paths cfg = do
+  let path = machinesFilePath paths
+      rendered = Toml.encode machinesConfigCodec cfg
+  outcome <- try (writeSecretFile path rendered) :: IO (Either IOException ())
+  pure $ case outcome of
+    Left err -> Left (T.pack path <> ": could not write: " <> T.pack (show err))
+    Right () -> Right ()
+
+-- | The boot entry point: load both configuration files and resolve them into
+-- the registry every other layer consumes.
+--
+-- This is the function no other unit could be written against — a gate reviewer
+-- caught that revision 1 of the plan defined the resolver and the loader but
+-- never called either at startup.
+--
+-- A malformed @machines.toml@ fail-closes the boot with a message naming the
+-- file (mirroring @security.toml@'s precedent). A malformed @security.toml@ is
+-- treated as default-safe here; the existing boot paths already load and report
+-- that file separately.
+resolveMachinesForBoot :: SealPaths -> Bool -> IO (Either Text MachineRegistry)
+resolveMachinesForBoot paths allowLocalhost = do
+  loaded <- loadMachinesConfig paths
+  pure $ case loaded of
+    Left err  -> Left err
+    Right cfg -> Right (resolveMachines allowLocalhost paths cfg)

@@ -55,7 +55,7 @@ import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Config.Migrate
   ( configHasLegacySecurityFields, migrateSecurityConfig )
 import Seal.Config.Paths
-  ( SealPaths (..), configFilePath, securityFilePath )
+  ( SealPaths (..), configFilePath, machinesFilePath, securityFilePath )
 import Seal.Config.Security
   ( AccessControlFileConfig (..), SecurityConfig (..)
   , UntrustedExecFileConfig (..), UntrustedExecRemoteFileConfig (..)
@@ -234,7 +234,7 @@ spec = describe "Seal.Config.Templates" $ do
       withSealHome $ \paths -> do
         (created, warnings) <- ensureConfigTemplates paths
         warnings `shouldBe` []
-        created `shouldBe` [configFilePath paths, securityFilePath paths]
+        created `shouldBe` [configFilePath paths, securityFilePath paths, machinesFilePath paths]
         TIO.readFile (configFilePath paths) `shouldReturn` configTomlTemplate
         TIO.readFile (securityFilePath paths) `shouldReturn` securityTomlTemplate
         (createdAgain, warningsAgain) <- ensureConfigTemplates paths
@@ -254,7 +254,7 @@ spec = describe "Seal.Config.Templates" $ do
         let mine = "# my own config\nmax_turns = 5\n"
         TIO.writeFile (configFilePath paths) mine
         (created, _) <- ensureConfigTemplates paths
-        created `shouldBe` [securityFilePath paths]
+        created `shouldBe` [securityFilePath paths, machinesFilePath paths]
         TIO.readFile (configFilePath paths) `shouldReturn` mine
 
     it "reports a failure instead of throwing, and still writes the other file" $
@@ -264,7 +264,7 @@ spec = describe "Seal.Config.Templates" $ do
         TIO.writeFile (spConfig paths) "not a directory"
         (created, warnings) <- ensureConfigTemplates paths
         length warnings `shouldBe` 1
-        created `shouldBe` [securityFilePath paths]
+        created `shouldBe` [securityFilePath paths, machinesFilePath paths]
         doesFileExist (configFilePath paths) `shouldReturn` False
 
     it "defers to the security migration while config.toml is pre-split" $
@@ -275,7 +275,9 @@ spec = describe "Seal.Config.Templates" $ do
         createDirectoryIfMissing True (spConfig paths)
         TIO.writeFile (configFilePath paths) "vault_unlock = \"startup\"\n"
         (created, warnings) <- ensureConfigTemplates paths
-        created `shouldBe` []
+        -- machines.toml is unrelated to the security migration, so it is
+        -- still seeded; only security.toml defers.
+        created `shouldBe` [machinesFilePath paths]
         warnings `shouldBe` []
         doesFileExist (securityFilePath paths) `shouldReturn` False
 
