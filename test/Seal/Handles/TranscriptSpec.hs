@@ -4,14 +4,19 @@ module Seal.Handles.TranscriptSpec (spec) where
 
 import Control.Exception (try, evaluate, throwIO, fromException, SomeException)
 import Data.Aeson (object, (.=))
+import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
+import Data.Either (isLeft)
+import Data.Maybe (isJust)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Time (getCurrentTime, UTCTime)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.Timeout (timeout)
 import Test.Hspec
 
 import Seal.Providers.Class
@@ -252,6 +257,35 @@ spec = describe "Seal.Handles.Transcript" $ do
           case r of
             Left (TranscriptError msg) -> msg `shouldSatisfy` T.isInfixOf "dead"
             Right _ -> expectationFailure "expected a TranscriptError but got none"
+
+    it "leaving the bracket terminates promptly when the writer died mid-turn" $
+      -- Regression: when the writer daemon dies inside 'writeOne' it sets
+      -- 'aliveRef' False and exits, so NOTHING consumes the 'ITShutdown'
+      -- the bracket's release action queues. 'shutdown' used to block on
+      -- an unconditional 'takeTMVar done' and hung there forever. That
+      -- stranded the turn thread ("thread blocked indefinitely in an STM
+      -- transaction") and skipped the three 'closeFd' calls, leaking a
+      -- descriptor set per failed turn — a crashed session was observed
+      -- holding four leaked sets. The release action must observe the
+      -- dead daemon and close the handles regardless.
+      --
+      -- The daemon is killed the same way production killed it: a Text
+      -- thunk that throws when the writer forces it to encode the line.
+      -- (Production's thunk was a strict 'decodeUtf8' of non-UTF-8
+      -- process output; 'badText' is that exception, constructed
+      -- directly, so the test does not depend on a subprocess.)
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        e <- mkEntryRecord 1
+        let badText = TE.decodeUtf8 (BS.pack [0xe8])
+        outcome <- timeout 5000000 $
+          withIndexedTranscript dir $ \h -> do
+            -- The write is enqueued, so the throw lands in the daemon.
+            r <- try (itwRecordAndAck h (IndexedTranscriptWrite [Message User [CbText badText]] e)) :: IO (Either SomeException ())
+            r `shouldSatisfy` isLeft
+            alive <- itwIsAlive h
+            alive `shouldBe` False
+        -- 'Nothing' means the bracket never returned: the shutdown hang.
+        outcome `shouldSatisfy` isJust
 
     it "emits a minimal envelope delta (only changed fields) on the second request" $
       withSystemTempDirectory "seal-indexed-tx" $ \dir -> do

@@ -494,7 +494,20 @@ withIndexedTranscript dir action = do
             pure st'
       shutdown convFd entriesFd idxFd done = do
         atomically (writeTQueue q (ITShutdown done))
-        atomically (takeTMVar done)
+        -- Wait for the daemon to acknowledge the shutdown, but NEVER
+        -- unconditionally: if the writer died mid-turn, nothing remains to
+        -- consume the 'ITShutdown' we just queued, and a plain 'takeTMVar'
+        -- then blocks the bracket forever. That hang is not cosmetic — it
+        -- strands the turn thread ("thread blocked indefinitely in an STM
+        -- transaction") and skips the 'closeFd' calls below, leaking three
+        -- descriptors per failed turn (a crashed session leaked four handle
+        -- sets, one per dead turn). A dead-daemon shutdown takes the
+        -- 'aliveRef' branch instead and closes the fds unconditionally.
+        _ <- atomically $
+          (Just <$> takeTMVar done)
+            `orElse` (do
+               stillAlive <- readTVar aliveRef
+               if stillAlive then retry else pure Nothing)
         closeFd convFd
         closeFd entriesFd
         closeFd idxFd
