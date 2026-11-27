@@ -208,7 +208,7 @@ uioSignaturesUnchanged                     -- no uio* takes an ExecTarget
 dispatchImportsUIOEnvFields                -- record update compiles
 ```
 
-### WU-4: `machine` in the opcode schemas + error rendering
+### WU-4: `machine` in the opcode schemas + opcode-side error rendering
 
 **DoD**
 - [ ] `machineField`, `machineSchemaProp :: [Selectable] -> Value`,
@@ -219,12 +219,20 @@ dispatchImportsUIOEnvFields                -- record update compiles
 - [ ] `uoDesc` gains "always runs on the session machine" on
       **`Browser.hs:79`, `src/Seal/Web/Fetch.hs:46`, `src/Seal/Web/Search.hs:115`**.
 - [ ] Schemas become functions of `[Selectable]`; `buildSessionRegistry` passes it.
-- [ ] **Every `RejectReason` except `RrMissingField Workspace` renders payload-free**
-      for the model — `renderMachineError` is total, so an unspecified constructor
-      leaks host text.
+- [ ] **No model-facing text may carry a `RejectReason` payload.** `RejectReason`
+      is a WU-1 config type; the *config-side* renderer
+      `renderMachineConfigError` is WU-9's. This unit's obligation is narrower and
+      buildable now: `renderMachineError` (which takes `MachineError`) must not
+      extract a host from `MachineUnusable`'s payload — asserted as the negative
+      `rejectReasonNeverLeaksHost`.
 
 **Files (create)** `src/Seal/ISA/Ops/Machine.hs`, `test/Seal/ISA/Ops/MachineSpec.hs`
 **Files (edit)** every `uoInSchema` site for the 8 machine-selectable opcodes —
+also the **constructor call sites** the new `[Selectable]` parameter breaks:
+`Worker.hs:512`, `test/Seal/ISA/Ops/BinSpec.hs:197,237,248,255,262,276,285,291`,
+`test/Seal/ISA/Ops/FileSpec.hs` (~22 `fileReadOp` sites),
+`test/Seal/Agent/LoopSpec.hs:673,722,771`,
+`test/Seal/Gateway/PatIngestionSpec.hs:302`, `test/Seal/Phase4Spec.hs:67`.
 `Shell.hs:51`, `Bin.hs:89`, `Process.hs:28`, `Search.hs:36`, `Repo.hs:111`,
 `File.hs:145,239,331` (9 sites, 6 modules) — plus the `uoDesc` note on
 `Browser.hs:81`, `Web/Fetch.hs:45-46`, `Web/Search.hs:114-115`.
@@ -566,10 +574,16 @@ recordHasNoHostUserOrPath                -- negative
 recordedNameEqualsExecutedMachine
 ```
 
-### WU-13: `SETUP_REPO` on a non-session machine
+### WU-13: `SETUP_REPO` on a non-session machine (+ clone transport from the env)
 
 **DoD**
 - [ ] Clone runs on the named machine.
+- [ ] **`runSetupRepo` takes its `CloneDeps` from the environment**, not the
+      constructor closure: read `uioCdCloneDeps` (`UIOGit.hs:64-65`), falling back
+      to the closed-over value when the env carries none. Verified necessary:
+      `setupRepoOp :: CloneDeps -> …` (`Repo.hs:107-108`) closes over its deps and
+      `runSetupRepo deps …` (`:534`) passes them to `cloneRepoIO` (`:537`), so the
+      per-call `uieCloneDeps` swap is inert for this opcode without it.
 - [ ] When `machine ≠ session machine`: no auto-bind, no re-scan, no invalidation.
 - [ ] `smRepoMachine` recorded; result text states follow-up relative paths resolve
       on the **session** machine.
@@ -583,6 +597,8 @@ recordedNameEqualsExecutedMachine
 setupRepoOnOtherMachineSkipsAutoBind
 setupRepoOnOtherMachineRecordsRepoMachine
 setupRepoResultTextNamesSessionMachine
+setupRepoUsesTargetMachineTransport       -- cloneDeps from env, not the closure:
+                                          -- cdIsRemote/cdPinnedKnownHosts are B's
 setupRepoOnSessionMachineUnchanged
 ```
 
@@ -615,7 +631,8 @@ setupRepoOnSessionMachineUnchanged
       `mkSafePath`.
 **Files (edit)** `src/Seal/Command/Registry.hs`, `src/Seal/Types/Command.hs`,
 `src/Seal/AppMain.hs`, `seal-harness.cabal`, `test/Main.hs`
-**Depends on** WU-9.
+**Depends on** WU-1, WU-7, WU-9. *(Consumes `execKnownHostsPath` from WU-7 and
+the resolver's single `scKnownHosts` construction site from WU-1.)*
 
 **RED**
 ```

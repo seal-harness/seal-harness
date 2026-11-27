@@ -582,7 +582,7 @@ data MachineRouting = MachineRouting
   , rtSelectable :: [MachineName]
   }
 
-data MachineSlot = SlotReady !UntrustedIO | SlotFailed !MachineError
+data MachineSlot = SlotReady !UntrustedIO !CloneDeps | SlotFailed !MachineError
 -- SessionExec owns: IORef (Map MachineName MachineSlot)
 ```
 
@@ -626,9 +626,10 @@ So resolution becomes:
 
 ```haskell
 -- in dispatch, after opAuthorize, before the ACK
-resolved <- resolveMachineForCall uioEnv input        -- Maybe MachineName, no SSH
-handle   <- rtResolve (uieMachines uioEnv) resolved   -- may bootstrap lazily
-let callEnv = uioEnv { uieUntrustedIO = handle }      -- per-call env
+resolved       <- resolveMachineForCall uioEnv input           -- no SSH
+(handle, deps) <- rtResolve (uieMachines uioEnv) resolved      -- may bootstrap
+let callEnv = uioEnv { uieUntrustedIO = handle
+                     , uieCloneDeps   = deps }                 -- per-call env
 …
   r <- runUIOWithEnv callEnv (uoRun op input)
 ```
@@ -636,6 +637,30 @@ let callEnv = uioEnv { uieUntrustedIO = handle }      -- per-call env
 `uieUntrustedIO` is the single handle every `uio*` function reads, so replacing it
 per call redirects the whole untrusted surface. **No `ExecTarget`, no
 `withTarget`, no `uioResolveTarget`, no signature changes, no call-site churn.**
+
+### 6.2.2 `CloneDeps` is a closure, not an environment read
+
+An earlier revision claimed the `uieCloneDeps` swap gives a cross-machine
+`SETUP_REPO` the target machine's transport. **That claim is false.**
+`setupRepoOp :: CloneDeps -> AutonomyLevel -> Opcode` (`Repo.hs:107-108`) closes
+over its `CloneDeps` at registry-build time; `runSetupRepo deps …`
+(`Repo.hs:534`) and `cloneRepoIO deps …` (`:536-537`) use that closure and never
+read `uieCloneDeps`. The closure is bound from the session at
+`TurnEngine.hs:315,919` and `Worker.hs:512`, so a `SETUP_REPO` routed to machine
+B would still clone over machine A's transport (`cdIsRemote`,
+`cdPinnedKnownHosts`, `cdRepoReg`).
+
+Resolution: `SETUP_REPO` reads its clone deps from the **per-call environment**,
+via `uioCdCloneDeps` (`UIOGit.hs:64-65` — already exported, already used by
+`Worker.hs:340`), falling back to the closed-over value when the environment
+carries none. The closure becomes a default; the environment becomes the source
+of truth. Without this, the swap is inert for the one opcode that needs it.
+
+`MachineSlot` therefore carries both capabilities, and `rtResolve` returns both:
+
+```haskell
+rtResolve :: MachineName -> IO (Either MachineError (UntrustedIO, CloneDeps))
+```
 
 ### 6.2.1 What this gives up, stated honestly
 
