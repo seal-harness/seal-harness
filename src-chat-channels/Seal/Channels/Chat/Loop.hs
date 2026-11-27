@@ -97,6 +97,25 @@ import Seal.Channels.Chat.Types
    convKeyFromSource, SessionMap, newSessionMap, sessionLookup,
    sessionInsert, GatewayConfig (..), StreamingState (..),
    newStreamingState, resetStreamingState)
+import Seal.Channels.Chat.LastRender
+  ( LastArgs (..)
+  , LastError (..)
+  , LastView (..)
+  , PendingQuestion (..)
+  , ResolveInput (..)
+  , TabHeading (..)
+  , assistantItems
+  , mostRecentToolLine
+  , isLastHelpArg
+  , isLegacyPayload
+  , lastHelp
+  , parseLastArgs
+  , renderLast
+  , renderLastError
+  , resolveLast
+  , viewTag
+  )
+import Seal.Channels.Chat.TabRender (nameOf)
 import Seal.Channels.Chat.ToolRender
   (formatToolLine)
 import Seal.Channels.Chat.WsClient
@@ -346,6 +365,11 @@ data ChatChannelConfig = ChatChannelConfig
     -- ^ The clock the edit gate reads. Default 'getCurrentTime'. Tests
     -- override it with an advanceable clock so "once the interval elapses" is
     -- assertable without a real delay.
+  , cccGetTranscript :: Manager -> Text -> SessionId -> IO (Either Text [Value])
+    -- ^ @GET …\/transcript@. The seam @\/last@ and the focus block use, so
+    -- both are testable against a stub; the default is 'httpGetTranscript'.
+    -- Deliberately takes NO limit: /last reuses the same unbounded read
+    -- 'sendLastReply' already performed on every /b, so it adds no new cost.
   , cccGetLists :: Manager -> Text -> IO (Either Text ListsJson)
     -- ^ @GET /api/lists@. The seam @/tab list@ uses to render rows; the
     -- default is 'httpGetLists'.
@@ -395,6 +419,7 @@ defaultChatChannelConfig mgr gw = ChatChannelConfig
   , cccStartWs = startWsClient (gcWsSecure gw) (gcTlsCert gw) Nothing
   , cccAnswerQuestion = httpAnswerQuestion
   , cccGetQuestions = httpGetQuestions
+  , cccGetTranscript = httpGetTranscript
   , cccGetLists = httpGetLists
   , cccNow = getCurrentTime
   }
@@ -569,8 +594,11 @@ handleFocus cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchSta
                 ensureWsConn cfg chan wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key sid
                 -- Send "focused tab N" confirmation.
                 ccSend chan ("focused tab " <> T.singleton (tabIndexToChar idx))
-                -- Fetch and send the last assistant reply for context.
-                sendLastReply cfg chan sid
+                -- Then the same block /last would give for this tab, so the
+                -- user lands knowing what state it is in. LastEmpty and a
+                -- fetch failure stay silent: the focus succeeded, and a
+                -- trailing "last failed:" would read as a failed focus.
+                sendFocusBlock cfg chan idx sid
 
 -- | Handle an inject command (@\/N payload@): resolve the tab index to a
 -- session id via @GET /api/tabs@, then send the payload to that session
@@ -606,8 +634,27 @@ handleInject cfg chan mSrc idx payload = do
                 case eResult of
                   Right sr | srKind sr == "error" -> ccSend chan (fromMaybe "error" (srError sr))
                   Right sr | not (T.null (srResponse sr)) -> ccSend chan (srResponse sr)
+                  -- An answer-shaped payload that produced an empty reply
+                  -- means no question was waiting: the text was taken as a
+                  -- fresh prompt instead. Staying silent here (the old
+                  -- behaviour) leaves the user believing they answered a
+                  -- question that has since expired.
+                  Right sr | srKind sr == "assistant"
+                          , isAnswerShaped payload ->
+                      ccSend chan ("/last " <> T.singleton (tabIndexToChar idx)
+                                   <> " has no question waiting \8212 that message started a new turn")
                   Right _ -> pure ()  -- assistant response comes via WS
                   Left e -> ccSend chan ("error: " <> e)
+
+-- | Could this injected payload plausibly be an answer to a question?
+--
+-- Narrow on purpose: a short, whitespace-free token (a number, @yes@, @no@). A
+-- real prompt with no reply yet is also an empty @assistant@ response, and must
+-- stay silent as it always has.
+isAnswerShaped :: Text -> Bool
+isAnswerShaped t =
+  let s = T.strip t
+  in not (T.null s) && T.length s <= 16 && not (T.any (== ' ') s)
 
 -- | The usage line for a bare (or blank-prompt) @/bg@.
 bgUsage :: Text
@@ -1157,16 +1204,24 @@ sendWatchNotification cfg chan sid = do
           (s : _) -> pure (sessionDisplayTitle s)
           []      -> pure sidText
       Left _ -> pure sidText
-  mReply <- do
-    eEntries <- httpGetTranscript mgr apiBase sid
-    case eEntries of
-      Right entries -> pure (lastAssistantText entries)
-      Left _        -> pure Nothing
+  -- One fetch serves both the reply and the tool line. The reply is still
+  -- rendered by 'lastAssistantText' (T.concat), unchanged, so the pre-existing
+  -- watch assertions hold byte for byte; the tool line is only consulted when
+  -- there is no text.
+  eEntries <- httpGetTranscript mgr apiBase sid
+  let entries = either (const []) id eEntries
+      mReply = lastAssistantText entries
+      mTool = mostRecentToolLine (assistantItems entries)
   dbg ("[watch] notification tabIdx=" <> tabIdx <> " sessionTitle=" <> sessionTitle <> " hasReply=" <> (case mReply of Just _ -> "true"; Nothing -> "false"))
   let header = "\x1F4D4 Tab " <> tabIdx <> " (" <> sessionTitle <> ") finished thinking"
   case mReply of
     Just reply | not (T.null reply) -> ccSend chan (header <> ":\n" <> reply)
-    _ -> ccSend chan header
+    -- A turn with no text must still say something: name the last tool, and
+    -- if it ran none, say that rather than sending a bare header (the
+    -- requirements forbid a bodyless notification unconditionally).
+    _ -> case mTool of
+      Just line -> ccSend chan (header <> ":\n" <> line)
+      Nothing -> ccSend chan (header <> ":\nno reply and no tool ran \8212 /last " <> tabIdx)
 
 -- | Extract the @id@ field from a session info JSON object (from
 -- @GET /api/sessions@). Returns 'Nothing' when the field is missing or
@@ -1838,17 +1893,41 @@ resolveSession cfg chan sessions wsConns pendingAsks bgSessions tabTracker watch
   where
     fallbackSid = pure (case mkSessionId "default" of Right s -> s; Left _ -> error "unreachable")
 
--- | Fetch and send the last assistant reply from the session's transcript.
-sendLastReply
+-- | Send the @\/last@-style block for a tab that was just focused.
+--
+-- Renders 'LastMessages', 'LastWorking' and 'LastQuestion'; stays silent for
+-- 'LastEmpty' and for any fetch failure. The focus itself already succeeded, so
+-- a follow-up error line would read as a failed focus, and an empty tab should
+-- not cost a notification.
+sendFocusBlock
   :: ChatChannel c
-  => ChatChannelConfig -> c -> SessionId -> IO ()
-sendLastReply cfg chan sid = do
+  => ChatChannelConfig -> c -> TabIndex -> SessionId -> IO ()
+sendFocusBlock cfg chan idx sid = do
   let apiBase = gcApiBase (cccGateway cfg)
       mgr = cccHttpManager cfg
-  eEntries <- httpGetTranscript mgr apiBase sid
-  case eEntries of
-    Left _ -> pure ()
-    Right entries -> for_ (lastAssistantText entries) (ccSend chan)
+  eLists <- cccGetLists cfg mgr apiBase
+  eEntries <- cccGetTranscript cfg mgr apiBase sid
+  eQs <- cccGetQuestions cfg mgr apiBase sid
+  case (eLists, eEntries, eQs) of
+    (Right lj, Right entries, Right qs) -> do
+      let heading = TabHeading idx (findTabName lj idx)
+          view = resolveLast ResolveInput
+            { lriHeading = heading
+            , lriItems = assistantItems entries
+            , lriThinking = sessionIdText sid `elem` ljThinkingSessionIds lj
+            , lriQuestion = case qs of
+                (q : _) -> Just (PendingQuestion (pqjQuestion q) (decodeOptions q))
+                [] -> Nothing
+            , lriCount = 1
+            , lriLegacy = any isLegacyPayload entries
+            }
+      -- LastEmpty is suppressed here (see the doc comment).
+      when (viewTag view /= "empty") $ ccSend chan (renderLast view)
+    _ -> pure ()
+  where
+    findTabName lj i = case [ t | t <- ljTabs lj, tjIndex t == tabIndexToInt i ] of
+      (t : _) -> nameOf lj t
+      [] -> Nothing
 
 -- | Handle a callback query (button tap) from the platform. The callback_data
 -- is @"<8hex>:<index>"@. Resolves the 8-hex prefix to a pending ask, resolves
@@ -2282,9 +2361,82 @@ handleTabList cfg chan = do
 -- type. DoD 4 of the requirements says @\/last@ never changes the focused tab;
 -- this signature is how that is enforced.
 --
--- WU-A stub: the real body lands in WU-C.
 handleLast
   :: ChatChannel c
   => ChatChannelConfig -> c -> Maybe SessionId
   -> ConversationKey -> Text -> IO ()
-handleLast _cfg chan _mSid _key _args = ccSend chan ""
+handleLast cfg chan mFocusedSid _key args
+  | isLastHelpArg args = ccSend chan lastHelp
+  | otherwise = case parseLastArgs args of
+      Left e -> ccSend chan (renderLastError e)
+      Right parsed -> do
+        eLists <- cccGetLists cfg mgr apiBase
+        case eLists of
+          Left _ -> ccSend chan (renderLastError LETabs)
+          Right lj -> case resolveTarget lj parsed mFocusedSid of
+            Left e -> ccSend chan (renderLastError e)
+            Right (idx, sid) -> do
+              let tabChar = tabIndexToChar idx
+              eEntries <- cccGetTranscript cfg mgr apiBase sid
+              case eEntries of
+                Left _ -> ccSend chan (renderLastError (LETranscript tabChar))
+                Right entries -> do
+                  eQs <- cccGetQuestions cfg mgr apiBase sid
+                  case eQs of
+                    Left _ -> ccSend chan (renderLastError (LEQuestions tabChar))
+                    Right qs -> do
+                      let heading = TabHeading idx (headingTitle lj idx)
+                          items = assistantItems entries
+                          legacy = any isLegacyPayload entries
+                          question = case qs of
+                            (q : _) -> Just PendingQuestion
+                              { lqText = pqjQuestion q
+                              , lqOptions = decodeOptions q
+                              }
+                            [] -> Nothing
+                          thinking = sessionIdText sid `elem` ljThinkingSessionIds lj
+                          view = resolveLast ResolveInput
+                            { lriHeading = heading
+                            , lriItems = items
+                            , lriThinking = thinking
+                            , lriQuestion = question
+                            , lriCount = laCount parsed
+                            , lriLegacy = legacy
+                            }
+                      traceLast idx view
+                      ccSend chan (renderLast view)
+  where
+    mgr = cccHttpManager cfg
+    apiBase = gcApiBase (cccGateway cfg)
+
+    -- The tab the user named, or the focused tab's. A named tab must exist and
+    -- have a session; the focused tab's session is already known, so we only
+    -- need to find which tab points at it.
+    resolveTarget lj parsed mSid = case laTab parsed of
+      Just idx -> case findTab lj idx of
+        Nothing -> Left (LENoSuchTab (T.singleton (tabIndexToChar idx)))
+        Just t -> case tjSessionId t of
+          Nothing -> Left (LENoSession (tabIndexToChar idx))
+          Just sidText -> case mkSessionId sidText of
+            Left _ -> Left (LENoSession (tabIndexToChar idx))
+            Right sid -> Right (idx, sid)
+      Nothing -> case mSid of
+        Nothing -> Left LENoCurrentTab
+        Just sid -> case [ t | t <- ljTabs lj, tjSessionId t == Just (sessionIdText sid) ] of
+          [] -> Left LENoCurrentTab
+          (t : _) -> case mkTabIndex (tjIndex t) of
+            Left _ -> Left LENoCurrentTab
+            Right idx -> Right (idx, sid)
+
+    findTab lj idx = case [ t | t <- ljTabs lj, tjIndex t == tabIndexToInt idx ] of
+      (t : _) -> Just t
+      [] -> Nothing
+
+    headingTitle lj idx = findTab lj idx >>= nameOf lj
+
+    -- One structured line per invocation: tab char, view, and whether a
+    -- question was shown. NEVER item text, question text, or the title.
+    traceLast idx view =
+      hPutStrLn stderr ("[last] tab=" <> [tabIndexToChar idx]
+        <> " view=" <> T.unpack (viewTag view)
+        <> " question=" <> (case view of LastQuestion {} -> "true"; _ -> "false"))

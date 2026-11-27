@@ -34,6 +34,7 @@ module Seal.Channels.Chat.LastRender
   , resolveLast
   , viewTag
   , renderedTools
+  , mostRecentToolLine
     -- * Rendering
   , renderLast
   , quoteBody
@@ -433,6 +434,17 @@ renderedTools v = case v of
   LastWorking _ Nothing -> []
   LastQuestion {} -> []
   LastEmpty {} -> []
+
+-- | The tool line for the newest tool in a turn, or 'Nothing' when the turn
+-- ran no tool. Used by the watch notification, so a bodyless notification
+-- names what ran instead of being empty.
+--
+-- Deliberately the same 3-state rendering as 'renderedTools', so a tool reads
+-- identically wherever it appears.
+mostRecentToolLine :: [AssistantItem] -> Maybe Text
+mostRecentToolLine items = case [ o | LriToolOnly o <- items ] of
+  [] -> Nothing
+  os -> Just (toolLine (last os))
 
 -- | One tool line. 'LtsUnfinished' is rendered distinctly from 'LtsOk',
 -- because it means "no result in the window" — i.e. unknown — and a bare name

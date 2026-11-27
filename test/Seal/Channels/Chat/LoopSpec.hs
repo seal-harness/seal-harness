@@ -29,6 +29,7 @@ import Seal.Channels.Chat.HttpClient
 import Seal.Channels.Chat.RateLimit (defaultStreamProgressConfig)
 import Seal.Channels.Chat.Types
   ( ChatMessageId (..)
+  , SessionMap
   , ConversationKey (..)
   , newSessionMap
   , newStreamingState
@@ -343,6 +344,7 @@ stubCfg mgr seams = (defaultChatChannelConfig mgr defaultGatewayConfig)
       nextQueued (smRepoSetupQueue seams) (Right ())
   , cccGetRepos = \_mgr _apiBase ->
       nextQueued (smReposQueue seams) (Right [])
+  , cccGetTranscript = \_mgr _apiBase _sid -> pure (Right [])
   , cccSendMessage = \_mgr _apiBase sid _mSrc prompt -> do
       modifyIORef' (smSends seams) ((sid, prompt) :)
       nextQueued (smSendQueue seams) (Right okSendResult)
@@ -3406,3 +3408,176 @@ spec = do
           sent <- getAllSent chan
           sent `shouldSatisfy` any (T.isInfixOf "reply on B")
         _ -> expectationFailure "expected exactly one new WS connection"
+
+  describe "/last" $ do
+    it "shows the named tab's last message" $ do
+      r <- lastRig
+      writeIORef (lrEntries r) [ respEntry [ textBlk "all green" ] ]
+      lastRun r "/last 1"
+      sends <- getSends (lrChan r)
+      sends `shouldSatisfy` any (T.isInfixOf "all green")
+
+    it "does not change the focused tab" $ do
+      r <- lastRig
+      writeIORef (lrEntries r) [ respEntry [ textBlk "hello" ] ]
+      before <- sessionLookup (lrSessions r) (lrKey r)
+      lastRun r "/last 1"
+      after <- sessionLookup (lrSessions r) (lrKey r)
+      after `shouldBe` before
+      before `shouldBe` Just (mkSid "s0")
+
+    it "never sends a focus confirmation (so no WS re-target)" $ do
+      r <- lastRig
+      writeIORef (lrEntries r) [ respEntry [ textBlk "hi" ] ]
+      lastRun r "/last 1"
+      sends <- getSends (lrChan r)
+      sends `shouldSatisfy` (not . any (T.isInfixOf "focused tab"))
+
+    it "renders a no-text turn as the opcode name and pass/fail" $ do
+      r <- lastRig
+      writeIORef (lrEntries r)
+        [ reqEntry [ resultBlk "t1" True ] []
+        , respEntry [ toolBlk "t1" "SHELL_EXEC" ] ]
+      lastRun r "/last 1"
+      sends <- getSends (lrChan r)
+      sends `shouldSatisfy` any (T.isInfixOf "SHELL_EXEC (failed)")
+
+    it "renders a pending question with the answer footer" $ do
+      r <- lastRig
+      writeIORef (lrEntries r) [ respEntry [ textBlk "hi" ] ]
+      writeIORef (lrQs r) [ PendingQuestionJson "q1" "Which database?" [] ]
+      lastRun r "/last 1"
+      sends <- getSends (lrChan r)
+      sends `shouldSatisfy` any (T.isInfixOf "Which database?")
+      sends `shouldSatisfy` any (T.isInfixOf "Answer with /1")
+
+    it "renders a busy tab as still working, not as finished" $ do
+      r <- lastRig
+      writeIORef (lrEntries r) [ respEntry [ textBlk "partial" ] ]
+      writeIORef (lrThinking r) ["s1"]
+      lastRun r "/last 1"
+      sends <- getSends (lrChan r)
+      sends `shouldSatisfy` any (T.isInfixOf "still working")
+
+    it "reports an empty tab plainly" $ do
+      r <- lastRig
+      lastRun r "/last 1"
+      sends <- getSends (lrChan r)
+      sends `shouldSatisfy` any (T.isInfixOf "no messages yet")
+
+    it "reports an unknown tab and points at /tab list" $ do
+      r <- lastRig
+      lastRun r "/last z"
+      sends <- getSends (lrChan r)
+      sends `shouldBe` ["last failed: no such tab z \8212 /tab list"]
+
+    it "reports a bad count" $ do
+      r <- lastRig
+      lastRun r "/last 1 nope"
+      sends <- getSends (lrChan r)
+      sends `shouldSatisfy` any (T.isInfixOf "isn't a number")
+
+    it "shows help for /last -h" $ do
+      r <- lastRig
+      lastRun r "/last -h"
+      sends <- getSends (lrChan r)
+      sends `shouldSatisfy` any (T.isInfixOf "Usage: /last [tab] [n]")
+
+    it "reports a tab-list fetch failure and never claims a message" $ do
+      chan <- mkMockChan
+      mgr <- newManager defaultManagerSettings
+      seams <- mkSeams
+      let cfg = (stubCfg mgr seams) { cccGetLists = \_ _ -> pure (Left "boom") }
+      sessions <- newSessionMap
+      wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey WsConn))
+      pendingAsks <- newPendingAsks
+      bg <- newBgSessions
+      tabTracker <- newTVarIO Map.empty
+      watchState <- newWatchState
+      thinkingTabs <- newThinkingTabs
+      handleInbound cfg chan sessions wsConns pendingAsks bg tabTracker
+        watchState thinkingTabs (ConversationKey "signal" "last-tabsfail") "/last 1"
+      sends <- getSends chan
+      sends `shouldSatisfy` any (T.isInfixOf "couldn't read the tab list")
+
+-- | A /last test rig: two tabs, a mutable transcript, and mutable questions.
+-- Tab 1 ("fix the flaky test") is the one under test; s0 is the focused tab.
+data LastRig = LastRig
+  { lrChan     :: MockChan
+  , lrCfg      :: ChatChannelConfig
+  , lrSessions :: SessionMap
+  , lrKey      :: ConversationKey
+  , lrEntries  :: IORef [A.Value]
+  , lrQs       :: IORef [PendingQuestionJson]
+  , lrThinking :: IORef [Text]
+  }
+
+lastRig :: IO LastRig
+lastRig = do
+  chan <- mkMockChan
+  mgr <- newManager defaultManagerSettings
+  seams <- mkSeams
+  entriesRef <- newIORef ([] :: [A.Value])
+  qsRef <- newIORef ([] :: [PendingQuestionJson])
+  thinkingRef <- newIORef ([] :: [Text])
+  let rows = [ TabJson 0 (Just "s0") "session:ai" (Just "work") Nothing
+             , TabJson 1 (Just "s1") "session:ai" (Just "fix the flaky test") Nothing
+             ]
+      lists = ListsJson
+        { ljTabs = rows
+        , ljTabSessions =
+            [ A.object [ "id" .= ("s1" :: Text), "description" .= ("fix the flaky test" :: Text) ] ]
+        , ljThinkingSessionIds = []
+        }
+      cfg = (stubCfg mgr seams)
+        { cccGetLists = \_ _ -> do
+            th <- readIORef thinkingRef
+            pure (Right lists { ljThinkingSessionIds = th })
+        , cccGetTranscript = \_ _ _ -> Right <$> readIORef entriesRef
+        , cccGetQuestions = \_ _ _ -> Right <$> readIORef qsRef
+        }
+  sessions <- newSessionMap
+  let key = ConversationKey "signal" "last-conv"
+  sessionInsert sessions key (mkSid "s0")
+  pure LastRig { lrChan = chan, lrCfg = cfg, lrSessions = sessions
+               , lrKey = key, lrEntries = entriesRef, lrQs = qsRef
+               , lrThinking = thinkingRef }
+
+-- | Run one inbound line through the loop with the rig's plumbing.
+lastRun :: LastRig -> Text -> IO ()
+lastRun r body = do
+  wsConns <- newTVarIO Map.empty :: IO (TVar (Map ConversationKey WsConn))
+  pendingAsks <- newPendingAsks
+  bg <- newBgSessions
+  tabTracker <- newTVarIO Map.empty
+  watchState <- newWatchState
+  thinkingTabs <- newThinkingTabs
+  handleInbound (lrCfg r) (lrChan r) (lrSessions r) wsConns pendingAsks bg
+    tabTracker watchState thinkingTabs (lrKey r) body
+
+-- JSON builders for the tests ------------------------------------------------
+
+textBlk :: Text -> A.Value
+textBlk t = A.object [ "type" .= ("text" :: Text), "text" .= t ]
+
+toolBlk :: Text -> Text -> A.Value
+toolBlk tid nm = A.object
+  [ "type" .= ("tool_use" :: Text), "id" .= tid, "name" .= nm ]
+
+resultBlk :: Text -> Bool -> A.Value
+resultBlk tid failed = A.object
+  [ "type" .= ("tool_result" :: Text), "tool_use_id" .= tid, "is_error" .= failed ]
+
+respEntry :: [A.Value] -> A.Value
+respEntry blocks = A.object
+  [ "direction" .= ("response" :: Text)
+  , "payload" .= A.object [ "content" .= blocks ]
+  ]
+
+reqEntry :: [A.Value] -> [A.Value] -> A.Value
+reqEntry results _ = A.object
+  [ "direction" .= ("request" :: Text)
+  , "payload" .= A.object
+      [ "messages" .= [ A.object
+          [ "role" .= ("user" :: Text), "content" .= results ] ] ]
+  ]
