@@ -40,23 +40,27 @@ vault_unlock = "on_demand"
 # ---------------------------------------------------------------------------
 # Where untrusted code runs
 # ---------------------------------------------------------------------------
-# Left commented out rather than written as the default: the setting interacts
-# with how the binary was built. A build made with `-f remote-only-untrusted`
-# has no local executor, and an absent table is what tells it so; writing
-# mode = "local" there would change its behaviour.
+# allow_localhost decides whether this machine is one of the places untrusted
+# tool calls may run. It does not list the other machines - those live in
+# ~/.seal/machines.toml, one [machines.<name>] table each, because a session can
+# address several and a single yes/no cannot describe them.
+#
+#   allow_localhost = true   -> "local" is selectable. This is the default, and
+#                               what an install with no table at all gets.
+#   allow_localhost = false  -> "local" is not selectable, by the operator or by
+#                               the model. Every untrusted call must name a
+#                               machine from machines.toml.
+#
+# Written out rather than left absent, because a *present table missing this
+# key* is refused at boot: that is the shape a half-finished migration leaves
+# behind, and assuming the default there would silently re-enable local
+# execution on an install that had deliberately turned it off.
+#
+# A build made with `-f remote-only-untrusted` has no local executor and
+# therefore refuses to start with allow_localhost = true.
 #
 # [untrusted_execution]
-# mode = "local"                     # local | remote
-#
-# Remote execution fail-closes at call time when this block is incomplete: a
-# half-configured remote refuses to run rather than falling back to local.
-# [untrusted_execution.remote]
-# host        = "builder.example.com"
-# user        = "seal"
-# port        = 22
-# identity    = "/home/you/.ssh/id_ed25519"
-# known_hosts = "/home/you/.ssh/known_hosts"   # mandatory: host keys are pinned
-# workspace   = "/srv/seal/workspace"
+# allow_localhost = false
 
 # ---------------------------------------------------------------------------
 # Web gateway

@@ -40,7 +40,6 @@
 module Seal.Config.Security
   ( SecurityConfig (..)
   , UntrustedExecFileConfig (..)
-  , UntrustedExecRemoteFileConfig (..)
   , AccessControlFileConfig (..)
   , CredentialFileConfig (..)
   , accessControlCodec
@@ -69,6 +68,7 @@ module Seal.Config.Security
   , saveSecurityConfig
   , updateSecurityConfig
   , untrustedExecConfigFromSecurity
+  , allowLocalhostFromSecurity
   ) where
 
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
@@ -78,7 +78,7 @@ import Data.ByteString qualified as BS
 import Data.HashMap.Strict qualified as HashMap
 import Data.Functor ((<&>))
 import Data.List.NonEmpty qualified as NonEmpty
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
@@ -101,10 +101,7 @@ import Toml qualified
 import Seal.Gateway.Config
   ( GatewayConfig, PartialGatewayConfig, defaultGatewayConfig, gatewayTableCodec
   , withGatewayDefaults )
-import Seal.Tools.Exec.Types
-  ( SshConfig (..), mkSshHost, mkSshUser, mkRemotePath )
-import Seal.Tools.Exec.Untrusted
-  ( UntrustedExecConfig (..), UntrustedExecMode (..) )
+import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
 
 -- | The boot-only, agent-immutable security configuration. Carries the
 -- @untrusted_execution@ section (remote-only enforcement) and the vault
@@ -122,10 +119,9 @@ data SecurityConfig = SecurityConfig
   , scVaultKeyType :: Maybe Text
     -- ^ Display label: @\"x25519\"@ | @\"yubikey\"@ | @\"user\"@.
   , scUntrustedExec :: Maybe UntrustedExecFileConfig
-    -- ^ Optional @[untrusted_execution]@ section (remote-only untrusted
-    -- execution). Absent means @mode=local@ (default). @mode=remote@
-    -- fail-closes at call time when the remote block is absent or
-    -- unreachable (boot still succeeds).
+    -- ^ Optional @[untrusted_execution]@ section. Absent means
+    -- @allow_localhost = true@ (today's behaviour). Present without the
+    -- key is a decode error — see 'UntrustedExecFileConfig'.
   , scAccessControl :: Maybe AccessControlFileConfig
     -- ^ Optional @[access_control]@ section. Absent means *unconfigured*: the
     -- gateway serves only the setup screen until the operator enrolls a
@@ -140,29 +136,35 @@ data SecurityConfig = SecurityConfig
     -- 'Seal.Gateway.Config.gatewayConfigFromSecurity' resolves it.
   } deriving stock (Eq, Show)
 
--- | The @[untrusted_execution]@ section (spec §3 Layer A). @mode@ is
--- @\"local\"@ (default) or @\"remote\"@ (fail-closed). The optional
--- @[untrusted_execution.remote]@ sub-table carries the SSH coordinates;
--- absent under @mode=local@ (no remote needed), and @mode=remote@ parses
--- OK without it (fail-closed is at call time, not parse time — spec §7
--- row 1).
-data UntrustedExecFileConfig = UntrustedExecFileConfig
-  { uefcMode   :: Text
-    -- ^ @\"local\"@ | @\"remote\"@
-  , uefcRemote :: Maybe UntrustedExecRemoteFileConfig
-  } deriving stock (Eq, Show)
-
--- | The @[untrusted_execution.remote]@ sub-table (spec §5). Every field is
--- optional at the TOML layer; the call site validates that the required
--- fields (@host@/@user@/@known_hosts@/@workspace@) are present when
--- @mode=remote@ (absent ⇒ fail-closed at call time).
-data UntrustedExecRemoteFileConfig = UntrustedExecRemoteFileConfig
-  { uerfcHost       :: Maybe Text
-  , uerfcUser       :: Maybe Text
-  , uerfcPort       :: Maybe Int
-  , uerfcIdentity   :: Maybe FilePath
-  , uerfcKnownHosts :: Maybe FilePath
-  , uerfcWorkspace  :: Maybe Text
+-- | The @[untrusted_execution]@ section.
+--
+-- __@allow_localhost@ replaces @mode@.__ The section carries exactly one
+-- setting: whether @local@ — the harness machine itself — is a selectable
+-- execution machine. The SSH coordinates that used to live in
+-- @[untrusted_execution.remote]@ moved to @machines.toml@ as named machines,
+-- which is what lets one session address more than one host.
+--
+-- __Two absences are different, and the difference is load-bearing.__
+--
+-- * the /whole section/ absent => @allow_localhost = true@. That is today's
+--   behaviour and the frozen default ("an install with none of these files
+--   keeps working exactly as it does today").
+-- * the section /present without the key/ => a decode error.
+--
+-- Without the second rule a failed migration from the old shape would
+-- silently downgrade a remote-only install to local execution: the old
+-- @mode = \"remote\"@ and its @[remote]@ table are ignored by this codec, and
+-- a permissive decoder would resolve the leftover section to the default
+-- @True@. 'untrustedExecConfigCodec' reads @allow_localhost@ with a
+-- /required/ codec, so a present-but-keyless section is a decode 'Failure'
+-- the boot path reports.
+--
+-- A @Bool@ also closes a silent-coercion hole the old field had: it resolved
+-- anything that was not literally @\"remote\"@ to local mode, so a typo
+-- (@mode = \"remtoe\"@) quietly permitted local execution.
+newtype UntrustedExecFileConfig = UntrustedExecFileConfig
+  { uefcAllowLocalhost :: Bool
+    -- ^ Whether @local@ is a selectable execution machine.
   } deriving stock (Eq, Show)
 
 -- | The @[access_control]@ section (design §4). @mode@ is @\"passkey\"@ or
@@ -448,21 +450,16 @@ securityConfigCodec = SecurityConfig
   <*> gatewayTableCodec .= scGateway
 
 -- | Bidirectional tomland codec for the @[untrusted_execution]@ section.
+--
+-- @allow_localhost@ is read with the *required* 'Toml.bool', not
+-- 'Toml.dioptional', so a section that is present but carries no
+-- @allow_localhost@ key is a decode failure rather than a default. The
+-- section's own presence is still optional: the enclosing codec wraps this
+-- one in 'Toml.dioptional', so an absent section yields 'Nothing' and the
+-- default @True@ applies.
 untrustedExecConfigCodec :: Toml.TomlCodec UntrustedExecFileConfig
 untrustedExecConfigCodec = UntrustedExecFileConfig
-  <$> Toml.text "mode" .= uefcMode
-  <*> Toml.dioptional (Toml.table untrustedExecRemoteConfigCodec "remote") .= uefcRemote
-
--- | Bidirectional tomland codec for the @[untrusted_execution.remote]@
--- sub-table. Every field is optional at the TOML layer.
-untrustedExecRemoteConfigCodec :: Toml.TomlCodec UntrustedExecRemoteFileConfig
-untrustedExecRemoteConfigCodec = UntrustedExecRemoteFileConfig
-  <$> Toml.dioptional (Toml.text "host")        .= uerfcHost
-  <*> Toml.dioptional (Toml.text "user")        .= uerfcUser
-  <*> Toml.dioptional (Toml.int "port")         .= uerfcPort
-  <*> Toml.dioptional (Toml.string "identity")  .= uerfcIdentity
-  <*> Toml.dioptional (Toml.string "known_hosts") .= uerfcKnownHosts
-  <*> Toml.dioptional (Toml.text "workspace")   .= uerfcWorkspace
+  <$> Toml.bool "allow_localhost" .= uefcAllowLocalhost
 
 -- ---------------------------------------------------------------------------
 -- Public API
@@ -485,13 +482,57 @@ loadSecurityConfig path = do
 -- preflight needs the document as text (for the legacy-layout check) /and/ the
 -- decoded section at the same time, and reading the file twice could see two
 -- different documents.
+--
+-- __Presence is checked separately from decoding, deliberately.__
+-- @[untrusted_execution]@ is decoded by @'Toml.dioptional' . 'Toml.table'@, and
+-- that combination reports a table whose /contents/ fail to decode as
+-- @Nothing@ — indistinguishable from the table being absent. That collapse is
+-- precisely the silent downgrade 'UntrustedExecFileConfig' exists to prevent: a
+-- leftover @mode = "remote"@ section would decode to "absent", and absent
+-- means @allow_localhost = true@. So a section that is present in the document
+-- but did not decode is a hard error here, not a default.
 decodeSecurityConfig :: Text -> Either Text SecurityConfig
 decodeSecurityConfig contents = case Toml.parse contents of
   Left err   -> Left (Toml.unTomlParseError err)
   Right toml -> case Toml.runTomlCodec securityConfigCodec
                      (normalizeSecurityToml toml) of
-    Success cfg  -> Right cfg
     Failure errs -> Left (Toml.prettyTomlDecodeErrors errs)
+    Success cfg
+      | sectionPresent "untrusted_execution" toml && isNothing (scUntrustedExec cfg) ->
+          Left (T.unlines
+            [ "the [untrusted_execution] section is present but does not decode."
+            , "It now carries allow_localhost = true | false, and nothing else:"
+            , "  [untrusted_execution]"
+            , "  allow_localhost = false"
+            , "A section that still holds the retired mode = \"remote\" key is a"
+            , "leftover from a failed migration. Refusing to boot rather than"
+            , "assuming the default, because the default permits local execution."
+            ])
+      | otherwise -> Right cfg
+
+-- | Is a top-level table of this name present in the parsed document?
+--
+-- Two shapes both mean "present", and neither alone is enough:
+--
+-- * /with keys/ — caught by walking the key paths, which also covers the dotted
+--   spelling @untrusted_execution.allow_localhost = false@ that never produces a
+--   prefix-tree node;
+-- * /with no keys at all/ — a bare @[untrusted_execution]@ header produces a
+--   prefix-tree node but no key paths, so the walk above misses it. That shape
+--   is the dangerous one to miss: it decodes to @Nothing@ and would silently
+--   permit local execution.
+--
+-- A commented-out block is neither, so it reads as absent — which is what the
+-- shipped template needs.
+sectionPresent :: Text -> Toml.TOML -> Bool
+sectionPresent name toml =
+  hasAKey || hasANode
+  where
+    hasAKey = any startsWithName (tomlKeyPaths toml)
+    startsWithName pieces = case map Toml.unPiece pieces of
+      (p : _) -> p == name
+      []      -> False
+    hasANode = HashMap.member (Toml.Piece name) (Toml.tomlTables toml)
 
 -- | Whether a write is allowed to discard the pre-split credential tables.
 --
@@ -749,58 +790,35 @@ emptyAccessControl = AccessControlFileConfig
   , acfcRpId = Nothing
   }
 
--- | Resolve the 'SecurityConfig'\'s @[untrusted_execution]@ section to the
--- typed 'UntrustedExecConfig' the dispatcher consumes. Returns
--- 'Nothing' when the section is absent OR @mode=local@ (the default —
--- no remote needed, the local executor is wired by the call site).
--- Returns @Just (UemRemote, ...remote...)@ when @mode=remote@,
--- with the remote 'SshConfig' if the remote block is fully present
--- (host/user/known_hosts/workspace all set). A @mode=remote@ with a
--- missing/incomplete remote block returns @Just (UemRemote, Nothing)@
--- — fail-closed is at call time (spec §7 row 1), not at config resolution.
-untrustedExecConfigFromSecurity :: SecurityConfig -> Maybe UntrustedExecConfig
+-- | Resolve the @[untrusted_execution]@ section to the typed
+-- 'UntrustedExecConfig' the selector and the startup check consume.
+--
+-- __Total by construction.__ The old shape returned @Maybe@ because it packed
+-- two unrelated answers into one value: "is local execution permitted" *and*
+-- "what are the remote SSH coordinates". The coordinates now live in
+-- @machines.toml@, so the only question left is the boolean — and a boolean
+-- with a default always has an answer. That is what removes the @Maybe@ from
+-- the ten call sites which used to branch on it, and with it the class of bug
+-- where @Nothing@ meant three different things (section absent, local
+-- permitted, and — under the hardened build — remote only).
+--
+-- See 'UntrustedExecFileConfig' for why an absent section and a
+-- present-but-keyless section resolve differently.
+untrustedExecConfigFromSecurity :: SecurityConfig -> UntrustedExecConfig
 untrustedExecConfigFromSecurity cfg =
-  resolveByMode =<< scUntrustedExec cfg
+  UntrustedExecConfig
+    { uecAllowLocalhost = case scUntrustedExec cfg of
+        Nothing -> True
+          -- An install with none of these files keeps working exactly as it
+          -- does today: local execution permitted.
+        Just section -> uefcAllowLocalhost section
+    }
 
-resolveByMode :: UntrustedExecFileConfig -> Maybe UntrustedExecConfig
-resolveByMode uec =
-  let mode = if uefcMode uec == "remote" then UemRemote else UemLocal
-  in case mode of
-       UemRemote -> Just (UntrustedExecConfig UemRemote (resolveRemoteSsh uec))
-       UemLocal  -> localModeResult uec
-
--- | Resolve the [untrusted_execution.remote] sub-table to an 'SshConfig'.
--- Shared by both the UemRemote branch and the hardened-build localModeResult.
-resolveRemoteSsh :: UntrustedExecFileConfig -> Maybe SshConfig
-resolveRemoteSsh uec = uefcRemote uec >>= \r ->
-  uerfcHost r >>= \host ->
-  uerfcUser r >>= \user ->
-  uerfcKnownHosts r >>= \knownHosts ->
-  uerfcWorkspace r >>= \workspace ->
-  let port = fromMaybe 22 (uerfcPort r)
-      identity = uerfcIdentity r
-  in case ( mkSshHost host
-          , mkSshUser user
-          , mkRemotePath workspace
-          ) of
-       (Right h, Right u, Right w) -> Just SshConfig
-         { scHost       = h
-         , scUser       = u
-         , scPort       = port
-         , scIdentity   = identity
-         , scKnownHosts = knownHosts
-         , scWorkspace  = w
-         }
-       _ -> Nothing
-
-#if defined(REMOTE_ONLY_UNTRUSTED)
-localModeResult :: UntrustedExecFileConfig -> Maybe UntrustedExecConfig
-localModeResult uec =
-  Just (UntrustedExecConfig UemRemote (resolveRemoteSsh uec))
-#else
-localModeResult :: UntrustedExecFileConfig -> Maybe UntrustedExecConfig
-localModeResult _ = Nothing
-#endif
+-- | Does this configuration permit @local@ as an execution machine? The one
+-- projection every @allow_localhost@ consumer should use, so "permitted" has
+-- a single definition.
+allowLocalhostFromSecurity :: SecurityConfig -> Bool
+allowLocalhostFromSecurity = uecAllowLocalhost . untrustedExecConfigFromSecurity
 
 --------------------------------------------------------------------------------
 -- The one-way mode writer (design §6.1)

@@ -33,6 +33,7 @@ module Seal.Tools.Exec.Machine
   , rtSession
   , UnusableReason (..)
   , rtSelectable
+  , resolveRegistryTarget
   , seedRouting
   , mkStaticRouting
   , MachineSlot (..)
@@ -43,11 +44,13 @@ module Seal.Tools.Exec.Machine
 
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Map.Strict (Map)
-import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 
-import Seal.Config.Machines (MachineName, Selectable (..))
+import Data.Map.Strict qualified as Map
+import Seal.Config.Machines
+  ( MachineName, MachineRegistry (..), MachineTarget (..), Selectable (..)
+  , localMachineName )
 import Seal.SourceControl.Clone (CloneDeps)
 import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
 
@@ -186,6 +189,39 @@ resolveVia cache name bootstrap baseDeps = do
         Left err -> do
           atomicModifyIORef' cache (\m -> (Map.insert name (SlotFailed err) m, ()))
           pure (Left err)
+
+-- | Resolve a registry plus an optional chosen name to the machine that runs
+-- and its target.
+--
+-- The one pure resolution every pre-WU-9 caller shares, so the precedence
+-- rule — the recorded machine, else the configured @default@, else @local@ —
+-- is written once. @local@ is only a key of 'regMachines' when
+-- @allow_localhost@ permits it, so an unresolvable fallback means local
+-- execution is off and nothing else is configured: 'NoMachineSelected', which
+-- is exactly the state the requirements' "allow_localhost is false and no
+-- execution machine is configured" text describes.
+--
+-- 'Seal.Session.Machine.machineForSession' is the session-aware wrapper: it
+-- distinguishes /why/ a named machine is unavailable, which only the
+-- config-error renderer needs.
+resolveRegistryTarget
+  :: MachineRegistry -> Maybe MachineName -> Either MachineError (MachineName, MachineTarget)
+resolveRegistryTarget reg mNamed =
+  case mNamed of
+    Just name -> case Map.lookup name (regMachines reg) of
+      Just target -> Right (name, target)
+      Nothing     -> Left (MachineGone name)
+    Nothing -> case regDefault reg of
+      Just d -> case Map.lookup d (regMachines reg) of
+        Just target -> Right (d, target)
+        -- A default that does not resolve should already have been dropped by
+        -- resolution with a warning; treat it as absent rather than failing.
+        Nothing -> localOrNothing
+      Nothing -> localOrNothing
+  where
+    localOrNothing = case Map.lookup localMachineName (regMachines reg) of
+      Just target -> Right (localMachineName, target)
+      Nothing     -> Left NoMachineSelected
 
 -- | The session's machine — the default for a call that names none.
 rtSession :: MachineRouting -> MachineName

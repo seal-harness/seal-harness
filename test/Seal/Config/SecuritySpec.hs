@@ -20,13 +20,14 @@ import Test.QuickCheck (Gen, elements, forAll, oneof)
 
 import Seal.Config.Security
   ( AccessControlFileConfig (..), SecurityConfig (..), UntrustedExecFileConfig (..)
-  , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig
+  , allowLocalhostFromSecurity, defaultSecurityConfig
   , VaultKeyFields (..), WriteMode (..), hasLegacyLayout, loadSecurityConfig
   , gatewayConfigFromSecurity, openUniqueTemp, saveSecurityConfig, tomlKeyPaths
   , untrustedExecConfigFromSecurity, updateAccessControlSection
   , updateSecurityConfig, updateVaultKeySection )
 import Seal.Gateway.Config
   ( GatewayConfig (..), PartialGatewayConfig (..), defaultGatewayConfig )
+import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
 
 
 spec :: Spec
@@ -127,74 +128,60 @@ spec = describe "Seal.Config.Security" $ do
         Right cfg <- loadSecurityConfig path
         scUntrustedExec cfg `shouldBe` Nothing
 
-    it "parses [untrusted_execution] with mode = local (default)" $
+    it "parses allow_localhost = true" $
       withSystemTempDirectory "seal-sec-test" $ \dir -> do
         let path = dir </> "security.toml"
         TIO.writeFile path $ T.unlines
           [ "[untrusted_execution]"
-          , "mode = \"local\""
+          , "allow_localhost = true"
           ]
         Right cfg <- loadSecurityConfig path
-        scUntrustedExec cfg `shouldBe` Just (UntrustedExecFileConfig
-          { uefcMode = "local"
-          , uefcRemote = Nothing
-          })
+        scUntrustedExec cfg `shouldBe` Just (UntrustedExecFileConfig True)
 
-    it "parses [untrusted_execution] with mode = remote and a [remote] sub-table" $
+    it "parses allow_localhost = false" $
       withSystemTempDirectory "seal-sec-test" $ \dir -> do
         let path = dir </> "security.toml"
         TIO.writeFile path $ T.unlines
           [ "[untrusted_execution]"
-          , "mode = \"remote\""
-          , "[untrusted_execution.remote]"
-          , "host = \"exec.internal\""
-          , "user = \"agent\""
-          , "port = 22"
-          , "known_hosts = \"/home/agent/.ssh/known_hosts\""
-          , "workspace = \"/srv/agent-workspace\""
+          , "allow_localhost = false"
           ]
         Right cfg <- loadSecurityConfig path
-        scUntrustedExec cfg `shouldBe` Just (UntrustedExecFileConfig
-          { uefcMode = "remote"
-          , uefcRemote = Just (UntrustedExecRemoteFileConfig
-              { uerfcHost = Just "exec.internal"
-              , uerfcUser = Just "agent"
-              , uerfcPort = Just 22
-              , uerfcIdentity = Nothing
-              , uerfcKnownHosts = Just "/home/agent/.ssh/known_hosts"
-              , uerfcWorkspace = Just "/srv/agent-workspace"
-              })
-          })
+        scUntrustedExec cfg `shouldBe` Just (UntrustedExecFileConfig False)
 
-    it "parses mode=remote with no [remote] block (fail-closed is at call time, not parse time)" $
+    -- Design 2.3's decode rule, and the guard against T-MIG-5's silent
+    -- downgrade: a section that is PRESENT but carries no allow_localhost is a
+    -- decode error, not a default. Without this, a failed migration from the
+    -- old mode="remote" shape leaves exactly this document behind and the next
+    -- boot resolves it to allow_localhost = true.
+    it "present section without allow_localhost is a decode error" $
       withSystemTempDirectory "seal-sec-test" $ \dir -> do
         let path = dir </> "security.toml"
         TIO.writeFile path $ T.unlines
           [ "[untrusted_execution]"
           , "mode = \"remote\""
           ]
-        Right cfg <- loadSecurityConfig path
-        scUntrustedExec cfg `shouldBe` Just (UntrustedExecFileConfig
-          { uefcMode = "remote"
-          , uefcRemote = Nothing
-          })
+        result <- loadSecurityConfig path
+        case result of
+          Left _  -> pure ()
+          Right _ -> expectationFailure
+            "a present-but-keyless [untrusted_execution] decoded successfully; \
+            \that is the silent downgrade the two-absence rule exists to stop"
+
+    it "present but empty section is a decode error" $
+      withSystemTempDirectory "seal-sec-test" $ \dir -> do
+        let path = dir </> "security.toml"
+        TIO.writeFile path "[untrusted_execution]\n"
+        result <- loadSecurityConfig path
+        case result of
+          Left _  -> pure ()
+          Right _ -> expectationFailure
+            "an empty [untrusted_execution] section decoded successfully"
 
     it "round-trips an untrusted_execution section through save/load" $
       withSystemTempDirectory "seal-sec-test" $ \dir -> do
         let path = dir </> "security.toml"
         let cfg = defaultSecurityConfig
-              { scUntrustedExec = Just (UntrustedExecFileConfig
-                  { uefcMode = "remote"
-                  , uefcRemote = Just (UntrustedExecRemoteFileConfig
-                      { uerfcHost = Just "exec.internal"
-                      , uerfcUser = Just "agent"
-                      , uerfcPort = Just 22
-                      , uerfcIdentity = Nothing
-                      , uerfcKnownHosts = Just "/home/agent/.ssh/known_hosts"
-                      , uerfcWorkspace = Just "/srv/agent-workspace"
-                      })
-                  })
-              }
+              { scUntrustedExec = Just (UntrustedExecFileConfig False) }
         saveSecurityConfig path cfg PreserveCredentials `shouldReturn` Right ()
         result <- loadSecurityConfig path
         case result of
@@ -291,13 +278,25 @@ spec = describe "Seal.Config.Security" $ do
 
   describe "untrustedExecConfigFromSecurity" $ do
 
-    it "returns Nothing when the section is absent" $ do
-      untrustedExecConfigFromSecurity defaultSecurityConfig `shouldBe` Nothing
+    -- The two-absence rule, from the resolver's side.
+    it "an absent section resolves to allow_localhost = true (today's behaviour)" $
+      untrustedExecConfigFromSecurity defaultSecurityConfig
+        `shouldBe` UntrustedExecConfig True
 
-    it "returns Nothing when mode=local (no remote needed)" $ do
+    it "allow_localhost = true resolves to a permitting config" $
       let cfg = defaultSecurityConfig
-            { scUntrustedExec = Just (UntrustedExecFileConfig "local" Nothing) }
-      untrustedExecConfigFromSecurity cfg `shouldBe` Nothing
+            { scUntrustedExec = Just (UntrustedExecFileConfig True) }
+      in untrustedExecConfigFromSecurity cfg `shouldBe` UntrustedExecConfig True
+
+    it "allow_localhost = false resolves to a non-permitting config" $
+      let cfg = defaultSecurityConfig
+            { scUntrustedExec = Just (UntrustedExecFileConfig False) }
+      in untrustedExecConfigFromSecurity cfg `shouldBe` UntrustedExecConfig False
+
+    it "allowLocalhostFromSecurity is the same projection" $
+      forAll genSecurityConfig $ \sc ->
+        allowLocalhostFromSecurity sc
+          == uecAllowLocalhost (untrustedExecConfigFromSecurity sc)
 
   -- Plan WU1 tests 26–28. The plan names 'updateSecurityConfigEither'; the
   -- implementation keeps the base branch's "two narrow writers" guarantee by
@@ -431,9 +430,7 @@ genSecurityConfig :: Gen SecurityConfig
 genSecurityConfig = do
   uefc <- oneof
        [ pure Nothing
-       , Just <$> (UntrustedExecFileConfig
-           <$> elements ["local", "remote"]
-           <*> pure Nothing)
+       , Just . UntrustedExecFileConfig <$> elements [True, False]
        ]
   pure SecurityConfig
     { scVaultPath      = Nothing
@@ -484,20 +481,20 @@ mentionsMigrate (Right ()) = False
 explicitTablesFixture :: Text
 explicitTablesFixture = T.unlines
   [ "[untrusted_execution]"
-  , "mode = \"local\""
+  , "allow_localhost = true"
   , ""
   , "[access_control]"
   , "mode = \"passkey\""
   , "origin = \"https://seal.example.com\""
   ]
 
--- | The same data, spelled with dotted keys: @untrusted_execution.mode@ at the
+-- | The same data, spelled with dotted keys: @untrusted_execution.allow_localhost@ at the
 -- root (one flat pair, no table node) plus the same @[access_control]@ section.
 -- A rewrite normalises it into a table, which must not look like a change in
 -- the document's data.
 dottedTablesFixture :: Text
 dottedTablesFixture = T.unlines
-  [ "untrusted_execution.mode = \"local\""
+  [ "untrusted_execution.allow_localhost = true"
   , ""
   , "[access_control]"
   , "mode = \"passkey\""

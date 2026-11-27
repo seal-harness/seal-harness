@@ -36,6 +36,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import System.Directory (doesFileExist)
+import Data.HashMap.Strict qualified as HashMap
 import System.IO (hPutStrLn, stderr)
 
 import Toml qualified
@@ -212,9 +213,59 @@ reconcileWithExisting cfgPath secPath = do
 decodeSecurityFields :: Text -> Either Text SecurityConfig
 decodeSecurityFields contents = case Toml.parse contents of
   Left err     -> Left (Toml.unTomlParseError err)
-  Right toml   -> case Toml.runTomlCodec securityConfigCodec toml of
+  Right toml   -> case Toml.runTomlCodec securityConfigCodec
+                       (translateRetiredMode toml) of
     Success cfg  -> Right cfg
     Failure errs -> Left (Toml.prettyTomlDecodeErrors errs)
+
+-- | Rewrite the retired @[untrusted_execution] mode@ key as its replacement,
+-- @allow_localhost@, before decoding.
+--
+-- __This is what keeps an upgraded install from silently downgrading.__ Deleting
+-- @mode@ from the codec is what makes the translation necessary: without it, a
+-- @config.toml@ carrying @mode = \"remote\"@ would present a
+-- @[untrusted_execution]@ table the new codec cannot read, the migration would
+-- refuse to touch it (correctly — it never strips what it could not move), and
+-- the next 'loadSecurityConfig' would find no @security.toml@ and fall back to
+-- the default @allow_localhost = true@. A remote-only install would quietly
+-- start running untrusted code on the harness machine.
+--
+-- The mapping is the one the frozen requirements pin: @mode = \"remote\"@ becomes
+-- @allow_localhost = false@; @mode = \"local\"@ (or an absent @mode@) becomes
+-- @allow_localhost = true@. An unrecognised value maps to @false@ — the
+-- restrictive direction, so a typo cannot turn local execution on.
+translateRetiredMode :: Toml.TOML -> Toml.TOML
+translateRetiredMode toml = case Toml.runTomlCodec legacyUntrustedExecCodec toml of
+  Success Nothing -> toml   -- no [untrusted_execution] table at all
+  Failure _       -> toml   -- not the legacy shape; leave it for the real codec
+  -- A table with no `mode` key: the retired shape does not apply.
+  Success (Just Nothing) -> toml
+  Success (Just (Just mode)) ->
+    -- "Already decodes under the new shape" cannot be tested with the whole
+    -- config codec: `Toml.dioptional` reports a table whose contents fail to
+    -- decode as `Nothing`, so that codec *succeeds* on exactly the document we
+    -- need to translate. Presence has to be asked at the AST level.
+    case Toml.runTomlCodec (Toml.table allowLocalhostCodec "untrusted_execution") toml of
+      Success _ -> toml
+      Failure _ ->
+        let allow = mode == "local"
+        in toml { Toml.tomlTables = HashMap.insert (Toml.Piece "untrusted_execution")
+                     (Toml.Leaf (Toml.Piece "untrusted_execution" Toml.:|| [])
+                        (mempty { Toml.tomlPairs = HashMap.fromList
+                                    [ (Toml.Piece "allow_localhost" Toml.:|| []
+                                      , Toml.AnyValue (Toml.Bool allow)) ] }))
+                     (Toml.tomlTables toml) }
+
+-- | Just the @allow_localhost@ key, used only to ask "does this table already
+-- carry the new shape?".
+allowLocalhostCodec :: Toml.TomlCodec Bool
+allowLocalhostCodec = Toml.bool "allow_localhost"
+
+-- | Just the retired @mode@ key, read leniently so a table that also carries
+-- other (ignored) keys still answers.
+legacyUntrustedExecCodec :: Toml.TomlCodec (Maybe (Maybe Text))
+legacyUntrustedExecCodec =
+  Toml.dioptional (Toml.table (Toml.dioptional (Toml.text "mode")) "untrusted_execution")
 
 -- | A field is present but does not decode. Changing nothing is the only safe
 -- outcome: stripping it would destroy the value, and the migration is a move,

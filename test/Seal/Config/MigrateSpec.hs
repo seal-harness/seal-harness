@@ -129,13 +129,12 @@ spec = describe "Seal.Config.Migrate" $ do
         createDirectoryIfMissing True (tmp </> "config")
         TIO.writeFile cfgPath $ T.unlines
           [ "[untrusted_execution]"
-          , "mode = \"local\""
+          , "allow_localhost = false"
           ]
         migrateSecurityConfig paths
         Right sec <- loadSecurityConfig secPath
-        case scUntrustedExec sec of
-          Just uefc -> uefcMode uefc `shouldBe` "local"
-          Nothing -> expectationFailure "expected untrusted_execution to be migrated"
+        -- The migrated flag is preserved, not re-derived from a mode string.
+        fmap uefcAllowLocalhost (scUntrustedExec sec) `shouldBe` Just False
 
   describe "[gateway] moves like the other boot-only sections" $ do
     it "moves the table into a new security.toml and strips it from config.toml" $

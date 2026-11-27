@@ -82,8 +82,12 @@ import Seal.Config.BootPlan
 import Seal.Security.EnrollmentGrant (GrantSource (..))
 import Seal.Config.Security
   ( AccessControlFileConfig (..), SecurityConfig (..), loadSecurityConfig
-  , gatewayConfigFromSecurity, untrustedExecConfigFromSecurity )
-import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
+  , allowLocalhostFromSecurity, gatewayConfigFromSecurity
+  , untrustedExecConfigFromSecurity )
+import Seal.Config.Machines
+  ( MachineTarget (..), resolveRegistryForSecurity )
+import Seal.Tools.Exec.Machine (resolveRegistryTarget)
+import Seal.Tools.Exec.Untrusted (enforceRemoteOnly)
 import Seal.Config.Paths (SealPaths (..), auditDir, configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, serveLockPath, sessionMetaPath, sshAgentsDir, tabListPath, tlsCertPath, tlsKeyPath, vaultFilePath, watchMapPath)
 import Seal.Security.DaemonLock (ServeLock, acquireServeLock)
 import Seal.Gateway.AccessControl
@@ -94,7 +98,7 @@ import Seal.Gateway.Config
   ( GatewayConfig (..), gatewayHostError
   , gatewayHostResolutionError, hostResolves, tlsConfigError, tlsEnabled, tlsOriginError
   , effectiveTlsPaths )
-import Seal.Tools.Exec.FileExplorer (mkLocalFileExplorer, mkRemoteFileExplorer, mkFailClosedFileExplorer)
+import Seal.Tools.Exec.FileExplorer (mkLocalFileExplorer, mkRemoteFileExplorer)
 import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Gateway.Server (runGateway)
 import Seal.Providers.OllamaReadinessProbe
@@ -205,6 +209,17 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
       ioError (userError ("security.toml could not be parsed; refusing to start. "
                           <> T.unpack err))
     Right c  -> pure c
+  -- The @-f remote-only-untrusted@ startup check (design 8 step 3, WU-16).
+  -- A hardened binary has no local executor, so @allow_localhost = true@ is a
+  -- configuration it cannot honour: refuse to start rather than start and then
+  -- fail every local call. Placed with the other boot refusals, before anything
+  -- binds or forks.
+  case enforceRemoteOnly (untrustedExecConfigFromSecurity secCfg) of
+    Left err -> do
+      logIO logger ErrorS ("untrusted execution: " <> ls err)
+      ioError (userError (T.unpack err))
+    Right () -> pure ()
+
   -- Access control is resolved ONCE here, before any channel is forked or any
   -- port is bound, so the refuse-to-start matrix (design §10) runs first.
   let gwCfgForAccess = gatewayConfigFromSecurity secCfg
@@ -535,9 +550,10 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
   -- can be shared with the web send handler (SendDeps). The cursor store,
   -- reply registry, and write locks are created inside newChannelDeps.
   let loadCfg = fromRight defaultRuntimeConfig <$> loadRuntimeConfig cfgPath
-      isRemoteExec = case untrustedExecConfigFromSecurity secCfg of
-        Just uec -> uecMode uec == UemRemote
-        Nothing  -> False
+      -- The channel CloneDeps need "is the untrusted plane another machine"
+      -- for the deploy-key clone path. allow_localhost = false is exactly that
+      -- state: no local executor, so every call must reach a named machine.
+      isRemoteExec = not (allowLocalhostFromSecurity secCfg)
   chanDeps <- newChannelDeps
         paths rt repoRegH agentRegH pr backends autonomy (Just broker)
         reg tmuxR (Just mgr) approvals loadCfg isRemoteExec tabsH logger cursorsH
@@ -674,13 +690,22 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
       -- camera and phone photos while bounding gateway memory and the
       -- per-file remote transport.
       mediaPreviewBytes = 33554432
-  fileExplorer <- case untrustedExecConfigFromSecurity secCfg of
+  -- The explorer follows the session machine, whose coordinates now live in
+  -- machines.toml. WU-6b makes this per-session rather than once-at-boot; until
+  -- then it is built from the registry's session machine at boot, which is the
+  -- same machine every session starts on.
+  mExplorerSsh <- do
+    eReg <- resolveRegistryForSecurity paths secCfg
+    pure $ case eReg of
+      Left _ -> Left ()
+      Right machReg -> case resolveRegistryTarget machReg Nothing of
+        Right (_, MtSsh sshCfg) -> Right sshCfg
+        _                       -> Left ()
+  fileExplorer <- case mExplorerSsh of
     -- WU-1: split ceilings — viewer reads stay at maxScanBytes (128 KiB),
     -- downloads use a 4 MiB chunk size (full config wiring comes in WU-2).
-    Nothing -> pure (mkLocalFileExplorer maxScanBytes downloadChunkBytes)
-    Just uec -> case uecRemote uec of
-      Nothing -> pure mkFailClosedFileExplorer
-      Just sshCfg -> mkRemoteFileExplorer sshCfg mkRealRemoteRunner maxScanBytes downloadChunkBytes
+    Left () -> pure (mkLocalFileExplorer maxScanBytes downloadChunkBytes)
+    Right sshCfg -> mkRemoteFileExplorer sshCfg mkRealRemoteRunner maxScanBytes downloadChunkBytes
   iconCache <- newIconCache
   let deps = ApiDeps
         { adSessionRuntime  = sr

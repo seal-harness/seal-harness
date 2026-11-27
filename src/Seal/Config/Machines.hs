@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 -- | The @machines.toml@ execution-machine registry: the named machines
 -- untrusted opcodes may run on, plus the pure resolution from the file's
 -- (mostly-optional) shape to a validated 'MachineRegistry'.
@@ -36,6 +37,7 @@ module Seal.Config.Machines
   , loadMachinesConfig
   , saveMachinesConfig
   , resolveMachinesForBoot
+  , resolveRegistryForSecurity
   , machinesConfigCodec
   , Selectable (..)
   , selectables
@@ -51,6 +53,8 @@ module Seal.Config.Machines
 
 import Control.Exception (IOException, try)
 import Data.Char (isAscii, isAlphaNum, isControl, isDigit)
+import Data.HashMap.Strict qualified as HashMap
+import Toml.Type.Key (pattern (:||))
 import Data.Maybe (fromMaybe)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -63,7 +67,8 @@ import Toml (TomlCodec, (.=))
 import Toml qualified
 
 import Seal.Config.Paths (SealPaths, execKnownHostsPath, machinesFilePath)
-import Seal.Config.Security (writeSecretFile)
+import Seal.Config.Security
+  ( SecurityConfig, allowLocalhostFromSecurity, writeSecretFile )
 import Seal.Tools.Exec.Types
   ( SshConfig (..), mkSshHost, mkSshUser, mkRemotePath )
 
@@ -167,9 +172,43 @@ decodeMachinesConfig input =
   case Toml.parse input of
     Left err -> Left (MceParse (T.pack (show err)))
     Right toml ->
-      case Toml.runTomlCodec machinesConfigCodec toml of
+      case Toml.runTomlCodec machinesConfigCodec (normalizeMachinesTable toml) of
         Failure errs -> Left (MceParse (T.pack (show errs)))
         Success cfg  -> Right cfg
+
+-- | Make the @machines@ node explicit before decoding.
+--
+-- tomland's 'Toml.tableMap' looks the @machines@ node up by requiring it to
+-- carry an explicit value in the parsed AST. A file that declares only
+-- @[machines.\<name\>]@ sub-tables — the idiomatic style, and the only style the
+-- shipped template and every hand-written file use — never writes a bare
+-- @[machines]@ header, so that node is /implicit/ in tomland's prefix tree and
+-- the lookup silently returns an /empty map/ instead of the sub-tables'
+-- contents.
+--
+-- That failure mode is quiet enough to be dangerous here: an empty machine map
+-- reads as "no machines configured", which with @allow_localhost = false@ is
+-- the state that refuses to run anything. A file full of correct machines would
+-- be silently ignored. ('Seal.Config.File' normalizes @providers@ and
+-- @channels@ for exactly this reason.)
+--
+-- Round-tripped files (written by 'saveMachinesConfig') already carry the
+-- explicit node and pass through unchanged.
+normalizeMachinesTable :: Toml.TOML -> Toml.TOML
+normalizeMachinesTable t =
+  t { Toml.tomlTables = HashMap.adjust explicitNode "machines" (Toml.tomlTables t) }
+  where
+    -- Collapse an implicit @machines@ 'Toml.Branch' into a single 'Toml.Leaf'
+    -- whose value embeds those children as its own tables, mirroring what a
+    -- bare @[machines]@ header would have produced.
+    explicitNode :: Toml.PrefixTree Toml.TOML -> Toml.PrefixTree Toml.TOML
+    explicitNode tree = case tree of
+      Toml.Branch pref Nothing children ->
+        Toml.Leaf pref (mempty { Toml.tomlTables = children })
+      Toml.Branch _ (Just _) _ -> tree
+      Toml.Leaf (_ :|| [])  _  -> tree
+      Toml.Leaf (_ :|| (p : ps)) v ->
+        Toml.Leaf ("machines" :|| []) (mempty { Toml.tomlTables = Toml.single (p :|| ps) v })
 
 machinesConfigCodec :: TomlCodec MachinesConfig
 machinesConfigCodec = MachinesConfig
@@ -423,6 +462,19 @@ saveMachinesConfig paths cfg = do
   pure $ case outcome of
     Left err -> Left (T.pack path <> ": could not write: " <> T.pack (show err))
     Right () -> Right ()
+
+-- | Resolve the registry from the pair of files that decide it: the flag in
+-- @security.toml@ and the machines in @machines.toml@.
+--
+-- The one place the two-file coupling lives. Callers that already hold a
+-- 'SecurityConfig' (the boot paths, and the per-turn re-reads) use this rather
+-- than pairing 'allowLocalhostFromSecurity' with 'resolveMachinesForBoot'
+-- themselves, so no caller can accidentally resolve the machines against the
+-- wrong flag.
+resolveRegistryForSecurity
+  :: SealPaths -> SecurityConfig -> IO (Either Text MachineRegistry)
+resolveRegistryForSecurity paths secCfg =
+  resolveMachinesForBoot paths (allowLocalhostFromSecurity secCfg)
 
 -- | The boot entry point: load both configuration files and resolve them into
 -- the registry every other layer consumes.

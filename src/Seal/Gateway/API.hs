@@ -79,11 +79,12 @@ import Seal.Config.Paths
   ( SealPaths (..), repoKeysDir, securityFilePath, sessionMetaPath, sessionWorkdir
   , workdirsRoot )
 import Seal.Config.Security
-  ( SecurityConfig, untrustedExecConfigFromSecurity )
+  ( SecurityConfig )
 import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
-import Seal.Tools.Exec.Untrusted
-  ( UntrustedExecConfig (..), UntrustedExecMode (..) )
+
+import Seal.Config.Machines
+  ( MachineTarget (..), resolveRegistryForSecurity )
 import Seal.Session.ExecCache (cachedSessionExec, cachedWorkdirScan)
 import Seal.Session.Workdir (mkSessionExec, remoteSessionWorkdirPath, SessionExec (..))
 import Seal.SourceControl.Clone (CloneDeps (..))
@@ -93,6 +94,7 @@ import Seal.Tools.Exec.FileExplorer
 import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, setSessionAbort)
+import Seal.Tools.Exec.Machine (resolveRegistryTarget)
 import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import Seal.Session.Lock (sessionTurnInFlight)
@@ -1202,23 +1204,35 @@ parseSetupRepoBody body =
       Just (A.String b) | not (T.null (T.strip b)) -> Just b
       _ -> Nothing
 
--- | Agent-metadata cache env for API-driven scans. Remote mode only —
--- in local mode the workdir is local and the legacy crawl costs nothing.
--- Prefers the SendDeps runner seam so remote-mode integration tests stay
--- hermetic; production passes Nothing there and gets the real runner.
-metaCacheEnvForApi :: ApiDeps -> Maybe MetaCacheEnv
+-- | Agent-metadata cache env for API-driven scans, or 'Nothing' when there is
+-- no remote machine to cache against.
+--
+-- __IO now, because the coordinates moved.__ Before this feature the single
+-- remote came straight out of the already-loaded 'SecurityConfig'. Now every
+-- machine lives in @machines.toml@, so answering "what are the session
+-- machine's coordinates" means reading that file — and the machine registry is
+-- boot-only config, which is why it is re-read here rather than snapshotted on
+-- 'ApiDeps' (an operator who adds a machine should not have to restart).
+--
+-- In local mode the workdir IS local, so the per-file crawl has no SSH round
+-- trips to amortize and there is deliberately no cache: 'Nothing'.
+metaCacheEnvForApi :: ApiDeps -> IO (Maybe MetaCacheEnv)
 metaCacheEnvForApi deps = case adSend deps of
-  Just sendDeps | sdIsRemote sendDeps ->
-    case untrustedExecConfigFromSecurity (adSecurityConfig deps) of
-      Just (UntrustedExecConfig UemRemote (Just sshCfg)) ->
-        Just MetaCacheEnv
-          { mceRunner    = fromMaybe mkRealRemoteRunner (sdRemoteRunner sendDeps)
-          , mceSshCfg    = sshCfg
-          , mceCacheRoot = agentMetaCacheDir (adPaths deps)
+  Just sendDeps | sdIsRemote sendDeps -> do
+    eReg <- resolveRegistryForSecurity paths (adSecurityConfig deps)
+    pure $ case eReg of
+      Left _ -> Nothing
+      Right reg -> case resolveRegistryTarget reg Nothing of
+        Right (_, MtSsh sshCfg) -> Just MetaCacheEnv
+          { mceRunner      = fromMaybe mkRealRemoteRunner (sdRemoteRunner sendDeps)
+          , mceSshCfg      = sshCfg
+          , mceCacheRoot   = agentMetaCacheDir paths
           , mceRunTransfer = rsyncTransferIO sshCfg
           }
-      _ -> Nothing
-  _ -> Nothing
+        _ -> Nothing
+  _ -> pure Nothing
+  where
+    paths = adPaths deps
 
 -- | Build the @POST /api/sessions/:id/setup-repo@ response from the
 -- 'Either' returned by 'Seal.Gateway.Send.handleSetupRepo': 400 carrying
@@ -1655,8 +1669,8 @@ handleSessionAgents deps sid = do
             cloneDeps <- cloneDepsForApiDeps deps
             e <- mkSessionExec paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner Nothing
             pure (e, Nothing)
+      metaEnv <- metaCacheEnvForApi deps
       let wfs = seWorkdirFs exec
-          metaEnv = metaCacheEnvForApi deps
       workdirBackend <- case mCache of
         Just cache -> do
           -- One shared scan; serve the union from a static backend.
@@ -1707,21 +1721,17 @@ handleSessionWorkdir deps sid = do
   if not exists
     then pure (errJson status404 "session not found")
     else do
-      let wdPath = case untrustedExecConfigFromSecurity (adSecurityConfig deps) of
-            Nothing ->
-              -- Local mode: the workdir is on the same machine as the
-              -- gateway, so the absolute path is directly usable.
-              T.pack (sessionWorkdir paths sid)
-            Just uec -> case uecRemote uec of
-              Just sshCfg ->
-                -- Remote mode with a configured SSH workspace: the
-                -- workdir is on the remote machine.
-                remoteSessionWorkdirPath sshCfg sid
-              Nothing ->
-                -- Remote mode without a complete remote block
-                -- (fail-closed at the executor level): fall back to the
-                -- local path shape so the frontend has something to show.
-                T.pack (sessionWorkdir paths sid)
+      -- The workdir lives on the session's execution machine, so this reads the
+      -- machine registry rather than a single security.toml block. An absent or
+      -- unusable machine falls back to the local path shape, so the frontend
+      -- always has something to show; 'handleSessionAgents' is where an
+      -- unusable machine surfaces as an error.
+      eReg <- resolveRegistryForSecurity paths (adSecurityConfig deps)
+      let wdPath = case eReg of
+            Right reg -> case resolveRegistryTarget reg Nothing of
+              Right (_, MtSsh sshCfg) -> remoteSessionWorkdirPath sshCfg sid
+              _ -> T.pack (sessionWorkdir paths sid)
+            Left _ -> T.pack (sessionWorkdir paths sid)
       pure (jsonLBS status200 (A.encode (object ["path" .= wdPath])))
 
 -- | Parse the @archived@ boolean field from a PUT /api/sessions/:id/archived

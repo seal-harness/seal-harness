@@ -70,8 +70,10 @@ import Seal.Config.Paths
    sessionDir,
    sessionLogPath, sessionRequestsPath, sessionResponsesPath, sessionWorkdir)
 import qualified Katip as K2 (Severity (..), ls)
+import Seal.Config.Machines
+  ( MachineTarget (..), machineNameText, resolveRegistryForSecurity )
 import Seal.Config.Security
-  ( SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity )
+  ( SecurityConfig, loadSecurityConfig )
 import Seal.Logging.Global (globalLogIO)
 import Seal.Core.Backends (Backends (..))
 import Seal.Core.MessageSource (MessageSource)
@@ -154,7 +156,7 @@ import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption)
 import Seal.Tools.Exec.Remote (RemoteRunner, mkRealRemoteRunner)
-import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
+import Seal.Tools.Exec.Machine (resolveRegistryTarget)
 import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs (..), snapIsDirectoryAt, snapTopDirs )
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
@@ -649,30 +651,41 @@ metaCacheEnvFor
   :: TurnDeps -> SealPaths -> Either Text SecurityConfig
   -> IO (Maybe MetaCacheEnv)
 metaCacheEnvFor td paths eSecCfg = do
-  let mEnv = case (tdIsRemote td, eSecCfg) of
-        (True, Right secCfg) ->
-          case untrustedExecConfigFromSecurity secCfg of
-            Just (UntrustedExecConfig UemRemote (Just sshCfg)) -> Just MetaCacheEnv
-              { mceRunner       = fromMaybe mkRealRemoteRunner (tdRemoteRunner td)
-              , mceSshCfg       = sshCfg
-              , mceCacheRoot    = agentMetaCacheDir paths
-              , mceRunTransfer  = rsyncTransferIO sshCfg
-              }
-            _ -> Nothing
-        _ -> Nothing
+  eReg <- case eSecCfg of
+    Left _   -> pure (Left "security config load failed")
+    Right sc -> resolveRegistryForSecurity paths sc
+  let mEnv = case (tdIsRemote td, eReg) of
+        (True, Right reg) -> remoteEnvOf reg
+        _                 -> Nothing
       reason = case mEnv of
         Just _  -> "Just (snapshot routing active)"
-        Nothing -> case (tdIsRemote td, eSecCfg) of
+        Nothing -> case (tdIsRemote td, eReg) of
           (False, _) -> "Nothing (local mode)"
-          (_, Left err) ->
-            "Nothing (security config load failed: " ++ T.unpack err ++ ")"
-          (_, Right secCfg) ->
-            case untrustedExecConfigFromSecurity secCfg of
-              Just uec | uecMode uec == UemRemote ->
-                "Nothing (mode=remote but ssh config missing/incomplete)"
-              _ -> "Nothing (mode is not remote)"
+          (_, Left err) -> "Nothing (" ++ T.unpack err ++ ")"
+          (_, Right reg) -> case resolveRegistryTarget reg Nothing of
+            Left _ -> "Nothing (the session's execution machine is unavailable)"
+            Right (_, MtLocal) ->
+              "Nothing (the session's execution machine is local, so the crawl "
+                ++ "has no SSH round trips to amortize)"
+            Right (name, MtSsh _) ->
+              "Nothing (" ++ T.unpack (machineNameText name)
+                ++ " is remote but the snapshot env could not be built)"
   globalLogIO K2.DebugS (K2.ls (T.pack ("[agent-meta] env=" <> reason)))
   pure mEnv
+  where
+    -- The cache needs a *remote* machine's coordinates and its transport.
+    -- Before this feature a single security.toml block supplied both; now the
+    -- session's machine in machines.toml does. 'MtLocal' has no coordinates
+    -- and needs none — a local crawl has no round trips to amortize, which is
+    -- why this arm stays 'Nothing'.
+    remoteEnvOf reg = case resolveRegistryTarget reg Nothing of
+      Right (_, MtSsh sshCfg) -> Just MetaCacheEnv
+        { mceRunner      = fromMaybe mkRealRemoteRunner (tdRemoteRunner td)
+        , mceSshCfg      = sshCfg
+        , mceCacheRoot   = agentMetaCacheDir paths
+        , mceRunTransfer = rsyncTransferIO sshCfg
+        }
+      _ -> Nothing
 
 runTurnBody
   :: TurnDeps -> TurnAdapter -> SessionMeta -> Maybe MessageSource -> Text

@@ -74,7 +74,7 @@ deployKeySpec = describe "Seal.Gateway.ApiIntegration (git deploy-key)" $ do
           -- ── Environment diagnostics ──
           putStrLn ""
           putStrLn "═══════════════════════════════════════════════════"
-          putStrLn ("MODE: " <> T.unpack (uemLabel (ateMode env)))
+          putStrLn ("MODE: " <> T.unpack (uemLabel (ateIsRemote env)))
           putStrLn ("BARE REPO: " <> drBareRepoPath dr)
           putStrLn ("KEYFILE: " <> fromMaybe "<none>" (drKeyfilePath dr))
           -- Check the keyfile exists.
@@ -198,7 +198,7 @@ patTestBody env = case ateDummyRepo env of
         markerPath = spHome (atePaths env) </> ghEnvMarkerName
     putStrLn ""
     putStrLn (  "═══ PAT SETUP_REPO ["
-             <> T.unpack (uemLabel (ateMode env)) <> "] url=" <> T.unpack url)
+             <> T.unpack (uemLabel (ateIsRemote env)) <> "] url=" <> T.unpack url)
 
     sid <- callApiNewTab env "ollama" "llama3.2"
 

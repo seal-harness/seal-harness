@@ -239,6 +239,27 @@ specIO = describe "Seal.Config.Machines (file IO)" $ do
         loaded <- loadMachinesConfig paths
         loaded `shouldBe` Right defaultMachinesConfig
 
+      -- Regression: the idiomatic hand-written style writes only
+      -- [machines.<name>] sub-tables and never a bare [machines] header.
+      -- tomland's tableMap silently returned an EMPTY map for that shape, so a
+      -- file full of correct machines decoded as "no machines configured" —
+      -- which, with allow_localhost = false, is the state that refuses to run
+      -- anything.
+      it "decodes [machines.<name>] sub-tables with no bare [machines] header" $ \paths -> do
+        writeFile (machinesFilePath paths) $ unlines
+          [ "default = \"builder\""
+          , "[machines.builder]"
+          , "host = \"exec.internal\""
+          , "user = \"agent\""
+          , "workspace = \"/srv/agent-workspace\""
+          ]
+        loaded <- loadMachinesConfig paths
+        case loaded of
+          Right cfg -> do
+            Map.keys (mcMachines cfg) `shouldBe` ["builder"]
+            mcDefault cfg `shouldBe` Just "builder"
+          Left err -> expectationFailure ("decode failed: " <> T.unpack err)
+
       it "a malformed file is Left naming the file" $ \paths -> do
         writeFile (machinesFilePath paths) "default = 5\n[[["
         loaded <- loadMachinesConfig paths

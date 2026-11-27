@@ -22,7 +22,7 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value)
 import Data.Either (fromRight)
 import Data.IORef (readIORef)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.Console.Haskeline
@@ -50,7 +50,10 @@ import Seal.Command.Registry (mintTabSession)
 import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
 import Seal.Config.File (defaultRuntimeConfig, loadRuntimeConfig)
-import Seal.Config.Security (SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity)
+import Seal.Config.Security
+  ( SecurityConfig, allowLocalhostFromSecurity, defaultSecurityConfig
+  , loadSecurityConfig, untrustedExecConfigFromSecurity )
+import Seal.Tools.Exec.Untrusted (enforceRemoteOnly)
 import Seal.Config.Paths (SealPaths (..), securityFilePath)
 import Seal.Core.Backends (Backends (..), newBackends)
 import Seal.Core.TurnEngine (TurnDeps (..), TurnAdapter (..), TurnOutcome (..), runSessionTurn)
@@ -58,13 +61,12 @@ import qualified Seal.Core.TurnEngine as TurnEngine
 import Seal.Core.Types (SessionId, OpName (..))
 import Seal.Ingest (Disposition (..), PreprocessChain, RawInbound (..), ingest)
 #if !defined(REMOTE_ONLY_UNTRUSTED)
-import Seal.Tools.Exec.UntrustedIO ( mkLocalUntrustedIO, mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
+import Seal.Tools.Exec.UntrustedIO
+  ( mkLocalUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
 #else
-import Seal.Tools.Exec.UntrustedIO ( mkRemoteUntrustedIO, mkRemoteUntrustedIOStub, UntrustedIO )
+import Seal.Tools.Exec.UntrustedIO (mkRemoteUntrustedIOStub, UntrustedIO)
 #endif
-import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..))
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption, mkHostKeyAdoption)
-import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, setSessionAbort)
 import Seal.ISA.RepeatDetect (SessionRepeatRegistry)
 import Seal.Agent.Def.Types (agentDefIdText)
@@ -155,7 +157,29 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
   execCache <- newSessionExecCache
   active0 <- readIORef (srActive sr)
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
-  let isRemote = either (const False) (isJust . untrustedExecConfigFromSecurity) eSecCfg
+  -- The @-f remote-only-untrusted@ startup check, in the CLI boot path. The
+  -- hardened binary has no local executor, so @allow_localhost = true@ is a
+  -- configuration it cannot honour: refuse rather than start and fail every
+  -- local call. Both boot paths run this (here and 'Seal.Command.Serve'); before
+  -- this feature the check had no call site at all.
+  case eSecCfg of
+    Right secCfg -> case enforceRemoteOnly (untrustedExecConfigFromSecurity secCfg) of
+      Left err -> ioError (userError (T.unpack err))
+      Right () -> pure ()
+    -- An unparseable security.toml is already reported and degraded to defaults
+    -- below; the hardened check then sees the default and refuses, which is the
+    -- safe direction.
+    Left _ -> case enforceRemoteOnly (untrustedExecConfigFromSecurity defaultSecurityConfig) of
+      Left err -> ioError (userError (T.unpack err))
+      Right () -> pure ()
+  let allowLocal = either (const True) allowLocalhostFromSecurity eSecCfg
+      -- The channel's CloneDeps need to know whether the untrusted plane is a
+      -- different machine, because the deploy-key clone path only needs agent
+      -- forwarding and a remote known_hosts temp file when it is. A local
+      -- executor means it is not. (Before this feature this read "was the
+      -- section present", which conflated "configured for remote" with "runs
+      -- remotely".)
+      isRemote = not allowLocal
       histFile       = spState paths </> "history"
       innerSettings  = (defaultSettings :: Settings IO) { complete = noCompletion }
       hlSettings     = innerSettings { historyFile = Just histFile }
@@ -463,24 +487,21 @@ renderTab t =
     <> maybe "" ("  " <>) (tLabel t)
 
 -- | Resolve the untrusted-execution 'UntrustedIO' capability handle from the
--- 'SecurityConfig'. Absent section / mode=local → the local arm (real local
--- executor wired to the workspace root). mode=remote + remote fully
--- configured → the remote arm (the SSH executor; the opcodes run remotely
--- via 'mkRemoteUntrustedIO'). mode=remote + remote absent/incomplete → the
--- fail-closed stub so untrusted opcodes fail at call time (the
--- 'UeExec ExecNotImplemented' error surfaces).
+-- 'SecurityConfig' and the local workspace root.
+--
+-- __This only answers the local question now.__ Every remote machine's
+-- coordinates live in @machines.toml@, so there is no single remote for this
+-- function to build: with @allow_localhost@ on it yields the local executor,
+-- and with it off it fail-closes. Callers that need a specific machine go
+-- through 'Seal.Session.Workdir.mkSessionExec' (which resolves the registry) or
+-- the per-call routing in 'Seal.ISA.Dispatch'.
+--
+-- Before this feature the off-arm here built the *one* remote from
+-- @[untrusted_execution.remote]@. That is what named machines replace.
 untrustedIOFromSecurity :: WorkspaceRoot -> SecurityConfig -> UntrustedIO
-untrustedIOFromSecurity wsRoot cfg =
-  case untrustedExecConfigFromSecurity cfg of
-    Nothing -> defaultHandle
-    Just uec ->
-      case uecRemote uec of
-        Nothing -> mkRemoteUntrustedIOStub  -- mode=remote, no remote configured
-        Just sshCfg ->
-          -- The remote SSH arm. The RemoteRunner is the real
-          -- 'mkRealRemoteRunner' (System.Process-backed); the SSH argv +
-          -- host-key pinning are inherited from 'Seal.Tools.Exec.Remote'.
-          mkRemoteUntrustedIO sshCfg mkRealRemoteRunner
+untrustedIOFromSecurity wsRoot cfg
+  | allowLocalhostFromSecurity cfg = defaultHandle
+  | otherwise                      = mkRemoteUntrustedIOStub
   where
 #if !defined(REMOTE_ONLY_UNTRUSTED)
     defaultHandle = mkLocalUntrustedIO wsRoot
