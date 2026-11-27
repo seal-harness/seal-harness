@@ -98,15 +98,27 @@ defaultNamingMissingMachineDropped      -- regDefault = Nothing + warning
 malformedTomlIsLeft                     -- decode failure surfaces, not silent-empty
 ```
 
-### WU-2: Routing, slots, errors, test seams
+### WU-2: Routing in `UIOEnv`, slots, errors, test seams
 
 **DoD**
 - [ ] `MachineError` per design §5.2, typed payloads only:
       `MachineUnreachable !MachineName !UnreachableReason`,
       `MachineHostKeyChanged !MachineName`. No free `Text` payload.
 - [ ] `UnreachableReason = UrConnectFailed | UrBootstrapFailed | UrHostKeyUnknown`.
-- [ ] `MachineName` resolution is total for a selectable name; no `ExecTarget`
-      wrapper (WU-3 resolves in `dispatch`).
+- [ ] **`UIOEnv` gains a third field `uieMachines :: !MachineRouting`** — without
+      it `dispatch` cannot reach the routing at all.
+- [ ] `Seal.Tools.Exec.Machine` exports the **selectors** `rtResolve`,
+      `rtSession`, `rtSelectable` but **not** the `MachineRouting` constructor, so
+      callers can read the routing and cannot forge one.
+- [ ] **`MachineSlot` carries `CloneDeps` too**:
+      `SlotReady !UntrustedIO !CloneDeps | SlotFailed !MachineError`. `CloneDeps`
+      is transport-bound (`cdIsRemote`, `cdPinnedKnownHosts`,
+      `SourceControl/Clone.hs:245,247`), so a call routed to machine B must get
+      B's clone deps, not the session machine's — otherwise WU-13's cross-machine
+      `SETUP_REPO` clones with a B handle and session transport.
+- [ ] Pure resolver over a registry, independent of `SessionMeta` (so WU-3 does not
+      forward-depend on WU-9):
+      `resolveName :: MachineRouting -> Maybe MachineName -> Either MachineError MachineName`.
 - [ ] `MachineRouting { rtResolve, rtSession, rtSelectable }` — constructor and
       fields **not exported**.
 - [ ] `MachineSlot = SlotReady !UntrustedIO | SlotFailed !MachineError`.
@@ -122,7 +134,11 @@ malformedTomlIsLeft                     -- decode failure surfaces, not silent-e
 
 **RED**
 ```
-machineRoutingOpaque                     -- compile-fail: ctor/fields unexported
+machineRoutingCtorNotExported             -- compile-fail: cannot construct
+machineRoutingSelectorsExported           -- rtResolve/rtSession readable
+uioEnvHasRoutingField                     -- dispatch can reach it
+slotCarriesCloneDeps                      -- per-machine clone deps
+mkTestUIOEnvEtaReducedStillCompiles       -- 3-field record, point-free ctor
 machineRoutingConstructorNotExported     -- compile-fail fixture
 mkTestUIOEnvSingletonStillWorks          -- existing 109 sites compile + behave
 mkTestUIOEnvWithTwoMachines              -- 2 distinct handles resolvable
@@ -142,28 +158,42 @@ signature changes, so the ~289 call sites and `Browser.hs` are untouched, and
 
 **DoD**
 - [ ] `resolveMachineForCall :: UIOEnv -> Value -> Either MachineError MachineName`
-      in `Seal.ISA.Dispatch` — no SSH, no handle build; shares `machineForSession`'s
-      ordered checks rather than reimplementing them.
+      in `Seal.ISA.Dispatch` — no SSH, no handle build. Uses WU-2's
+      `resolveName` (pure, registry + maybe-name), **not** `machineForSession`,
+      so this unit does not depend on WU-9.
+- [ ] **`Dispatch.hs:46` widens its import to `Seal.Tools.Exec.UIO.Internal (UIOEnv (..))`**
+      — the record update below does not compile against a type-only import.
 - [ ] `dispatch` resolves after `opAuthorize` and before `itwRecordAndAck`, then
-      builds `callEnv = uioEnv { uieUntrustedIO = handle }` and runs
-      `runUIOWithEnv callEnv` at the existing single binding site.
+      builds the per-call env **swapping both capability fields**:
+
+      ```haskell
+      (handle, cloneDeps) <- rtResolve (uieMachines uioEnv) resolved
+      let callEnv = uioEnv { uieUntrustedIO = handle
+                           , uieCloneDeps   = cloneDeps }
+      ```
+
+      and runs `runUIOWithEnv callEnv` at the existing single binding site.
 - [ ] `rtResolve` may bootstrap lazily; a failed bootstrap surfaces as a
       `MachineError` naming the machine, never `ExecNotImplementedReason`.
 - [ ] Resolution failure produces a tool error naming the valid choices **before
       any `uio*` call**.
+- [ ] `mkTestUIOEnv`'s eta-reduced `UIOEnv` construction and the three positional
+      sites (`Internal.hs:120,129,132`) are updated for the third field.
 
 **Files (edit)** `src/Seal/ISA/Dispatch.hs`, `test/Seal/ISA/DispatchSpec.hs`
-**Depends on** WU-2.
+**Depends on** WU-2. *(Not WU-9 — it uses WU-2's pure `resolveName`, not `machineForSession`.)*
 
 **RED**
 ```
 resolvePicksNamedMachine / resolveDefaultsToSession
+callEnvSwapsBothCapabilities              -- handle AND cloneDeps
 resolveUnknownNamesChoices                -- error lists selectable
 callEnvCarriesTargetHandle                 -- uieUntrustedIO == resolved handle
 unknownMachineRunsNothing                  -- zero counters (T-NOFALLBACK)
 omittedMachineUsesSessionMachine           -- T-NOSTICKY
 twoSshMachinesInOneSession                 -- 2 runners, 2 counters (T-TWO)
 uioSignaturesUnchanged                     -- no uio* takes an ExecTarget
+dispatchImportsUIOEnvFields                -- record update compiles
 ```
 
 ### WU-4: `machine` in the opcode schemas + error rendering
@@ -182,8 +212,13 @@ uioSignaturesUnchanged                     -- no uio* takes an ExecTarget
       leaks host text.
 
 **Files (create)** `src/Seal/ISA/Ops/Machine.hs`, `test/Seal/ISA/Ops/MachineSpec.hs`
-**Files (edit)** the 6 opcode schema sites + `Browser.hs` + `Web/{Fetch,Search}.hs`,
-`src/Seal/Core/TurnEngine.hs`, `seal-harness.cabal`, `test/Main.hs`
+**Files (edit)** every `uoInSchema` site for the 8 machine-selectable opcodes —
+`Shell.hs:51`, `Bin.hs:89`, `Process.hs:28`, `Search.hs:36`, `Repo.hs:111`,
+`File.hs:145,239,331` (9 sites, 6 modules) — plus the `uoDesc` note on
+`Browser.hs:81`, `Web/Fetch.hs:45-46`, `Web/Search.hs:114-115`.
+`Media/Image.hs` and `Media/Tts.hs` are **not** machine-selectable (they do not
+use `UntrustedIO` for transport) and are unchanged.
+Also: `src/Seal/Core/TurnEngine.hs`, `seal-harness.cabal`, `test/Main.hs`.
 **Depends on** WU-2.
 
 **RED**
@@ -197,28 +232,9 @@ renderNoMachineText                       -- T-STR-6 exact
 rejectReasonNeverLeaksHost                -- negative: RrInvalidHost payload absent
 ```
 
-**Files (create)** `src/Seal/ISA/Ops/Machine.hs`, `test/Seal/ISA/Ops/MachineSpec.hs`
-**Files (edit)** the 6 opcode modules + `Browser.hs` + `Web/{Fetch,Search}.hs`,
-`src/Seal/Core/TurnEngine.hs`, `seal-harness.cabal`, `test/Main.hs`
-**Depends on** WU-3b.
-
-**RED**
-```
-machineFieldAbsentIsNothing / PresentIsJust
-schemaEnumListsSelectableNames            -- incl. "local" when allowed
-renderMachineErrorSeparator               -- "SHELL_EXEC failed: " exact (T-STR-1)
-renderUnusableText                        -- T-STR-2 exact
-renderGoneText                            -- T-STR-5 exact
-renderNoMachineText                       -- T-STR-6 exact
-rejectReasonNeverLeaksHost                -- negative: RrInvalidHost payload absent
-unknownMachineRunsNothing                 -- zero counters (T-NOFALLBACK)
-omittedMachineUsesSessionMachine          -- T-NOSTICKY
-twoSshMachinesInOneSession                -- 2 runners, 2 counters (T-TWO)
-```
-
 ---
 
-## Phase 3 — Config files (moved ahead of WU-5)
+## Phase 3 — Config files (WU-7 only; WU-8 moved to Phase 4)
 
 ### WU-7: `machines.toml`, template, paths, boot wiring
 
@@ -264,7 +280,7 @@ resolveMachinesForBootReturnsRegistry
       documented in the CHANGELOG instead (WU-17), not engineered around.
 
 **Files (edit)** `src/Seal/Config/Migrate.hs`, `test/Seal/Config/MigrateSpec.hs`
-**Depends on** WU-6, WU-7.
+**Depends on** WU-6, WU-7. *Moved to Phase 4 — it needs WU-6's `uefcAllowLocalhost`.*
 
 **RED**
 ```
@@ -280,7 +296,7 @@ modeRemovedOnMigrationBoot                -- DW-2: old block gone
 
 ---
 
-## Phase 4 — Session exec and caching
+## Phase 4 — `allow_localhost`, then migration, then session exec
 
 ### WU-6: `allow_localhost`, selector, enforcement
 
@@ -416,7 +432,7 @@ storeAndWorkerConstructMetaWithMachine
 **Files (edit)** `src/Seal/Channel/Cli.hs`, `src/Seal/Command/New.hs`,
 `src-gateway-types/Seal/Gateway/Types/{NewArgs,Route}.hs`,
 `src/Seal/Gateway/{API,OpenApi}.hs`, `src/Seal/Session/Store.hs`,
-`src/Seal/Channels/Chat/Loop.hs`,
+`src-chat-channels/Seal/Channels/Chat/Loop.hs`,
 `test/Seal/Gateway/ApiRouteSpec.hs`,
 `frontend/src/{components/NewTabComposer.tsx,hooks/useNewTabSpec.ts}`
 **Depends on** WU-2, WU-9.
@@ -470,8 +486,9 @@ sessionInfoJsonAgreesWithRenderTab         -- T-STR-12
 ### WU-12: ACK record names the machine
 
 **DoD**
-- [ ] `resolveMachineForCall` — no SSH, no handle build; **shares
-      `machineForSession`'s ordered checks** rather than reimplementing them.
+- [ ] Consumes WU-3's `resolveMachineForCall` (**WU-3 owns that function**; this
+      unit does not redefine it) and WU-9's `machineForSession` for the
+      session-scoped error cases.
 - [ ] Resolution happens in `dispatch` **before** `itwRecordAndAck`; the resolved
       name is stamped into the invocation entry (`mkInvocationEntryWithMachine`).
 - [ ] `opAuthorize` still runs first — a denied call resolves and records nothing.
