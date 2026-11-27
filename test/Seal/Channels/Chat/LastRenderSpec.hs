@@ -327,6 +327,8 @@ spec = do
     it "degrades an empty message list to the empty view" $
       renderLast (LastMessages hd []) `shouldBe` renderLast (LastEmpty hd)
 
+  leakSpec
+
   describe "quoteBody" $ do
     it "prefixes non-blank lines and leaves a bare > on blank lines" $
       quoteBody "a\n\nb" `shouldBe` "> a\n>\n> b"
@@ -382,3 +384,57 @@ reqEntry toolResults _extra = A.object
       Just (A.String "false") -> A.Object (KeyMap.insert (Key.fromText "is_error") (A.Bool False) o)
       _ -> A.Object o
     fixErr v = v
+
+-- | The security invariant, as an executable check rather than a comment:
+-- nothing the renderer emits may carry a tool input, a tool-result body, the
+-- system prompt, or a thinking block, all of which are present in the input.
+leakSpec :: Spec
+leakSpec = describe "constraint 2 (nothing the assistant did not author)" $ do
+  let em = "\8212"
+      hd = TabHeading (mkIdx 'b') (Just "t")
+
+  it "never renders a tool input, the system prompt, a result, or thinking" $ do
+    let evil = A.object
+          [ "direction" .= ("response" :: T.Text)
+          , "payload" .= A.object
+              [ "system" .= ("SYSSENTINEL" :: T.Text)
+              , "result" .= ("RESULTSENTINEL" :: T.Text)
+              , "content" .=
+                  [ blk "text" [("text", "ok")]
+                  , blk "tool_use" [("id", "t1"), ("name", "SHELL_EXEC"), ("input", "INPUTSENTINEL")]
+                  , blk "thinking" [("thinking", "THINKSENTINEL")]
+                  ]
+              ]
+          ]
+        out = renderLast (resolveLast (ResolveInput hd (assistantItems [evil]) False Nothing 1 False))
+    -- A response with text renders the text (not the tool line), so the tool
+    -- name is legitimately absent; what matters is that no sentinel leaks.
+    out `shouldSatisfy` T.isInfixOf "ok"
+    mapM_ (\s -> out `shouldSatisfy` (not . T.isInfixOf s))
+      ["INPUTSENTINEL", "SYSSENTINEL", "RESULTSENTINEL", "THINKSENTINEL"]
+
+  it "never renders a tool input on the tool-line path either" $ do
+    -- No text, so the tool line is what renders: the input must still not leak.
+    let evil = A.object
+          [ "direction" .= ("response" :: T.Text)
+          , "payload" .= A.object
+              [ "content" .=
+                  [ blk "tool_use" [("id", "t1"), ("name", "SHELL_EXEC"), ("input", "INPUTSENTINEL")]
+                  , blk "thinking" [("thinking", "THINKSENTINEL")]
+                  ]
+              ]
+          ]
+        out = renderLast (resolveLast (ResolveInput hd (assistantItems [evil]) False Nothing 1 False))
+    out `shouldSatisfy` T.isInfixOf "SHELL_EXEC"
+    mapM_ (\snt -> out `shouldSatisfy` (not . T.isInfixOf snt))
+      ["INPUTSENTINEL", "THINKSENTINEL"]
+
+  it "matches the four requirement error strings byte for byte" $ do
+    renderLastError (LENoSuchTab "z")
+      `shouldBe` "last failed: no such tab z " <> em <> " /tab list"
+    renderLastError (LENoSession 'b')
+      `shouldBe` "last failed: tab b has no session (harness tab)"
+    renderLastError LENoCurrentTab
+      `shouldBe` "last failed: no current tab"
+    renderLastError (LETranscript 'b')
+      `shouldBe` "last failed: couldn't read tab b's transcript " <> em <> " try again in a moment"
