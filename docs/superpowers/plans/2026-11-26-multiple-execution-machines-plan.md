@@ -22,13 +22,22 @@
 | P10 | **DW-14 half-vacuous.** Post-execution stamping passes a success-path assertion | CTO | **WU-12** RED |
 | P11 | **Frozen strings 2, 5, 6, 8 unasserted** (RED stopped at the ADT constructor) | Completeness | WU-4/9/10 RED |
 | P12 | **`mtSshCannotCarryMismatchedName` unfalsifiable** — true by construction | Completeness | deleted |
-| P13 | **WU-3 splittable** after WU-2; my "atomic" claim was wrong | CTO | split into WU-3a/b |
+| P13 | **WU-3 splittable** after WU-2; my "atomic" claim was wrong | CTO | resolved differently — see P20 |
 | P14 | **`machines.toml` malformed unhandled** | Completeness | **WU-7** RED |
 | P15 | **`make check` is 4 targets** + frontend build, not 3 | Feasibility | corrected below |
 | P16 | **`mkSessionUntrustedIO` + its back-compat test** assert the escape hatch being deleted | Completeness | **WU-3b** |
 | P17 | **`FileExplorer`, `AgentMetaCache` in no unit** | Completeness | **WU-6b** (new) |
 | P18 | **Rollback direction unsafe**: reverting the binary after migration leaves no `[untrusted_execution]` ⇒ old codec defaults to local | Completeness | **WU-8b** |
 | P19 | **`enforceRemoteOnly` call site unnamed**; hardened build can still run locally via unguarded `mkLocalUntrustedIO` at `Workdir.hs:188` | Security | **WU-16** |
+
+**Round 2 of the plan gate** (Feasibility FAIL, Completeness FAIL, Scope FAIL
+in round 1; this batch is Scope round 1's findings):
+
+| # | Finding | Reviewer | Fix |
+|---|---|---|---|
+| P20 | **Materially simpler design available**: resolve `machine` in `dispatch` and swap `uieUntrustedIO` per call, leaving all 12 `uio*` signatures untouched | Scope | **WU-3** rewritten; WU-3a/3b deleted; ~289 sites avoided. Operator approved the switch |
+| P21 | **WU-8 retained `mode` for rollback**, contradicting "loses `[untrusted_execution] mode`" and making Done-when 2 unpassable | Scope | Retention removed; hazard documented in CHANGELOG instead |
+| P22 | **WU-10 added chat-channel `ASK_HUMAN`**, but the requirements say "no interactive prompt; the configured default is used" | Scope | Removed; unset ⇒ `MachineDefaultUnset` |
 
 ## How to read this plan
 
@@ -89,14 +98,15 @@ defaultNamingMissingMachineDropped      -- regDefault = Nothing + warning
 malformedTomlIsLeft                     -- decode failure surfaces, not silent-empty
 ```
 
-### WU-2: `ExecTarget`, routing, slots, errors, test seams
+### WU-2: Routing, slots, errors, test seams
 
 **DoD**
 - [ ] `MachineError` per design §5.2, typed payloads only:
       `MachineUnreachable !MachineName !UnreachableReason`,
       `MachineHostKeyChanged !MachineName`. No free `Text` payload.
 - [ ] `UnreachableReason = UrConnectFailed | UrBootstrapFailed | UrHostKeyUnknown`.
-- [ ] `newtype ExecTarget = ExecTarget MachineName` — constructor **not exported**.
+- [ ] `MachineName` resolution is total for a selectable name; no `ExecTarget`
+      wrapper (WU-3 resolves in `dispatch`).
 - [ ] `MachineRouting { rtResolve, rtSession, rtSelectable }` — constructor and
       fields **not exported**.
 - [ ] `MachineSlot = SlotReady !UntrustedIO | SlotFailed !MachineError`.
@@ -112,7 +122,7 @@ malformedTomlIsLeft                     -- decode failure surfaces, not silent-e
 
 **RED**
 ```
-execTargetConstructorNotExported         -- compile-fail fixture
+machineRoutingOpaque                     -- compile-fail: ctor/fields unexported
 machineRoutingConstructorNotExported     -- compile-fail fixture
 mkTestUIOEnvSingletonStillWorks          -- existing 109 sites compile + behave
 mkTestUIOEnvWithTwoMachines              -- 2 distinct handles resolvable
@@ -124,66 +134,68 @@ rejectReasonPayloadExcludedFromModelView -- negative: no host text in any render
 
 ## Phase 2 — The per-call seam
 
-### WU-3a: `withTarget`, file ops, process, search
+### WU-3: Dispatcher-side resolution
+
+**Changed by operator decision** — replaces revision 2's WU-3a/WU-3b. No `uio*`
+signature changes, so the ~289 call sites and `Browser.hs` are untouched, and
+`mkSessionUntrustedIO`/`uioUntrustedIO`/`uieUntrustedIO` all stay.
 
 **DoD**
-- [ ] `withTarget :: ExecTarget -> (UntrustedIO -> IO a) -> UIO (Either MachineError a)`.
-- [ ] `uioResolveTarget :: Maybe Text -> UIO (Either MachineError ExecTarget)`.
-- [ ] `sessionTarget :: UIO ExecTarget`.
-- [ ] `ExecTarget` on: `uioRead`, `uioWrite`, `uioPatch`, `uioProcessList`,
-      `uioProcessKill`, `uioSearchFiles`.
-- [ ] `Seal.Tools.Exec.WorkdirFs.hs:418` passes `sessionTarget`.
-- [ ] `MachineRouting` stays opaque; T-CAP grep passes.
+- [ ] `resolveMachineForCall :: UIOEnv -> Value -> Either MachineError MachineName`
+      in `Seal.ISA.Dispatch` — no SSH, no handle build; shares `machineForSession`'s
+      ordered checks rather than reimplementing them.
+- [ ] `dispatch` resolves after `opAuthorize` and before `itwRecordAndAck`, then
+      builds `callEnv = uioEnv { uieUntrustedIO = handle }` and runs
+      `runUIOWithEnv callEnv` at the existing single binding site.
+- [ ] `rtResolve` may bootstrap lazily; a failed bootstrap surfaces as a
+      `MachineError` naming the machine, never `ExecNotImplementedReason`.
+- [ ] Resolution failure produces a tool error naming the valid choices **before
+      any `uio*` call**.
 
-**Files (edit)** `src/Seal/Tools/Exec/UIO/{Internal,UIO}.hs`, `WorkdirFs.hs`,
-`src/Seal/ISA/Ops/{File,Search,Process}.hs`
+**Files (edit)** `src/Seal/ISA/Dispatch.hs`, `test/Seal/ISA/DispatchSpec.hs`
 **Depends on** WU-2.
 
 **RED**
 ```
-uioReadTakesTarget / uioWriteTakesTarget / ... (6)
-withTargetUnknownIsMachineErrorNotNotImplemented
-workdirFsUsesSessionTarget
-noOpcodeDestructuresMachineRouting       -- T-CAP grep
+resolvePicksNamedMachine / resolveDefaultsToSession
+resolveUnknownNamesChoices                -- error lists selectable
+callEnvCarriesTargetHandle                 -- uieUntrustedIO == resolved handle
+unknownMachineRunsNothing                  -- zero counters (T-NOFALLBACK)
+omittedMachineUsesSessionMachine           -- T-NOSTICKY
+twoSshMachinesInOneSession                 -- 2 runners, 2 counters (T-TWO)
+uioSignaturesUnchanged                     -- no uio* takes an ExecTarget
 ```
 
-### WU-3b: shell/bin ops, the `*Env` variants, and the escape-hatch removal
-
-**DoD**
-- [ ] `ExecTarget` on `uioShellExec`, `uioBinExec`, `uioShellExecEnv`,
-      `uioShellExecGitEnv`, `uioBinExecEnv`, `uioBinExecGitEnv`.
-- [ ] `uioUntrustedIO` deleted; `Repo.hs`'s `cloneRepoIO` migrated to `withTarget`.
-- [ ] `uieUntrustedIO` deleted from `UIOEnv`.
-- [ ] **`mkSessionUntrustedIO` deleted** and `WorkdirSpec.hs:267`'s back-compat
-      test removed — both assert the escape hatch being closed.
-- [ ] **`src/Seal/ISA/Ops/Browser.hs`** updated (`:97` calls `uioBinExec`).
-
-**Files (edit)** `UIO/{Internal,UIO}.hs`, `src/Seal/ISA/Ops/{Shell,Bin,Repo,Browser}.hs`,
-`src/Seal/Session/Workdir.hs`, `test/Seal/Config/WorkdirSpec.hs`
-**Depends on** WU-3a.
-
-**RED**
-```
-uioShellExecTakesTarget / uioBinExecTakesTarget / 4 Env variants
-repoCloneGoesThroughWithTarget
-mkSessionUntrustedIOIsGone               -- compile-fail fixture
-browserManageStillRuns                   -- regression: agent-browser path works
-```
-
-### WU-4: The eight opcodes accept `machine`
+### WU-4: `machine` in the opcode schemas + error rendering
 
 **DoD**
 - [ ] `machineField`, `machineSchemaProp :: [Selectable] -> Value`,
       `renderMachineError :: OpName -> MachineError -> Text` in `Seal.ISA.Ops.Machine`.
 - [ ] Separator is **`" failed: "`** — `\(OpName n) -> n <> " failed: " <> body err`.
-- [ ] 8 opcodes accept optional `machine`, resolve via `uioResolveTarget`, fail
-      before execution on unknown names.
+- [ ] The 8 untrusted opcode **schemas** gain the optional `machine` property.
+      `uoRun` bodies are unchanged (WU-3 consumes it).
 - [ ] `uoDesc` gains "always runs on the session machine" on
       **`Browser.hs:79`, `src/Seal/Web/Fetch.hs:46`, `src/Seal/Web/Search.hs:115`**.
 - [ ] Schemas become functions of `[Selectable]`; `buildSessionRegistry` passes it.
 - [ ] **Every `RejectReason` except `RrMissingField Workspace` renders payload-free**
-      for the model (a generic "is unusable" body) — `renderMachineError` is total,
-      so an unspecified constructor leaks host text.
+      for the model — `renderMachineError` is total, so an unspecified constructor
+      leaks host text.
+
+**Files (create)** `src/Seal/ISA/Ops/Machine.hs`, `test/Seal/ISA/Ops/MachineSpec.hs`
+**Files (edit)** the 6 opcode schema sites + `Browser.hs` + `Web/{Fetch,Search}.hs`,
+`src/Seal/Core/TurnEngine.hs`, `seal-harness.cabal`, `test/Main.hs`
+**Depends on** WU-2.
+
+**RED**
+```
+machineFieldAbsentIsNothing / PresentIsJust
+schemaEnumListsSelectableNames            -- incl. "local" when allowed
+renderMachineErrorSeparator               -- "SHELL_EXEC failed: " exact (T-STR-1)
+renderUnusableText                        -- T-STR-2 exact
+renderGoneText                            -- T-STR-5 exact
+renderNoMachineText                       -- T-STR-6 exact
+rejectReasonNeverLeaksHost                -- negative: RrInvalidHost payload absent
+```
 
 **Files (create)** `src/Seal/ISA/Ops/Machine.hs`, `test/Seal/ISA/Ops/MachineSpec.hs`
 **Files (edit)** the 6 opcode modules + `Browser.hs` + `Web/{Fetch,Search}.hs`,
@@ -244,11 +256,12 @@ resolveMachinesForBootReturnsRegistry
 - [ ] `migrateExecutionMachines`, all five rows of design §4 + the failure row.
 - [ ] Idempotent; fail-open but never downgrades.
 - [ ] Drops `known_hosts`.
-- [ ] **Rollback safety (P18)**: migration **leaves `mode` in place**, adding
-      `allow_localhost` alongside it, so a reverted binary still reads `mode`.
-      A second migration pass removes `mode` only once
-      `machines.toml` exists with a resolvable machine. Otherwise reverting the
-      binary after migration silently downgrades a remote-only install to local.
+- [ ] **`mode` is removed on the migration boot**, as the frozen requirements
+      state ("loses `[untrusted_execution] mode`"; "removed from `security.toml`
+      once the new copy is written"). Done-when 2 asserts "with the old block gone".
+      Retaining `mode` for rollback convenience was rejected: it would make DW-2
+      unpassable and is a new requirement, not a review fix. The revert hazard is
+      documented in the CHANGELOG instead (WU-17), not engineered around.
 
 **Files (edit)** `src/Seal/Config/Migrate.hs`, `test/Seal/Config/MigrateSpec.hs`
 **Depends on** WU-6, WU-7.
@@ -262,7 +275,7 @@ modeLocalBecomesFlagTrue
 existingMachinesTomlWins
 idempotentSecondRunIsNoOp
 failedWriteDoesNotDowngrade               -- T-MIG-5
-modeRetainedWhileMachinesTomlMissing      -- rollback safety
+modeRemovedOnMigrationBoot                -- DW-2: old block gone
 ```
 
 ---
@@ -383,7 +396,10 @@ storeAndWorkerConstructMetaWithMachine
 - [ ] `buildMachinePrompt :: [Selectable] -> Maybe MachineName -> Text`
       (its own pure function; `formatQuestionWithOptions` untouched).
 - [ ] TUI prompts at ≥2, none at 1, empty ⇒ default.
-- [ ] **Chat channels**: default used silently; `ASK_HUMAN` with the list when unset.
+- [ ] **Chat channels**: default used silently. **No interactive prompt** — the
+      requirements are explicit ("no interactive prompt; the configured default is
+      used"). When no default is configured the session fails with
+      `MachineDefaultUnset`; there is no `ASK_HUMAN` fallback.
 - [ ] `NewArgs.naMachine :: Maybe Text`; `parseNewArgs` gains `-x`;
       `Seal.Command.New` gains the fifth optparse flag.
 - [ ] `/new -x <unknown>` fails at `/new` time with the valid choices.
@@ -625,7 +641,7 @@ All green before `gh pr ready`.
 
 | Risk | Mitigation |
 |---|---|
-| WU-3a/b together touch ~289 sites | Split into two compile-green slices (file/process/search; shell/bin/Env) |
+| Dispatcher resolution is one unit | No `uio*` signature changes at all (P20), so no 289-site churn and no split |
 | `.cabal` + `test/Main.hs` edited by ~10 units | Minimal edits; rebase `main` before `gh pr ready` |
 | Two config files can disagree | Resolver takes the flag as a parameter (WU-1); WU-6's decode rule |
 | Adding a field to `SessionMeta` breaks positional construction | WU-9 scopes `Store.hs` + `Worker.hs` explicitly |

@@ -1,6 +1,7 @@
 # Multiple Execution Machines — Design
 
-> **Status:** Revision 3, for Design Review Gate round 3.
+> **Status:** Revision 5. §6 rewritten for dispatcher-side resolution (operator
+> decision, 2026-11-27).
 > **Requirements:** `docs/superpowers/requirements/2026-11-26-multiple-execution-machines-requirements.md`
 > (approved 2026-11-26, frozen, **with two operator-approved amendments recorded
 > in §0.2**).
@@ -598,56 +599,96 @@ first use.
 that lets a future opcode bypass machine selection. Its last reader
 (`cloneRepoIO`, `Repo.hs:90-91`) migrates to `withTarget`.
 
-### 6.2 `ExecTarget` and `withTarget`
+### 6.2 Resolution happens in `dispatch` — revision 5
+
+**Changed by operator decision.** Revisions 1–4 threaded a `newtype ExecTarget`
+through all twelve `uio*` functions — ~289 call sites and two dedicated work
+units. That was the "registry in the environment, explicit argument at every call
+site" design chosen when the cost was unquantified. With the cost known, the
+operator chose **dispatcher-side resolution** instead, which keeps the registry in
+`UIOEnv` (so the original instinct holds) without touching a single `uio*`
+signature.
+
+The mechanism already exists. `dispatch` holds both the environment and the raw
+input, and binds the environment to the action in exactly one place:
 
 ```haskell
-newtype ExecTarget = ExecTarget MachineName   -- constructor NOT exported
-
-withTarget :: ExecTarget -> (UntrustedIO -> IO a) -> UIO (Either MachineError a)
+dispatch reg h backend uioEnv toolTimeout abortFlag name input = …
+            UntrustedOpcode {} -> do
+              entry <- liftIO (mkInvocationEntry name input)
+              liftIO (itwRecordAndAck h …)
+              let ioAction = do
+                    r <- runUIOWithEnv uioEnv (uoRun op input)   -- one binding site
+                    pure (Right r)
 ```
 
-Generalized to `IO a` so it fits `cloneRepoIO`'s `IO CloneResult`.
-
-Honest guarantee: **"some target was named"**, not "the caller chose it" —
-`sessionMachine` wraps `rtSession` unvalidated, correct per the requirements but
-weaker than revision 1 claimed.
-
-Failure branches return a `MachineError` naming the machine, never
-`ExecNotImplementedReason` (revision 1's `Nothing` branch made a lookup miss
-indistinguishable from a stubbed backend).
-
-### 6.3 Resolution lives in the `UIO` surface
-
-The round-1 compile error: opcode bodies are `UIO` (no `MonadReader`/`MonadIO`),
-and `CapabilityScopingWorkdirFsFailSpec.hs:53` fails the build if any
-`src/Seal/ISA/Ops/` module imports `UIO.Internal`.
+So resolution becomes:
 
 ```haskell
--- Seal.Tools.Exec.UIO (opcodes import this legally)
-uioResolveTarget :: Maybe Text -> UIO (Either MachineError ExecTarget)
-sessionTarget    :: UIO ExecTarget
+-- in dispatch, after opAuthorize, before the ACK
+resolved <- resolveMachineForCall uioEnv input        -- Maybe MachineName, no SSH
+handle   <- rtResolve (uieMachines uioEnv) resolved   -- may bootstrap lazily
+let callEnv = uioEnv { uieUntrustedIO = handle }      -- per-call env
+…
+  r <- runUIOWithEnv callEnv (uoRun op input)
+```
 
--- Seal.ISA.Ops.Machine (pure only)
-machineField :: Value -> Maybe Text
-machineSchemaProp :: [MachineName] -> Value
+`uieUntrustedIO` is the single handle every `uio*` function reads, so replacing it
+per call redirects the whole untrusted surface. **No `ExecTarget`, no
+`withTarget`, no `uioResolveTarget`, no signature changes, no call-site churn.**
+
+### 6.2.1 What this gives up, stated honestly
+
+`ExecTarget` made the target mandatory *at the type level*: a new `uio*` function
+that forgot to take one would not compile. Dispatcher resolution has no such
+guarantee — an opcode reads whichever handle the environment carries and cannot
+tell whether that is the session machine or a per-call override.
+
+That guarantee was not load-bearing, because the opcode never *chooses* the
+machine: the model's choice arrives in the input `Value`, which only `dispatch`
+parses. The type-level constraint protected a decision the opcode layer never
+makes. It cost a per-call review surface; it bought immunity to a future `uio*`
+function forgetting a parameter. Accepted trade.
+
+The invariant that does matter is preserved: resolution happens once, in
+`dispatch`, and the value recorded in the ACK entry is the same value used to
+build `callEnv` (§6.5), so the record cannot name a machine other than the one
+that runs.
+
+### 6.3 Resolution helpers
+
+The round-1 compile error is moot: resolution is no longer in opcode land. Pure
+helpers stay there because they only read the input `Value` and a static name
+list.
+
+```haskell
+-- Seal.ISA.Ops.Machine (pure only; opcodes import this)
+machineField      :: Value -> Maybe Text
+machineSchemaProp :: [Selectable] -> Value
 renderMachineError :: OpName -> MachineError -> Text
+
+-- Seal.ISA.Dispatch (holds UIOEnv; resolves and builds the per-call env)
+resolveMachineForCall :: UIOEnv -> Value -> Either MachineError MachineName
 ```
 
-`MachineRouting`'s constructor/fields are unexported; only `mkMachineRouting`
-(for `mkSessionExec`) and the `UIO` functions above. T-CAP is a grep/compile-fail
-obligation.
+`MachineRouting`'s constructor and fields stay unexported; only
+`mkMachineRouting` (for `mkSessionExec`) and `rtResolve`.
+`CapabilityScopingWorkdirFsFailSpec.hs:53` (no `src/Seal/ISA/Ops/` module may
+import `UIO.Internal`) still passes: no opcode module gains an import.
 
-One source of truth per lifetime: the **schema enum** from `regMachines` (static,
-names only); **resolution** from the `UIO` env (dynamic, handles). The registry
-builder receives `[MachineName]`, never live handles. `buildSessionRegistry`
-already runs per turn (`TurnEngine.hs:279`, `:747`, `:1136`), so no caching change.
+One source of truth per lifetime is unchanged: the **schema enum** from
+`regMachines` (static, names only); **resolution** from the `UIO` env (dynamic,
+handles). The registry builder receives `[MachineName]`, never live handles.
+`buildSessionRegistry` already runs per turn (`TurnEngine.hs:279`, `:747`,
+`:1136`), so no caching change.
 
 ### 6.4 Opcode input
 
-The eight untrusted opcodes gain an optional `machine` property, parsed by
-`machineField`, resolved by `uioResolveTarget`. `Nothing` → session machine;
-`Just t` → validated/looked up; unknown becomes a tool error naming valid choices
-**before any `uio*` call**. `Seal.ISA.Opcode`'s GADT is unchanged.
+The eight untrusted opcodes gain an optional `machine` property **in their
+schemas only**. Nothing is parsed in the opcode body: `machine` is consumed by
+`dispatch` (§6.2), and an unknown or unusable name becomes a tool error naming the
+valid choices **before any `uio*` call**, so nothing runs anywhere. Neither
+`Seal.ISA.Opcode`'s GADT nor any opcode's `uoRun` body changes.
 
 `machineField` in a shared module is a mild break from the per-field local-helper
 convention (`commandField`, `pathField`), justified by 8 consumers.
