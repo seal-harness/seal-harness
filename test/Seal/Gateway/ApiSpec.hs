@@ -20,6 +20,7 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (fromJust, fromMaybe, isJust, listToMaybe, mapMaybe)
 import Data.Set qualified as Set
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
 import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime(..), fromGregorian)
 import Data.Vector qualified as V
@@ -52,6 +53,7 @@ import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntime
 import Seal.Config.Paths
   ( SealPaths (..), sessionConversationPath, sessionDir, sessionMetaPath
   , sessionWorkdir, sshAgentsDir )
+import Seal.Config.Machines (mkMachineName)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types
@@ -2532,6 +2534,50 @@ spec = describe "Seal.Gateway.API" $ do
         Just (A.Object o) -> case lookupK "path" o of
           Just (A.String p) ->
             p `shouldBe` T.pack (cacheDir </> "workdirs" </> T.unpack sidTxt)
+          other -> expectationFailure ("expected path string, got: " <> show other)
+        _ -> expectationFailure ("expected JSON object, got: " <> show body)
+
+  -- WU-6b: the reported workdir must be the one on the machine the session is
+  -- RECORDED on, not the one on the current default. A resumed session reports
+  -- where its work actually is.
+  it "GET /api/sessions/:id/workdir follows the session's recorded machine" $
+    withSystemTempDirectory "seal-api-machine" $ \stateDir -> do
+      let cacheDir = stateDir </> "cache"
+          homeDir = stateDir </> "home"
+          paths = fakePaths { spHome = homeDir, spState = stateDir, spCache = cacheDir }
+          sidTxt = "20260701-120000-098"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      -- machines.toml: "default" is the default, but this session is recorded on
+      -- "builder", whose workspace differs.
+      createDirectoryIfMissing True homeDir
+      TIO.writeFile (homeDir </> "machines.toml") $ T.unlines
+        [ "default = \"default\""
+        , "[machines.default]"
+        , "host = \"a.example.com\""
+        , "user = \"seal\""
+        , "workspace = \"/srv/default-ws\""
+        , "[machines.builder]"
+        , "host = \"b.example.com\""
+        , "user = \"seal\""
+        , "workspace = \"/srv/builder-ws\""
+        ]
+      let builder = case mkMachineName "builder" of
+            Right n -> n; Left e -> error ("machine fixture: " <> T.unpack e)
+          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing (Just builder) Nothing
+                   (UTCTime (fromGregorian 2026 7 1) 0)
+                   (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sidTxt, "workdir"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> case lookupK "path" o of
+          Just (A.String p) ->
+            -- The recorded machine's workspace, NOT the default's.
+            p `shouldBe` T.pack ("/srv/builder-ws/workdirs/" <> T.unpack sidTxt)
           other -> expectationFailure ("expected path string, got: " <> show other)
         _ -> expectationFailure ("expected JSON object, got: " <> show body)
 

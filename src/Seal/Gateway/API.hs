@@ -142,6 +142,7 @@ import Seal.Providers.OllamaReadiness
   ( OllamaReadiness (..), readinessWire )
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
+import Seal.Session.Machine (machineForSession)
 import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
 import Seal.SourceControl.Repo
   ( RepoCredential (..), RepoId, SourceRepo (..), hostAllowed, mkRepoId
@@ -1727,17 +1728,22 @@ handleSessionWorkdir deps sid = do
   if not exists
     then pure (errJson status404 "session not found")
     else do
-      -- The workdir lives on the session's execution machine, so this reads the
-      -- machine registry rather than a single security.toml block. An absent or
-      -- unusable machine falls back to the local path shape, so the frontend
-      -- always has something to show; 'handleSessionAgents' is where an
-      -- unusable machine surfaces as an error.
+      -- The workdir lives on the session's execution machine, and "the
+      -- session's" is its /recorded/ machine ('smMachine') — not the current
+      -- default, which may have moved since. A resumed session therefore reports
+      -- the path where its work actually is. 'machineForSession' is the same
+      -- resolver the turn engine uses, so the two cannot disagree about where a
+      -- session runs.
+      mSessionMeta <- readSessionMeta paths sid
       eReg <- resolveRegistryForSecurity paths (adSecurityConfig deps)
-      let wdPath = case eReg of
-            Right reg -> case resolveRegistryTarget reg Nothing of
+      let wdPath = case (mSessionMeta, eReg) of
+            (Just meta, Right reg) -> case machineForSession reg meta of
               Right (_, MtSsh sshCfg) -> remoteSessionWorkdirPath sshCfg sid
               _ -> T.pack (sessionWorkdir paths sid)
-            Left _ -> T.pack (sessionWorkdir paths sid)
+            -- An unresolvable machine falls back to the local path shape, so the
+            -- frontend always has something to show. 'handleSessionAgents' is
+            -- where an unusable machine surfaces as an error.
+            _ -> T.pack (sessionWorkdir paths sid)
       pure (jsonLBS status200 (A.encode (object ["path" .= wdPath])))
 
 -- | Parse the @archived@ boolean field from a PUT /api/sessions/:id/archived
