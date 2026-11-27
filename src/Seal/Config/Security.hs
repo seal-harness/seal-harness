@@ -45,6 +45,7 @@ module Seal.Config.Security
   , accessControlCodec
   , credentialCodec
   , normalizeAccessControlTable
+  , expandDottedKeys
   , fixNode
   , hasLegacyLayout
   , readLegacyCredentials

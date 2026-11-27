@@ -28,26 +28,35 @@
 module Seal.Config.Migrate
   ( migrateSecurityConfig
   , configHasLegacySecurityFields
+  , migrateExecutionMachines
   ) where
 
 import Control.Exception (try, SomeException)
+import Control.Monad (when)
 import Data.Maybe (isJust, isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
-import System.Directory (doesFileExist)
+import System.Directory (doesFileExist, doesPathExist)
 import Data.HashMap.Strict qualified as HashMap
+import Data.List.NonEmpty qualified as NonEmpty
+import Data.Map.Strict qualified as Map
 import System.IO (hPutStrLn, stderr)
 
+import Toml ((.=))
 import Toml qualified
 
 import Validation (Validation (..))
 
 import Seal.Config.File
   ( loadRuntimeConfig, saveRuntimeConfig )
-import Seal.Config.Paths (SealPaths, configFilePath, securityFilePath)
+import Seal.Config.Machines
+  ( MachineFileConfig (..), MachinesConfig (..), saveMachinesConfig )
+import Seal.Config.Paths
+  ( SealPaths, configFilePath, machinesFilePath, securityFilePath )
 import Seal.Config.Security
-  ( SecurityConfig (..), securityConfigCodec
+  ( SecurityConfig (..), UntrustedExecFileConfig (..), expandDottedKeys
+  , securityConfigCodec, writeSecretFile
   , WriteMode (PreserveCredentials), loadSecurityConfig, saveSecurityConfig
   , tomlKeyPaths )
 import Seal.Gateway.Config (gatewayTableCodec)
@@ -78,6 +87,13 @@ migrateSecurityConfig paths = do
     (_, False)    -> pure ()
     (False, True) -> migrateIntoNewFile cfgPath secPath
     (True, True)  -> reconcileWithExisting cfgPath secPath
+  -- The execution-machine migration runs LAST, on purpose. It writes
+  -- security.toml, and this function chooses its branch by asking whether that
+  -- file already exists — so creating it earlier would send an upgraded install
+  -- down the "security.toml wins" path and leave the vault fields stranded in
+  -- config.toml. Running it after means the legacy move happens against the
+  -- files as the operator left them.
+  migrateExecutionMachines paths
 
 -- | Do these @config.toml@ bytes still carry the pre-split security fields?
 --
@@ -326,3 +342,249 @@ warnWriteFailed secPath err =
 
 say :: Text -> IO ()
 say = hPutStrLn stderr . T.unpack
+
+--------------------------------------------------------------------------------
+-- The execution-machine migration (design 4)
+--------------------------------------------------------------------------------
+
+-- | Move an install's single remote execution target into @machines.toml@, and
+-- replace @[untrusted_execution] mode@ with @allow_localhost@.
+--
+-- Runs from 'migrateSecurityConfig', so every boot path that already migrates
+-- gets it, and it needs no separate call.
+--
+-- == The five rows, and why each one is what it is
+--
+--   * __No @[untrusted_execution]@, no machine@ — leave both alone. The absent
+--     section already resolves to @allow_localhost = true@, and writing an
+--     explicit @true@ would look like a decision the operator made.
+--   * __@mode = \"remote\"@ with a complete remote block__ — write
+--     @[machines.default]@ named @default@, point @default@ at it, set
+--     @allow_localhost = false@, drop the block. @known_hosts@ is /dropped/,
+--     not migrated: the pin file is harness-owned now and no machines.toml field
+--     names it, so carrying the path across would add a key nothing reads.
+--   * __@mode = \"remote\"@ with an incomplete block__ — set the flag, write no
+--     machine, and say so loudly. A machine missing @host@/@user@/@workspace@
+--     would resolve to a rejection, and making it the @default@ would then make
+--     every session fail; and guessing the missing fields is not the migration's
+--     job.
+--   * __@mode = \"local\"@ or absent__ — @allow_localhost = true@.
+--   * __@machines.toml@ exists__ — it wins. Only the strip happens, so an
+--     operator who already wrote machines by hand keeps exactly them. The flag
+--     is still set from the old @mode@, because "local execution is off" is a
+--     fact about the install that the new file cannot express.
+--
+-- == Ordering: the flag first, the machine second
+--
+-- The flag write is what makes a remote-only install stop permitting local
+-- execution, and it is the write that must not be lost. So it happens first, and
+-- a later failure leaves @allow_localhost = false@ with no machine: the harness
+-- refuses to run anything and says so, which is the fail-closed direction. The
+-- opposite order would leave a permissive flag on a machine-less install.
+--
+-- Idempotent: after the first successful run the section no longer carries a
+-- @mode@, so every branch below is a no-op.
+migrateExecutionMachines :: SealPaths -> IO ()
+migrateExecutionMachines paths = do
+  let secPath = securityFilePath paths
+      cfgPath = configFilePath paths
+  -- The block may be in either file: an install that never completed the
+  -- earlier config.toml -> security.toml move still has it in config.toml.
+  secRaw <- readIfPresent secPath
+  cfgRaw <- readIfPresent cfgPath
+  case pickSource secPath cfgPath secRaw cfgRaw of
+    Nothing -> pure ()
+    Just (sourcePath, raw) -> case retiredMode raw of
+      Nothing -> pure ()   -- no retired mode: already new-shape, or none at all
+      Just mode -> do
+        machineWritten <- case (mode, completeRemoteBlock raw) of
+          ("remote", Just block) -> writeMigratedMachine paths block
+          ("remote", Nothing)    -> do
+            say ("[seal] WARNING: " <> T.pack sourcePath <> " had [untrusted_execution] "
+                  <> "mode = \"remote\" with an incomplete [untrusted_execution.remote] "
+                  <> "block, so no machine was written. allow_localhost is now false, so "
+                  <> "nothing will run until you add a machine under [machines.<name>] in "
+                  <> T.pack (machinesFilePath paths) <> ".")
+            pure True   -- "no machine needed" — do not block the strip
+          _ -> pure True
+        when machineWritten $ do
+          stripRetiredSection sourcePath secPath
+          when (mode == "remote") $
+            say ("[seal] migrated [untrusted_execution] from " <> T.pack sourcePath
+                  <> " to allow_localhost = false in " <> T.pack secPath
+                  <> " (one-time). Edit " <> T.pack secPath <> " for future changes.")
+
+-- | Read a file, or 'Nothing' when it is absent or unreadable. A read failure
+-- must not be mistaken for "no legacy block" in a way that strips something, so
+-- unreadable files simply do not participate.
+readIfPresent :: FilePath -> IO (Maybe Text)
+readIfPresent path = do
+  exists <- doesFileExist path
+  if not exists
+    then pure Nothing
+    else do
+      result <- try @SomeException (TIO.readFile path)
+      pure (either (const Nothing) Just result)
+
+-- | Which file's @[untrusted_execution]@ block wins. @security.toml@ is the
+-- authoritative one (the same precedence the rest of the migration uses), so it
+-- is consulted first; @config.toml@ only if security has no retired block.
+pickSource :: FilePath -> FilePath -> Maybe Text -> Maybe Text -> Maybe (FilePath, Text)
+pickSource secPath cfgPath secRaw cfgRaw =
+  case secRaw of
+    Just raw | hasRetiredMode raw -> Just (secPath, raw)
+    _ -> case cfgRaw of
+      Just raw | hasRetiredMode raw -> Just (cfgPath, raw)
+      _                             -> Nothing
+  where
+    -- A file "has" the retired shape if it carries mode=, in either spelling.
+    hasRetiredMode raw = case retiredMode raw of
+      Just _  -> True
+      Nothing -> False
+
+-- | The value of the retired @mode@ key, in either spelling.
+retiredMode :: Text -> Maybe Text
+retiredMode raw = case Toml.parse raw of
+  Left _     -> Nothing
+  Right toml -> case Toml.runTomlCodec retiredModeCodec (expandDotted toml) of
+    Success (Just (Just m)) -> Just m
+    _                       -> Nothing
+  where
+    -- A dotted key (`untrusted_execution.mode = "remote"`) never becomes a table
+    -- node, so the table codec would miss it. Reuse the same expansion the
+    -- security loader uses.
+    expandDotted = expandDottedKeys
+
+-- | The retired @mode@ key, read leniently (a table carrying other keys still
+-- answers).
+retiredModeCodec :: Toml.TomlCodec (Maybe (Maybe Text))
+retiredModeCodec =
+  Toml.dioptional (Toml.table (Toml.dioptional (Toml.text "mode")) "untrusted_execution")
+
+-- | The legacy @[untrusted_execution.remote]@ block, when every field a machine
+-- needs is present. 'Nothing' means incomplete.
+completeRemoteBlock :: Text -> Maybe MachineFileConfig
+completeRemoteBlock raw = case Toml.parse raw of
+  Left _     -> Nothing
+  Right toml -> case Toml.runTomlCodec remoteBlockCodec (expandDottedKeys toml) of
+    Success (Just (Just block))
+      | Just _ <- mfcHost block
+      , Just _ <- mfcUser block
+      , Just _ <- mfcWorkspace block -> Just block
+    _ -> Nothing
+
+-- | The legacy remote block, read out of @[untrusted_execution.remote]@.
+--
+-- The nesting matters: the sub-table's codec is a complete codec, and
+-- @Toml.table … \"remote\"@ finds it inside the section.
+remoteBlockCodec :: Toml.TomlCodec (Maybe (Maybe MachineFileConfig))
+remoteBlockCodec =
+  Toml.dioptional (Toml.table remoteFields "untrusted_execution")
+  where
+    remoteFields = Toml.dioptional (Toml.table machineFields "remote")
+    machineFields = MachineFileConfig
+      <$> Toml.dioptional (Toml.text "host")       .= mfcHost
+      <*> Toml.dioptional (Toml.text "user")       .= mfcUser
+      <*> Toml.dioptional (Toml.int "port")        .= mfcPort
+      <*> Toml.dioptional (Toml.string "identity") .= mfcIdentity
+      -- known_hosts is deliberately NOT read: it is dropped. Leaving it out of
+      -- the codec is what makes "we drop it" a property rather than a comment.
+      <*> Toml.dioptional (Toml.text "workspace")  .= mfcWorkspace
+
+-- | Write the migrated machine, unless @machines.toml@ already has an answer.
+writeMigratedMachine :: SealPaths -> MachineFileConfig -> IO Bool
+writeMigratedMachine paths block = do
+  -- "Something is already at this path" — a regular file, a directory, a
+  -- symlink. Anything at all means the operator (or another tool) has an answer
+  -- there, and it wins (design §4 row 5): overwriting a document we cannot see
+  -- is not a migration. 'doesPathExist' rather than 'doesFileExist' so a
+  -- directory also counts, and the write below fails loudly instead of quietly
+  -- replacing a file someone else owns.
+  occupied <- doesPathExist (machinesFilePath paths)
+  if occupied
+    then pure True
+    else do
+      written <- saveMachinesConfig paths MachinesConfig
+        { mcDefault = Just "default"
+        , mcMachines = Map.fromList [("default", block)]
+        }
+      case written of
+        Right () -> pure True
+        Left err -> do
+          say ("[seal] WARNING: could not write " <> T.pack (machinesFilePath paths)
+                <> " - " <> err
+                <> "\n  allow_localhost has been set to false, so nothing will run "
+                <> "until a machine is added. Fix permissions and restart.")
+          pure False
+
+-- | Remove the retired @[untrusted_execution]@ table (and its @.remote@
+-- sub-table) from whichever file carried it, setting @allow_localhost@ to the
+-- value the old mode implied.
+--
+-- __@mode@ is removed, not retained.__ The frozen requirements say the install
+-- "loses @[untrusted_execution] mode@", and Done-when 2 asserts the old block is
+-- gone. Retaining it for rollback convenience is the hazard the CHANGELOG
+-- documents instead (WU-17): reverting the binary after this leaves no section,
+-- and the old codec reads that as @mode = \"local\"@.
+stripRetiredSection :: FilePath -> FilePath -> IO ()
+stripRetiredSection sourcePath secPath = do
+  raw <- TIO.readFile sourcePath
+  case Toml.parse raw of
+    Left _ -> pure ()
+    Right toml -> do
+      let withoutBlock = dropSection toml
+          flag = retiredMode raw == Just "remote" -- remote => false
+      if sourcePath == secPath
+        then do
+          -- Rewrite security.toml with the flag and without the old table, in
+          -- one write, so there is no window where the mode is gone and the flag
+          -- is not yet there.
+          let rewritten = setAllowLocalhost (not flag) withoutBlock
+          outcome <- try @SomeException
+            (writeSecretFile secPath
+               (Toml.prettyOptions Toml.defaultOptions rewritten))
+          case outcome of
+            Right () -> pure ()
+            Left err -> warnStripFailed secPath (T.pack (show err))
+        else do
+          -- The block lived in config.toml: set the flag in security.toml, then
+          -- clean config.toml through the same path the other legacy fields use.
+          loaded <- loadSecurityConfig secPath
+          case loaded of
+            Left _ -> pure ()   -- unreadable: change nothing
+            Right sec -> do
+              written <- saveSecurityConfig secPath
+                           (sec { scUntrustedExec =
+                                    Just (UntrustedExecFileConfig (not flag)) })
+                           PreserveCredentials
+              case written of
+                Left err -> warnStripFailed secPath err
+                Right () -> pure ()
+
+-- | Drop the whole @[untrusted_execution]@ subtree from a parsed document.
+dropSection :: Toml.TOML -> Toml.TOML
+dropSection toml =
+  toml { Toml.tomlTables = HashMap.delete (Toml.Piece "untrusted_execution")
+                                  (Toml.tomlTables toml)
+       , Toml.tomlPairs = HashMap.filterWithKey
+           (\k _ -> case map Toml.unPiece (NonEmpty.toList (Toml.unKey k)) of
+              ("untrusted_execution" : _) -> False
+              _                           -> True)
+           (Toml.tomlPairs toml)
+       }
+
+-- | Set @allow_localhost@ in a parsed document, replacing any existing value.
+setAllowLocalhost :: Bool -> Toml.TOML -> Toml.TOML
+setAllowLocalhost allow toml =
+  toml { Toml.tomlTables = HashMap.insert (Toml.Piece "untrusted_execution")
+           (Toml.Leaf (Toml.Piece "untrusted_execution" Toml.:|| [])
+              (mempty { Toml.tomlPairs = HashMap.fromList
+                          [ (Toml.Piece "allow_localhost" Toml.:|| []
+                            , Toml.AnyValue (Toml.Bool allow)) ] }))
+           (Toml.tomlTables toml) }
+
+warnStripFailed :: FilePath -> Text -> IO ()
+warnStripFailed path err =
+  say ("[seal] WARNING: could not rewrite " <> T.pack path <> " - " <> err
+        <> "\n  The old [untrusted_execution] block is still there. Fix permissions "
+        <> "at ~/.seal/ and restart; the next boot retries.")
