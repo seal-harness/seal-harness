@@ -46,6 +46,10 @@ data ChatRoute
                                        --   prompt in a freshly minted headless
                                        --   session, untracked as a tab
   | ChatSlash Text                     -- ^ other /commands (deferred to the HTTP API)
+  | ChatLast Text                      -- ^ /last [tab] [n] — the raw argument text
+                                       --   verbatim (may be empty). Parsed by
+                                       --   'Seal.Channels.Chat.LastRender.parseLastArgs',
+                                       --   so this module stays a leaf.
   deriving stock (Eq, Show)
 
 -- | Route one inbound line. The Layer-1 terse grammar:
@@ -81,6 +85,8 @@ route t
                   Right (ChatNewSession (stripNewPrefix rest))
                | T.toCaseFold (T.takeWhile (/= ' ') rest) == "bg" ->
                   Right (ChatBackground (stripBgPrefix rest))
+               | T.toCaseFold (T.takeWhile (/= ' ') rest) == "last" ->
+                   Right (ChatLast (stripLastPrefix rest))
                | otherwise ->
                   Right (ChatSlash rest)
   where
@@ -110,6 +116,12 @@ stripNewPrefix rest =
 -- dropped.
 stripBgPrefix :: Text -> Text
 stripBgPrefix = stripNewPrefix  -- same shape: drop the first word + one space
+
+-- | Extract the argument text from the @last@ prefix. @\"last\"@ yields
+-- @\"\"@; @\"last b 3\"@ yields @\"b 3\"@. Trimmed, so a trailing space does
+-- not become an empty second token.
+stripLastPrefix :: Text -> Text
+stripLastPrefix = T.strip . stripNewPrefix
 
 -- | Given a valid tab index + the text after it: if the rest is empty (or
 -- whitespace-only), it's a Focus; otherwise it's an Inject (the payload is

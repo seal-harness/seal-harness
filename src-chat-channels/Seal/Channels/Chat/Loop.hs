@@ -516,6 +516,9 @@ handleInboundWithSource cfg chan sessions wsConns pendingAsks bgSessions tabTrac
         -- Tab commands go through the HTTP API (the gateway routes them).
         sendSlash cfg chan sessions wsConns pendingAsks bgSessions tabTracker watchState thinkingTabs key mSrc body
       Right ChatTabList -> handleTabList cfg chan
+      Right (ChatLast args) -> do
+        mSid <- sessionLookup sessions key
+        handleLast cfg chan mSid key args
       Right (ChatPlain text) -> do
         -- A plain message answers a pending ask from one of this
         -- conversation's background sessions, if there is one. Checked
@@ -2265,3 +2268,23 @@ handleTabList cfg chan = do
       case tabListRows lj of
         []   -> ccSend chan "no tabs"
         rows -> mapM_ (ccSend chan . renderTabListRow) rows
+
+-- | Handle @\/last [tab] [n]@: render another tab's last assistant
+-- message(s) without changing which tab this conversation is focused on.
+--
+-- == Why the signature carries no 'SessionMap'
+--
+-- The focused tab is resolved by the CALLER ('handleInboundWithSource', which
+-- already holds the session map) and passed in as @Maybe SessionId@. That makes
+-- the "this is a read" guarantee structural rather than a matter of
+-- discipline: 'handleLast' has no handle it could write through, so
+-- 'sessionInsert', 'ensureWsConn' and 'registerWatchedAsk' are impossible by
+-- type. DoD 4 of the requirements says @\/last@ never changes the focused tab;
+-- this signature is how that is enforced.
+--
+-- WU-A stub: the real body lands in WU-C.
+handleLast
+  :: ChatChannel c
+  => ChatChannelConfig -> c -> Maybe SessionId
+  -> ConversationKey -> Text -> IO ()
+handleLast _cfg chan _mSid _key _args = ccSend chan ""

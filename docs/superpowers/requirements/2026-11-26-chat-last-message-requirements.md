@@ -1,6 +1,6 @@
 # `/last` — Requirements
 
-**Status**: awaiting human approval.
+**Status**: approved 2026-11-26, amended 2026-11-26 (see Amendments below).
 **Branch**: `channels/last-message-requirements`
 **Scope**: Signal and Telegram chat channels only.
 
@@ -50,9 +50,9 @@ names what ran instead of being empty:
 Tool lines use the same glyph per opcode that the live progress bubble already
 uses, so a user who watched the turn recognises what they are seeing.
 
-**A tab waiting on a question** — `/last` shows the question and its options,
-and the user answers the same way they already answer one: with a number or
-plain text.
+**A tab waiting on a question** — `/last` shows the question and its options.
+The user answers with `/N <answer>` (`/b 1`, `/b yes`, `/b your own text`),
+which delivers to *that tab's* session without changing focus. (Amended: A2.)
 
 **A tab still working** — the reply says so rather than implying the tab
 finished:
@@ -86,9 +86,10 @@ behaves as it does today.
 
 - **`/last` never changes which tab the user is focused on.** It is a read. A
   user can look at tab `b` from tab `a` and stay on `a`.
-- **`/last` never sends anything the assistant did not author.** Assistant text
-  and opcode *names* only — never tool inputs, never tool results, never file
-  contents, never secrets.
+- **`/last` never sends anything the assistant did not author.** Assistant text,
+  opcode *names*, and — for a tab currently blocked on a question — that
+  question's text and options (see Amendments, A1). Never a *historical* tool
+  input, tool result, file content, or secret.
 - **Works on both Telegram and Signal**, with the message splitting each
   platform already does for long messages.
 - **A watched tab that ends with no text never produces a notification with no
@@ -134,3 +135,48 @@ Not requirements — recorded so the design does not have to rediscover them.
 - Two defects found while reviewing the earlier design are worth their own
   issues and are **not** part of this work: tool-call arguments reach web
   clients unredacted, and `allow_from` is parsed but never enforced.
+
+---
+
+## Amendments
+
+Operator decisions, given verbally during plan review on 2026-11-26 and
+transcribed here by the implementing agent so the baseline stays truthful. Each
+one resolves a contradiction the original document could not settle on its own.
+**The operator should read these and correct any mis-transcription** — this
+document is human-authored prose, and the agent's job here is recording, not
+writing.
+
+**A1 — Constraint 2 and question text.** `/last` MAY send a pending question's
+text and options, including the confirmation-gate prompt, which embeds the tool
+call being confirmed:
+
+```
+Allow SHELL_EXEC {"command":"curl -H 'Authorization: ...' ..."}? [y/N]
+```
+
+The operator accepted this (2026-11-26) because the same text is already
+delivered to the same chat conversation when the prompt fires; `/last` repeats
+it on request rather than introducing it. Scope of the exception: a question
+that is **currently pending** on that tab, and nothing else. Fixing the prompt
+so it stops embedding arguments is tracked separately and is the proper root
+fix.
+
+**A2 — How a question is answered.** The original text said "with a number or
+plain text". That is not true for a tab the conversation is not focused on: a
+plain reply is routed to the *focused* tab (and can answer a different question
+there). The answer path is therefore `/N <answer>`, which targets the named
+tab's session. `/last` never changes the focused tab.
+
+**A3 — Hint wording.** The "for more" hint reads `/last <tab> 5 for more`,
+exactly as the example in this document shows. It does not scale the suggested
+count.
+
+**A4 — Out-of-scope surface touched.** One optional work unit changes how an
+unrecognised transcript block type is rendered by the web frontend (it currently
+surfaces as raw JSON; afterwards it is dropped). The operator approved this as
+part of the work despite the web frontend being out of scope.
+
+**A5 — Tab title in the heading.** The heading shows the tab's display title,
+which may be a user message snippet rather than assistant text. This is
+consistent with the examples in this document and with `/tab list`.
