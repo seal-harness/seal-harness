@@ -66,7 +66,7 @@ fakePaths = SealPaths { spHome = "", spState = "", spConfig = "", spKeys = "", s
 fakeMeta :: SessionMeta
 fakeMeta =
   let sid = case mkSessionId "capstone" of Right s -> s; Left _ -> error "sid"
-  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
        (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
 
 runAppStatus :: Application -> Request -> IO Int

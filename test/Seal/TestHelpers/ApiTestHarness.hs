@@ -479,9 +479,17 @@ buildTestEnv tmp isRemoteMode mRepo opts = do
   vaultRt <- makeFakeVaultRuntime (maybeToList mVaultSeed)
 
   -- Session runtime.
-  let meta0 = SessionMeta
-        (case mkSessionId "test" of Right s -> s; Left _ -> error "sid") "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
-        (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+  -- Named construction: this had drifted far enough that a positional literal
+  -- silently bound a timestamp to the wrong field as soon as one was inserted.
+  let testTime = UTCTime (fromGregorian 2026 1 1) 0
+      meta0 = SessionMeta
+        { smId = case mkSessionId "test" of Right s -> s; Left _ -> error "sid"
+        , smProvider = "ollama", smModel = "llama3.2", smChannel = "web"
+        , smParent = Nothing, smAgent = Nothing, smSystemOverride = Nothing
+        , smAgentName = Nothing, smDescription = Nothing, smSealFrontMatter = True
+        , smRepoUrl = Nothing, smMachine = Nothing, smRepoBranch = Nothing
+        , smCreatedAt = testTime, smLastActive = testTime
+        }
   activeRef <- newIORef meta0
   let sr = SessionRuntime
         { srPaths = paths, srConfigPath = configRoot </> "config.toml"

@@ -45,6 +45,7 @@ metaWith frontMatter =
        , smAgentName = Just "zoe", smDescription = Nothing
        , smSealFrontMatter = frontMatter
        , smRepoUrl = Nothing
+       ,smMachine    = Nothing
        , smRepoBranch = Nothing
        , smCreatedAt = sampleTime, smLastActive = sampleTime }
 

@@ -449,6 +449,7 @@ writeChildMeta deps childSid = do
     , smDescription = Nothing
     , smSealFrontMatter = True
     , smRepoUrl = Nothing
+    ,smMachine    = Nothing
     , smRepoBranch = Nothing
     , smCreatedAt = now
     , smLastActive = now
@@ -573,6 +574,7 @@ writeHandoffMeta deps childSid agentDef taskRepo = do
     , smDescription = Nothing
     , smSealFrontMatter = True
     , smRepoUrl = rsUrl <$> repo
+    ,smMachine    = Nothing
     , smRepoBranch = repo >>= rsBranch
     , smCreatedAt = now
     , smLastActive = now

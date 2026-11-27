@@ -44,14 +44,14 @@ import Data.Time (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
 import Seal.Agent.Def.Types (AgentDef)
 import Seal.Agent.Def.Workdir (listWorkdirAgentDefsSnap)
 import Seal.Config.Paths (SealPaths)
-import Seal.Config.Machines (MachineRegistry (..), resolveRegistryForSecurity)
+import Seal.Config.Machines
+  ( MachineName, MachineRegistry (..), resolveRegistryForSecurity )
 import Seal.Config.Security (SecurityConfig)
 import Seal.Core.Types (SessionId)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Session.AgentMetaCache (MetaCacheEnv, buildRoutingWorkdirFs)
 import Seal.Session.Workdir
-  ( SessionExec (..), isFailClosedSessionExec, mkSessionExec
-  )
+  ( SessionExec (..), isFailClosedSessionExec, mkSessionExecFor )
 import Seal.Skills.Backend (listWorkdirSkillsSnap)
 import Seal.Skills.Types (Skill)
 import Seal.SourceControl.Clone (CloneDeps)
@@ -105,26 +105,32 @@ newSessionExecCacheWith now =
 --
 -- IO because reading @machines.toml@ is IO. A malformed file fingerprints as its
 -- error text, so fixing the file also invalidates the cache.
-execFingerprint :: SealPaths -> SecurityConfig -> IO Text
-execFingerprint paths secCfg = do
+execFingerprint :: SealPaths -> SecurityConfig -> Maybe MachineName -> IO Text
+execFingerprint paths secCfg mMachine = do
   eReg <- resolveRegistryForSecurity paths secCfg
   pure $ T.pack $ case eReg of
     Left err  -> "unresolvable: " <> T.unpack err
-    Right reg -> show (regMachines reg, regRejected reg, regDefault reg)
+    Right reg -> show (regMachines reg, regRejected reg, regDefault reg, mMachine)
 
 -- | Fetch-or-build the session's 'SessionExec'. Successes are memoized by
 -- 'SessionId'; rebuilt on a fingerprint mismatch or explicit
 -- 'invalidateExec'. Fail-closed builds are never stored.
+--
+-- @mMachine@ is the session's recorded machine ('smMachine'), and it is part of
+-- the fingerprint: a session resumed on a different machine must build a fresh
+-- exec even when @machines.toml@ has not changed. Without that, the cache would
+-- hand back the previous machine's handles.
 cachedSessionExec
   :: SessionExecCache -> SealPaths -> SecurityConfig -> SessionId
-  -> CloneDeps -> RemoteRunner -> Maybe HostKeyAdoption -> IO SessionExec
-cachedSessionExec cache paths secCfg sid cloneDeps runner mAdoption = do
+  -> CloneDeps -> RemoteRunner -> Maybe HostKeyAdoption
+  -> Maybe MachineName -> IO SessionExec
+cachedSessionExec cache paths secCfg sid cloneDeps runner mAdoption mMachine = do
   execs <- readIORef (sceExecs cache)
-  fp <- execFingerprint paths secCfg
+  fp <- execFingerprint paths secCfg mMachine
   case Map.lookup sid execs of
     Just ce | ceFingerprint ce == fp -> pure (ceExec ce)
     _ -> do
-      exec <- mkSessionExec paths secCfg sid cloneDeps runner mAdoption
+      exec <- mkSessionExecFor paths secCfg sid cloneDeps runner mAdoption mMachine
       if isFailClosedSessionExec exec
         then pure exec   -- never cache failures: a later retry must succeed
         else do

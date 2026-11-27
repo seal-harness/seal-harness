@@ -205,6 +205,7 @@ library
         Seal.Session.AgentMetaCache
         Seal.Session.ExecCache
         Seal.Session.Branch
+        Seal.Session.Machine
         Seal.Session.Meta
         Seal.Session.Store
         Seal.Session.Workdir
@@ -634,6 +635,7 @@ test-suite tests
         Seal.Session.AgentMetaCacheSpec
         Seal.Session.ExecCacheSpec
         Seal.Session.BranchSpec
+        Seal.Session.MachineSpec
         Seal.Session.MetaSpec
         Seal.Session.StoreSpec
         Seal.Session.LogSpec

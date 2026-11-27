@@ -22,6 +22,7 @@ sampleMeta =
        , smDescription = Nothing
        , smSealFrontMatter = True
        , smRepoUrl = Nothing
+       ,smMachine    = Nothing
        , smRepoBranch = Nothing
        , smCreatedAt = sampleTime, smLastActive = sampleTime }
 

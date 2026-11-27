@@ -45,6 +45,7 @@ stubMeta = SessionMeta
   , smDescription = Nothing
   , smSealFrontMatter = True
   , smRepoUrl = Nothing
+  ,smMachine    = Nothing
   , smRepoBranch = Nothing
   , smCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
   , smLastActive = UTCTime (fromGregorian 2026 1 1) 0
@@ -243,7 +244,7 @@ spec = describe "Seal.Command.Tab" $ do
       withSystemTempDirectory "seal-mint" $ \tmp -> do
         let paths = dummyPaths tmp
         backend <- Def.staticAgentDefBackend []
-        meta <- mintTabSession paths (pure (Right defaultRuntimeConfig)) backend
+        meta <- mintTabSession paths (pure (Right defaultRuntimeConfig)) backend Nothing
         smChannel meta `shouldBe` "web"
         -- The mint must not write session.json: the caller persists only
         -- after the tab insert succeeds.
@@ -390,6 +391,7 @@ metaWithDescription sid mDesc = SessionMeta
   , smDescription = mDesc
   , smSealFrontMatter = True
   , smRepoUrl = Nothing
+  ,smMachine    = Nothing
   , smRepoBranch = Nothing
   , smCreatedAt = testTime, smLastActive = testTime
   }

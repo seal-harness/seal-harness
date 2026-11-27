@@ -699,7 +699,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
   cloneDeps <- mkCloneDepsTurn td
   exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
-                 (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
+                 (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt (smMachine meta))
                  eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
   let wfs    = seWorkdirFs exec
       wsRoot = seWorkspaceRoot exec
@@ -1088,8 +1088,11 @@ sessionSkillBackend td sid = do
   let paths = tdPaths td
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
   cloneDeps <- mkCloneDepsTurn td
+  -- The session's recorded machine, so the scan runs against the machine the
+  -- session is actually on rather than the current default.
+  mMeta <- loadSessionMeta paths sid
   exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
-                 (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
+                 (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt (mMeta >>= smMachine))
                  eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
   let wfs = seWorkdirFs exec
       wsRoot = seWorkspaceRoot exec
@@ -1126,7 +1129,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
     cloneDeps <- mkCloneDepsTurn td
     exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
-                   (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
+                   (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt (mMeta >>= smMachine))
                    eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
     let wfs = seWorkdirFs exec
         wsRoot = seWorkspaceRoot exec
@@ -1322,8 +1325,13 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
         let execSid = case mAnchor of
               Just _  -> parentSid
               Nothing -> childSid
+        -- The exec being reused (or built) belongs to `execSid`, so it is that
+        -- session's recorded machine that must be honoured: anchoring to the
+        -- parent means running where the parent runs, and a fresh child inherits
+        -- the parent's choice because it starts life in the parent's world.
+        execMeta <- loadSessionMeta (tdPaths td) execSid
         seUIOEnv <$> either (\_ _ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
-                            (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) (tdPaths td) sc execSid childCloneDeps runner mAdopt)
+                            (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) (tdPaths td) sc execSid childCloneDeps runner mAdopt (execMeta >>= smMachine))
                             eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
     , dwdParentWorkdir = Just (sessionWorkdir (tdPaths td) parentSid)
     , dwdAutonomy = tdAutonomy td
@@ -1378,6 +1386,7 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
       , smDescription = Nothing
       , smSealFrontMatter = True
       , smRepoUrl = Nothing
+      ,smMachine    = Nothing
       , smRepoBranch = Nothing
       , smCreatedAt = tnow, smLastActive = tnow }
 
@@ -1400,7 +1409,7 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
   childCloneDeps <- mkCloneDepsTurn td
   eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
   childExec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
-                      (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner mAdopt)
+                      (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner mAdopt Nothing)
                       eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
   let childWsRoot = seWorkspaceRoot childExec
       childWebCfg = either (const Nothing) rcWeb eCfg

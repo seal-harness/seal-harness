@@ -436,7 +436,7 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
                 -- resolution chain is unchanged for every other caller.
                 provider = fromMaybe (fromMaybe cfgProv mProv) (cjProvider job)
                 model = fromMaybe (fromMaybe cfgModel mModel) (cjModel job)
-            meta <- newSession paths provider model "cron" mJobAgent
+            meta <- newSession paths provider model "cron" mJobAgent Nothing
             let sid = smId meta
             -- Register the completion handler BEFORE forking the turn: the turn
             -- can finish (or fail) as soon as it starts, and a completion with
@@ -543,7 +543,7 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
   -- only lands on disk when the user sends the first message (the web send
   -- handler writes the transcript to the session dir). This avoids
   -- polluting the sessions list with an empty session on every `seal serve`.
-  sessionMeta <- initSessionMeta paths cfg (bAgentDefs backends)
+  sessionMeta <- initSessionMeta paths cfg (bAgentDefs backends) Nothing
   activeRef   <- newIORef sessionMeta
   broker <- newStreamBroker 1024
   -- Build the shared ChannelDeps early so the reply registry + write locks

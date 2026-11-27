@@ -722,6 +722,7 @@ spec = do
                 , smDescription = Nothing
                 , smSealFrontMatter = True
                 , smRepoUrl = Nothing
+                ,smMachine    = Nothing
                 , smRepoBranch = Nothing
                 , smCreatedAt = aTime, smLastActive = aTime }
           saveSessionMeta paths meta
@@ -768,6 +769,7 @@ spec = do
             , smDescription = Nothing
             , smSealFrontMatter = True
             , smRepoUrl = Nothing
+            ,smMachine    = Nothing
             , smRepoBranch = Nothing
             , smCreatedAt = aTime, smLastActive = aTime }
       saveSessionMeta paths meta

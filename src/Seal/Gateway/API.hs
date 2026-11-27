@@ -86,7 +86,8 @@ import Seal.Session.AgentMetaCache
 import Seal.Config.Machines
   ( MachineTarget (..), resolveRegistryForSecurity )
 import Seal.Session.ExecCache (cachedSessionExec, cachedWorkdirScan)
-import Seal.Session.Workdir (mkSessionExec, remoteSessionWorkdirPath, SessionExec (..))
+import Seal.Session.Workdir
+  ( mkSessionExecFor, remoteSessionWorkdirPath, SessionExec (..) )
 import Seal.SourceControl.Clone (CloneDeps (..))
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.Security.Path (lexicalCollapse, blockedSegment)
@@ -141,7 +142,7 @@ import Seal.Providers.OllamaReadiness
   ( OllamaReadiness (..), readinessWire )
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
 import Seal.SourceControl.Repo
   ( RepoCredential (..), RepoId, SourceRepo (..), hostAllowed, mkRepoId
   , parseCredentialKind, parseRepoHost, parseVcsKind, repoCredentialKindText
@@ -1328,7 +1329,7 @@ handleTabNew deps v =
           if not parentExists
             then pure (errJson status404 "session not found")
             else do
-              meta <- newSessionMeta paths provider model "web" mAgent
+              meta <- newSessionMeta paths provider model "web" mAgent Nothing
               let sid = smId meta
               eSeed <- branchSession paths parentSid sid n
               case eSeed of
@@ -1373,7 +1374,7 @@ handleTabNew deps v =
 plainProviderSession
   :: ApiDeps -> SealPaths -> Text -> Text -> Maybe AgentDefId -> IO Response
 plainProviderSession deps paths provider model mAgent = do
-  meta <- newSessionMeta paths provider model "web" mAgent
+  meta <- newSessionMeta paths provider model "web" mAgent Nothing
   let sid = smId meta
   res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
   case res of
@@ -1468,7 +1469,7 @@ handleSessionNew deps v = do
         Just t  -> eitherToMaybe (mkAgentDefId t)
         Nothing -> mDefAgent
       channel = if lookupBodyBool "headless" then "bg" else fromMaybe "web" (lookupBodyStr "channel")
-  meta <- newSession paths provider model channel mAgent
+  meta <- newSession paths provider model channel mAgent Nothing
   triggerBroadcast deps
   pure (jsonOk (object [ "session_id" .= sessionIdText (smId meta) ]))
   where
@@ -1525,7 +1526,7 @@ handleSessionRebindNew deps sidTxt body =
               let provider = fromMaybe (smProvider oldMeta) (bodyStr "provider" body)
                   model    = fromMaybe (smModel oldMeta) (bodyStr "model" body)
                   channel  = fromMaybe "web" (bodyStr "channel" body)
-              meta <- newSession paths provider model channel mDefAgent
+              meta <- newSession paths provider model channel mDefAgent Nothing
               let newSid = smId meta
                   newSidTxt = sessionIdText newSid
               snap <- snapshotTabs (adTabsHandle deps)
@@ -1656,6 +1657,11 @@ handleSessionAgents deps sid = do
       -- instance the turn engine uses) so the remote mkdir -p bootstrap and
       -- the workdir discovery scan each run once per session, not once per
       -- frontend fetch. The adMkSessionExec seam (tests) bypasses the cache.
+      -- This session's recorded machine, so the exec (and therefore the
+      -- discovery scan) follows the machine the session is on rather than the
+      -- current default.
+      mSessionMeta <- readSessionMeta paths sid
+      let mMachine = mSessionMeta >>= smMachine
       (exec, mCache) <- case adMkSessionExec deps of
         Just mk -> do
           e <- mk sid
@@ -1663,11 +1669,11 @@ handleSessionAgents deps sid = do
         Nothing -> case adSend deps of
           Just sendDeps -> do
             cloneDeps <- cloneDepsForApiDeps deps
-            e <- cachedSessionExec (sdExecCache sendDeps) paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner (sdHostKeyAdoption sendDeps)
+            e <- cachedSessionExec (sdExecCache sendDeps) paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner (sdHostKeyAdoption sendDeps) mMachine
             pure (e, Just (sdExecCache sendDeps))
           Nothing -> do
             cloneDeps <- cloneDepsForApiDeps deps
-            e <- mkSessionExec paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner Nothing
+            e <- mkSessionExecFor paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner Nothing mMachine
             pure (e, Nothing)
       metaEnv <- metaCacheEnvForApi deps
       let wfs = seWorkdirFs exec

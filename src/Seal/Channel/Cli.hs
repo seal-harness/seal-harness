@@ -228,7 +228,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
         let (cfgProv, cfgModel) = defaultSessionSelection cfg
             provider = fromMaybe cfgProv mProv
             model    = fromMaybe cfgModel mModel
-        meta <- newSession paths provider model "bg" mAgent
+        meta <- newSession paths provider model "bg" mAgent Nothing
         let bgSid = smId meta
             bgCaps = def
               { ccSend = ccSend caps
@@ -414,7 +414,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
                   plainHandler payload
                 Right (Seal.Routing.Route.TabCommand tsc) ->
                   liftIO (handleTabCommand paths caps th
-                            (mintTabSession paths (loadRuntimeConfig (prConfigPath pr)) (bAgentDefs backends))
+                            (mintTabSession paths (loadRuntimeConfig (prConfigPath pr)) (bAgentDefs backends) Nothing)
                             tsc)
                 Right Seal.Routing.Route.CurrentTab -> liftIO $ do
                   active <- readIORef (srActive sr)
