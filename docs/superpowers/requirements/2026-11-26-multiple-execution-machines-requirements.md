@@ -3,6 +3,18 @@
 **Status**: approved (2026-11-26, operator) — frozen. Changes require a scope
 change request, not a review fix.
 **Branch**: `feature/multiple-execution-machines`
+
+**Amendments** (operator-approved 2026-11-27, recorded after design review
+found two renders unimplementable as written):
+
+1. The TUI machine prompt drops platform labels. The `(linux, default)` /
+   `(macos)` annotations have no data source — `machines.toml` defines no `os`
+   field. The prompt shows `(default)` and `(this machine)` only.
+2. The session-list entry drops the `ai` kind token: `2  seal-harness  mac-mini`.
+   No renderer in the harness emits a bare `ai` token (`TabKind` derives `show`,
+   yielding `KindAi`), and the example carried one column more than the tab line
+   it was illustrating.
+
 **Scope**: Let an operator define several named execution machines, choose one
 per session, and let the model choose one per tool call.
 
@@ -166,7 +178,7 @@ Trust this key? [y/N] y
 A session list entry:
 
 ```text
-2  ai  seal-harness  mac-mini
+2  seal-harness  mac-mini
 ```
 
 The model choosing a machine mid-session, visible as the call argument:

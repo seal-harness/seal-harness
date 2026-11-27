@@ -38,6 +38,15 @@ Round-2 fixes in this revision:
 | R2-14 | `MachineUnreachable` carries free `Text` — drift hazard | §5.4 typed payload |
 | R2-15 | DW-10: when does a deleted machine fail — resume or first call? | §5.1 states it |
 
+**Round 3** (Designer; Security and CTO did not report before this revision):
+
+| # | Finding | Fix |
+|---|---|---|
+| R3-1 | Row 4's `RrLoopbackHost` was nullary, so the renderer could only hardcode `localhost` — wrong for `127.0.0.1`/`::1` | §2.2: `RrLoopbackHost !Text` carries the configured host |
+| R3-2 | `2 ai seal-harness mac-mini` has no producer: `renderTab` emits `KindAi` (stock `Show`), and has 3 slots not 4 | §0.2 amendment 2: kind token dropped from the requirement; §5.6 rewritten |
+| R3-3 | `buildMachinePrompt` took `[MachineName]`, but `local` is not a constructible `MachineName` and must be suppressible | §5.6: `Selectable = SelLocal | SelMachine !MachineName` |
+| R3-4 | `opNameText` does not exist (`OpName` is a newtype) | §5.5 uses the field directly |
+
 ### 0.1 Declined (round 1, NEW REQUIREMENT)
 
 `default` naming a missing machine boot-fatal; `[machines.local]` as a load
@@ -149,7 +158,9 @@ Pure, so testable without boot:
    `host`/`user`/`workspace` → `RrMissingField Host|User|Workspace`; `port`
    outside `1..65535` → `RrInvalidPort`.
 2. **Loopback guard ordered before host validation**, so a loopback host yields
-   `RrLoopbackHost` and the "is this machine" text rather than `mkSshHost`'s
+   `RrLoopbackHost host` (it carries the configured host, so the rendered text
+   names what the operator actually wrote — `127.0.0.1` renders as `127.0.0.1`,
+   not a hardcoded `localhost`) and the "is this machine" text rather than `mkSshHost`'s
    generic "invalid characters". (`mkSshHost` already rejects `:`
    at `Types.hs:133`, so `::1` never reached the old check — the ordering is what
    makes the message right.)
@@ -348,7 +359,7 @@ data MachineError
   | MachineHostKeyChanged !MachineName       -- §5.4 mapping
 
 data RejectReason
-  = RrMissingField !MissingField | RrLoopbackHost
+  = RrMissingField !MissingField | RrLoopbackHost !Text
   | RrInvalidHost !Text | RrInvalidWorkspace !Text | RrInvalidPort
 
 data UnreachableReason = UrConnectFailed | UrBootstrapFailed | UrHostKeyUnknown
@@ -413,14 +424,28 @@ asserting **exact equality** in §10.2.
 | 5 | `SHELL_EXEC failed: this session runs on execution machine "mac-mini", which is no longer configured. Resuming it on another machine would run its work somewhere it never ran. Add "mac-mini" back to ~/.seal/machines.toml, or start a new session.` | `renderMachineError` ← `MachineGone` | `OpName -> MachineError -> Text` |
 | 6 | `SHELL_EXEC failed: allow_localhost is false and no execution machine is configured. Add one under [machines.<name>] in ~/.seal/machines.toml.` | `renderMachineError` ← `NoMachineSelected` | ditto |
 | 7 | `machine "mac-mini" is not yet known.` / `  host: mac-mini.lan` / `  key:  ssh-ed25519 SHA256:9xQ…7fA` / `Trust this key? [y/N]` | `buildAdoptionPrompt` ← `HostKeyInfo` (§3.4) | `HostKeyInfo -> Text` |
-| 8 | `execution machine [default: linux-builder]:` + 3 numbered lines + `> 3` (**amended** — no platform labels, §0.2) | `buildMachinePrompt` | `[MachineName] -> Maybe MachineName -> Maybe MachineName -> Text` |
+| 8 | `execution machine [default: linux-builder]:` + 3 numbered lines + `> 3` (**amended** — no platform labels, §0.2) | `buildMachinePrompt` | `[Selectable] -> Maybe MachineName -> Text` (§5.6) |
 | 9 | `session: anthropic / claude-opus-4-8  machine: mac-mini` | `Seal.Channel/Cli.hs:188` banner | `SessionMeta -> Text` |
+| 10 | `2  seal-harness  mac-mini` (**amended** — kind token dropped, §0.2 amendment 2) | `renderTab` (`Cli.hs:461`) | `Tab -> Text` |
+| 11 | `selectable: local, linux-builder, mac-mini` / `default:    linux-builder` / `unusable:   builder (workspace not configured)` | `/machine list` (§5.7) | `MachineRegistry -> Text` |
+
+Two further literals in the requirements are **not** producer output and are
+recorded here so their absence is a decision, not an omission: the model's own
+call echo `SHELL_EXEC  {"command": …, "machine": …}` (the transcript renders the
+model's argument; no harness message is produced) and the `y` the user types in
+the key prompt (user input, not rendered).
+
+**Line wrapping.** Several frozen strings are hard-wrapped across lines in the
+requirements for width. The wrap is prose formatting, not part of the string; the
+`T-STR-*` assertions compare the joined single-line form.
 
 **The separator is ` failed: `** — revision 2 wrote `"<OP>: failed: "`, which
 emits `SHELL_EXEC: failed:`. Frozen text is `SHELL_EXEC failed:`.
 
 ```haskell
 renderMachineError op err = opNameText op <> " failed: " <> body err
+-- NB: OpName is `newtype OpName Text` (no opNameText helper exists); use the
+-- field accessor the repo already uses, or `\(OpName n) -> n`.
 ```
 
 The repo's `<OPNAME>: <msg>` convention is the reason a new renderer is
@@ -435,11 +460,20 @@ why it is typed.
 
 ### 5.6 Display: four surfaces
 
-**Correction to rounds 1 and 2.** Both reviews assumed the requirements'
-`2  ai  seal-harness  mac-mini` was `renderSessionLine` and then argued about
-dropping `provider/model`. It is not: it matches **`renderTab`**
-(`Cli.hs:461-463`) — `<index>  <kind>  <label>` — which is what the tab list
-renders. Nothing needs dropping; the machine becomes the label.
+**Correction to rounds 1–3.** Rounds 1 and 2 assumed the requirements'
+`2  ai  seal-harness  mac-mini` was `renderSessionLine` and argued about dropping
+`provider/model`. Revision 3 correctly re-attributed it to `renderTab`
+(`Cli.hs:461-463`) but then wrongly concluded "nothing needs dropping" — because
+`renderTab` is `<index>  <kind>  <label>` (three slots) and renders `kind` via
+`T.pack (show (tKind t))` over a stock-derived `Show` (`TabTypes` at
+`src-gateway-types/Seal/Gateway/Types/Tab.hs:62-64`), so it emits `KindAi`, never
+`ai`. Four tokens, and no producer of a bare `ai` token exists anywhere.
+
+Resolved by **amending the requirements** (§0.2 amendment 2): the kind token is
+dropped, so the entry is `2  seal-harness  mac-mini` — index, label, machine
+(label already carries the repo name). The TUI tab line renders
+`<index>  KindAi  <label>  <machine>`; the `KindAi` token is pre-existing output
+and out of scope to relabel.
 
 | Surface | File | Change |
 |---|---|---|
@@ -449,10 +483,23 @@ renders. Nothing needs dropping; the machine becomes the label.
 | Web sidebar row | `frontend/src/types.ts` (`SessionInfo`), `Sidebar.tsx:66-140`, `lib/tabLineConfig.ts` | `machine` field + `TabLineField` member + `tabLineConfig.ts` arrays |
 | Web session JSON | `Seal/Gateway/SessionJson.hs:81` (`sessionInfoJson`) | `"machine"` field, resolved name (never `null` on upgrade) |
 
-`buildMachinePrompt` signature: the third argument is the default, so
-`[MachineName] -> Maybe MachineName -> Maybe MachineName -> Text` (selectable,
-default, session-fixed). It renders `(default)` and `(this machine)` only —
-platform labels are dropped per §0.2.
+`buildMachinePrompt` cannot take `[MachineName]`: `local` is not a constructible
+`MachineName` (`mkMachineName` rejects the reserved name, §2.2), and the renderer
+must suppress the `local` row entirely when `allow_localhost = false`. Taking a
+`[MachineName]` would force it either to hardcode a row it cannot suppress, or to
+offer a machine `MachineNotPermitted` then rejects. So the selectable set is its
+own type:
+
+```haskell
+data Selectable = SelLocal | SelMachine !MachineName
+
+buildMachinePrompt :: [Selectable] -> Maybe MachineName -> Text
+```
+
+`SelLocal` renders `1. local          (this machine)`; a `SelMachine` equal to the
+default renders `(default)`. Platform labels are dropped per §0.2. `Selectable` is
+also what `GET /api/machines` (§5.8) and the web picker consume, so the two
+surfaces cannot disagree about whether `local` is offered.
 
 ### 5.7 New command surfaces, and their wiring
 
