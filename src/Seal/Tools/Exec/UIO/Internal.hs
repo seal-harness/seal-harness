@@ -54,13 +54,12 @@ import Control.Monad.Reader (ReaderT, ask, asks, runReaderT)
 import Data.ByteString (ByteString)
 import Data.Text (Text)
 import Data.Text qualified as T
-import System.IO.Unsafe (unsafePerformIO)
 
 import Seal.Config.Machines (MachineName, mkMachineName)
 import Seal.Security.Path (WorkspaceRoot)
-import Seal.SourceControl.Clone (CloneDeps, stubCloneDeps)
+import Seal.SourceControl.Clone (CloneDeps)
 import Seal.Tools.Exec.Machine
-  ( MachineError (..), MachineRouting, mkMachineRouting, seedRouting )
+  ( MachineRouting, mkStaticRouting )
 import Seal.Text.LineFile (LineWindow)
 import Seal.Tools.Args (BinArg, BinName, SearchPattern, ShellCommand)
 import Seal.Tools.Exec.Remote (RemoteRunner)
@@ -116,22 +115,16 @@ runUIOWithEnv env (UIO action) = runReaderT action env
 -- wrapper (W-A3) + tests (Git specs seed a stub 'CloneDeps' into the
 -- 'UIOEnv' via this helper).
 mkTestUIOEnv :: UntrustedIO -> CloneDeps -> UIOEnv
-mkTestUIOEnv uio deps = mkTestUIOEnvWith uio deps singletonRouting
+mkTestUIOEnv uio deps = mkTestUIOEnvWith uio deps (singletonRoutingFor uio deps)
 
 -- | A routing table with exactly one machine — the session machine — wrapping
 -- the supplied handle. Kept total and IO-free so the ~90 existing
 -- 'mkTestUIOEnv' call sites keep compiling and behaving unchanged; a call
 -- naming any /other/ machine simply fails with 'MachineUnknown', which is the
 -- correct behaviour for an env that was built without one.
-singletonRouting :: MachineRouting
-{-# NOINLINE singletonRouting #-}
--- NOINLINE: a top-level unsafePerformIO must be a CAF, so the routing (and its
--- handle cache) is built once per process rather than per use site.
-singletonRouting = unsafePerformIO $ do
-  routing <- mkMachineRouting testSessionName [] noBootstrap stubCloneDeps
-  seedRouting routing [(testSessionName, mkRemoteUntrustedIOStub, stubCloneDeps)]
-  where
-    noBootstrap _ _ = pure (Left (MachineUnknown (T.pack "default") []))
+singletonRoutingFor :: UntrustedIO -> CloneDeps -> MachineRouting
+singletonRoutingFor uio deps =
+  mkStaticRouting testSessionName [(testSessionName, uio, deps)]
 
 -- | The singleton session machine's name. Not @local@: @local@ is reserved and
 -- must not be constructible via 'mkMachineName'.
@@ -156,7 +149,7 @@ mkTestUIOEnvWith = UIOEnv
 mkLocalUIO :: WorkspaceRoot -> CloneDeps -> UIO a -> IO a
 mkLocalUIO wsRoot cloneDeps action =
   let uio = mkLocalUntrustedIO wsRoot
-      env = UIOEnv uio cloneDeps singletonRouting
+      env = UIOEnv uio cloneDeps (singletonRoutingFor uio cloneDeps)
   in runUIOWithEnv env action
 
 -- | @mode=remote@: the workdir is a remote workspace path; 'UntrustedIO'
@@ -166,14 +159,14 @@ mkRemoteUIO :: SshConfig -> RemoteRunner -> WorkspaceRoot -> CloneDeps
             -> UIO a -> IO a
 mkRemoteUIO sshCfg runner _wsRoot cloneDeps action =
   let uio = mkRemoteUntrustedIO sshCfg runner
-      env = UIOEnv uio cloneDeps singletonRouting
+      env = UIOEnv uio cloneDeps (singletonRoutingFor uio cloneDeps)
   in runUIOWithEnv env action
 
 -- | Fail-closed: every operation returns 'Left'\/stub. For misconfigured
 -- or unreachable remotes; mirrors 'mkRemoteUntrustedIOStub'.
 mkUIOStub :: CloneDeps -> UIO a -> IO a
 mkUIOStub cloneDeps action =
-  let env = UIOEnv mkRemoteUntrustedIOStub cloneDeps singletonRouting
+  let env = UIOEnv mkRemoteUntrustedIOStub cloneDeps (singletonRoutingFor mkRemoteUntrustedIOStub cloneDeps)
   in runUIOWithEnv env action
 
 -- ---------------------------------------------------------------------------

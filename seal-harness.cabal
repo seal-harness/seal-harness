@@ -195,6 +195,7 @@ library
         Seal.Config.Migrate
         Seal.Config.Machines
         Seal.Tools.Exec.Machine
+        Seal.ISA.Ops.Machine
         Seal.Config.Paths
         Seal.Config.Security
         Seal.Config.Templates
@@ -611,6 +612,8 @@ test-suite tests
          Seal.Config.SecurityScopingFailSpec
          Seal.CapabilityScopingWorkdirFsFailSpec
         Seal.Tools.Exec.MachineSpec
+        Seal.ISA.Ops.MachineSpec
+        Seal.ISA.DispatchMachineSpec
         Seal.Config.PathsSpec
         Seal.Config.TemplatesSpec
         Seal.ConfigSpec

@@ -108,6 +108,8 @@ import qualified Seal.Config.FileSpec
 import qualified Seal.Config.MigrateSpec
 import qualified Seal.Config.MachinesSpec
 import qualified Seal.Tools.Exec.MachineSpec
+import qualified Seal.ISA.Ops.MachineSpec
+import qualified Seal.ISA.DispatchMachineSpec
 import qualified Seal.Config.SecuritySpec
 import qualified Seal.Config.SecurityAccessControlSpec
 import qualified Seal.Config.SecurityScopingFailSpec
@@ -341,6 +343,8 @@ specs = do
   Seal.Config.CredentialsSpec.spec
   Seal.Config.FileSpec.spec
   Seal.Tools.Exec.MachineSpec.spec
+  Seal.ISA.Ops.MachineSpec.spec
+  Seal.ISA.DispatchMachineSpec.spec
   Seal.Config.MigrateSpec.spec
   Seal.Config.MachinesSpec.spec
   Seal.Config.SecuritySpec.spec

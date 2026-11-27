@@ -31,8 +31,10 @@ module Seal.Tools.Exec.Machine
   , mkMachineRouting
   , rtResolve
   , rtSession
+  , UnusableReason (..)
   , rtSelectable
   , seedRouting
+  , mkStaticRouting
   , MachineSlot (..)
   , MachineError (..)
   , UnreachableReason (..)
@@ -43,8 +45,9 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
+import Data.Text qualified as T
 
-import Seal.Config.Machines (MachineName, Selectable)
+import Seal.Config.Machines (MachineName, Selectable (..))
 import Seal.SourceControl.Clone (CloneDeps)
 import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
 
@@ -209,3 +212,22 @@ seedRouting
 seedRouting routing entries = do
   mapM_ (\(n, uio, deps) -> _mrSeed routing n (SlotReady uio deps)) entries
   pure routing
+
+-- | A routing table with a fixed, pre-resolved set of machines — no 'IORef', no
+-- bootstrap. Used by 'mkTestUIOEnv' so an environment built around a specific
+-- handle routes to that handle rather than to a stub.
+mkStaticRouting
+  :: MachineName
+  -> [(MachineName, UntrustedIO, CloneDeps)]
+  -> MachineRouting
+mkStaticRouting session entries =
+  MachineRouting
+    { _mrResolve = \name -> pure $ case lookup name static of
+        Just (uio, deps) -> Right (uio, deps)
+        Nothing          -> Left (MachineUnknown (T.pack (show name)) [])
+    , _mrSession = session
+    , _mrSelectable = map (SelMachine . fst) static
+    , _mrSeed = \_ _ -> pure ()
+    }
+  where
+    static = [ (n, (uio, deps)) | (n, uio, deps) <- entries ]
