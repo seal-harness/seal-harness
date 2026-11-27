@@ -1,6 +1,6 @@
 # Multiple Execution Machines — Implementation Plan
 
-> **Design:** `docs/superpowers/specs/2026-11-26-multiple-execution-machines-design.md` (revision 4, accepted)
+> **Design:** `docs/superpowers/specs/2026-11-26-multiple-execution-machines-design.md` (revision 5, accepted)
 > **Requirements:** `docs/superpowers/requirements/2026-11-26-multiple-execution-machines-requirements.md` (frozen, 2 amendments)
 > **Branch:** `feature/multiple-execution-machines` · **PR** #354
 > **Revision 2** — after Plan Review Gate round 1 (Feasibility FAIL, Completeness FAIL)
@@ -41,7 +41,7 @@ in round 1; this batch is Scope round 1's findings):
 
 ## How to read this plan
 
-20 work units in 8 phases. Each has DoD, file scope, dependencies, and a RED
+18 work units in 7 phases. Each has DoD, file scope, dependencies, and a RED
 block — the assertions that must fail before the unit starts.
 
 **`make check` is four targets plus an npm build**: `check: build test lint
@@ -266,7 +266,7 @@ malformedTomlFailsClosedAtBoot            -- names the file
 resolveMachinesForBootReturnsRegistry
 ```
 
-### WU-8: Migration + rollback safety
+### WU-8: Migration (`mode` removed; revert hazard documented)
 
 **DoD**
 - [ ] `migrateExecutionMachines`, all five rows of design §4 + the failure row.
@@ -298,7 +298,7 @@ modeRemovedOnMigrationBoot                -- DW-2: old block gone
 
 ## Phase 4 — `allow_localhost`, then migration, then session exec
 
-### WU-6: `allow_localhost`, selector, enforcement
+### WU-6: `allow_localhost`, selector, enforcement *(runs before WU-8)*
 
 **DoD**
 - [ ] `UntrustedExecFileConfig = { uefcAllowLocalhost :: !Bool }`;
@@ -445,7 +445,7 @@ parseNewArgsAgreesWithOptparse                  -- T-STR-11
 newWithUnknownMachineFailsBeforeMinting
 selectionPersistedToSmMachine                   -- P2
 resumeUsesRecordedNotDefault                    -- T-RESUME (DW-9)
-chatChannelUsesDefault / asksWhenUnset
+chatChannelUsesDefault / chatChannelNeverPrompts   -- no ASK_HUMAN fallback
 apiMachinesRouteRegistered                      -- route count 82 + OpenAPI arm
 apiMachinesOmitsCoordinates                     -- negative
 pickerHiddenAtOne / shownAtTwo                  -- vitest
@@ -634,9 +634,11 @@ hardenedBuildCannotConstructLocalExecutor  -- the Workdir.hs:188 path is CPP'd o
 
 - [ ] `config/templates/security.toml`: replace `mode`/`known_hosts` with
       `allow_localhost`, pointing at `machines.toml`.
-- [ ] `CHANGELOG.md`: operator-visible schema change + migration note **and the
-      rollback note** (reverting the binary after migration needs `mode` present,
-      which WU-8 guarantees).
+- [ ] `CHANGELOG.md`: operator-visible schema change + migration note, and an
+      explicit **revert warning**: migration removes `mode`, so rolling the binary
+      back after migration leaves no `[untrusted_execution]` section and the old
+      codec defaults to `mode = "local"`. Operators must re-add the section by
+      hand before downgrading.
 
 **Files (edit)** `config/templates/security.toml`, `CHANGELOG.md`
 **Depends on** WU-7, WU-8.
@@ -663,4 +665,4 @@ All green before `gh pr ready`.
 | Two config files can disagree | Resolver takes the flag as a parameter (WU-1); WU-6's decode rule |
 | Adding a field to `SessionMeta` breaks positional construction | WU-9 scopes `Store.hs` + `Worker.hs` explicitly |
 | Route table is a closed GADT | WU-10 lists all five registration edits |
-| Reverting after migration | WU-8 retains `mode` until `machines.toml` is complete |
+| Reverting after migration | **Not mitigated** — the requirements mandate `mode` be removed. The hazard is documented in `CHANGELOG.md` (WU-17), not engineered around |
