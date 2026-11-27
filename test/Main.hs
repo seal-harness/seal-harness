@@ -107,6 +107,7 @@ import qualified Seal.Config.CredentialsSpec
 import qualified Seal.Config.FileSpec
 import qualified Seal.Config.MigrateSpec
 import qualified Seal.Config.MachinesSpec
+import qualified Seal.Tools.Exec.MachineSpec
 import qualified Seal.Config.SecuritySpec
 import qualified Seal.Config.SecurityAccessControlSpec
 import qualified Seal.Config.SecurityScopingFailSpec
@@ -339,6 +340,7 @@ specs = do
   Seal.Config.BootPlanSpec.spec
   Seal.Config.CredentialsSpec.spec
   Seal.Config.FileSpec.spec
+  Seal.Tools.Exec.MachineSpec.spec
   Seal.Config.MigrateSpec.spec
   Seal.Config.MachinesSpec.spec
   Seal.Config.SecuritySpec.spec

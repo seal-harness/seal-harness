@@ -34,6 +34,8 @@ module Seal.Config.Machines
   , MachinesConfigError (..)
   , decodeMachinesConfig
   , machinesConfigCodec
+  , Selectable (..)
+  , selectables
   , MachineTarget (..)
   , MissingField (..)
   , RejectReason (..)
@@ -179,6 +181,29 @@ machineFileCodec = MachineFileConfig
 -- ---------------------------------------------------------------------------
 -- Resolution
 -- ---------------------------------------------------------------------------
+
+-- | What the user (and the model, via the tool schema) may choose. A separate
+-- type from 'MachineTarget' because @local@ is not a constructible
+-- 'MachineName' — 'mkMachineName' reserves it — so the choosable set cannot be
+-- a @[MachineName]@ without either hardcoding the local row (and being unable
+-- to suppress it when the flag is off) or offering a machine the selector then
+-- rejects.
+data Selectable
+  = SelLocal
+  | SelMachine !MachineName
+  deriving stock (Eq, Show)
+
+-- | The choosable set, in a stable order: local first (it is the harness
+-- machine), then the rest by name. The order is the order the TUI prompt and
+-- the schema enum present, so it is pinned here rather than left to Map's
+-- internal ordering.
+selectables :: MachineRegistry -> [Selectable]
+selectables reg =
+  let names = Map.keys (regMachines reg)
+      hasLocal = localMachineName `elem` names
+      others = filter (/= localMachineName) names
+  in [SelLocal | hasLocal]
+       <> map SelMachine others
 
 -- | A selectable machine. 'MtSsh' carries no name — the name is the key of the
 -- 'regMachines' map, so a target cannot disagree with the key it was found
