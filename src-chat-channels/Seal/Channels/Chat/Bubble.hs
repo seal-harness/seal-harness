@@ -21,6 +21,8 @@ module Seal.Channels.Chat.Bubble
   ( Splice
   , bubbleText
   , formatAsk
+  , formatQuestionBody
+  , liveAskHint
   , chunkMessage
   , chunkLen
   ) where
@@ -67,16 +69,35 @@ bubbleText splices text cursor =
 -- numbered list plus the numeric hint (the form a chat channel without inline
 -- keyboards can answer). Pure.
 formatAsk :: Text -> [QuestionOption] -> Text
-formatAsk question [] = question <> "\n\nReply with your answer."
-formatAsk question opts =
+formatAsk question opts = formatQuestionBody question opts <> liveAskHint opts
+
+-- | The question and its numbered options, with **no** reply hint.
+--
+-- Split out from 'formatAsk' because the hint is only correct when a plain
+-- reply actually reaches the question. On the @\\/last@ path it does not (a
+-- plain reply goes to the focused tab, not the tab being viewed), so @\\/last@
+-- supplies its own answer hint. Emitting "Reply with a number" there would
+-- tell the user to do the one thing that misroutes their answer.
+--
+-- Joining 'formatQuestionBody' with 'liveAskHint' reproduces 'formatAsk'
+-- exactly, for both the open-ended and the optioned shape. Pure.
+formatQuestionBody :: Text -> [QuestionOption] -> Text
+formatQuestionBody question [] = question
+formatQuestionBody question opts =
   question
   <> "\n\n"
   <> T.intercalate "\n" (zipWith formatOption [1 :: Int ..] opts)
-  <> "\n\nReply with a number or type your own answer."
   where
     formatOption n (QuestionOption lbl desc)
       | T.null desc = T.pack (show n) <> ") " <> lbl
       | otherwise   = T.pack (show n) <> ") " <> lbl <> " \8212 " <> desc
+
+-- | The trailing hint 'formatAsk' appends. Carries its own leading blank line,
+-- so @'formatQuestionBody' q os <> 'liveAskHint' os@ is byte-identical to
+-- 'formatAsk' @q os@. Pure.
+liveAskHint :: [QuestionOption] -> Text
+liveAskHint []   = "\n\nReply with your answer."
+liveAskHint _    = "\n\nReply with a number or type your own answer."
 
 -- ---------------------------------------------------------------------------
 -- Chunking
