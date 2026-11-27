@@ -774,8 +774,11 @@ machine's files via `FILE_*`/`SEARCH_FILES`.
 ### 7.3 WorkdirFs
 
 Affected: `WorkdirFs.hs:418` calls `runUIOWithEnv uioEnv (uioShellExec cmd Nothing)`,
-so a leading `ExecTarget` breaks it. One line: `sessionTarget`. Revision 1 claimed
-it "keeps working unmodified" — semantics, not signature.
+is **unchanged** by this revision: with dispatcher resolution (design §6.2) the
+environment it receives already carries the resolved handle, so
+`runUIOWithEnv uioEnv (uioShellExec cmd Nothing)` compiles and behaves as before.
+It always operates on the session machine's workdir, which is correct — it is the
+discovery/path layer, not the per-call execution layer.
 
 ## 8. Where `local` and the flag are enforced
 
@@ -862,7 +865,7 @@ actually emit).
 | WU | Content | Green boundary |
 |---|---|---|
 | W1 | `Config.Machines` + `MachineName` + resolution + `RejectReason` | new specs; nothing existing touched |
-| W2 | `ExecTarget`/`MachineRouting`/`MachineSlot`/`MachineError`; `mkTestUIOEnv` singleton default | compiles; suite green |
+| W2 | `MachineRouting`/`MachineSlot`/`MachineError`/`Selectable`; `mkTestUIOEnv` singleton default + `mkTestUIOEnvWith` | compiles; suite green |
 | W3 | 12 `uio*` signatures + `withTarget` + `WorkdirFs` + `uioUntrustedIO` removal + `Repo` | mechanical, ~289 sites |
 | W4 | 8 opcodes: `machine` input, `uioResolveTarget`, schema enum, `renderMachineError`, descs | opcode specs |
 | W5 | `SessionExec` resolver + slot `IORef` + lazy bootstrap + `ExecCache` re-key | workdir/cache specs |
@@ -879,9 +882,10 @@ actually emit).
 | W16 | `/machine list` + `seal machine pin` wiring (§5.7) | `CommandMachineSpec`, `HelpSpec` |
 | W17 | `CHANGELOG`, `templates/security.toml` copy | — |
 
-W3 is the only unit that cannot be split further: `ExecTarget` is unconstructible
-until `UIOEnv` carries the routing, so the signature change is atomic. Sized from
-call sites (§12), not opcode count.
+No unit requires a cross-cutting signature change: dispatcher resolution (§6.2)
+confines the work to `Seal.ISA.Dispatch`, and the opcode schemas (§6.4) are
+additive. W3 is small; the largest units are W10 (route registration) and W16
+(the hardened build).
 
 ## 12. Counted breaking-change inventory
 
