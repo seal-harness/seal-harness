@@ -75,8 +75,11 @@ with a non-exhaustive `openApiMeta` case is a hard build error.
 - [ ] `MachineRegistry { regMachines, regRejected, regDefault }`.
 - [ ] `resolveMachines :: Bool -> SealPaths -> MachinesConfig -> MachineRegistry`
       — pure; the flag and paths are parameters, so it reads neither config file.
+- [ ] **`MachineRegistry` gains `regWarnings :: [Text]`** — defined here in WU-1
+      (it is a field of WU-1's record, so WU-1 never forward-depends on WU-2).
 - [ ] Order: field validation → loopback guard **before** host validation → `local`
-      injected iff flag → `regDefault` resolved or dropped with a warning.
+      injected iff flag → `regDefault` resolved or dropped, appending a
+      `regWarnings` entry either way.
 - [ ] `isLoopbackHost`: `localhost`, `127.0.0.0/8`, `::1`, `[::1]`, `0.0.0.0`, `::`.
 - [ ] `loadMachinesConfig` returns `Either Text MachinesConfig` (WU-7 owns the file IO;
       WU-1 owns decode).
@@ -119,18 +122,21 @@ malformedTomlIsLeft                     -- decode failure surfaces, not silent-e
 - [ ] Pure resolver over a registry, independent of `SessionMeta` (so WU-3 does not
       forward-depend on WU-9):
       `resolveName :: MachineRouting -> Maybe MachineName -> Either MachineError MachineName`.
-- [ ] `resolveMachines` returns its diagnostics **in the value**, not as a side
-      effect: `MachineRegistry` gains `regWarnings :: [Text]`, so a pure function
-      can report "`[machines.local]` ignored" and "`default` names no resolved
-      machine" without logging. WU-7's boot path prints them; tests assert on the
-      list.
 - [ ] `MachineRouting { rtResolve, rtSession, rtSelectable }` — constructor and
       fields **not exported**.
-- [ ] `MachineSlot = SlotReady !UntrustedIO | SlotFailed !MachineError`.
+- [ ] `MachineSlot = SlotReady !UntrustedIO !CloneDeps | SlotFailed !MachineError`
+      (single definition — the earlier mention at line 114 is the same type).
 - [ ] `Selectable = SelLocal | SelMachine !MachineName` (**defined here**, not WU-1).
 - [ ] `mkTestUIOEnv` keeps arity, defaulting to singleton routing.
-- [ ] **`mkTestUIOEnvWith :: [(MachineName, UntrustedIO)] -> MachineName -> CloneDeps -> UIOEnv`**
-      — the multi-machine seam. Without it DW-11/DW-12/T-NOFALLBACK are unbuildable.
+- [ ] **`mkTestUIOEnvWith :: [(MachineName, (UntrustedIO, CloneDeps))] -> MachineName -> CloneDeps -> UIOEnv`**
+      — the multi-machine seam. Each machine carries **its own** `CloneDeps`
+      (transport-bound: `cdIsRemote`, `cdPinnedKnownHosts`), plus a session-level
+      `CloneDeps` for the default. Without per-machine clone deps, WU-2's
+      `slotCarriesCloneDeps` and WU-3's `callEnvSwapsBothCapabilities` are
+      unverifiable, and cross-machine `SETUP_REPO` would run B's commands over
+      A's transport.
+- [ ] `rtResolve :: MachineName -> IO (Either MachineError (UntrustedIO, CloneDeps))`
+      — returns both capabilities, matching what WU-3's `callEnv` swap needs.
 - [ ] `mkTestMachineRouting` for the same reason.
 
 **Files (create)** `src/Seal/Tools/Exec/Machine.hs`, `test/Seal/Tools/Exec/MachineSpec.hs`
@@ -182,8 +188,9 @@ signature changes, so the ~289 call sites and `Browser.hs` are untouched, and
       `MachineError` naming the machine, never `ExecNotImplementedReason`.
 - [ ] Resolution failure produces a tool error naming the valid choices **before
       any `uio*` call**.
-- [ ] `mkTestUIOEnv`'s eta-reduced `UIOEnv` construction and the three positional
-      sites (`Internal.hs:120,129,132`) are updated for the third field.
+      *(The `UIOEnv` third-field update — eta-reduced `mkTestUIOEnv` plus the
+      positional sites at `Internal.hs:120,130,137` — is WU-2's scope, not this
+      unit's.)*
 
 **Files (edit)** `src/Seal/ISA/Dispatch.hs`, `test/Seal/ISA/DispatchSpec.hs`
 **Depends on** WU-2. *(Not WU-9 — it uses WU-2's pure `resolveName`, not `machineForSession`.)*
@@ -413,7 +420,7 @@ readOnBWrittenOnAIsNotFound
 `test/Seal/Core/SystemPromptSpec.hs`,
 `test/Seal/Tabs/PartitionSpec.hs`,
 `test/Seal/Channel/CliSpec.hs`,
-`test/Seal/Command/{TabSpec,SessionSpec,NewSpec}.hs`,
+`test/Seal/Command/{TabSpec,SessionSpec,NewSpec,ModelSpec}.hs`,
 `test/Seal/Agent/Runtime/Delegation/WorkerSpec.hs`,
 `test/Seal/RepoDiscoverySpec.hs`,
 `test/Seal/ISA/Ops/{SessionSpec,AgentHandoffSpec}.hs`,
@@ -455,6 +462,16 @@ must gain the field. There are ~30 across the files listed above, all under
 - [ ] `/new -x <unknown>` fails at `/new` time with the valid choices.
 - [ ] **The selection is persisted into `smMachine`** at session creation
       (`newSessionMeta`/`newSession` gain a machine parameter) — P2.
+- [ ] **Every `newSession`/`newSessionMeta` caller is updated** (the arity change
+      fans out): `src/Seal/ISA/Ops/Session.hs:342`,
+      `src/Seal/Command/Serve.hs:424` (cron),
+      `test/Seal/Session/SearchSpec.hs` (15 calls), and the gateway handlers at
+      `API.hs:1457,1514`. A caller that omits the machine uses `regDefault`;
+      `Ops/Session.hs` and the cron path pass the session machine explicitly.
+- [ ] **Chat-channel `/new -x` reaches session creation**: the chat loop mints over
+      HTTP, so `src-chat-channels/Seal/Channels/Chat/HttpClient.hs:223,233`
+      (`mintBody`/`rebindBody`) gain a machine parameter alongside provider/model,
+      and `Loop.hs:1727` threads `naMachine` into them.
 - [ ] `GET /api/machines` — **full route registration (P3)**:
       `SealRoute` constructor + `routeMeta` arm + `allRoutes` entry
       (`src-gateway-types/Seal/Gateway/Types/Route.hs`), `openApiMeta` arm
@@ -466,7 +483,9 @@ must gain the field. There are ~30 across the files listed above, all under
 **Files (edit)** `src/Seal/Channel/Cli.hs`, `src/Seal/Command/New.hs`,
 `src-gateway-types/Seal/Gateway/Types/{NewArgs,Route}.hs`,
 `src/Seal/Gateway/{API,OpenApi}.hs`, `src/Seal/Session/Store.hs`,
-`src-chat-channels/Seal/Channels/Chat/Loop.hs`,
+`src-chat-channels/Seal/Channels/Chat/{Loop,HttpClient}.hs`,
+`src/Seal/ISA/Ops/Session.hs`, `src/Seal/Command/Serve.hs`,
+`test/Seal/Session/SearchSpec.hs`,
 `test/Seal/Gateway/ApiRouteSpec.hs`,
 `frontend/src/{components/NewTabComposer.tsx,hooks/useNewTabSpec.ts}`
 **Depends on** WU-2, WU-9.
@@ -476,6 +495,8 @@ must gain the field. There are ~30 across the files listed above, all under
 promptAtTwo / noneAtOne / emptyTakesDefault     -- T-STR-8 exact layout
 promptIncludesLocalRow / omitsItWhenFlagFalse
 parseNewArgsAgreesWithOptparse                  -- T-STR-11
+chatNewDashXReachesSessionCreate                -- override survives to smMachine
+newDashXLocalUnderFlagFails                     -- known-but-forbidden name
 newWithUnknownMachineFailsBeforeMinting
 selectionPersistedToSmMachine                   -- P2
 resumeUsesRecordedNotDefault                    -- T-RESUME (DW-9)
@@ -583,6 +604,7 @@ setupRepoOnSessionMachineUnchanged
       loopback refusal.
 
 **Files (create)** `src/Seal/Command/Machine.hs`, `test/Seal/Command/MachineSpec.hs`
+**Files (edit)** `test/Seal/CapabilityScopingWorkdirFsFailSpec.hs` (the guard)
 - [ ] **`machines.toml` joins the agent-immutable set.** `blockedNames`
       (`Security/Path.hs:54`) already covers `.seal`; this change asserts the new
       files are unreachable from an opcode path. Extend
@@ -597,7 +619,7 @@ setupRepoOnSessionMachineUnchanged
 
 **RED**
 ```
-machineListExactOutput                    -- T-STR-10
+machineListExactOutput                    -- T-STR-13
 machineListOmitsEmptySections
 machineListReusesConfigErrorRenderer
 registeredUnderGroupGeneral                -- HelpSpec ordering intact
