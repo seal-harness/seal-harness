@@ -193,6 +193,7 @@ library
         Seal.Config.Credentials
         Seal.Config.File
         Seal.Config.Migrate
+        Seal.Config.Machines
         Seal.Config.Paths
         Seal.Config.Security
         Seal.Config.Templates
@@ -603,6 +604,7 @@ test-suite tests
         Seal.Config.CredentialsSpec
         Seal.Config.FileSpec
         Seal.Config.MigrateSpec
+        Seal.Config.MachinesSpec
         Seal.Config.SecurityAccessControlSpec
        Seal.Config.SecuritySpec
          Seal.Config.SecurityScopingFailSpec
