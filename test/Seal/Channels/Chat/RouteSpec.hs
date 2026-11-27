@@ -54,6 +54,27 @@ spec = do
     it "routes /new -p anthropic to ChatNewSession with args" $
       route "/new -p anthropic" `shouldBe` Right (ChatNewSession "-p anthropic")
 
+    it "routes /last to ChatLast with empty args" $
+      route "/last" `shouldBe` Right (ChatLast "")
+
+    it "routes /last b to ChatLast \"b\"" $
+      route "/last b" `shouldBe` Right (ChatLast "b")
+
+    it "routes /last b 3 to ChatLast \"b 3\"" $
+      route "/last b 3" `shouldBe` Right (ChatLast "b 3")
+
+    it "routes /last b 2 junk to ChatLast verbatim (extra tokens ignored later)" $
+      route "/last b 2 junk" `shouldBe` Right (ChatLast "b 2 junk")
+
+    it "matches /last case-insensitively (command word only)" $
+      route "/LAST b" `shouldBe` Right (ChatLast "b")
+
+    it "does NOT treat /lasty as /last" $
+      route "/lasty" `shouldBe` Right (ChatSlash "lasty")
+
+    it "still routes /l to ChatFocus (no collision with /last)" $
+      route "/l" `shouldBe` Right (ChatFocus (mkIdxC 'l'))
+
     it "routes /vault to ChatSlash" $
       route "/vault" `shouldBe` Right (ChatSlash "vault")
 
