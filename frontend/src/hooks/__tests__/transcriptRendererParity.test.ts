@@ -445,6 +445,30 @@ function conversationWithSetupRepoChannel(): TranscriptEntry[] {
 }
 
 /** Conversation with a SKILL_LOAD opcode entry (legacy). */
+// A turn-failure entry: the backend writes it as an EKHarness entry whose
+// payload carries `failure` (and NOT an `op`), so it is the one row whose
+// recognition must not depend on `op` or on `harness` (which the gateway
+// hardcodes to null). Including it here is what makes the parity battery
+// actually cover this feature -- without it, both renderers could drift on
+// failure rows and every assertion would still pass.
+function conversationWithTurnFailure(): TranscriptEntry[] {
+  return [
+    makeEntry({
+      id: 'tf1',
+      direction: 'request',
+      payload: JSON.stringify({
+        messages: [],
+        harness: 'turn-failure',
+        failure: {
+          headline: 'invalid UTF-8 in tool output',
+          cause: 'unicode',
+          ref: '1a2b3c4d',
+        },
+      }),
+    }),
+  ]
+}
+
 function conversationWithSkillLoad(): TranscriptEntry[] {
   return [
     makeEntry({
@@ -827,6 +851,7 @@ describe('data-layer parity: useTranscriptMessages vs transcriptToMessages', () 
     })
 
     it('SKILL_LOAD (legacy opcode)', () => {
+      expectFullParity(conversationWithTurnFailure())
       expectFullParity(conversationWithSkillLoad())
     })
 

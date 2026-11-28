@@ -15,6 +15,8 @@ module Seal.Core.TurnEngine
   , buildChildRegistryAdapter
   , resolveSystemPrompt
   , TurnDeps (..)
+  , reportTurnFailure
+  , TurnFailureReport (..)
   , TurnAdapter (..)
   , TurnOutcome (..)
   , runSessionTurn
@@ -29,9 +31,9 @@ module Seal.Core.TurnEngine
   , broadcastSessionEntries
   ) where
 
-import Control.Exception (bracket, catch)
+import Control.Exception (SomeException, bracket, catch, throwIO)
 import Control.Monad (unless, void, when)
-import Data.Aeson (Value)
+import Data.Aeson (Value (..), toJSON)
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Set (member, fromList)
@@ -77,13 +79,15 @@ import Seal.Core.Backends (Backends (..))
 import Seal.Core.MessageSource (MessageSource)
 import Seal.Core.Types (ModelId (..), OpName (..), SessionId, mkSessionId, sessionIdText)
 import Seal.Gateway.Broadcast
-  (broadcastAgentDefsChanged, broadcastHarnessStatus, broadcastReplyDelivered, wrapCapsForAskStatus)
+  (broadcastAgentDefsChanged, broadcastHarnessStatus, broadcastReplyDelivered,
+   broadcastTurnFailure, wrapCapsForAskStatus)
 import Seal.Gateway.StreamBroker (StreamBroker, BrokerEvent (..), broadcast, takeNewEntries)
 import Seal.Gateway.Transcript (readTranscriptEntries, showIso)
 import Seal.Handles.AskReply (ApprovalCache)
 import Seal.Handles.Tab (TabKind (KindAi))
 import Seal.Handles.Transcript
   ( IndexedTranscriptHandle, withIndexedTranscript, itwSetSecretOps, itwReadEntries
+  , itwLastFailure
   , itwRecordAndAck, itwReadConversation, IndexedTranscriptWrite (..)
   , TranscriptError (..), completionHarnessTag, pendingCompletionCount
   , readAndClearCompletions )
@@ -116,7 +120,10 @@ import Seal.ISA.Ops.Skills
 import Seal.ISA.Ops.Cron (cronManageOp)
 import Seal.ISA.Opcode (Opcode, OpResult (..), localBackend, opName, orIsError)
 import qualified Seal.ISA.Registry as ISA
-import Seal.Logging.Exceptions (withExceptionLogging)
+import Seal.Logging.Exceptions (withExceptionLoggingRef)
+import Seal.Transcript.TurnFailure
+  ( FailureCause (..), TurnFailure (..), classify, renderForChat, renderForLog
+  , renderForModel, renderForUser )
 import Seal.Logging.Logger (SealLogger)
 import Seal.Providers.Class
   (ContentBlock (..), Message (..), Role (..), SomeProvider, ToolChoice (..))
@@ -552,7 +559,24 @@ runSessionTurn td adapter meta mSrc t = do
       -- handle that subscribed but never sees the turn complete). The
       -- engine's bracket is NOT entered (no "thinking" signal was sent).
       taPreTurn adapter sid meta t
-      pure (TurnOutcome (Just err))
+      -- CP2 (design §2.2): report it. This path throws NOTHING -- it returns
+      -- an Either -- so CP1 never sees it, and a bad model name or a missing
+      -- vault key would otherwise still fail in total silence. That is the
+      -- highest-frequency production failure, and the requirements list
+      -- "a provider resolution failure" as in scope.
+      --
+      -- Reported in its own transcript bracket: the engine's bracket is not
+      -- entered, so there is no handle in scope. Best-effort by construction
+      -- (§3.6) -- a failure to report must not mask the original failure.
+      let failure = TurnFailure
+            "the model provider could not be resolved"
+            CauseProviderUnresolved
+            ""
+      withIndexedTranscript sessionDirPath (\tHandle ->
+         void (reportTurnFailure td tHandle sid paths failure))
+        `catch` \(_ :: SomeException) -> pure ()
+      appendSessionLog (Just (sessionLogPath paths sid)) "ERROR" err
+      pure (TurnOutcome (Just (renderForUser failure)))
     Right (prov, model) -> do
       createDirectoryIfMissing True sessionDirPath
       saveSessionMeta paths meta
@@ -622,8 +646,26 @@ runSessionTurn td adapter meta mSrc t = do
             aborted <- isAborted abortFlag
             unless aborted (onTurnEnd sid))
         (\_ -> withSessionLock (tdLocks td) sid $
-          withIndexedTranscript sessionDirPath $ \tHandle ->
-            runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandle)
+          withIndexedTranscript sessionDirPath $ \tHandle -> do
+            -- CP3 (design §2.3): 'runTurnBody' does real work BEFORE it
+            -- reaches CP1 -- mkEnv, the runtime/security config loads,
+            -- cachedWorkdirScan, resolveSystemPrompt, buildSessionRegistry.
+            -- A throw in that prologue would otherwise escape the engine and
+            -- be caught only by the caller's generic handler, which reports
+            -- no transcript entry. This wrap makes CP1 subsume the prologue,
+            -- so §3.7's "once per runTurnBody" is actually true.
+            --
+            -- CP1 still lives inside, and returns a 'Left' rather than
+            -- throwing, so this outer handler cannot double-report.
+            runTurnBody td adapter meta mSrc t sid paths prov model
+              stopFanoutDoneRef tHandle
+              `catch` \(e :: SomeException) -> do
+                     -- A prologue throw. Report it, then rethrow so the
+                     -- bracket cleanup and the caller still see it.
+                     mInner <- itwLastFailure tHandle
+                     void $ reportTurnFailure td tHandle sid paths
+                              (classify mInner e "")
+                     throwIO e)
       -- [engine] Auto-tab the session (idempotent; no-op if a tab already
       -- binds sid). Gated on shouldAutoTab so /bg sessions stay headless.
       when (shouldAutoTab meta) $
@@ -823,7 +865,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
           , erMeta = Map.empty
           }
     recordHandoff tHandle (IndexedTranscriptWrite fullMsgs entry)
-  eResult <- withExceptionLogging (tdLogger td) (Just (sessionLogPath paths sid)) "turn" $
+  eResult <- withExceptionLoggingRef (tdLogger td) (Just (sessionLogPath paths sid)) "turn" $
     runApp appEnv (runTurn env t)
   -- [completion-diag] A completion still sitting in the sidecar when the
   -- turn ends may have no delivery scheduled: the idle wake-up was skipped
@@ -843,12 +885,85 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
         <> " sub-agent completion(s) still pending when the turn ended; "
         <> "check that a wake-up picks them up")
   case eResult of
-    Left errMsg -> pure (Just errMsg)
+    Left (e, ref) -> do
+      -- The live signal, the durable entry, the chat fan-out and the operator
+      -- log all fire from here. Reported once: this is the body, not the
+      -- cleanup, so a turn whose cleanup throws cannot double-report.
+      mInner <- itwLastFailure tHandle
+      report <- reportTurnFailure td tHandle sid paths (classify mInner e ref)
+      pure (Just (tfrUserText report))
     Right _     -> do
       -- [engine] Broadcast new transcript entries (one canonical post-turn
       -- sequence; the per-entry live broadcast already fired via aeOnEntry).
       broadcastNewEntries (tdBroker td) paths sid (modelText model) (smCreatedAt meta')
       pure Nothing
+
+-- | What a failure report produced, for the caller to surface.
+newtype TurnFailureReport = TurnFailureReport { tfrUserText :: Text }
+
+-- | Report a failed turn on every surface it is owed to.
+--
+-- Called from the choke points (design \u00a72.1-2.3). Each duty is
+-- INDEPENDENTLY guarded, because recording a failure must never be able to
+-- suppress the signal that tells the user about it (constraint 2): if the
+-- durable write throws, the live broadcast still fires.
+--
+-- Order is deliberate. The live signal runs FIRST: 'itwRecordAndAck' can block
+-- for @defaultAckTimeoutUs@ (30s) against a /stuck/ writer, and requirement 3
+-- says the live signal fires immediately -- on exactly the scenario that
+-- motivated the change. The unconditional @seal.log@ line is last but is never
+-- skippable, since it is the operator's independent fallback.
+--
+-- @erConvLen = 1@ is load-bearing and NOT an incidental choice: a harness
+-- entry's @erConvLen@ is a delta that advances the replay cursor
+-- ('Seal.Transcript.Reconstruct'), and it must equal the number of conversation
+-- messages actually passed here -- exactly one, from 'renderForModel'. A
+-- mismatch silently corrupts every later entry's cursor.
+reportTurnFailure
+  :: TurnDeps -> IndexedTranscriptHandle -> SessionId -> SealPaths
+  -> TurnFailure -> IO TurnFailureReport
+reportTurnFailure td tHandle sid paths failure = do
+  let mLog = Just (sessionLogPath paths sid)
+      runDuty label act = act `catch` \(e :: SomeException) ->
+        appendSessionLog mLog "ERROR"
+          ("failure-reporting " <> label <> " itself failed: "
+            <> T.pack (take 200 (show e)))
+  runDuty "broadcast" (broadcastTurnFailure (tdBroker td) sid failure)
+  runDuty "record"    (recordFailure tHandle failure)
+  runDuty "fanout"    (fanoutFailure (tdReplies td) sid (renderForChat failure))
+  appendSessionLog mLog "ERROR" (renderForLog failure)
+  pure (TurnFailureReport (renderForUser failure))
+
+-- | Write the durable failure entry ("the model sees its own prior failures",
+-- decision 1) and push it so the focused client sees it without a reload.
+recordFailure :: IndexedTranscriptHandle -> TurnFailure -> IO ()
+recordFailure tHandle failure = do
+  now <- getCurrentTime
+  hid <- newHarnessId
+  -- Pass the FULL conversation plus the new line, not just the new line.
+  -- 'writeOne' slices positionally: @take erConvLen (drop writtenLen msgs)@.
+  -- With only the new message, @drop writtenLen@ empties the list and nothing
+  -- is appended. 'recordHandoff' passes @prior <> completions@ for the same
+  -- reason.
+  prior <- itwReadConversation tHandle
+  let entry = EntryRecord
+        { erId = harnessIdToText hid
+        , erTimestamp = now
+        , erKind = EKHarness
+        -- one conversation line: the model-visible message below
+        , erConvLen = 1
+        , erEnvelope = Nothing
+        , erUsage = Nothing
+        , erStop = Nothing
+        , erDurationMs = Nothing
+        , erHarness = Just "turn-failure"
+        , erCorrelation = Just (tfRef failure)
+        , erMeta = Map.fromList
+            [ ("headline", String (tfHeadline failure))
+            , ("failure", toJSON failure)
+            ]
+        }
+  itwRecordAndAck tHandle (IndexedTranscriptWrite (prior <> [renderForModel failure]) entry)
 
 -- | Record a completed sub-agent's message as a durable handoff.
 --
@@ -1008,6 +1123,17 @@ fanoutLastReply replies mBroker paths sid = do
         replyFanout replies sid reply
         count <- replySubscriberCount replies sid
         when (count > 0) (broadcastReplyDelivered mBroker sid)
+
+-- | Fan a failure notice out to the chat channels subscribed to this session.
+--
+-- Deliberately separate from 'fanoutLastReply': that function scans for the
+-- last ASSISTANT message and would both miss a harness entry and misfire the
+-- @reply-delivered@ signal. A failure is not a reply.
+--
+-- The text is headline + reference only (see 'renderForChat'): this is the one
+-- surface that leaves the machine, so it carries the least detail.
+fanoutFailure :: ReplyRegistry -> SessionId -> Text -> IO ()
+fanoutFailure = replyFanout
 
 -- | Extract the concatenated text content of the last 'Assistant' message.
 lastAssistantText :: [Message] -> Maybe Text

@@ -7,7 +7,7 @@ import Data.Aeson (object, (.=))
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
 import Data.Either (isLeft)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -27,6 +27,7 @@ import Seal.Transcript.Entries
   ( EntryKind (..), EntryRecord (..), EnvelopeDelta (..), emptyEnvelopeDelta )
 import Seal.Transcript.Types
 import Seal.Handles.Transcript
+import Seal.Transcript.TurnFailure (FailureCause (..), classify, tfCause)
 
 mkEntry :: IO TranscriptEntry
 mkEntry = do
@@ -257,6 +258,34 @@ spec = describe "Seal.Handles.Transcript" $ do
           case r of
             Left (TranscriptError msg _) -> msg `shouldSatisfy` T.isInfixOf "dead"
             Right _ -> expectationFailure "expected a TranscriptError but got none"
+
+    it "itwLastFailure exposes the daemon's fatal cause after it dies" $
+      -- The motivating incident: the daemon died of a strict UTF-8 decode, but
+      -- the caller only ever saw "the writer died". Carrying the daemon's own
+      -- exception out of the bracket is what lets the failure report name the
+      -- real cause instead of the wrapper.
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        e <- mkEntryRecord 1
+        let badText = TE.decodeUtf8 (BS.pack [0xe8])
+        withIndexedTranscript dir $ \h -> do
+          _ <- try (itwRecordAndAck h (IndexedTranscriptWrite [Message User [CbText badText]] e))
+                 :: IO (Either SomeException ())
+          mInner <- itwLastFailure h
+          case mInner of
+            Nothing -> expectationFailure "expected the daemon's fatal cause to be recorded"
+            Just inner ->
+              tfCause (classify Nothing inner "r") `shouldBe` CauseUnicode
+
+    it "itwLastFailure is Nothing for a healthy writer" $
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        e <- mkEntryRecord 1
+        withIndexedTranscript dir $ \h -> do
+          itwRecordAndAck h (IndexedTranscriptWrite [Message User [CbText "ok"]] e)
+          itwLastFailure h >>= \m -> m `shouldSatisfy` isNothing
+
+    it "fakeIndexedTranscript reports no failure" $ do
+      (h, _) <- fakeIndexedTranscript
+      itwLastFailure h >>= \m -> m `shouldSatisfy` isNothing
 
     it "leaving the bracket terminates promptly when the writer died mid-turn" $
       -- Regression: when the writer daemon dies inside 'writeOne' it sets

@@ -19,6 +19,8 @@
 --    defense).
 module Seal.Logging.Exceptions
   ( withExceptionLogging
+  , withExceptionLoggingRef
+  , mkCorrelationId
   ) where
 
 import Control.Exception
@@ -67,6 +69,42 @@ withExceptionLogging logger mLogPath whereLabel action =
         logIO logger ErrorS (escapeNewlines (ls fullDetail))
         logTurnError mLogPath fullDetail
         pure (Left userMsg)
+
+-- | Like 'withExceptionLogging', but also hands the caller the exception and
+-- the correlation id it logged.
+--
+-- The three-part result exists because a failure report needs all three, and
+-- only one of them survives the plain variant:
+--
+-- * the /exception/ — so the report can classify the real cause. The plain
+--   variant consumes it into a sanitized 'Text', which is not recoverable.
+-- * the /ref/ — so the report's reference id is the SAME id as the log line.
+--   The plain variant mints it internally and only embeds it inside the
+--   returned 'Text', so a caller cannot use it to join to @seal.log@.
+-- * the /result/ — 'Right' on success, so the caller’s happy path is unchanged.
+--
+-- 'AsyncException' is rethrown after logging, exactly as in the plain variant:
+-- a shutdown is not a failure.
+withExceptionLoggingRef
+  :: SealLogger
+  -> Maybe FilePath
+  -> Text
+  -> IO a
+  -> IO (Either (SomeException, Text) a)
+withExceptionLoggingRef logger mLogPath whereLabel action =
+  (Right <$> action) `catch` \e -> do
+    case (fromException e :: Maybe AsyncException) of
+      Just asyncEx -> do
+        logIO logger InfoS (escapeNewlines (ls $
+          "shutdown signal in " <> whereLabel <> ": " <> showLs asyncEx))
+        logTurnError mLogPath ("shutdown signal in " <> whereLabel <> ": " <> showLs asyncEx)
+        throwIO e
+      Nothing -> do
+        correlationId <- mkCorrelationId
+        let (_userMsg, fullDetail) = sanitizeException whereLabel e correlationId
+        logIO logger ErrorS (escapeNewlines (ls fullDetail))
+        logTurnError mLogPath fullDetail
+        pure (Left (e, correlationId))
 
 -- | Generate a short correlation id (8 hex chars from a random nonce).
 mkCorrelationId :: IO Text

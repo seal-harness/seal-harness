@@ -1986,6 +1986,25 @@ export function findPreambleId(entries: TranscriptEntry[]): string | undefined {
  *  first LLM request in the view, see `findPreambleId`). The verbatim on-disk
  *  transcript line (`raw`) is carried through to the "View raw JSON (message)"
  *  modal so Seal always makes EVERYTHING visible to the user. */
+/**
+ * The user-facing cause line for a turn-failure entry.
+ *
+ * The wire carries a closed kebab-case vocabulary from
+ * Seal.Transcript.TurnFailure. An unknown value is returned as-is (stripping
+ * an `other:` prefix) so a newer server's cause still displays against an
+ * older client rather than rendering blank.
+ */
+export function renderCauseLabel(cause: string): string {
+  switch (cause) {
+    case 'unicode': return 'UnicodeException'
+    case 'no-space': return 'resource exhausted (No space left on device)'
+    case 'too-many-files': return 'resource exhausted (Too many open files)'
+    case 'transcript-dead': return 'session transcript unavailable'
+    case 'provider-unresolved': return 'model provider could not be resolved'
+    default: return cause.startsWith('other:') ? cause.slice('other:'.length) : cause
+  }
+}
+
 export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
   const done = perf.begin('transcriptToMessages')
   const messages: Message[] = []
@@ -2021,6 +2040,34 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
         // action="load"; legacy SKILL_LOAD entries still match for old
         // transcripts); SETUP_REPO carries status/target
         // (and, on failure, the error text is in the conversation message).
+        // Turn-failure entry. MUST be kept in step with the production copy
+        // in hooks/useTranscriptMessages.ts (processEntry): the two are
+        // near-verbatim duplicates and transcriptRendererParity.test.ts
+        // asserts deep equality between them, so adding the branch to only
+        // one silently drifts until a fixture happens to contain a failure.
+        const failure = parsed.failure as
+          { headline?: string; cause?: string; ref?: string } | undefined
+        if (failure) {
+          const headline = typeof failure.headline === 'string' ? failure.headline : 'the turn failed'
+          const ref = typeof failure.ref === 'string' ? failure.ref : ''
+          const cause = typeof failure.cause === 'string' ? renderCauseLabel(failure.cause) : ''
+          messages.push({
+            id: e.id + '-turn-failure',
+            entryId: e.id,
+            convLen: e.convLen ?? undefined,
+            agentName: 'Turn failed',
+            agentStatus: 'idle',
+            timestamp: ts,
+            kind: 'turn-failure',
+            blocks: [{
+              id: 'failure-' + e.id,
+              text: `\u26a0 Turn failed \u2014 ${headline}`,
+            }],
+            turnFailure: { headline, cause, ref },
+            rawJson,
+          })
+          continue
+        }
         const opName = (parsed.op as { name?: string } | undefined)?.name
         const isSkillLoad = opName === 'SKILL_LOAD' || (opName === 'SKILL_MANAGE' && (parsed.input as { action?: string } | undefined)?.action === 'load')
         if (isSkillLoad && parsed.result) {

@@ -64,6 +64,10 @@ export type ActivityEvent =
   | { kind: 'session-created'; session: StreamSessionMeta }
   | { kind: 'reply-delivered'; timestamp: string }
   | { kind: 'tool-call'; tool: string; input: string }
+  /** A turn died. Carries only the plain-language headline and the reference
+   *  id -- never the cause, which is withheld from every surface that could
+   *  leave the machine (see Seal.Transcript.TurnFailure). */
+  | { kind: 'turn-error'; headline: string; ref: string; timestamp?: string }
 
 export interface ActivityEnvelope {
   type: 'activity'
@@ -291,6 +295,15 @@ export interface SessionActivityState {
    *  is doing during long-running tool calls (e.g. SHELL_EXEC running
    *  `make lint` inside `nix develop`). */
   toolCall: { tool: string; input: string } | null
+  /** A `turn-error` activity arrived and no successful turn has completed
+   *  since. Drives the sidebar's failed state so a dead turn is visible when
+   *  the tab is NOT focused. Cleared on focus and on the next successful
+   *  turn (a `harness-status: idle` after a `thinking`), so it never becomes
+   *  a permanent marker. */
+  failed?: boolean
+  /** The reference id of the most recent failure, for the tab's title/aria
+   *  description. Absent when `failed` is falsy. */
+  failedRef?: string
 }
 
 export interface UseTranscriptStream {
