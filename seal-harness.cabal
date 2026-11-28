@@ -662,6 +662,8 @@ test-suite tests
          Seal.Config.WorkdirSpec
          Seal.Tools.Exec.LocalSpec
          Seal.Tools.Exec.HardenedBuildSpec
+         Seal.Tools.Exec.ExecErrorMappingSpec
+         Seal.Tools.Exec.SelfKeyGuardSpec
          Seal.Session.MachineRoutingSpec
          Seal.ISA.Ops.MachineSchemaSpec
          Seal.Tools.Exec.RemoteSpec

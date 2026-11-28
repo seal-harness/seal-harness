@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 -- | 'UntrustedExecBackend' — a smart-constructed type that can ONLY be
 -- built from an 'Ssh' backend (spec 4). A local container/VM shares the
@@ -140,3 +141,4 @@ selectExecBackend cfg = \case
   TbSsh sshCfg   -> Right (EbRemote sshCfg)
   TbTmux _       -> Left ExecNotImplemented
   TbContainer _  -> Left ExecNotImplemented
+

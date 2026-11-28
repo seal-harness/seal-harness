@@ -9,6 +9,7 @@ import System.Directory (doesFileExist)
 import Test.Hspec
 
 import Seal.Tools.Exec.HostKeyAdoption
+import Seal.Config.Machines (MachineName, mkMachineName)
 import Seal.Tools.Exec.Types
   ( SshConfig (..), mkSshHost, mkSshUser, mkRemotePath
   )
@@ -23,14 +24,15 @@ spec = describe "Seal.Tools.Exec.HostKeyAdoption" $ do
         let knownHosts = tmp <> "/known_hosts"
             keyLineT = "192.168.0.104 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkeydata" :: Text
             probe _ = pure (Right HostKeyInfo
-              { hkiHost = "zoe@192.168.0.104"
+              { hkiMachine = Nothing
+            , hkiHost = "zoe@192.168.0.104"
               , hkiKeyType = "ssh-ed25519"
               , hkiKeyLine = keyLineT
               , hkiFingerprint = "SHA256:TestFingerprint1234"
               })
             confirm _ = pure True
             hka = mkHostKeyAdoptionWithProbe probe confirm
-        result <- hkaAdopt hka (sshCfg knownHosts)
+        result <- hkaAdopt hka (machine "alpha") (sshCfg knownHosts)
         result `shouldBe` Right ()
         exists <- doesFileExist knownHosts
         exists `shouldBe` True
@@ -42,14 +44,15 @@ spec = describe "Seal.Tools.Exec.HostKeyAdoption" $ do
         let knownHosts = tmp <> "/known_hosts"
             keyLineT = "192.168.0.104 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkeydata" :: Text
             probe _ = pure (Right HostKeyInfo
-              { hkiHost = "zoe@192.168.0.104"
+              { hkiMachine = Nothing
+            , hkiHost = "zoe@192.168.0.104"
               , hkiKeyType = "ssh-ed25519"
               , hkiKeyLine = keyLineT
               , hkiFingerprint = "SHA256:TestFingerprint1234"
               })
             confirm _ = pure False
             hka = mkHostKeyAdoptionWithProbe probe confirm
-        result <- hkaAdopt hka (sshCfg knownHosts)
+        result <- hkaAdopt hka (machine "alpha") (sshCfg knownHosts)
         result `shouldSatisfy` \case
           Left msg -> "rejected" `T.isInfixOf` msg
           _        -> False
@@ -60,7 +63,7 @@ spec = describe "Seal.Tools.Exec.HostKeyAdoption" $ do
       let probe _ = pure (Left "ssh-keyscan failed: connection refused")
           confirm _ = pure True
           hka = mkHostKeyAdoptionWithProbe probe confirm
-      result <- hkaAdopt hka (sshCfg "/tmp/irrelevant")
+      result <- hkaAdopt hka (machine "alpha") (sshCfg "/tmp/irrelevant")
       result `shouldSatisfy` \case
         Left msg -> "ssh-keyscan failed" `T.isInfixOf` msg
         _        -> False
@@ -72,14 +75,15 @@ spec = describe "Seal.Tools.Exec.HostKeyAdoption" $ do
             keyLineT = T.pack keyLineS :: Text
         writeFile knownHosts (keyLineS <> "\n")
         let probe _ = pure (Right HostKeyInfo
-              { hkiHost = "zoe@192.168.0.104"
+              { hkiMachine = Nothing
+            , hkiHost = "zoe@192.168.0.104"
               , hkiKeyType = "ssh-ed25519"
               , hkiKeyLine = keyLineT
               , hkiFingerprint = "SHA256:TestFingerprint1234"
               })
             confirm _ = pure True
             hka = mkHostKeyAdoptionWithProbe probe confirm
-        result <- hkaAdopt hka (sshCfg knownHosts)
+        result <- hkaAdopt hka (machine "alpha") (sshCfg knownHosts)
         result `shouldBe` Right ()
         content <- readFile knownHosts
         countOccurrences keyLineS content `shouldBe` 1
@@ -91,14 +95,15 @@ spec = describe "Seal.Tools.Exec.HostKeyAdoption" $ do
             newKeyT = "192.168.0.104 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAInewkeydata" :: Text
         writeFile knownHosts (existingKey <> "\n")
         let probe _ = pure (Right HostKeyInfo
-              { hkiHost = "zoe@192.168.0.104"
+              { hkiMachine = Nothing
+            , hkiHost = "zoe@192.168.0.104"
               , hkiKeyType = "ssh-ed25519"
               , hkiKeyLine = newKeyT
               , hkiFingerprint = "SHA256:NewFingerprint"
               })
             confirm _ = pure True
             hka = mkHostKeyAdoptionWithProbe probe confirm
-        result <- hkaAdopt hka (sshCfg knownHosts)
+        result <- hkaAdopt hka (machine "alpha") (sshCfg knownHosts)
         result `shouldBe` Right ()
         content <- readFile knownHosts
         content `shouldSatisfy` ("Iexistingkey" `isInfixOf`)
@@ -108,7 +113,7 @@ spec = describe "Seal.Tools.Exec.HostKeyAdoption" $ do
 
     it "always returns Left 'not available'" $ do
       let hka = mkHostKeyAdoptionStub
-      result <- hkaAdopt hka (sshCfg "/tmp/irrelevant")
+      result <- hkaAdopt hka (machine "alpha") (sshCfg "/tmp/irrelevant")
       result `shouldSatisfy` \case
         Left msg -> "not available" `T.isInfixOf` msg
         _        -> False
@@ -135,9 +140,42 @@ spec = describe "Seal.Tools.Exec.HostKeyAdoption" $ do
 
   describe "buildAdoptionPrompt" $ do
 
+    it "T-STR-7: renders the frozen four lines exactly" $ do
+      -- Frozen copy from the requirements, §5.5 row 7. Asserted as EXACT
+      -- equality on the joined single-line form, including the two-space
+      -- indent and the `key:  ` padding that aligns the values — the design
+      -- §3.4 calls that padding out as part of the string, not formatting.
+      let info = HostKeyInfo
+            { hkiMachine = Just (machine "mac-mini")
+            , hkiHost = "mac-mini.lan"
+            , hkiKeyType = "ssh-ed25519"
+            , hkiKeyLine = "mac-mini.lan ssh-ed25519 AAAA..."
+            , hkiFingerprint = "SHA256:9xQ7fA"
+            }
+      buildAdoptionPrompt info `shouldBe` T.unlines
+        [ "machine \"mac-mini\" is not yet known."
+        , "  host: mac-mini.lan"
+        , "  key:  ssh-ed25519 SHA256:9xQ7fA"
+        , "Trust this key? [y/N]"
+        ]
+
+    it "names the machine, so a key prompt cannot be confused across machines" $ do
+      -- Two machines answering the same host string must produce distinct
+      -- prompts; otherwise a human confirming one is confirming both.
+      let infoFor nm = HostKeyInfo
+            { hkiMachine = Just (machine nm)
+            , hkiHost = "shared-host.lan"
+            , hkiKeyType = "ssh-ed25519"
+            , hkiKeyLine = "shared-host.lan ssh-ed25519 AAAA..."
+            , hkiFingerprint = "SHA256:same"
+            }
+      buildAdoptionPrompt (infoFor "alpha")
+        `shouldNotBe` buildAdoptionPrompt (infoFor "beta")
+
     it "includes the host, key type, and fingerprint" $ do
       let info = HostKeyInfo
-            { hkiHost = "zoe@192.168.0.104"
+            { hkiMachine = Nothing
+            , hkiHost = "zoe@192.168.0.104"
             , hkiKeyType = "ssh-ed25519"
             , hkiKeyLine = "192.168.0.104 ssh-ed25519 AAAA..."
             , hkiFingerprint = "SHA256:AbCdEf1234"
@@ -146,7 +184,9 @@ spec = describe "Seal.Tools.Exec.HostKeyAdoption" $ do
       prompt `shouldSatisfy` ("zoe@192.168.0.104" `T.isInfixOf`)
       prompt `shouldSatisfy` ("ssh-ed25519" `T.isInfixOf`)
       prompt `shouldSatisfy` ("SHA256:AbCdEf1234" `T.isInfixOf`)
-      prompt `shouldSatisfy` ("Adopt this host key?" `T.isInfixOf`)
+      -- Superseded by the frozen copy (T-STR-7); kept as the
+      -- "all three facts are present" check.
+      prompt `shouldSatisfy` ("Trust this key? [y/N]" `T.isInfixOf`)
 
 -- ---------------------------------------------------------------------------
 -- Helpers
@@ -171,3 +211,10 @@ countOccurrences needle haystack =
     isPrefixOf' [] _ = True
     isPrefixOf' _ [] = False
     isPrefixOf' (x:xs) (y:ys) = x == y && isPrefixOf' xs ys
+
+-- | 'mkMachineName' behind a helper: the constructor is deliberately
+-- unexported, and the reserved @local@ is refused by design.
+machine :: Text -> MachineName
+machine t = case mkMachineName t of
+  Right n -> n
+  Left e  -> error ("fixture: mkMachineName " <> T.unpack t <> ": " <> T.unpack e)

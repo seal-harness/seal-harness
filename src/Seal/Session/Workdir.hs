@@ -221,7 +221,7 @@ mkSessionExec paths secCfg sid cloneDeps runner mAdoption = do
       Left err -> pure (failClosedSessionExecWithReason cloneDeps
                          ("this session's execution machine is unavailable: "
                            <> T.pack (show err)))
-      Right (_, MtLocal) -> do
+      Right (_nm, MtLocal) -> do
         eWd <- ensureSessionWorkdir paths sid
         case eWd of
           Right wd ->
@@ -229,7 +229,7 @@ mkSessionExec paths secCfg sid cloneDeps runner mAdoption = do
             in pure (mkLocalExec wsRoot cloneDeps)
           Left err -> pure (failClosedSessionExecWithReason cloneDeps
                               ("local workdir creation failed: " <> T.pack (show err)))
-      Right (_, MtSsh sshCfg) -> do
+      Right (nm, MtSsh sshCfg) -> do
           eRemoteWd <- ensureRemoteSessionWorkdir sshCfg runner sid
           case eRemoteWd of
             Left (WdRemoteMkdirFailed errText)
@@ -243,7 +243,7 @@ mkSessionExec paths secCfg sid cloneDeps runner mAdoption = do
                             <> hostText sshCfg
                             <> " >> " <> T.pack (scKnownHosts sshCfg)))
                   Just hka -> do
-                    eAdopt <- hkaAdopt hka sshCfg
+                    eAdopt <- hkaAdopt hka nm sshCfg
                     case eAdopt of
                       Left adoptErr -> pure (failClosedSessionExecWithReason cloneDeps
                                               ("host-key adoption failed: " <> adoptErr))

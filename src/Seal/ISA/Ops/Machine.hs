@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 -- | Pure helpers shared by the eight machine-selectable untrusted opcodes.
 --
@@ -27,6 +28,7 @@ module Seal.ISA.Ops.Machine
   , renderUnusableReason
   , renderSelectableNames
   , machinePropertySchema
+  , execErrorToMachineError
   ) where
 
 import Data.Aeson
@@ -39,7 +41,8 @@ import Seal.Config.Machines (MachineName, Selectable (..), machineNameText)
 import Seal.Core.Types (OpName (..))
 import Seal.Tools.Exec.Machine
   ( MachineError (..), UnusableReason (..)
-  , UnreachableReason, renderUnreachableReason )
+  , UnreachableReason (..), renderUnreachableReason )
+import Seal.Tools.Exec.Types (ExecError (..))
 
 -- ---------------------------------------------------------------------------
 -- Input
@@ -153,3 +156,36 @@ machineErrorBody = \case
 -- above so the dependency is visible without widening this module's surface.
 renderUnreachable :: UnreachableReason -> Text
 renderUnreachable = renderUnreachableReason
+
+-- ---------------------------------------------------------------------------
+-- ExecError → MachineError
+-- ---------------------------------------------------------------------------
+
+-- | Project an 'ExecError' onto the model-facing 'MachineError'.
+--
+-- __Why a projection and not a reworded string.__ On the remote arm a failed
+-- workdir bootstrap fail-closed with a string that rendered the machine's HOST
+-- and the local known-hosts PATH, and that string reaches the model as the tool
+-- error. The requirements say the model may never see a host, address, key or
+-- path. Rewording would fix today's leak and leave the next one possible;
+-- 'MachineError' structurally cannot carry a coordinate, so the type is the
+-- guarantee.
+--
+-- The 'ExecNotImplementedReason' arm matters most: it carries free 'Text' that
+-- callers populate with a path (the @Workdir.hs@ fail-closed reasons). It maps
+-- to a NULLARY reason, so the text is dropped rather than forwarded —
+-- deliberately lossy: the detail belongs in the harness log, not the transcript.
+--
+-- @ExecHostKeyMismatch@ maps to 'MachineHostKeyChanged', whose rendered text
+-- states that adoption is never offered. It must not be conflated with
+-- @ExecHostKeyUnknown@, which is the TOFU candidate.
+execErrorToMachineError :: MachineName -> ExecError -> MachineError
+execErrorToMachineError name = \case
+  ExecHostKeyMismatch            -> MachineHostKeyChanged name
+  ExecHostKeyUnknown             -> MachineUnreachable name UrHostKeyUnknown
+  ExecRemoteUnreachable          -> MachineUnreachable name UrConnectFailed
+  ExecRemoteRequired             -> MachineUnreachable name UrConnectFailed
+  ExecNotAllowed                 -> MachineUnreachable name UrConnectFailed
+  ExecLocalNotPermittedForUntrusted -> MachineNotPermitted name
+  ExecNotImplemented             -> MachineUnreachable name UrBootstrapFailed
+  ExecNotImplementedReason _     -> MachineUnreachable name UrBootstrapFailed
