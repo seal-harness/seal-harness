@@ -22,6 +22,7 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
     id: 's1',
     agent: null,
     runtime: 'session:anthropic',
+    machine: 'local',
     model: 'claude-sonnet-4-20250514',
     lastActive: new Date().toISOString(),
     createdAt: new Date('2024-01-01T00:00:00Z').toISOString(),

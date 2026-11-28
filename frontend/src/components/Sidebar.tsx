@@ -143,6 +143,7 @@ function SessionRow({
           repoUrl: session.repoUrl,
           channel: session.channel,
           agent: session.agent,
+          machine: session.machine,
         }
         const line = renderConfigurableLine(fields ?? [], data)
         if (!line) return null
@@ -321,6 +322,14 @@ export function Sidebar({
     return session?.channel ?? null
   }
 
+  // The execution machine of the tab's session. `SessionInfo.machine` is
+  // non-null from the server, but a tab may have no backing session (a raw
+  // harness tab), so this stays nullable and the renderer omits the column.
+  const tabMachine = (tab: TabInfo): string | null => {
+    const session = findSession(tab.session_id, sessions, archivedSessions, tabSessions)
+    return session?.machine ?? null
+  }
+
   // Coarse age pill for a tab — mirrors the Recent Sessions age pill, which
   // uses activity.lastEntryAt ?? session.lastActive. Tabs without a backing
   // session (e.g. raw shell tabs) or any activity frame render no pill.
@@ -373,6 +382,7 @@ export function Sidebar({
           tabAgent={tabAgent}
           tabProvider={tabProvider}
           tabChannel={tabChannel}
+          tabMachine={tabMachine}
           fields={tabLineFields}
           onSelectTab={onSelectTab}
           onNewTab={onNewTab}
@@ -393,6 +403,7 @@ export function Sidebar({
           tabAgent={tabAgent}
           tabProvider={tabProvider}
           tabChannel={tabChannel}
+          tabMachine={tabMachine}
           fields={tabLineFields}
           onSelectTab={onSelectTab}
           onCloseTab={onCloseTab}

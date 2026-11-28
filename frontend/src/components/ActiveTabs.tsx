@@ -27,6 +27,7 @@ export interface TabLineData {
   repoUrl: string | null
   channel: string | null
   agent: string | null
+  machine: string | null
 }
 
 /** Derive the repo display name from the repo URL, with a fallback to the
@@ -66,6 +67,10 @@ function renderTabLineField(field: TabLineField, data: TabLineData): ReactNode {
     case 'agent':
       return data.agent ? (
         <span style={{ color: 'var(--text-faint)' }}>{data.agent}</span>
+      ) : null
+    case 'machine':
+      return data.machine ? (
+        <span style={{ color: 'var(--text-faint)' }}>{data.machine}</span>
       ) : null
   }
 }
@@ -244,6 +249,7 @@ export function TabRow({
   agent,
   provider,
   channel,
+  machine,
   fields,
 }: {
   tab: TabInfo
@@ -277,6 +283,9 @@ export function TabRow({
   /** The starting channel of this tab's session (e.g. "web", "signal",
    *  "cli"), or null/empty when no channel was recorded. */
   channel?: string | null
+  /** The execution machine this tab's session runs on, or null/empty when
+   *  unknown. Never null from the server on upgrade — see SessionInfo. */
+  machine?: string | null
   /** Ordered list of fields to render on the second line. When omitted,
    *  defaults to provider → repo → channel. */
   fields?: TabLineField[]
@@ -484,6 +493,9 @@ export function TabRow({
             repoUrl: repoUrl ?? null,
             channel: channel ?? null,
             agent: agent ?? null,
+            // Always present from the server (never null on upgrade), so this
+            // is the only field that never yields a blank column.
+            machine: machine ?? null,
           })
         )}
       </div>
@@ -502,6 +514,7 @@ export function ActiveTabs({
   tabAgent,
   tabProvider,
   tabChannel,
+  tabMachine,
   fields,
   onSelectTab,
   onNewTab,
@@ -540,6 +553,9 @@ export function ActiveTabs({
   /** Resolve a tab to the starting channel (e.g. "web", "signal", "cli")
    *  of its session, or null when no channel was recorded. */
   tabChannel: (tab: TabInfo) => string | null
+  /** Resolve a tab to its session's execution machine name, or null when
+   *  unknown. Never null on upgrade — see SessionInfo. */
+  tabMachine: (tab: TabInfo) => string | null
   /** Ordered list of fields to render on each tab's second line. */
   fields: TabLineField[]
   onSelectTab: (index: number) => void
@@ -590,6 +606,7 @@ export function ActiveTabs({
           agent={tabAgent(tab)}
           provider={tabProvider(tab)}
           channel={tabChannel(tab)}
+          machine={tabMachine(tab)}
           fields={fields}
         />
       ))}

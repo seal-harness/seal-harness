@@ -39,6 +39,7 @@ describe('ProviderBadge favicon', () => {
         tabAgent={() => null}
         tabProvider={() => 'my-vllm'}
         tabChannel={() => null}
+        tabMachine={() => null}
         fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={() => {}}
         onNewTab={() => {}}
@@ -67,6 +68,7 @@ describe('ProviderBadge favicon', () => {
         tabAgent={() => null}
         tabProvider={() => 'ollama'}
         tabChannel={() => null}
+        tabMachine={() => null}
         fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={() => {}}
         onNewTab={() => {}}
@@ -97,6 +99,7 @@ describe('ProviderBadge favicon', () => {
         tabAgent={() => null}
         tabProvider={() => 'my-vllm'}
         tabChannel={() => null}
+        tabMachine={() => null}
         fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={() => {}}
         onNewTab={() => {}}

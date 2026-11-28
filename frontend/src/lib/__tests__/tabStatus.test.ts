@@ -15,6 +15,7 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
     autoSummary: null,
     firstMessageSnippet: null,
     channel: null,
+    machine: 'local',
     channelUserId: null,
     lastUserMessageAt: null,
     repoUrl: null,

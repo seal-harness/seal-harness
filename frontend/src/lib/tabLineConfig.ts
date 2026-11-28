@@ -11,9 +11,10 @@
  *    - model    — the shortened model id (e.g. "sonnet-4")
  *    - repo     — the repo name derived from the session's repoUrl
  *    - channel  — the starting channel (e.g. "web", "signal", "cli")
- *    - agent    — the display name of the bound agent */
+ *    - agent    — the display name of the bound agent
+ *    - machine  — the execution machine the session runs on */
 
-export type TabLineField = 'provider' | 'model' | 'repo' | 'channel' | 'agent'
+export type TabLineField = 'provider' | 'model' | 'repo' | 'channel' | 'agent' | 'machine'
 
 /** Human-readable labels for the config popover. */
 export const TAB_LINE_FIELD_LABELS: Record<TabLineField, string> = {
@@ -22,17 +23,20 @@ export const TAB_LINE_FIELD_LABELS: Record<TabLineField, string> = {
   repo:     'Repo',
   channel:  'Channel',
   agent:    'Agent',
+  machine:  'Machine',
 }
 
 /** All valid field ids in canonical order — used for validation and for
  *  rendering the available-fields list in the config popover. */
-export const ALL_TAB_LINE_FIELDS: TabLineField[] = ['provider', 'model', 'repo', 'channel', 'agent']
+export const ALL_TAB_LINE_FIELDS: TabLineField[] = ['provider', 'model', 'repo', 'channel', 'agent', 'machine']
 
-/** The default field selection and order: provider + repo + channel.
- *  Provider identifies the model backend, repo gives provenance, and the
- *  starting channel shows where the session came from. Model and agent are
- *  de-emphasized (still selectable via the config popover). */
-export const DEFAULT_TAB_LINE_FIELDS: TabLineField[] = ['provider', 'repo', 'channel']
+/** The default field selection and order: provider + repo + channel + machine.
+ *  Provider identifies the model backend, repo gives provenance, the starting
+ *  channel shows where the session came from, and machine shows where its
+ *  untrusted work runs — which is the whole point of the feature, so it is on
+ *  by default rather than hidden behind the config popover. Model and agent
+ *  stay de-emphasized (still selectable). */
+export const DEFAULT_TAB_LINE_FIELDS: TabLineField[] = ['provider', 'repo', 'channel', 'machine']
 
 const STORAGE_KEY = 'seal.tabLineFields'
 

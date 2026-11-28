@@ -21,6 +21,7 @@ export function RunningHarnesses({
   tabAgent,
   tabProvider,
   tabChannel,
+  tabMachine,
   fields,
   onSelectTab,
   onCloseTab,
@@ -46,6 +47,8 @@ export function RunningHarnesses({
   tabProvider: (tab: TabInfo) => string
   /** Resolve a tab to the starting channel — see ActiveTabs.tabChannel. */
   tabChannel: (tab: TabInfo) => string | null
+  /** Resolve a tab to its session's execution machine — see ActiveTabs. */
+  tabMachine: (tab: TabInfo) => string | null
   /** Ordered list of fields to render on each tab's second line. */
   fields: TabLineField[]
   onSelectTab: (index: number) => void
@@ -100,6 +103,7 @@ export function RunningHarnesses({
             agent={tabAgent(tab)}
             provider={tabProvider(tab)}
             channel={tabChannel(tab)}
+            machine={tabMachine(tab)}
             fields={fields}
           />
         ))}
