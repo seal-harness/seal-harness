@@ -82,6 +82,5 @@ static: ## Build and verify the fully static x86_64-linux binary at ./result-sta
 		exit 1; \
 	}
 	@echo "ok: $$(file -b result-static/bin/seal)"
-
 codegraph-sigs: ## Print all the type signatures in the project
 	codegraph query "" --kind function --limit 10000 --json | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));d.filter(x=>x.node.language==='haskell'&&x.node.signature).forEach(x=>console.log(x.node.qualifiedName+' :: '+x.node.signature))"
