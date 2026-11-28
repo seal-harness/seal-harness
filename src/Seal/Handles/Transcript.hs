@@ -243,6 +243,16 @@ data IndexedTranscriptHandle = IndexedTranscriptHandle
   -- writer's own view of the conversation — compare against
   -- @length <$> itwReadConversation@ to spot a reader that is behind the
   -- writer (a completion injection the model never saw).
+  , itwLastFailure :: IO (Maybe SomeException)
+  -- ^ The exception that killed the daemon, if it died. 'Nothing' for a
+  -- healthy writer (or a fake).
+  --
+  -- Without this the caller only ever learns that the transcript became
+  -- unavailable, which says nothing about /why/. In the incident that
+  -- motivated this field, the daemon died of a strict UTF-8 decode while the
+  -- caller saw only "the writer died" — so the report said the useless thing
+  -- instead of the actionable one. 'Seal.Transcript.TurnFailure.classify'
+  -- unwraps this to name the real cause.
   }
 
 -- | Invariant counters for the indexed transcript writer.
@@ -534,6 +544,9 @@ withIndexedTranscript dir action = do
         shutdown convFd entriesFd idxFd done)
     $ \(convFd, entriesFd, idxFd) -> do
         secretOpsRef <- newIORef Set.empty
+        -- Set by the daemon's handler BEFORE it flips aliveRef, so any caller
+        -- that observes the death also sees the cause (no torn read).
+        lastFailureTv <- newTVarIO Nothing
         let st0 = IndexedTranscriptState convFd entriesFd idxFd existingConv secretOpsRef Nothing
             -- The daemon with an exception handler: if writeOne throws, mark
             -- the daemon dead, fail every queued ACK (so callers blocked on
@@ -541,6 +554,9 @@ withIndexedTranscript dir action = do
             -- then exits — no further writes are attempted.
             safeDaemon st =
               daemon st `catch` \e -> do
+                -- Order matters: record the cause, THEN mark dead. A caller
+                -- that sees aliveRef=False is guaranteed to find the cause.
+                atomically (writeTVar lastFailureTv (Just e))
                 atomically (writeTVar aliveRef False)
                 globalLogIO ErrorS ("[transcript] writer daemon died: " <> ls (T.pack (show (e :: SomeException))))
                 -- Drain remaining queue items WITHOUT filling their ACK slots
@@ -644,6 +660,7 @@ withIndexedTranscript dir action = do
           , itwIsAlive = readTVarIO aliveRef
           , itwDiagnostics = readTVarIO diagTv
           , itwRecordedLength = readTVarIO writtenLenTv
+          , itwLastFailure    = readTVarIO lastFailureTv
           }
 
 -- | Read back the entries file, skipping malformed lines.
@@ -689,6 +706,7 @@ fakeIndexedTranscript = do
         , itwIsAlive = pure True
         , itwDiagnostics = pure emptyTranscriptDiagnostics
         , itwRecordedLength = length <$> readMVar convRef
+        , itwLastFailure    = pure Nothing
         }
     , do cs <- readMVar convRef
          es <- readMVar entriesRef

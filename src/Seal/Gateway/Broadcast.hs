@@ -18,6 +18,7 @@ module Seal.Gateway.Broadcast
   ( broadcastListsSnapshot
   , broadcastHarnessStatus
   , broadcastReplyDelivered
+  , broadcastTurnFailure
   , broadcastAgentDefsChanged
   , broadcastSkillsChanged
   , broadcastReposChanged
@@ -36,6 +37,7 @@ import Data.Time (getCurrentTime)
 import Data.Set (Set)
 import Data.Set qualified as Set
 
+import Seal.Transcript.TurnFailure (TurnFailure (..))
 import Control.Exception (onException)
 import Katip (Severity (..), ls)
 import Seal.Logging.Global (globalLogIO)
@@ -98,6 +100,28 @@ broadcastReplyDelivered mBroker sid =
       now <- getCurrentTime
       broadcast broker (BeActivity sid (object
         [ "kind" .= ("reply-delivered" :: Text)
+        , "timestamp" .= T.pack (showIso now)
+        ]))
+
+-- | Push a per-session @turn-error@ activity signal to every WS subscriber
+-- focused on the session, so a client learns the turn failed /without/ a
+-- reload (requirement 3).
+--
+-- Carries the headline and reference only -- never the cause. The cause is
+-- deliberately withheld from any surface that could leave the machine, and the
+-- banner only needs enough to point at the durable transcript entry.
+--
+-- 'Nothing' broker (tests) is a no-op.
+broadcastTurnFailure :: Maybe StreamBroker -> SessionId -> TurnFailure -> IO ()
+broadcastTurnFailure mBroker sid failure =
+  case mBroker of
+    Nothing -> pure ()
+    Just broker -> do
+      now <- getCurrentTime
+      broadcast broker (BeActivity sid (object
+        [ "kind" .= ("turn-error" :: Text)
+        , "headline" .= tfHeadline failure
+        , "ref" .= tfRef failure
         , "timestamp" .= T.pack (showIso now)
         ]))
 
