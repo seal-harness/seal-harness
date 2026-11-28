@@ -22,8 +22,10 @@ import Test.QuickCheck (Gen, elements, forAll, listOf1)
 import Seal.Channels.Chat.Bubble
   ( bubbleText
   , formatAsk
+  , formatQuestionBody
   , chunkLen
   , chunkMessage
+  , liveAskHint
   )
 import Seal.Channels.Chat.Class (ChunkUnit (..), QuestionOption (..))
 
@@ -117,6 +119,32 @@ spec = do
     it "omits the description separator when an option has none" $
       formatAsk "Pick" [QuestionOption "no" ""]
         `shouldBe` "Pick\n\n1) no\n\nReply with a number or type your own answer."
+
+  describe "formatQuestionBody" $ do
+    it "omits the reply hint entirely for an open-ended question" $
+      formatQuestionBody "Which branch?" [] `shouldBe` "Which branch?"
+
+    it "renders numbered options with no reply hint" $
+      formatQuestionBody "Pick" [QuestionOption "yes" "proceed", QuestionOption "no" ""]
+        `shouldBe` "Pick\n\n1) yes \8212 proceed\n2) no"
+
+    it "never emits a reply hint (the /last path supplies its own)" $
+      formatQuestionBody "Pick" [QuestionOption "yes" ""]
+        `shouldSatisfy` (not . T.isInfixOf "Reply with")
+
+  describe "liveAskHint" $ do
+    it "is the open-ended hint" $
+      liveAskHint [] `shouldBe` "\n\nReply with your answer."
+
+    it "is the numbered hint" $
+      liveAskHint [QuestionOption "yes" ""]
+        `shouldBe` "\n\nReply with a number or type your own answer."
+
+    it "recomposes formatAsk exactly, for both shapes" $ do
+      formatQuestionBody "Q" [] <> liveAskHint []
+        `shouldBe` formatAsk "Q" []
+      let os = [QuestionOption "yes" "proceed", QuestionOption "no" ""]
+      formatQuestionBody "Q" os <> liveAskHint os `shouldBe` formatAsk "Q" os
 
   describe "chunkMessage" $ do
     it "returns the message as-is when under the limit" $

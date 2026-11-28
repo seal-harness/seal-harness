@@ -210,16 +210,37 @@ registerCompletedAgentResult (AgentRuntime tv) subagentId result = do
     case Map.lookup subagentId insts of
       Nothing -> pure ()  -- resolve-error child never registered
       Just inst -> do
+        -- Truthful mapping (WU-3): a timed-out or user-interrupted child
+        -- is Interrupted, an errored child is Crashed; completions and
+        -- bounded non-completions are Stopped. Pre-WU-3 every
+        -- non-error outcome — including CsTimeout — collapsed to
+        -- Stopped, hiding the deadline hit from AGENT_INSTANCES and the
+        -- operator log.
         let newStatus = case crStatus result of
-              CsError -> Crashed (fromMaybe "unknown error" (crError result))
-              _       -> Stopped
+              CsError      -> Crashed (fromMaybe "unknown error" (crError result))
+              CsTimeout    -> Interrupted
+              CsInterrupted -> Interrupted
+              CsCompleted  -> Stopped
+              CsFailed     -> Stopped
             inst' = inst { aiStatus = newStatus, aiResult = Just result, aiThreadId = tid }
         writeTVar tv (Map.insert subagentId inst' insts)
   -- Log outside STM. If this fires before registerRunningAgent (the race
   -- the in-fork spawnCallback was meant to fix), this is a no-op and the
   -- log will show the child was never registered.
   globalLogIO DebugS (ls ("[idle-diag] registerCompletedAgentResult: subagent=" <> subagentIdText subagentId
-    <> " newStatus=" <> (case crStatus result of CsError -> "Crashed"; _ -> "Stopped")))
+    <> " status=" <> statusKindText (crStatus result)
+    <> " exit_reason=" <> T.pack (show (crExitReason result))))
+
+-- | The wire-level status name for logging — the real 'ChildStatus', not
+-- a collapsed registry display state. Keeps the operator log truthful:
+-- a timed-out child logs @status=cs_timeout@, not @Stopped@.
+statusKindText :: ChildStatus -> Text
+statusKindText = \case
+  CsCompleted   -> "cs_completed"
+  CsFailed      -> "cs_failed"
+  CsTimeout     -> "cs_timeout"
+  CsInterrupted -> "cs_interrupted"
+  CsError       -> "cs_error"
 
 -- | Run the worker action, transitioning the instance to 'Crashed' on
 -- exception. A normal completion leaves the status as 'Running' until the

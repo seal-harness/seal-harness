@@ -32,7 +32,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
 import Seal.Config.Paths (SealPaths (..), sessionDir)
-import Seal.Core.Types (ModelId (..), mkSessionId)
+import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Gateway.Transcript
   ( TranscriptSource (..)
   , TranscriptTimings (..)
@@ -46,6 +46,8 @@ import Seal.Gateway.Transcript
   , firstUserMessageSnippetFast
  , readTranscriptEntriesLimited
  , setEncodeMs
+ , sessionEntryFactsFast
+ , SessionEntryFacts (..)
   )
 import Seal.Transcript.Conv (ConvLine (..), encodeConvLine)
 import Seal.Transcript.ConvIndex (buildIndex)
@@ -54,7 +56,7 @@ import Seal.Transcript.Types (Direction (..), TranscriptEntry (..))
 import Seal.Transcript.Entries
   (EntryRecord (..), EntryKind (..), encodeEntryRecordRaw)
 
-import Seal.Providers.Class (ContentBlock (..), Message, pattern Message, Role (..))
+import Seal.Providers.Class (ContentBlock (..), Message, pattern Message, Role (..), Usage (..))
 import Seal.Providers.Class qualified as PC (pattern Message, Role (..))
 
 sampleTime :: UTCTime
@@ -74,6 +76,7 @@ mkHarnessTe payload = TranscriptEntry
   , tePayload = payload
   , teDurationMs = Nothing
   , teCorrelation = Nothing
+  , teConvLen = Nothing
   , teMeta = Map.empty
   }
 
@@ -158,6 +161,32 @@ getTopField _ _ = Nothing
 
 spec :: Spec
 spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
+  -- The branch anchor must reach the WIRE. These three render paths each
+  -- hand-build the frontend JSON object field-by-field (they do not
+  -- serialize TranscriptEntry), so adding the field to the record alone
+  -- leaves it off the wire: the branch button then renders nowhere, and
+  -- the failure is invisible to tests that only inspect TranscriptEntry.
+  describe "branch anchor (convLen) on the wire" $ do
+    it "reconEntryToFrontend emits convLen from teConvLen" $ do
+      let te = (mkHarnessTe skillLoadPayload) { teConvLen = Just 7 }
+      case reconEntryToFrontend 0 te of
+        Nothing -> expectationFailure "expected Just"
+        Just v  -> getTopField "convLen" v `shouldBe` Just (Number 7)
+
+    it "reconEntryToFrontend emits null convLen when the entry has no anchor" $ do
+      let te = (mkHarnessTe skillLoadPayload) { teConvLen = Nothing }
+      case reconEntryToFrontend 0 te of
+        Nothing -> expectationFailure "expected Just"
+        Just v  -> getTopField "convLen" v `shouldBe` Just Null
+
+    it "convLineToFrontend emits convLen = lineIndex + 1" $ do
+      let rawLine = A.object
+            [ "role"    .= ("user" :: String)
+            , "content" .= ([] :: [A.Value])
+            ]
+      getTopField "convLen" (convLineToFrontend "llama3" [] "ts" 4 rawLine)
+        `shouldBe` Just (Number 5)
+
   describe "userId in frontend entries" $ do
     it "reconEntryToFrontend emits teMeta.userId and teMeta.channel" $ do
       let te = (mkHarnessTe skillLoadPayload)
@@ -270,6 +299,7 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
               ]
           , teDurationMs = Nothing
           , teCorrelation = Nothing
+          , teConvLen = Nothing
           , teMeta = Map.empty
           }
         frontendField k val = case val of
@@ -360,6 +390,7 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
               ]
           , teDurationMs = Nothing
           , teCorrelation = Nothing
+          , teConvLen = Nothing
           , teMeta = Map.empty
           }
         -- Look up the "tools" array inside a frontend payload object.
@@ -913,3 +944,96 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
         result <- readTranscriptEntriesLimited (ReadLastN 2) paths "model-x" "2026-01-01T00:00:00.000Z" testSid
         -- Should return 2 entries (the last 2 conversation lines)
         length result `shouldBe` 2
+
+  -- ── sessionEntryFactsFast (session token count) ─────────────────────
+  --
+  -- Regression coverage for the reported bug: the status-bar token count must
+  -- be a property of the SESSION (derived from entries.jsonl), never of the
+  -- chunk window the transcript view happens to have loaded.
+  describe "Seal.Gateway.Transcript.sessionEntryFactsFast" $ do
+    let fakePaths stateDir =
+          SealPaths { spHome = "", spState = stateDir, spConfig = ""
+                    , spKeys = "", spCache = "" }
+        testSid = case mkSessionId "20260701-120000-042" of
+          Right s -> s
+          Left e  -> error ("invalid sid: " ++ show e)
+        -- | Build an EntryRecord with an explicit usage (Nothing = no usage).
+        mkE :: EntryKind -> Int -> Maybe Usage -> EntryRecord
+        mkE kind convLen mUsage = EntryRecord
+          { erId = ""
+          , erTimestamp = sampleTime
+          , erKind = kind
+          , erConvLen = convLen
+          , erEnvelope = Nothing
+          , erUsage = mUsage
+          , erStop = Nothing
+          , erDurationMs = Nothing
+          , erHarness = Nothing
+          , erCorrelation = Nothing
+          , erMeta = Map.empty
+          }
+        writeEntries :: SealPaths -> SessionId -> [EntryRecord] -> IO ()
+        writeEntries paths sid es = do
+          let sdir = sessionDir paths sid
+          createDirectoryIfMissing True sdir
+          BC.writeFile (sdir </> "entries.jsonl")
+            (BL.toStrict (mconcat (map (\e -> BL.fromStrict (encodeEntryRecordRaw e) <> "\n") es)))
+
+    it "reports the LAST response's input+output, not a cumulative sum" $
+      withSystemTempDirectory "seal-facts" $ \stateDir -> do
+        let paths = fakePaths stateDir
+        writeEntries paths testSid
+          [ mkE EKRequest 1 Nothing
+          , mkE EKResponse 2 (Just (Usage 100 20))
+          , mkE EKRequest 3 Nothing
+          , mkE EKResponse 4 (Just (Usage 150 30))
+          , mkE EKRequest 5 Nothing
+          , mkE EKResponse 6 (Just (Usage 400 50))
+          ]
+        f <- sessionEntryFactsFast paths testSid
+        sefTokensUsed f `shouldBe` Just 450
+        sefLastUserMessageAt f `shouldSatisfy` (/= Nothing)
+
+    it "skips a zero-usage response and uses the previous non-zero one" $
+      withSystemTempDirectory "seal-facts" $ \stateDir -> do
+        let paths = fakePaths stateDir
+        writeEntries paths testSid
+          [ mkE EKRequest 1 Nothing
+          , mkE EKResponse 2 (Just (Usage 120 40))
+          , mkE EKRequest 3 Nothing
+          -- Ollama's abnormal stream-end path reports 0/0: not a measurement.
+          , mkE EKResponse 4 (Just (Usage 0 0))
+          ]
+        f <- sessionEntryFactsFast paths testSid
+        sefTokensUsed f `shouldBe` Just 160
+
+    it "returns Nothing for both fields when there is no entries.jsonl" $
+      withSystemTempDirectory "seal-facts" $ \stateDir -> do
+        let paths = fakePaths stateDir
+            sdir = sessionDir paths testSid
+        createDirectoryIfMissing True sdir
+        f <- sessionEntryFactsFast paths testSid
+        sefTokensUsed f `shouldBe` Nothing
+        sefLastUserMessageAt f `shouldBe` Nothing
+
+    it "returns Nothing for tokens when every response reports zero usage" $
+      withSystemTempDirectory "seal-facts" $ \stateDir -> do
+        let paths = fakePaths stateDir
+        writeEntries paths testSid
+          [ mkE EKRequest 1 Nothing
+          , mkE EKResponse 2 (Just (Usage 0 0))
+          ]
+        f <- sessionEntryFactsFast paths testSid
+        sefTokensUsed f `shouldBe` Nothing
+        sefLastUserMessageAt f `shouldSatisfy` (/= Nothing)
+
+    it "is unchanged by a later in-progress request (no completed response yet)" $
+      withSystemTempDirectory "seal-facts" $ \stateDir -> do
+        let paths = fakePaths stateDir
+        writeEntries paths testSid
+          [ mkE EKRequest 1 Nothing
+          , mkE EKResponse 2 (Just (Usage 200 50))
+          , mkE EKRequest 3 Nothing
+          ]
+        f <- sessionEntryFactsFast paths testSid
+        sefTokensUsed f `shouldBe` Just 250

@@ -20,7 +20,8 @@ import Data.Text (Text)
 import Seal.Agent.Def.Types (agentDefIdText)
 import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (sessionIdText)
-import Seal.Gateway.Transcript (firstUserMessageSnippetFast, lastUserMessageAtFast)
+import Seal.Gateway.Transcript
+  (firstUserMessageSnippetFast, sessionEntryFactsFast, SessionEntryFacts (..))
 import Seal.Handles.Tab (TabKind (..), tabIndexToInt)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Tabs.Types (Tab (..), TabRef (..), TabStatus (..))
@@ -77,8 +78,8 @@ sessionWire (BoundHarness _)   = Nothing
 -- agent is effective — either a bound 'smAgent' or a one-off uploaded
 -- file's frontmatter id), falling back to 'smAgent'\'s id for
 -- backwards-compat with old session.json files that predate smAgentName.
-sessionInfoJson :: Maybe Text -> Maybe Text -> SessionMeta -> Value
-sessionInfoJson mSnippet mLastUserMessageAt m = object
+sessionInfoJson :: Maybe Text -> Maybe Text -> Maybe Int -> SessionMeta -> Value
+sessionInfoJson mSnippet mLastUserMessageAt mTokensUsed m = object
   [ "id" .= sessionIdText (smId m)
   , "agent" .= ( smAgentName m <|> (agentDefIdText <$> smAgent m) )
   , "runtime" .= ("session:" <> smProvider m)
@@ -92,15 +93,28 @@ sessionInfoJson mSnippet mLastUserMessageAt m = object
   , "channel" .= smChannel m
   , "channelUserId" .= (Nothing :: Maybe Text)
   , "lastUserMessageAt" .= mLastUserMessageAt
+  -- Context occupancy of the most recent completed response (input+output),
+  -- derived server-side from the whole session's entries.jsonl. Null when no
+  -- response has reported usage. This is what the web status bar shows, so it
+  -- must never be derived from a client's loaded chunk window.
+  , "tokensUsed" .= mTokensUsed
   , "sealFrontMatter" .= smSealFrontMatter m
   ]
 
 -- | Build the 'SessionInfo' JSON for a session, reading the first user
--- message snippet and the last user-message timestamp from the transcript
--- so the session has a default title before the user sets an explicit
--- description and the sidebar can sort tabs by last-user-message time.
+-- message snippet, the last user-message timestamp, and the session's token
+-- usage from the transcript. The timestamp gives the session a default title /
+-- sidebar sort order before the user sets an explicit description; the token
+-- usage backs the web status bar.
+--
+-- The timestamp and token usage come from a SINGLE parse of @entries.jsonl@
+-- ('sessionEntryFactsFast'), so adding the token count does not add a read of
+-- that file to this per-session hot path.
 sessionInfoJsonWithSnippet :: SealPaths -> SessionMeta -> IO Value
 sessionInfoJsonWithSnippet paths m = do
   mSnippet <- firstUserMessageSnippetFast paths (smId m)
-  mLastUserMessageAt <- lastUserMessageAtFast paths (smId m)
-  pure (sessionInfoJson mSnippet mLastUserMessageAt m)
+  facts <- sessionEntryFactsFast paths (smId m)
+  pure (sessionInfoJson mSnippet
+          (sefLastUserMessageAt facts)
+          (sefTokensUsed facts)
+          m)

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { TopBar, type TopSection } from './components/TopBar'
 import { Sidebar } from './components/Sidebar'
-import { ChatArea, computeTokensUsed } from './components/ChatArea'
+import { ChatArea } from './components/ChatArea'
 import { HarnessControls } from './components/HarnessControls'
 import { NewTabComposer } from './components/NewTabComposer'
 import { AgentsView } from './components/AgentsView'
@@ -198,6 +198,7 @@ export default function App() {
   //      hooks (useTabs/useRecentSessions/useArchivedSessions) are the
   //      final fallback.
   const wsLists = useListsStream()
+  const refreshLists = wsLists.refresh
   // wsLive tracks whether the WS `lists` frame is delivering data. The hook's
   // `received` flag flips on the first frame regardless of content (a quiet
   // server sends empty arrays), so REST polling stops the moment WS connects.
@@ -306,7 +307,14 @@ export default function App() {
 
   // ── Composer state ────────────────────────────────────────────────────
   const [composerOpen, setComposerOpen] = useState(false)
-  const [branchFrom, setBranchFrom] = useState<string | undefined>(undefined)
+  // Branch state: the PARENT SESSION id (what the wire wants) plus the
+  // conversation anchor. The row's entryId is deliberately NOT stored — it
+  // is a render index, and putting it in `branch_from` is the original bug.
+  // A ref (not state) so the shared composer hook can read it at submit
+  // time without re-creating the hook.
+  const branchModeRef = useRef(false)
+  const [branchParentSid, setBranchParentSid] = useState<string | undefined>(undefined)
+  const [branchConvLen, setBranchConvLen] = useState<number | undefined>(undefined)
   // `newTabFocusTick` is no longer needed (composer is a standalone pane),
   const [newTabFocusTick, setNewTabFocusTick] = useState(0)
 
@@ -317,7 +325,7 @@ export default function App() {
   // ── Diagnostic: start memory monitor on mount ──
   useEffect(() => { startMemoryMonitor() }, [])
 
-  const composerSpec = useNewTabSpec()
+  const composerSpec = useNewTabSpec({ branchModeRef })
 
   // ── Preserve the focused session across tab-list mutations ──────────────
   // When the backend removes a tab above the focused one it compacts the
@@ -663,6 +671,22 @@ export default function App() {
     && (sessionActivity?.[currentSessionId]?.harness === 'thinking'
         || (sending && pendingQuestions.length === 0))
 
+  // Refresh the server-derived session list when a turn COMPLETES, so values
+  // the client can't compute itself stay current — notably `tokensUsed`, which
+  // is derived server-side from the whole transcript. The turn may have been
+  // started from any channel (web, Telegram, cron, ...), so this cannot rely on
+  // the web send path's own broadcast. Keying on the existing thinking→idle
+  // transition reuses a signal the transcript view already depends on, rather
+  // than adding a second activity subscription.
+  const wasThinkingRef = useRef(false)
+  useEffect(() => {
+    const nowThinking = sessionIsThinking
+    if (wasThinkingRef.current && !nowThinking && currentSessionId !== null) {
+      refreshLists()
+    }
+    wasThinkingRef.current = nowThinking
+  }, [sessionIsThinking, currentSessionId, refreshLists])
+
   // The tool currently being executed (if any). Broadcast by the backend
   // as a `tool-call` activity event before each tool dispatch. Shown in the
   // thinking indicator so the user can see what the agent is doing during
@@ -845,18 +869,30 @@ export default function App() {
     setNewTabFocusTick((n) => n + 1)
     syncPath(null)
     setCustomPromptFile(null)
-    setBranchFrom(undefined)
+    branchModeRef.current = false
+    setBranchParentSid(undefined)
+    setBranchConvLen(undefined)
     setComposerOpen(true)
   }, [syncPath])
 
-  const handleBranch = useCallback((entryId: string) => {
-    setBranchFrom(entryId)
+  // The parent session id is supplied HERE (App knows it); the ChatArea row
+  // only knows the row it rendered, so it reports the conversation anchor.
+  const handleBranch = useCallback((convLen: number) => {
+    if (!currentSessionId) return
+    branchModeRef.current = true
+    // The branch's workdir starts EMPTY and nothing is inherited, so clear
+    // the repo box: NewTabComposer dispatches SETUP_REPO for any non-empty
+    // repo, and a leftover value would clone into the fresh workdir.
+    composerSpec.setRepo('')
+    composerSpec.setRepoBranch('')
+    setBranchParentSid(currentSessionId)
+    setBranchConvLen(convLen)
     setComposerOpen(true)
     setSelectedId(null)
     setNewTabFocusTick((n) => n + 1)
     syncPath(null)
     setCustomPromptFile(null)
-  }, [syncPath])
+  }, [syncPath, currentSessionId])
 
   // The NewTabComposer owns the createTab/adoptWindow call; App navigates to
   // the newly-created tab on success (so the chat input wires up to the new
@@ -866,7 +902,9 @@ export default function App() {
   // on the previous selection.
   const handleComposerSubmit = useCallback((res: NewTabResponse | null) => {
     setComposerOpen(false)
-    setBranchFrom(undefined)
+    branchModeRef.current = false
+    setBranchParentSid(undefined)
+    setBranchConvLen(undefined)
     if (res) {
       // Prefer the session id when present — `session:<id>` resolves
       // `currentSessionId` directly without waiting for the tabs list to
@@ -911,7 +949,9 @@ export default function App() {
 
   const handleComposerCancel = useCallback(() => {
     setComposerOpen(false)
-    setBranchFrom(undefined)
+    branchModeRef.current = false
+    setBranchParentSid(undefined)
+    setBranchConvLen(undefined)
   }, [])
 
   // ── Tab/session mutators ──────────────────────────────────────────────
@@ -1035,7 +1075,11 @@ export default function App() {
     return null
   })()
 
-  const tokensUsed = useMemo(() => computeTokensUsed(entries), [entries])
+  // The session's token count comes from the server (SessionInfo.tokensUsed),
+  // NOT from `entries`. `entries` is the loaded chunk window, which the
+  // transcript reducer replaces wholesale on scroll — deriving the count from
+  // it made scrolling change the number. See sessionEntryFactsFast.
+  const tokensUsed = selectedSession?.tokensUsed ?? 0
 
   // ── Render ────────────────────────────────────────────────────────────
   // The top-level section switches the entire body. "Sessions" is the
@@ -1086,7 +1130,8 @@ export default function App() {
                 spec={composerSpec}
                 onSubmit={handleComposerSubmit}
                 onCancel={handleComposerCancel}
-                branchFrom={branchFrom}
+                branchParentSid={branchParentSid}
+                branchConvLen={branchConvLen}
               />
             </div>
           ) : selectedHarnessTab ? (

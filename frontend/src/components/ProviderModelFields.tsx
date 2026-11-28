@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { ProviderInfo, ProviderReadiness } from '../types'
-import { readinessLabel } from '../lib/readiness'
+import { isOfferableProvider, readinessLabel } from '../lib/readiness'
 
 /** Human labels for provider ids. An id this build does not know still renders
  *  as itself, never as an empty string and never as an error. */
@@ -64,6 +64,34 @@ interface ProviderSelectProps {
   showNoProvidersNotice?: boolean
 }
 
+/** Can this provider appear as an option?
+ *
+ *  Included when any of these holds:
+ *
+ *  - it is the control's current value (see below);
+ *  - it is stored but unresolved (`missing`) — hiding it would let an edit
+ *    silently clear the value, the same guard the Cron agent picker uses;
+ *  - `isOfferableProvider` says so: configured, and not positively absent.
+ *
+ *  That last clause is the fix for the reported bug. A keyless local Ollama is
+ *  `configured: true` whether or not anything is installed (`configured` is
+ *  config-only by design), so a machine with no Ollama still offered "Ollama
+ *  (Ollama Not Found)" here — an option that cannot answer the turn it is
+ *  picked for. The absence filter is deliberately narrow: see `isNotInstalled`
+ *  for why `not-running` and `no-models` stay listed. */
+function isSelectable(p: ProviderOption, current: string): boolean {
+  // The control's own value is never hidden. A <select> whose value has no
+  // matching option renders blank and, on the next change event, reports
+  // whatever the browser substitutes — so hiding a stored-but-unusable
+  // provider here would silently rewrite the operator's saved choice (and,
+  // for the Cron editor, drop it on the next save). "Cannot be picked afresh"
+  // and "must disappear from under an existing selection" are different
+  // questions; only the first is ours to answer.
+  if (p.name === current) return true
+  if (p.missing === true) return true
+  return isOfferableProvider(p)
+}
+
 /** The provider `<select>` shared by the "Start a new tab" composer and the
  *  Cron editor. The two call sites differ only in whether the leading
  *  "use configured default" option is shown and whether an empty list should
@@ -71,7 +99,7 @@ interface ProviderSelectProps {
 export function ProviderSelect({
   id, value, onChange, providers, loading, disabled, showDefaultOption, showNoProvidersNotice,
 }: ProviderSelectProps) {
-  const selectable = providers.filter((p) => p.configured !== false || p.missing === true)
+  const selectable = providers.filter((p) => isSelectable(p, value))
   const noProviders = !loading && selectable.length === 0
   return (
     <select
@@ -85,7 +113,11 @@ export function ProviderSelect({
       {loading && <option value="">Loading…</option>}
       {noProviders && showNoProvidersNotice && (
         <option value="" disabled>
-          (no providers configured — set an API key or start Ollama)
+          {/* Two causes reach this branch, so the copy names both rather than
+              asserting `configured` is false: nothing is configured, or what
+              is configured cannot be offered here (an Ollama that is not
+              installed). */}
+          (no usable providers — set an API key or install Ollama)
         </option>
       )}
       {showDefaultOption && <option value="">(use configured default)</option>}
@@ -94,8 +126,11 @@ export function ProviderSelect({
           {PROVIDER_LABELS[p.name] ?? p.name}
           {p.isDefault ? ' (default)' : ''}
           {/* `missing` wins over readiness when both apply: it is the stronger
-              statement (the stored id does not resolve at all), and readiness
-              is an annotation, never a gate — the option stays selectable. */}
+              statement (the stored id does not resolve at all). Readiness is
+              otherwise an annotation; every state except `not-installed` was
+              already filtered in, and a surviving `not-installed` can only be
+              the current value, where the label is exactly what the operator
+              needs to see. */}
           {p.missing ? ' (missing)' : optionReadinessAnnotation(p)}
         </option>
       ))}

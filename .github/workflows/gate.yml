@@ -106,19 +106,18 @@ jobs:
 
           # Package the freshly built dist the same way a release does, then
           # install from that tarball. This covers packaging + install together.
-          ./scripts/package-release.sh "${{ matrix.system }}" "" "seal-${{ matrix.system }}"
+          ./scripts/package-release.sh "${{ inputs.system }}" "" "seal-${{ inputs.system }}"
 
           TMP="$(mktemp -d)"
           trap 'rm -rf "$TMP"' EXIT
           HOME="$TMP/home" \
             XDG_DATA_HOME="$TMP/data" \
             XDG_BIN_HOME="$TMP/bin" \
-            bash scripts/install.sh --from-tarball "seal-${{ matrix.system }}.tar.gz"
+            bash scripts/install.sh --from-tarball "seal-${{ inputs.system }}.tar.gz"
 
           # Prove the installed binary actually starts: it must resolve the
           # libs it ships beside itself.
           "$TMP/bin/seal" --help > /dev/null
-
       # hlint is a documented requirement (`make check`) that CI did not
       # previously enforce. See issue #7.
       - name: Lint (hlint)

@@ -17,9 +17,12 @@
 -- caller-supplied worker for every task.
 module Seal.Agent.Runtime.Delegation.ConcurrentSpec (spec) where
 
-import Control.Concurrent (threadDelay)
-import Control.Exception (throwIO)
-import Data.IORef (newIORef, atomicModifyIORef')
+import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, takeMVar)
+import Control.Exception (AsyncException (..), SomeException, fromException, throwIO, try)
+import Control.Monad (forever, unless, void)
+import Seal.Agent.Loop (ChildStopKind (..), childStopKind)
+import Data.IORef (newIORef, readIORef, atomicModifyIORef', modifyIORef', writeIORef)
 import Data.List (nub)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -155,6 +158,63 @@ timeIt act = do
   a <- act
   end <- getCurrentTime
   pure (a, realToFrac (end `diffUTCTime` start))
+
+------------------------------------------------------------------------
+-- ParentActivity spy (heartbeat-liveness observation)
+------------------------------------------------------------------------
+
+-- | A spy that counts 'touchParentActivity' calls against the
+-- 'ParentActivity' it wraps, making heartbeat liveness observable in
+-- tests without waiting out the 30s production tick.
+--
+-- Mechanism: the real 'touchParentActivity' fills the cell with
+-- 'tryPutMVar' and immediately drains it with 'tryTakeMVar', so the
+-- cell's /state/ carries no touch history. A parked-reader thread
+-- blocked in 'takeMVar' is the observation channel instead: a
+-- 'tryPutMVar' on a cell with a blocked reader hands the value straight
+-- to that reader (the cell stays empty), so every touch that lands while
+-- the reader is parked is received and counted. A touch racing with the
+-- reader's brief unparked window (counter bump + re-park, microseconds)
+-- is missed — the ticks used here are milliseconds, four orders of
+-- magnitude wider, so a miss is negligible; the positive-control test
+-- spans several ticks precisely so a single miss cannot break it.
+data ActivitySpy = ActivitySpy
+  { asActivity :: ParentActivity
+    -- ^ the spied-on cell — pass this where production passes its parent
+    -- activity.
+  , asTouches :: IO Int
+    -- ^ the number of touches observed so far.
+  , asStop :: IO ()
+    -- ^ kill the parked-reader thread (call at the end of each test).
+  }
+
+mkActivitySpy :: IO ActivitySpy
+mkActivitySpy = do
+  cell <- newEmptyMVar
+  touches <- newIORef (0 :: Int)
+  spyTid <- forkIO $ forever $ do
+    takeMVar cell
+    modifyIORef' touches (+ 1)
+  pure ActivitySpy
+    { asActivity = ParentActivity cell
+    , asTouches = readIORef touches
+    , asStop = killThread spyTid
+    }
+
+-- | Bounded poll: check every 5ms until the condition holds, failing the
+-- test once the budget (µs) is exhausted. Keeps negative-assertion tests
+-- deterministic — we wait for the observable precondition before
+-- starting the grace clock.
+waitUntil :: Int -> IO Bool -> Expectation
+waitUntil budgetMicros check = loop budgetMicros
+  where
+    loop remaining
+      | remaining <= 0 = expectationFailure "waitUntil: condition not met before budget expired"
+      | otherwise = do
+          ok <- check
+          unless ok $ do
+            threadDelay 5000
+            loop (remaining - 5000)
 
 ------------------------------------------------------------------------
 -- Spec
@@ -363,3 +423,184 @@ spec = describe "Seal.Agent.Runtime.Delegation.Concurrent" $ do
       case eResults of
         Left err -> err `shouldSatisfy` ("paused" `T.isInfixOf`)
         Right _ -> expectationFailure "expected Left (paused), got Right"
+
+  ------------------------------------------------------------------
+  -- 12. Async-exception truthfulness (the termination bug)
+  ------------------------------------------------------------------
+  -- AGENT_STOP kills a child thread with ThreadKilled; the delegation
+  -- budget kills it with Timeout. Both are async exceptions. A bare
+  -- `catch @SomeException` at the worker seam converts either into an
+  -- error outcome, so a killed child is reported as a *result* — and a
+  -- timed-out child as success. The seam must rethrow async exceptions
+  -- so the kill propagates out of runDelegate.
+  describe "async-exception truthfulness — ThreadKilled escapes runDelegate" $ do
+    it "a worker throwing ThreadKilled propagates out of runDelegate instead of becoming Right [CsError]" $ do
+      let killedWorker _def _sid _task _hooks = throwIO ThreadKilled
+          task = ChildTask "test-def" "doomed to be killed" Nothing Nothing False Nothing
+      runWith (DiSingle task) killedWorker
+        `shouldThrow` (== ThreadKilled)
+
+  ------------------------------------------------------------------
+  -- 13. catchChildSync: the sync/async discriminator
+  ------------------------------------------------------------------
+  describe "catchChildSync" $ do
+    it "invokes the handler for a synchronous exception" $ do
+      e <- catchChildSync (throwIO (userError "sync boom")) pure
+      show (e :: SomeException) `shouldContain` "sync boom"
+    it "rethrows ThreadKilled instead of invoking the handler" $
+
+      catchChildSync (throwIO ThreadKilled) (pure . Just . show)
+        `shouldThrow` (== ThreadKilled)
+
+  ------------------------------------------------------------------
+  -- 14. runChildWithTimeout: the budget seam
+  ------------------------------------------------------------------
+  describe "runChildWithTimeout" $ do
+    it "returns Nothing for a worker that outlives the budget" $ do
+      let slowWorker = do
+            threadDelay 5000000  -- 5s against a 50ms budget
+            pure (ChildWorkerOutcome (Just "too late") CerCompleted 0 0 Nothing)
+      r <- runChildWithTimeout 50000 slowWorker
+      case r of
+        Nothing -> pure ()
+        Just _  -> expectationFailure "expected Nothing for an over-budget worker, got Just"
+    it "returns Just the outcome for a worker that finishes within the budget" $ do
+      let fastWorker = pure (ChildWorkerOutcome (Just "done") CerCompleted 0 0 Nothing)
+      r <- runChildWithTimeout 50000 fastWorker
+      case r of
+        Nothing -> expectationFailure "expected Just for a within-budget worker, got Nothing"
+        Just o -> do
+          cwoSummary o `shouldBe` Just "done"
+          cwoExitReason o `shouldBe` CerCompleted
+
+  ------------------------------------------------------------------
+  -- 15. withHeartbeat: the heartbeat bracket
+  ------------------------------------------------------------------
+  -- The heartbeat thread is a poller whose only exit path is its
+  -- stop-MVar. Before 'withHeartbeat' bracketed the fork, an async
+  -- exception escaping the child run — AGENT_STOP's killThread, or the
+  -- 'System.Timeout.timeout' budget — skipped the stop + killThread, so
+  -- the poller kept touching the parent-activity cell every 30s forever:
+  -- one leaked thread per stopped child, defeating the parent's
+  -- inactivity timeout. The bracket makes the release mask-guaranteed to
+  -- run even when the action propagates an async exception.
+  describe "withHeartbeat" $ do
+    let tickMicros = 20000  -- 20ms: observable in a test, still schedulable
+
+    it "keeps touching the parent-activity cell while a normal action runs, and stops once it returns" $ do
+      spy <- mkActivitySpy
+      withHeartbeat (Just (asActivity spy)) tickMicros (threadDelay 100000)
+      -- 100ms at a 20ms tick ≈ 5 touches; tolerate scheduler slack.
+      during <- asTouches spy
+      during `shouldSatisfy` (>= 1)
+      -- The happy path must clean up too: sample twice, three ticks
+      -- apart — no further touches (the poller was stopped by the
+      -- release).
+      threadDelay (3 * tickMicros)
+      c1 <- asTouches spy
+      threadDelay (3 * tickMicros)
+      c2 <- asTouches spy
+      c2 `shouldBe` c1
+      asStop spy
+
+    it "stops the heartbeat when the action propagates ThreadKilled (AGENT_STOP's kill)" $ do
+      spy <- mkActivitySpy
+      r <- try (withHeartbeat (Just (asActivity spy)) tickMicros (throwIO ThreadKilled) :: IO ())
+      case r of
+        Left e -> fromException e `shouldBe` (Just ThreadKilled :: Maybe AsyncException)
+        Right () -> expectationFailure "expected ThreadKilled to propagate out of withHeartbeat, got ()"
+      -- A leaked poller (the pre-bracket bug) would keep touching every
+      -- tick. Wait past several ticks and compare two samples three ticks
+      -- apart: the count must have plateaued.
+      threadDelay (3 * tickMicros)
+      c1 <- asTouches spy
+      threadDelay (3 * tickMicros)
+      c2 <- asTouches spy
+      c2 `shouldBe` c1
+      asStop spy
+
+    it "stops the heartbeat when the running thread is killed from outside (the production AGENT_STOP shape)" $ do
+      spy <- mkActivitySpy
+      selfTid <- myThreadId
+      void (forkIO (threadDelay 20000 >> killThread selfTid))
+      r <- try (withHeartbeat (Just (asActivity spy)) tickMicros (threadDelay 5000000) :: IO ())
+      case r of
+        Left e -> fromException e `shouldBe` (Just ThreadKilled :: Maybe AsyncException)
+        Right () -> expectationFailure "expected ThreadKilled to propagate out of withHeartbeat, got ()"
+      threadDelay (3 * tickMicros)
+      c1 <- asTouches spy
+      threadDelay (3 * tickMicros)
+      c2 <- asTouches spy
+      c2 `shouldBe` c1
+      asStop spy
+
+  ------------------------------------------------------------------
+  -- 16. Async path: a ThreadKilled worker is truthful
+  ------------------------------------------------------------------
+  -- AGENT_STOP kills the registered child thread (aiThreadId) with
+  -- ThreadKilled. On the async path the kill lands in the forked worker
+  -- thread; WU-1's seam makes it propagate out of runWorker, so the
+  -- completion callback must NOT fire — a stopped child is not a child
+  -- that "completed with an error". The heartbeat bracket on this path
+  -- is the same 'withHeartbeat' call as the sync path; the 30s
+  -- production tick makes direct leak observation here cost 30s+, so
+  -- the leak-kill itself is covered by the 'withHeartbeat' unit tests
+  -- above at a 20ms tick (structural coverage for this call site).
+  describe "runDelegateAsync — a ThreadKilled worker registers but never delivers a completion" $ do
+    it "spawn callback fires, completion callback never does" $ do
+      spy <- mkActivitySpy
+      startedRef <- newIORef False
+      resultsRef <- newIORef ([] :: [ChildResult])
+      spawnedRef <- newIORef ([] :: [ThreadId])
+      pauseFlag <- newSpawnPauseFlag
+      minter <- mkSessionMinter
+      let killedWorker _def _sid _task _hooks = do
+            writeIORef startedRef True
+            throwIO ThreadKilled
+          resolver _task = pure (Right (stubDef "test-def", killedWorker))
+          onDone r = modifyIORef' resultsRef (r :)
+          onSpawn _sid _def _childSid tid = modifyIORef' spawnedRef (tid :)
+          task = ChildTask "test-def" "async kill" Nothing Nothing False Nothing
+      eSpawned <- runDelegateAsync defaultDelegationConfig pauseFlag (Just (asActivity spy)) 0
+                    (DiSingle task) resolver onDone onSpawn minter
+      case eSpawned of
+        Left err -> expectationFailure ("expected Right, got Left: " <> T.unpack err)
+        Right sis -> length sis `shouldBe` 1
+      -- Deterministic precondition: wait until the child actually started.
+      waitUntil 500000 (readIORef startedRef)
+      -- Grace period far past the exception's propagation through the
+      -- seam: no completion may be delivered for a killed child.
+      threadDelay 60000
+      results <- readIORef resultsRef
+      length results `shouldBe` 0
+      spawned <- readIORef spawnedRef
+      length spawned `shouldBe` 1
+      asStop spy
+
+  ------------------------------------------------------------------
+  -- 17. childStopKind: the five-way marker classifier
+  ------------------------------------------------------------------
+  -- The worker's residual classifier: the five 'notifyStop' outcome texts
+  -- produced by 'Loop' (max turns / provider error / retry exhausted /
+  -- truncation / abort) must map to exactly one kind each; a genuine
+  -- final answer must map to Nothing. 'resolveExitReason' in Worker.hs
+  -- consumes this when the fanout never fired.
+  describe "childStopKind (WU-2)" $ do
+    it "classifies the max-turns marker" $
+      childStopKind "(stopped: reached the 90-turn limit for this message. Ask again to continue, or raise `max_turns` in config.toml.)"
+        `shouldBe` Just CskMaxTurns
+    it "classifies the provider-error marker" $
+      childStopKind "anthropic/claude-opus-4> provider error: rate limited"
+        `shouldBe` Just CskProviderError
+    it "classifies the retry-exhausted marker" $
+      childStopKind "ollama/llama3> The model returned an unusable response (no text or tool calls) after 3 attempts. This is typically a temporary model issue — try sending your message again. Details are in the session's seal.log."
+        `shouldBe` Just CskRetryExhausted
+    it "classifies the truncation marker" $
+      childStopKind "ollama/llama3> partial\n\n(stopped: response truncated at the 4096-token output limit after 3 continuation attempts. Send any message to continue.)"
+        `shouldBe` Just CskTruncation
+    it "classifies the abort marker (exact)" $
+      childStopKind "(stopped)" `shouldBe` Just CskAbort
+    it "does not classify a genuine final answer" $
+      childStopKind "Here is your answer: the build succeeded." `shouldBe` Nothing
+    it "does not classify text that merely mentions stopping" $
+      childStopKind "I stopped the server and restarted it." `shouldBe` Nothing

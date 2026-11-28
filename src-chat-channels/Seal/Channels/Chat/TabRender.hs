@@ -17,6 +17,7 @@ module Seal.Channels.Chat.TabRender
   ( TabListRow (..)
   , renderTabListRow
   , tabListRows
+  , nameOf
   ) where
 
 import Data.Aeson (Value)
@@ -63,7 +64,7 @@ tabListRows lj = map row (ljTabs lj)
       { tlrIndex = tjIndex t
       , tlrBusy  = isBusy t
       , tlrRepo  = mSession t >>= lookupText "repoUrl" >>= repoFromUrl
-      , tlrName  = fromMaybe "harness" (nameOf t)
+      , tlrName  = fromMaybe "harness" (nameOf lj t)
       }
 
     -- A tab is busy when its session is thinking. A harness tab has no
@@ -78,17 +79,28 @@ tabListRows lj = map row (ljTabs lj)
         (s : _) -> Just s
         []      -> Nothing
 
-    -- Label, then the frontend's title cascade, then a stable fallback.
-    nameOf t = firstNonEmpty
-      [ tjLabel t
-      , mSession t >>= lookupText "description"
-      , mSession t >>= lookupText "autoSummary"
-      , mSession t >>= lookupText "firstMessageSnippet"
-      , mSession t >>= lookupText "agent"
-      , Just $ case tjSessionId t of
-          Just sid -> "session:" <> T.take 12 sid
-          Nothing  -> "harness"
-      ]
+
+-- | A tab's display name: its label, then the frontend's title cascade, then a
+-- stable fallback (the short session id, or @harness@).
+--
+-- Exported so @\/last@'s heading uses exactly the same cascade as @\/tab list@,
+-- rather than growing a second one. Pure.
+nameOf :: ListsJson -> TabJson -> Maybe Text
+nameOf lj t = firstNonEmpty
+  [ tjLabel t
+  , mSession >>= lookupText "description"
+  , mSession >>= lookupText "autoSummary"
+  , mSession >>= lookupText "firstMessageSnippet"
+  , mSession >>= lookupText "agent"
+  , Just $ case tjSessionId t of
+      Just sid -> "session:" <> T.take 12 sid
+      Nothing  -> "harness"
+  ]
+  where
+    mSession = tjSessionId t >>= \sid ->
+      case filter (\s -> lookupText "id" s == Just sid) (ljTabSessions lj) of
+        (s : _) -> Just s
+        []      -> Nothing
 
 -- | The last non-empty path segment of a repo URL, with a trailing @.git@ and
 -- any trailing slash removed. @Nothing@ for an empty or segment-less URL.

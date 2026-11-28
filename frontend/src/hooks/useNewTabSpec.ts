@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useConfiguredProviders, fetchProviderModels, useDiscoverableWindows, useRepos, type CreateTabBody, fetchUiState, putUiState, addCustomModel, addRepo, type LastOptions } from './useApi'
 import type { DiscoverableWindow, ProviderInfo } from '../types'
+import { isOfferableProvider } from '../lib/readiness'
 
 export type NewTabKind = 'provider' | 'harness' | 'attach'
 
@@ -93,7 +94,20 @@ export interface NewTabSpec {
   persistOnSubmit: () => void
 }
 
-export function useNewTabSpec(): NewTabSpec {
+export function useNewTabSpec(
+  /** Branch mode — a LIVE flag, not a mount-time option. A branched session
+   *  must start with an EMPTY workdir, so a branch submit must never record
+   *  the repo; otherwise the next ordinary "new tab" would restore it and
+   *  auto-clone into an unrelated session (NewTabComposer dispatches
+   *  SETUP_REPO for any non-empty repo).
+   *
+   *  This is read through a ref because the hook instance is created once at
+   *  App mount and shared by every composer opening: a mount-time argument
+   *  could never change when the user clicks "branch from here". */
+  opts?: { branchModeRef?: { readonly current: boolean } },
+): NewTabSpec {
+  const branchModeRef = opts?.branchModeRef
+  const inBranchMode = (): boolean => branchModeRef?.current === true
   // Kind
   const [kind, setKind] = useState<NewTabKind>('provider')
 
@@ -174,7 +188,9 @@ export function useNewTabSpec(): NewTabSpec {
       if (opts.attachSession) setAttachSession(opts.attachSession)
       if (opts.attachWindow) setAttachWindow(opts.attachWindow)
       if (opts.attachManual) setAttachManual(true)
-      if (opts.repo) setRepo(opts.repo)
+      // Branch mode: never restore a last-used repo. The branch's workdir
+      // must start empty, and this box is what triggers SETUP_REPO.
+      if (opts.repo && !inBranchMode()) setRepo(opts.repo)
       // Provider + model: stage the model so the model-fetch effect (which
       // fires when the restored provider lands) honors it instead of the
       // configured default. The fetch effect clears the ref once consumed.
@@ -188,21 +204,23 @@ export function useNewTabSpec(): NewTabSpec {
   }, [])
 
   // Default the provider to whatever Seal is configured to use (the entry
-  // marked isDefault by the backend) — but only among the *configured*
-  // providers. Falling back to the first configured one, then the first
-  // overall (so an unconfigured provider is never auto-selected even when
-  // it is the only entry). `configured` is absent => configured (back-compat).
+  // marked isDefault by the backend) — but only among the providers the picker
+  // will actually offer: configured, and not positively absent. A provider the
+  // dropdown hides must never be auto-selected, or the form would submit a
+  // session bound to something that cannot answer, with the choice invisible.
+  // Falls back to the first usable provider; when there is none the provider
+  // stays empty and `validationError` explains why.
   useEffect(() => {
     if (!providersLoaded || configuredProviders.length === 0) return
-    const names = configuredProviders.map((p) => p.name)
-    const isCfg = (n: string) =>
-      configuredProviders.find((p) => p.name === n)?.configured !== false
-    if (!provider || !names.includes(provider) || !isCfg(provider)) {
-      const cfg = configuredProviders.filter((p) => p.configured !== false)
-      const def = cfg.find((p) => p.isDefault)
-      const fallback = (def ?? cfg[0] ?? configuredProviders[0])!.name
-      setProvider(fallback)
-    }
+    const usable = configuredProviders.filter(isOfferableProvider)
+    // An explicit selection the operator restored or made is kept — readiness
+    // is re-read on focus, so a briefly-unusable provider must not be swapped
+    // out under their hands.
+    const chosen = configuredProviders.find((p) => p.name === provider)
+    if (chosen !== undefined && isOfferableProvider(chosen)) return
+    const def = usable.find((p) => p.isDefault)
+    const next = (def ?? usable[0])?.name ?? ''
+    if (next !== provider) setProvider(next)
   }, [providersLoaded, configuredProviders, provider])
 
   // Fetch the model list when the provider changes (and we're in provider
@@ -272,6 +290,12 @@ export function useNewTabSpec(): NewTabSpec {
       if (providersLoaded && !configuredProviders.some((p) => p.configured !== false)) {
         return 'No providers configured — set an API key or start Ollama'
       }
+      // Configured providers exist but none can be offered (today: an Ollama
+      // whose probe found neither a daemon nor a binary). The dropdown is
+      // empty, so name the reason instead of the generic "Pick a model".
+      if (providersLoaded && !configuredProviders.some(isOfferableProvider)) {
+        return 'No usable provider — Seal found nothing to talk to. Install Ollama, or configure another provider in the Providers tab'
+      }
       if (modelsLoading) return 'Loading models…'
       if (!model.trim()) return useCustomModel ? 'Enter a custom model id' : 'Pick a model'
     }
@@ -321,7 +345,9 @@ export function useNewTabSpec(): NewTabSpec {
       attachSession,
       attachWindow,
       attachManual,
-      repo: repo.trim(),
+      // Branch mode must not rewrite the remembered repo, or the parent's
+      // URL would leak into the next ordinary new-tab form.
+      repo: inBranchMode() ? '' : repo.trim(),
     }
     void putUiState(opts)
     if (isCustomModel) {

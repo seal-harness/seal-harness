@@ -2,6 +2,49 @@
 
 ## 0.1.0.0 — unreleased
 
+* **"Branch session from here" now inherits history.** The button opened the
+  new-tab composer with a branch field filled in, then produced a session with
+  none of the parent's transcript. Two independent faults: the gateway had no
+  branch handling at all — `POST /api/tabs/new` silently discarded the
+  `branch_from` field — and the value it sent was a frontend **render index**,
+  not a session id, so even a correct gateway could not have resolved it.
+
+  A branch now carries the transcript up to the row you pick. The composer
+  sends the parent session id plus an explicit **conversation length**, and the
+  gateway copies that many `conversation.jsonl` lines (byte-exactly) along with
+  the matching `entries.jsonl` prefix, so inherited rows keep their tool-call
+  boxes, thinking blocks, and per-message model labels.
+
+  **The new session's workdir starts empty, and no repo is inherited.** Neither
+  is an omission: the transcript records tool inputs and outputs, never
+  filesystem snapshots, so a past workdir state cannot be reconstructed, and
+  copying the present one would misrepresent every branch taken from an earlier
+  row. Repo metadata is not carried either — `repo_url` promises "the repo
+  cloned into this workdir", which would be untrue of an empty one. The
+  composer's repo box is cleared in branch mode so a clone is always explicit;
+  paste a URL there to clone before the first turn.
+
+  A `branch_from` without a conversation length is now a **400**, not a silent
+  empty session: a client that sends the former is by definition branching, and
+  quietly returning an empty session is the exact failure this fixes. Session
+  ids are minted from the clock at millisecond resolution, so branching now
+  refuses to write into an id that already names a session rather than risk
+  clobbering it.
+
+  Also fixes a latent transcript-reconstruction bug found while threading the
+  anchor: the writer records `erConvLen` as a **delta** for harness entries
+  (a skill load or `SETUP_REPO` result contributes one line), but all three
+  reconstruction paths treated it as an absolute position. Those entries lost
+  their conversation line whenever reconstruction started mid-transcript, which
+  full reads (always starting at 0) never exposed.
+
+* **Linux x86_64 release binaries are fully static.** The `x86_64-linux`
+  artifact is now a static musl ELF with no dynamic loader and no embedded
+  `/nix/store` paths, so it runs on a machine without Nix. The portability check
+  now fails on a dynamically linked Linux artifact instead of warning, and
+  `make static` builds and verifies it directly. macOS continues to ship the
+  bundled-dylib tree.
+
 * **The enrollment link now works, and `enroll` prints it.** Two changes to the
   first-run enrollment journey, both reported from real use.
 

@@ -581,6 +581,7 @@ buildTestEnv tmp mode mRepo opts = do
         , adFileExplorerEnabled = False
 , adDownloadPromptBytes = 268435456
 , adDownloadChunkBytes = 4194304
+, adMediaPreviewBytes = 33554432
 , adDownloadAllowBlocked = False
 , adHttpManager = Nothing
 , adIconCache = Nothing

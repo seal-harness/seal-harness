@@ -25,6 +25,7 @@ import qualified Seal.Gateway.ApiIntegrationSpec
 import qualified Seal.Gateway.AgentIntegrationSpec
 import qualified Seal.Gateway.ApiSpec
 import qualified Seal.Gateway.ApiFilesSpec
+import qualified Seal.Gateway.MediaTypeSpec
 import qualified Seal.Gateway.BroadcastSpec
 import qualified Seal.Gateway.EntryCursorSpec
 import qualified Seal.Gateway.OpenApiSpec
@@ -37,6 +38,7 @@ import qualified Seal.Gateway.StreamHealthSpec
 import qualified Seal.Gateway.TranscriptSpec
 import qualified Seal.Util.StrictIOSpec
 import qualified Seal.AppMainSpec
+import qualified Seal.Session.BranchSpec
 import qualified Seal.Session.MetaSpec
 import qualified Seal.Session.AgentMetaCacheSpec
 import qualified Seal.Session.ExecCacheSpec
@@ -120,6 +122,7 @@ import qualified Seal.Channel.WiringSpec
 import qualified Seal.Channels.Chat.TypesSpec
 import qualified Seal.Channels.CursorSpec
 import qualified Seal.Channels.Chat.RouteSpec
+import qualified Seal.Channels.Chat.LastRenderSpec
 import qualified Seal.Channels.Chat.TabRenderSpec
 import qualified Seal.Channels.Chat.RateLimitSpec
 import qualified Seal.Channels.Chat.HttpClientSpec
@@ -254,6 +257,7 @@ specs = do
   Seal.Command.AccessControlSpec.spec
   Seal.Gateway.ApiSpec.spec
   Seal.Gateway.ApiFilesSpec.spec
+  Seal.Gateway.MediaTypeSpec.spec
   Seal.Gateway.ApiIntegrationSpec.spec
   Seal.Gateway.AgentIntegrationSpec.spec
   Seal.Gateway.BroadcastSpec.spec
@@ -268,6 +272,7 @@ specs = do
   Seal.Gateway.OpenApiSpec.spec
   Seal.Util.StrictIOSpec.spec
   Seal.AppMainSpec.spec
+  Seal.Session.BranchSpec.spec
   Seal.Session.MetaSpec.spec
   Seal.Session.AgentMetaCacheSpec.spec
   Seal.Session.ExecCacheSpec.spec
@@ -351,6 +356,7 @@ specs = do
   Seal.Channels.Chat.TypesSpec.spec
   Seal.Channels.CursorSpec.spec
   Seal.Channels.Chat.RouteSpec.spec
+  Seal.Channels.Chat.LastRenderSpec.spec
   Seal.Channels.Chat.TabRenderSpec.spec
   Seal.Channels.Chat.RateLimitSpec.spec
   Seal.Channels.Chat.HttpClientSpec.spec

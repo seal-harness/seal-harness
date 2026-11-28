@@ -102,6 +102,9 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
 function makeEntry(overrides: Partial<TranscriptEntry> = {}): TranscriptEntry {
   return {
     id: 'e1',
+    // The branch anchor: a real position in conversation.jsonl. Without it
+    // the row offers no branch button (entryId is only a render index).
+    convLen: 1,
     timestamp: '2024-06-01T12:00:00Z',
     direction: 'request',
     payload: JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }),
@@ -190,6 +193,32 @@ describe('App — sidebar selection', () => {
     // The chat-header title should now read the session's title (the
     // EditableSessionTitle shows it).
     expect(screen.getAllByText('Session A').length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('shows the session-level token count, not a count derived from the loaded window', async () => {
+    // Regression for the reported bug: the status-bar `Tokens` number used to
+    // be computed from `entries` — the chunk window the transcript view had
+    // loaded — so scrolling (which replaces that window wholesale) changed it.
+    // The count is now purely `SessionInfo.tokensUsed` (server-derived from the
+    // whole session), so no amount of transcript loading can move it.
+    defaultFetchDispatch()
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      fetchCalls.push({ url })
+      let body: unknown = []
+      if (url === '/api/sessions') {
+        body = [makeSession({ id: 'sess-T', description: 'Token Sess', tokensUsed: 178300 })]
+      } else if (url === '/api/agents') body = []
+      else if (url === '/api/providers') body = [{ name: 'anthropic', isDefault: true }]
+      return new globalThis.Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+    render(<App />)
+    const row = await screen.findByText('Token Sess', {}, { timeout: 4000 })
+    fireEvent.click(row)
+    // 178300 formats as "178.3k" (BottomBar.formatTokens).
+    expect(await screen.findByText(/178\.3k/, {}, { timeout: 4000 })).toBeTruthy()
   })
 
   it('the empty-session form shows the "Add Seal Harness front matter" toggle, on by default', async () => {

@@ -88,6 +88,7 @@ library seal-chat-channels
         Seal.Channels.Chat.ToolRender
         Seal.Channels.Chat.Bubble
         Seal.Channels.Chat.TabRender
+        Seal.Channels.Chat.LastRender
         Seal.Channels.Chat.Signal
         Seal.Channels.Chat.Telegram
         Seal.Channels.Chat.TelegramCommands
@@ -201,6 +202,7 @@ library
         Seal.Ingest
         Seal.Session.AgentMetaCache
         Seal.Session.ExecCache
+        Seal.Session.Branch
         Seal.Session.Meta
         Seal.Session.Store
         Seal.Session.Workdir
@@ -264,6 +266,7 @@ library
          Seal.Gateway.Send
          Seal.Gateway.SessionJson
          Seal.Gateway.ListsSnapshot
+         Seal.Gateway.MediaType
          Seal.Gateway.Broadcast
          Seal.Gateway.Server
          Seal.Gateway.OpenApi
@@ -489,6 +492,7 @@ test-suite tests
        Seal.Gateway.ApiRouteSpec
         Seal.Gateway.ApiSpec
         Seal.Gateway.ApiFilesSpec
+        Seal.Gateway.MediaTypeSpec
         Seal.Gateway.ApiIntegrationSpec
         Seal.Gateway.AgentIntegrationSpec
         Seal.Gateway.BroadcastSpec
@@ -568,6 +572,7 @@ test-suite tests
         Seal.Channel.WiringSpec
         Seal.Channels.Chat.RouteSpec
         Seal.Channels.Chat.TabRenderSpec
+        Seal.Channels.Chat.LastRenderSpec
         Seal.Channels.Chat.TypesSpec
         Seal.Channels.Chat.RateLimitSpec
         Seal.Channels.Chat.HttpClientSpec
@@ -623,6 +628,7 @@ test-suite tests
         Seal.Security.SecretsSpec
         Seal.Session.AgentMetaCacheSpec
         Seal.Session.ExecCacheSpec
+        Seal.Session.BranchSpec
         Seal.Session.MetaSpec
         Seal.Session.StoreSpec
         Seal.Session.LogSpec

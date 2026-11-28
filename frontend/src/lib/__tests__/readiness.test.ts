@@ -3,6 +3,8 @@ import {
   readinessLabel,
   readinessHint,
   readinessTone,
+  isNotInstalled,
+  isOfferableProvider,
   type ProviderReadiness,
 } from '../readiness'
 
@@ -123,4 +125,48 @@ describe('readinessTone (test 39)', () => {
       expect(['faint', 'muted', 'warn', 'ok']).toContain(readinessTone(s))
     }
   })
+})
+
+describe('isNotInstalled', () => {
+  // The one state that means "nothing here to use". Pinned exactly, because
+  // every other state must stay listed in the provider pickers — a broader
+  // predicate would hide a provider that is one command away.
+  it('is true only for not-installed', () => {
+    for (const s of ALL_STATES) {
+      expect(isNotInstalled(s)).toBe(s === 'not-installed')
+    }
+  })
+
+  it('is false for absent readiness (a non-Ollama provider)', () => {
+    expect(isNotInstalled(undefined)).toBe(false)
+  })
+})
+
+describe('isOfferableProvider', () => {
+  it('offers a configured, ready provider', () => {
+    expect(isOfferableProvider({ configured: true, readiness: 'ready' })).toBe(true)
+  })
+
+  // Back-compat: older payloads and test mocks omit `configured`.
+  it('treats absent configured as configured', () => {
+    expect(isOfferableProvider({})).toBe(true)
+    expect(isOfferableProvider({ readiness: 'not-running' })).toBe(true)
+  })
+
+  it('never offers an unconfigured provider', () => {
+    expect(isOfferableProvider({ configured: false })).toBe(false)
+    expect(isOfferableProvider({ configured: false, readiness: 'ready' })).toBe(false)
+  })
+
+  it('never offers a provider that is not installed', () => {
+    expect(isOfferableProvider({ configured: true, readiness: 'not-installed' })).toBe(false)
+  })
+
+  // The distinction the bug report's phrase "not found" could otherwise blur.
+  it.each(['not-running', 'no-models', 'no-fitting-model', 'unknown', 'pending', 'cloud'] as const)(
+    'still offers a provider whose readiness is %s',
+    (readiness) => {
+      expect(isOfferableProvider({ configured: true, readiness })).toBe(true)
+    },
+  )
 })

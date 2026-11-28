@@ -153,6 +153,71 @@ describe('NewTabComposer — provider kind', () => {
     expect(values).not.toContain('openrouter')
   })
 
+  // The reported bug: a machine with no Ollama still offered "Ollama" in the
+  // new-tab provider dropdown, annotated "Ollama Not Found" — an option that
+  // cannot answer the turn it is picked for.
+  it('43: omits an Ollama that is not installed', () => {
+    render(
+      <NewTabComposer
+        spec={makeSpec({
+          configuredProviders: [
+            makeProvider({ name: 'anthropic', isDefault: true, configured: true }),
+            makeProvider({ name: 'ollama', configured: true, readiness: 'not-installed' }),
+          ],
+          provider: 'anthropic',
+        })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    const sel = screen.getByLabelText('Provider') as HTMLSelectElement
+    expect(Array.from(sel.options).map((o) => o.value)).toEqual(['anthropic'])
+  })
+
+  // The states that are one command away stay visible. `not-running` in
+  // particular must not be swept up by a broader "hide anything not ready"
+  // reading of the bug report.
+  it('43b: keeps an Ollama that is installed but not running', () => {
+    render(
+      <NewTabComposer
+        spec={makeSpec({
+          configuredProviders: [
+            makeProvider({ name: 'anthropic', isDefault: true, configured: true }),
+            makeProvider({ name: 'ollama', isDefault: false, configured: true, readiness: 'not-running' }),
+          ],
+          provider: 'anthropic',
+        })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    const sel = screen.getByLabelText('Provider') as HTMLSelectElement
+    const ollama = Array.from(sel.options).find((o) => o.value === 'ollama')
+    expect(ollama).toBeTruthy()
+    expect(ollama!.textContent).toBe('Ollama (Not Running)')
+  })
+
+  // With nothing offerable the picker is empty, and the notice must not claim
+  // "no providers configured" — Ollama IS configured, it just is not installed.
+  it('43c: shows the no-usable-providers notice when the only provider is not installed', () => {
+    render(
+      <NewTabComposer
+        spec={makeSpec({
+          configuredProviders: [
+            makeProvider({ name: 'ollama', isDefault: true, configured: true, readiness: 'not-installed' }),
+          ],
+          provider: '',
+        })}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    const sel = screen.getByLabelText('Provider') as HTMLSelectElement
+    expect(sel.disabled).toBe(true)
+    expect(Array.from(sel.options).map((o) => o.textContent))
+      .toEqual(['(no usable providers — set an API key or install Ollama)'])
+  })
+
   it('submit calls createTab then onSubmit', async () => {
     const onSubmit = vi.fn()
     render(<NewTabComposer spec={makeSpec()} onSubmit={onSubmit} onCancel={() => {}} />)
@@ -321,19 +386,21 @@ describe('NewTabComposer — attach kind', () => {
   })
 })
 
-describe('NewTabComposer — branchFrom', () => {
-  it('pre-fills the branch_from field and locks kind to provider', () => {
+describe('NewTabComposer — branch mode', () => {
+  it('shows the parent session id and locks kind to provider', () => {
     const setKind = vi.fn()
     render(
       <NewTabComposer
         spec={makeSpec({ kind: 'provider', setKind })}
         onSubmit={() => {}}
         onCancel={() => {}}
-        branchFrom="entry-abc"
+        branchParentSid="20260101-000000-000"
+        branchConvLen={7}
       />,
     )
-    // The branch-from field is shown read-only with the value.
-    expect((screen.getByLabelText('Branch From') as HTMLInputElement).value).toBe('entry-abc')
+    // The branch-from field shows the PARENT SESSION ID, read-only.
+    expect((screen.getByLabelText('Branch From') as HTMLInputElement).value)
+      .toBe('20260101-000000-000')
     // The harness + attach kind pills are disabled.
     const harnessPill = screen.getByRole('radio', { name: 'New Harness' })
     const attachPill = screen.getByRole('radio', { name: 'Existing Harness' })
@@ -343,7 +410,7 @@ describe('NewTabComposer — branchFrom', () => {
     expect(screen.getByRole('radio', { name: 'AI Provider' })).not.toBeDisabled()
   })
 
-  it('calls createTab with branch_from set on submit', async () => {
+  it('calls createTab with the parent sid AND the conversation anchor', async () => {
     const onSubmit = vi.fn()
     const buildBody = vi.fn(() => ({ kind: 'provider', provider: 'anthropic', model: 'claude-sonnet-4' }))
     render(
@@ -351,7 +418,8 @@ describe('NewTabComposer — branchFrom', () => {
         spec={makeSpec({ kind: 'provider', buildBody })}
         onSubmit={onSubmit}
         onCancel={() => {}}
-        branchFrom="entry-abc"
+        branchParentSid="20260101-000000-000"
+        branchConvLen={7}
       />,
     )
     fireEvent.click(screen.getByLabelText('Submit new tab'))
@@ -360,7 +428,8 @@ describe('NewTabComposer — branchFrom', () => {
       kind: 'provider',
       provider: 'anthropic',
       model: 'claude-sonnet-4',
-      branch_from: 'entry-abc',
+      branch_from: '20260101-000000-000',
+      branch_conv_len: 7,
     })
   })
 })

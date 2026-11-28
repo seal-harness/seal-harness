@@ -65,6 +65,14 @@ module Seal.Agent.Runtime.Delegation
   , ChildRunHooks (..)
   , ChildWorkerOutcome (..)
     -- * Run
+  , catchChildSync
+    -- ^ rethrows async exceptions ('Timeout'/'ThreadKilled') untouched;
+    --   converts only synchronous ones to an error outcome.
+  , runChildWithTimeout
+  , withHeartbeat
+    -- ^ brackets the 30s parent-activity heartbeat around a child run so
+    --   the poller thread is stopped even when the run propagates an
+    --   async exception (AGENT_STOP's killThread, the timeout budget).
     , DelegateInput (..)
     , runDelegate
     , runDelegateAsync
@@ -89,7 +97,7 @@ import Control.Concurrent.STM
 import Control.Concurrent.MVar
   ( MVar, newEmptyMVar, newMVar, putMVar, readMVar, tryPutMVar
   , tryTakeMVar )
-import Control.Exception (SomeException, bracket, catch)
+import Control.Exception (SomeAsyncException (..), SomeException, bracket, catch, fromException, throwIO)
 import Control.Monad (forM, void, when)
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
@@ -100,7 +108,6 @@ import Data.Text qualified as T
 import Data.Time.Clock (diffUTCTime, getCurrentTime, UTCTime)
 import System.Random (randomRIO)
 import System.Timeout (timeout)
-
 import Katip (Severity (..), ls)
 import Seal.Logging.Global (globalLogIO)
 
@@ -109,8 +116,61 @@ import Seal.Core.Types (SessionId, sessionIdText)
 import qualified Seal.Config.File as ConfigFile
 
 -- ---------------------------------------------------------------------------
+-- Child-run seam
+-- ---------------------------------------------------------------------------
+
+-- | Rethrow any async exception raised inside the child action; catch only
+-- synchronous ones. 'System.Timeout.timeout' delivers its budget as an
+-- async exception (a 'SomeAsyncException' wrapper that is /not/ an
+-- 'Control.Exception.AsyncException.AsyncException'), and AGENT_STOP kills
+-- the child thread with 'Control.Exception.AsyncException.ThreadKilled' —
+-- a bare @catch @SomeException@ at the worker seam swallows both, so
+-- @timeout@ never observes 'Nothing' and a killed child is reported as an
+-- ordinary error result. Discriminating on 'SomeAsyncException' (not
+-- 'Control.Exception.AsyncException.AsyncException') is what makes the
+-- timeout budget propagate: @fromException e :: Maybe SomeAsyncException@
+-- is 'Just' for 'Timeout' but 'Nothing' for a userError.
+catchChildSync
+  :: IO a
+  -> (SomeException -> IO a)
+  -> IO a
+catchChildSync act handler =
+  act `catch` \e -> case fromException e :: Maybe SomeAsyncException of
+    Just _  -> throwIO e
+    Nothing -> handler e
+
+-- | Run a child worker under the delegation timeout budget. 'Nothing' means
+-- the budget expired — the caller maps that to 'CsTimeout'/'CerTimeout'.
+-- Point-free: it is 'System.Timeout.timeout' under a Haddock contract.
+runChildWithTimeout :: Int -> IO ChildWorkerOutcome -> IO (Maybe ChildWorkerOutcome)
+runChildWithTimeout = timeout
+
+-- | Bracket the parent-activity heartbeat around the child run. The
+-- release — stop-signal + kill — is mask-guaranteed to run when the run
+-- returns, throws, or propagates an async exception; without it, a
+-- propagated kill (AGENT_STOP) orphaned the 30s poller, which kept
+-- touching the parent-activity cell forever, one leak per stopped child.
+-- The tick is in microseconds: production passes 30_000_000 (30s); tests
+-- pass ~20ms so the leak-or-plateau behavior is observable in bounded
+-- time.
+withHeartbeat
+  :: Maybe ParentActivity
+  -> Int
+  -> IO a
+  -> IO a
+withHeartbeat mParentActivity tickMicros action =
+  bracket
+    (do stop <- newEmptyMVar
+        tid <- forkIO (heartbeatLoop mParentActivity stop tickMicros)
+        pure (stop, tid))
+    (\(stop, tid) -> tryPutMVar stop () >> killThread tid)
+    (const action)
+
+
+-- ---------------------------------------------------------------------------
 -- Config
 -- ---------------------------------------------------------------------------
+
 
 -- | The @[delegation]@ section of @config.toml@. Every field is optional; a
 -- missing key decodes as 'Nothing' and the resolver falls back to a default.
@@ -582,18 +642,12 @@ runDelegate cfg pauseFlag mParentActivity parentDepth input resolveTask = do
       mRes <- resolveTask task >>= \case
         Left err -> pure (Left err)
         Right (def, worker, childSid) -> do
-          -- Start the heartbeat thread.
-          hbStop <- newEmptyMVar
-          hbThreadId <- forkIO (heartbeatLoop mParentActivity hbStop)
           let runWithCatch =
-                worker def childSid task hooks
-                  `catch` \e -> pure (ChildWorkerOutcome
+                catchChildSync (worker def childSid task hooks) $ \e -> pure (ChildWorkerOutcome
                                        (Just (T.pack (show (e :: SomeException))))
                                        CerError 0 0 (Just childSid))
-          mOutcome <- timeout micros runWithCatch
-          -- Stop the heartbeat.
-          void (tryPutMVar hbStop ())
-          killThread hbThreadId
+          mOutcome <- withHeartbeat mParentActivity heartbeatTickMicros $
+                      runChildWithTimeout micros runWithCatch
           pure (maybe (Left "timeout") Right mOutcome)
       end <- getCurrentTime
       let dur = realToFrac (end `diffUTCTime` start) :: Double
@@ -764,18 +818,12 @@ runDelegateAsync cfg pauseFlag mParentActivity parentDepth input resolveTask cal
              -> UTCTime -> IORef [ToolTraceEntry] -> IORef [Text] -> IORef [Text]
              -> AgentDef -> AgentWorkerBuilder -> ChildRunHooks -> IO ()
     runWorker idx task childTimeout subagentId childSid micros start traceRef readRef writtenRef def worker hooks = do
-      -- Start the heartbeat thread.
-      hbStop <- newEmptyMVar
-      hbThreadId <- forkIO (heartbeatLoop mParentActivity hbStop)
       let runWithCatch =
-            worker def childSid task hooks
-              `catch` \e -> pure (ChildWorkerOutcome
+            catchChildSync (worker def childSid task hooks) $ \e -> pure (ChildWorkerOutcome
                                    (Just (T.pack (show (e :: SomeException))))
                                    CerError 0 0 (Just childSid))
-      mOutcome <- timeout micros runWithCatch
-      -- Stop the heartbeat.
-      void (tryPutMVar hbStop ())
-      killThread hbThreadId
+      mOutcome <- withHeartbeat mParentActivity heartbeatTickMicros $
+                  runChildWithTimeout micros runWithCatch
       end <- getCurrentTime
       let dur = realToFrac (end `diffUTCTime` start) :: Double
       case mOutcome of
@@ -859,10 +907,16 @@ childStatusFor = \case
   CerInterrupted  -> CsInterrupted
   CerError        -> CsError
 
--- | A 30s heartbeat that touches the parent-activity cell while the child
--- runs. Stops when the stop-MVar is filled.
-heartbeatLoop :: Maybe ParentActivity -> MVar () -> IO ()
-heartbeatLoop mParentActivity stopRef = loop
+-- | The heartbeat period: 30s in production. A named constant (not a
+-- 'withHeartbeat' default) so both call sites pass it explicitly.
+heartbeatTickMicros :: Int
+heartbeatTickMicros = 30000000
+
+-- | A heartbeat that touches the parent-activity cell while the child
+-- runs. Stops when the stop-MVar is filled. The tick is injectable so
+-- tests can observe leak-or-plateau behavior in bounded time.
+heartbeatLoop :: Maybe ParentActivity -> MVar () -> Int -> IO ()
+heartbeatLoop mParentActivity stopRef tickMicros = loop
   where
     loop = do
       stop <- tryTakeMVar stopRef
@@ -870,5 +924,5 @@ heartbeatLoop mParentActivity stopRef = loop
         Just ()  -> pure ()
         Nothing  -> do
           for_ mParentActivity touchParentActivity
-          threadDelay 30000000  -- 30s
+          threadDelay tickMicros
           loop

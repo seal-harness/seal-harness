@@ -568,4 +568,44 @@ describe('useTranscriptMessages', () => {
     const expected = resolveRawJson(transcriptToMessages(session2))
     expect(resolveRawJson(result.current)).toEqual(expected)
   })
+
+  // ── Branch anchor (WU-5 regression guard) ──────────────────────────────
+  // This asserts on the LIVE renderer (useTranscriptMessages) rather than
+  // the test-only transcriptToMessages: the app renders through this hook,
+  // so a convLen added only to ChatArea would leave the production branch
+  // request without an anchor.
+  it('carries convLen onto user and assistant rows (the branch anchor)', () => {
+    const entries: TranscriptEntry[] = [
+      makeEntry({
+        id: 'u1',
+        convLen: 1,
+        payload: JSON.stringify({
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'branch me' }] }],
+        }),
+      }),
+      makeEntry({
+        id: 'a1',
+        direction: 'response',
+        convLen: 2,
+        payload: JSON.stringify({ content: [{ type: 'text', text: 'hello' }] }),
+      }),
+    ]
+    const { result } = renderHook(() => useTranscriptMessages(entries, 's1'))
+    const userRow = result.current.find((m) => m.id === 'u1-user')
+    const assistantRow = result.current.find((m) => m.id === 'a1')
+    expect(userRow?.convLen).toBe(1)
+    expect(assistantRow?.convLen).toBe(2)
+  })
+
+  it('leaves convLen undefined on rows whose entry has no anchor', () => {
+    const entries: TranscriptEntry[] = [makeEntry({
+      id: 'u1',
+      payload: JSON.stringify({
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'no anchor' }] }],
+      }),
+    })]
+    const { result } = renderHook(() => useTranscriptMessages(entries, 's1'))
+    const userRow = result.current.find((m) => m.id === 'u1-user')
+    expect(userRow?.convLen).toBeUndefined()
+  })
 })

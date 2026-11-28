@@ -5,6 +5,8 @@
 module Seal.Agent.Loop
   ( runTurn
   , defaultMaxTokens
+  , ChildStopKind (..)
+  , childStopKind
   , aggregateStreamEvents
   , stripToolCallXml, findAllInvokeCalls
   , requestMeta
@@ -63,6 +65,42 @@ import Seal.Transcript.Entries
   ( EnvelopeDelta (..), EntryKind (..), EntryRecord (..) )
 import Seal.Transcript.Origin (annotateOrigins, originFromSource)
 import Seal.Types.App (App)
+
+-- | The five non-completion outcomes 'notifyStop' can deliver, as a
+-- classification of the exact text the loop produces. Kept beside the
+-- literals it classifies so the two cannot drift apart; the delegation
+-- worker consumes it as the residual classifier when the final-answer
+-- fanout never fired (see 'Seal.Agent.Runtime.Delegation.Worker').
+data ChildStopKind
+  = CskMaxTurns
+  | CskProviderError
+  | CskRetryExhausted
+  | CskTruncation
+  | CskAbort
+  deriving stock (Eq, Show)
+
+-- | Classify a stop text produced by this module's 'notifyStop' sites.
+-- Exactly the five markers below match; a genuine final answer (and any
+-- other text) yields 'Nothing'. The abort marker is checked exactly
+-- first, so an answer that merely /mentions/ @\"(stopped)\"@ inside a
+-- longer text does not classify (the truncation and max-turns markers
+-- are unambiguous prefixes/infixes of their own notices).
+childStopKind :: Text -> Maybe ChildStopKind
+childStopKind t
+  | t == "(stopped)" = Just CskAbort
+  | "(stopped: reached the " `T.isInfixOf` t = Just CskMaxTurns
+  | "(stopped: response truncated at the " `T.isInfixOf` t = Just CskTruncation
+  | "provider error: " `T.isInfixOf` t = Just CskProviderError
+  | "The model returned an unusable response" `T.isInfixOf` t = Just CskRetryExhausted
+  | otherwise = Nothing
+
+-- The three provider-notice markers are delivered as @prefix <> notice@
+-- (the @provider/model> @ channel tag), and the truncation notice is
+-- appended after any partial text — so the markers are /infixes/ of the
+-- delivered text, never prefixes. The classifier matches infixes for
+-- that reason; the residual path never sees genuine final answers
+-- (those always flip aeStopFanoutDone first).
+
 
 -- | The output-token cap sent to the provider on every completion request.
 -- Raised to 65536 so agents generating large documents (design docs, plans,

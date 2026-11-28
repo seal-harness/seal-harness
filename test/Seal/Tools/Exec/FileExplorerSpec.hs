@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE RankNTypes #-}
 module Seal.Tools.Exec.FileExplorerSpec (spec) where
 
 import Data.ByteString (ByteString)
@@ -16,6 +17,9 @@ import System.Directory
 import System.FilePath ((</>))
 import System.IO (hClose, IOMode (..), openBinaryFile)
 import System.IO.Temp (withSystemTempDirectory)
+import System.Exit (ExitCode (..))
+import System.Process
+  ( CreateProcess (..), StdStream (..), createProcess, proc, waitForProcess )
 import Test.Hspec
 
 import Seal.Tools.Exec.FileExplorer
@@ -687,6 +691,23 @@ spec = describe "Seal.Tools.Exec.FileExplorer" $ do
       recorded <- readIORef calls
       length recorded `shouldBe` 1
 
+    it "emits a portable BSD stat fallback (single -f format)" $ do
+      calls <- newIORef []
+      runner <- scriptedRunner calls [Right "12345 1700000000"]
+      fe <- mkRemoteFileExplorer sshCfg runner 1048576 1048576
+      _ <- feStatFile fe "/test/file.bin"
+      recorded <- readIORef calls
+      case recorded of
+        (cmd : _) -> do
+          -- GNU coreutils form first.
+          "stat -c '%s %Y' -- \"$p\"" `T.isInfixOf` cmd `shouldBe` True
+          -- BSD/macOS form: ONE -f format. `stat -f%z -f%m` is invalid on
+          -- BSD ("can't use format 'f' with 'f'") and exits 1, which broke
+          -- every remote inline image preview (it stats before reading).
+          "stat -f '%z %m' -- \"$p\"" `T.isInfixOf` cmd `shouldBe` True
+          "-f%z -f%m" `T.isInfixOf` cmd `shouldBe` False
+        [] -> expectationFailure "expected a recorded command"
+
   describe "feReadRange (remote)" $ do
     it "reads a chunk via dd through runRemoteStream" $ do
       calls <- newIORef []
@@ -706,6 +727,19 @@ spec = describe "Seal.Tools.Exec.FileExplorer" $ do
       r <- feReadRange fe "/test/big.bin" 0 100000
       case r of
         Right bs -> BS.length bs `shouldBe` 100000
+        Left e -> expectationFailure ("expected Right, got " <> show e)
+
+    it "drains the whole chunk when stdout arrives through a pipe" $ do
+      -- A pipe delivers at most one buffer's worth per read (~64 KiB), so a
+      -- single hGetSome returns a fraction of a 4 MiB dd block. The caller
+      -- must drain until the full block is in, or the image/download bytes
+      -- are silently corrupted.
+      let n = 4194304
+      runner <- streamingPipeRunner n
+      fe <- mkRemoteFileExplorer sshCfg runner 1048576 n
+      r <- feReadRange fe "/test/big.bin" 0 n
+      case r of
+        Right bs -> BS.length bs `shouldBe` n
         Left e -> expectationFailure ("expected Right, got " <> show e)
 
 -- ---------------------------------------------------------------------------
@@ -851,3 +885,30 @@ scriptedRunnerStream recRef canned0 = do
               pure (Right r)
     , runRemoteBytes = \_argv -> pure (Right (BS.empty, False))
     }
+
+-- | A 'RemoteRunner' whose stream arm spawns a real local process that
+-- writes @n@ bytes through a PIPE. Unlike 'scriptedRunnerStream' (a temp
+-- file, whose reads always fill the buffer), a pipe short-reads at its
+-- buffer size — this is what actually exercises the drain loop.
+streamingPipeRunner :: Int -> IO RemoteRunner
+streamingPipeRunner n = pure RemoteRunner
+  { runRemote = \_argv -> pure (Right "")
+  , runRemoteStdin = \_argv _stdin -> pure (Right "")
+  , runRemoteEnv = \_env _argv -> pure (Right "")
+  , runRemoteStream = \_argv action -> do
+      (_, mOut, _, ph) <-
+        createProcess (proc "sh" ["-c", "head -c " <> show n <> " /dev/zero"])
+          { std_in = NoStream, std_out = CreatePipe, std_err = NoStream }
+      case mOut of
+        Nothing -> pure (Left ExecRemoteUnreachable)
+        Just h -> do
+          r <- action h
+          -- Close first: an unread pipe would otherwise block the child
+          -- forever when the caller asks for fewer bytes than it writes.
+          hClose h
+          ec <- waitForProcess ph
+          pure $ case ec of
+            ExitSuccess -> Right r
+            ExitFailure _ -> Left ExecRemoteUnreachable
+  , runRemoteBytes = \_argv -> pure (Right (BS.empty, False))
+  }

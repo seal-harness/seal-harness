@@ -352,41 +352,78 @@ function CopySessionIdButton({ sessionId }: { sessionId: string }) {
   )
 }
 
-/** Open-workdir button for the chat header. Renders a small folder icon;
- *  clicking fetches the session's workdir path from the backend and
- *  navigates the SPA to the Files page opened to that path. Uses the same
- *  `header-scroll-btn` styling as the adjacent copy-session-id and
- *  scroll buttons. */
-function OpenWorkdirButton({ sessionId }: { sessionId: string }) {
-  const [loading, setLoading] = useState(false)
+/** The Files-page URL for a session workdir. The `path` parameter is what
+ *  FilesView reads on mount, so this is the whole address contract — kept in
+ *  one place so the link's href and any other caller agree on the encoding. */
+function workdirFilesUrl(path: string): string {
+  const params = new URLSearchParams()
+  params.set('path', path)
+  return `/files?${params.toString()}`
+}
+
+/** Open-workdir link for the chat header.
+ *
+ *  A real `<a target="_blank">` rather than a button that navigates the SPA:
+ *  the href is what makes the destination *visible* (hover shows the URL in
+ *  the browser's status bar, right-click offers "copy link address", and it
+ *  can be opened in a new tab). Keeping the transcript tab where it is also
+ *  means the user does not lose their place to go look at a directory.
+ *
+ *  Because the href has to exist before the user hovers, the workdir is
+ *  resolved eagerly on mount (and again whenever the selection changes) —
+ *  `<cache>/workdirs/<sid>` is fixed per session, so one resolve is enough.
+ *  Until it resolves, the anchor has no href: there is nothing truthful to
+ *  preview yet, and a click retries instead of opening a blank path. */
+function OpenWorkdirLink({ sessionId }: { sessionId: string }) {
+  const [path, setPath] = useState<string | null>(null)
   const [error, setError] = useState(false)
 
-  const onClick = async () => {
-    if (loading) return
-    setLoading(true)
+  useEffect(() => {
+    let cancelled = false
+    setPath(null)
     setError(false)
-    const path = await fetchSessionWorkdir(sessionId)
-    setLoading(false)
-    if (!path) {
+    void fetchSessionWorkdir(sessionId).then((resolved) => {
+      if (cancelled) return
+      if (resolved) setPath(resolved)
+      else setError(true)
+    })
+    return () => { cancelled = true }
+  }, [sessionId])
+
+  const onClick = async (ev: React.MouseEvent<HTMLAnchorElement>) => {
+    // With an href the browser's own link behaviour is exactly what we want
+    // (new tab, honouring the user's cmd/ctrl/middle-click preferences).
+    if (path) return
+    // Unresolved (still loading, or the fetch failed): retry rather than
+    // opening a link with no destination.
+    ev.preventDefault()
+    const resolved = await fetchSessionWorkdir(sessionId)
+    if (resolved) {
+      setPath(resolved)
+      setError(false)
+    } else {
       setError(true)
-      // Clear the error indicator after 1.5s (matches the copy feedback).
-      setTimeout(() => setError(false), 1500)
-      return
     }
-    // In-app navigation to the Files page with the workdir path as a
-    // query parameter. The FilesView reads `path` from the URL on mount
-    // and after popstate, so a pushState + popstate dispatch is enough.
-    const params = new URLSearchParams()
-    params.set('path', path)
-    window.history.pushState(null, '', `/files?${params.toString()}`)
-    window.dispatchEvent(new PopStateEvent('popstate'))
   }
 
+  const label = error
+    ? 'Could not resolve workdir'
+    : path
+      ? 'Open session workdir in Files'
+      : 'Resolving workdir'
   return (
-    <button
+    <a
       className="header-scroll-btn"
-      title={error ? 'Could not resolve workdir' : loading ? 'Resolving…' : 'Open session workdir in Files'}
-      aria-label={error ? 'Could not resolve workdir' : loading ? 'Resolving workdir' : 'Open session workdir in Files'}
+      href={path ? workdirFilesUrl(path) : undefined}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={error ? 'Could not resolve workdir' : path ? `Open ${path} in Files` : 'Resolving…'}
+      aria-label={label}
+      // No href ⇒ not a link and not focusable, so a keyboard user could not
+      // retry a failed resolve. Focusable + aria-disabled keeps the retry (and
+      // its Enter key) reachable while making the inert state explicit.
+      tabIndex={path ? undefined : 0}
+      aria-disabled={path ? undefined : true}
       onClick={onClick}
     >
       <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
@@ -394,7 +431,7 @@ function OpenWorkdirButton({ sessionId }: { sessionId: string }) {
         aria-hidden="true">
         <path d="M2 4.5 A1.5 1.5 0 0 1 3.5 3 H6 L7.5 4.5 H12.5 A1.5 1.5 0 0 1 14 6 V11.5 A1.5 1.5 0 0 1 12.5 13 H3.5 A1.5 1.5 0 0 1 2 11.5 Z" />
       </svg>
-    </button>
+    </a>
   )
 }
 
@@ -1406,7 +1443,7 @@ const ChatMessage = memo(function ChatMessage({
   onCancel,
 }: {
   message: Message
-  onBranch?: (entryId: string) => void
+  onBranch?: (convLen: number) => void
   sending?: boolean
   /** 'rendered' (default) formats the markdown; 'raw' shows the source. */
   markdownMode?: TranscriptViewMode
@@ -1505,9 +1542,9 @@ const ChatMessage = memo(function ChatMessage({
         {message.rawJson !== undefined && (
           <JsonButton kind="message" onClick={() => setJsonOpen(true)} />
         )}
-        {onBranch !== undefined && message.entryId !== undefined && (
+        {onBranch !== undefined && message.convLen !== undefined && (
           <BranchButton
-            onClick={() => onBranch(message.entryId!)}
+            onClick={() => onBranch(message.convLen!)}
             disabled={sending}
           />
         )}
@@ -1834,13 +1871,6 @@ export function tryParsePayload(p: TranscriptEntry['payload']): Record<string, u
   return null
 }
 
-/** The string length of a `payload` value — used for token estimation when
- *  the payload can't be parsed. Handles both the string and object shapes. */
-function payloadStrLen(p: TranscriptEntry['payload']): number {
-  if (typeof p === 'string') return p.length
-  try { return JSON.stringify(p).length } catch { return 0 }
-}
-
 export function extractTextFromContent(content: Array<{ type: string; text?: string }> | undefined): string | null {
   if (!content) return null
   const texts = content
@@ -2013,6 +2043,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           messages.push({
             id: e.id + '-skillload',
             entryId: e.id,
+            convLen: e.convLen ?? undefined,
             agentName: channel ? `Skill · ${channel}` : 'Skill',
             agentStatus: 'completed',
             timestamp: ts,
@@ -2057,6 +2088,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
           messages.push({
             id: e.id + '-setuprepo',
             entryId: e.id,
+            convLen: e.convLen ?? undefined,
             agentName: channel ? `Repo · ${channel}` : 'Repo',
             agentStatus: status === 'failed' ? 'idle' : 'completed',
             timestamp: ts,
@@ -2137,6 +2169,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
               messages.push({
                 id: e.id + '-user',
                 entryId: e.id,
+                convLen: e.convLen ?? undefined,
                 // Surface the originating channel (e.g. "telegram", "web")
                 // in the source label so the user can tell where a message
                 // came from. The channel is stamped into the request
@@ -2162,6 +2195,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
               messages.push({
                 id: e.id + '-asst',
                 entryId: e.id,
+                convLen: e.convLen ?? undefined,
                 agentName: e.model ?? 'Assistant',
                 agentStatus: 'completed',
                 timestamp: ts,
@@ -2218,6 +2252,7 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
         messages.push({
           id: e.id,
           entryId: e.id,
+          convLen: e.convLen ?? undefined,
           agentName: e.model ?? e.harness ?? 'Assistant',
           agentStatus: 'completed',
           timestamp: ts,
@@ -2243,62 +2278,6 @@ export function transcriptToMessages(entries: TranscriptEntry[]): Message[] {
 
   done({ count: entries.length })
   return messages
-}
-
-// ── Session stats (tokens used / context window) ──────────────────────────
-
-/** Compute the tokensUsed stat from the transcript. Prefers real usage
- *  numbers from response payloads (last input_tokens + cumulative
- *  output_tokens); falls back to a ~4-char-per-token estimate from payload
- *  text when the backend doesn't emit usage. The contextWindow denominator
- *  is fetched separately via `fetchModelContext` (the `useModelContext`
- *  effect inside ChatArea); this helper returns 0 for contextWindow so the
- *  caller can layer in the fetched value. */
-export function computeTokensUsed(entries: TranscriptEntry[]): number {
-  let hasRealUsage = false
-  let lastInputTokens = 0
-  let totalOutputTokens = 0
-  let estimatedTokens = 0
-
-  for (const e of entries) {
-    const parsed = tryParsePayload(e.payload)
-    if (!parsed) {
-      estimatedTokens += Math.ceil(payloadStrLen(e.payload) / 4)
-      continue
-    }
-    if (e.direction === 'response') {
-      const usage = parsed.usage as { input_tokens?: number; output_tokens?: number } | undefined
-      if (usage && (usage.input_tokens != null || usage.output_tokens != null)) {
-        hasRealUsage = true
-        lastInputTokens = usage.input_tokens ?? lastInputTokens
-        totalOutputTokens += usage.output_tokens ?? 0
-      } else {
-        const content = parsed.content as Array<{ type: string; text?: string }> | undefined
-        if (content) {
-          for (const block of content) {
-            if (block.type === 'text' && block.text) {
-              estimatedTokens += Math.ceil(block.text.length / 4)
-            }
-          }
-        }
-      }
-    }
-  }
-
-  if (hasRealUsage) {
-    return lastInputTokens + totalOutputTokens
-  }
-
-  // Fallback: estimate from the last request's payload size (~4 chars/token)
-  // plus accumulated response text estimates.
-  let lastRequestTextLen = 0
-  for (let i = entries.length - 1; i >= 0; i--) {
-    if (entries[i]!.direction === 'request') {
-      lastRequestTextLen = payloadStrLen(entries[i]!.payload)
-      break
-    }
-  }
-  return Math.ceil(lastRequestTextLen / 4) + estimatedTokens
 }
 
 /** Synthesize `PendingQuestion` objects from the transcript for ASK_HUMAN
@@ -2485,11 +2464,11 @@ export function ChatArea({
    *  the user can type into the new session immediately without an
    *  extra click. */
   selectedId?: string | null
-  /** When defined, each transcript row that carries an `entryId` renders a
-   *  branch button wired to `onBranch(entryId)`. Supplied by App only for
+  /** When defined, each transcript row that carries a `convLen` renders a
+   *  branch button wired to `onBranch(convLen)`. Supplied by App only for
    *  persisted provider sessions; undefined for harness sessions and in
    *  compose mode, which suppresses the button entirely. */
-  onBranch?: (entryId: string) => void
+  onBranch?: (convLen: number) => void
   /** Read-only transcript prefix rendered ABOVE the composer panel in a
    *  branch-draft compose flow. These rows carry no `onBranch` so they
    *  render no branch button and offer no send affordance — the only send
@@ -2962,7 +2941,7 @@ export function ChatArea({
            {isThinking && onStop && <StopButton onStop={onStop} />}
             <TranscriptViewToggle mode={markdownMode} onChange={changeMarkdownMode} />
            {selectedSession && <CopySessionIdButton sessionId={selectedSession.id} />}
-           {selectedSession && <OpenWorkdirButton sessionId={selectedSession.id} />}
+           {selectedSession && <OpenWorkdirLink sessionId={selectedSession.id} />}
             <button
               className="header-scroll-btn"
               title={loadingMore ? "Loading…" : "Scroll to top of transcript"}
@@ -3010,7 +2989,7 @@ export function ChatArea({
         {selectedSession && messages.length === 0 && (
           <div className="ml-auto flex items-center gap-1 shrink-0">
             <CopySessionIdButton sessionId={selectedSession.id} />
-            <OpenWorkdirButton sessionId={selectedSession.id} />
+            <OpenWorkdirLink sessionId={selectedSession.id} />
           </div>
         )}
       </div>

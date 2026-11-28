@@ -60,6 +60,12 @@ export interface SessionInfo {
    *  or no user message. Used by the sidebar to sort the Active Tabs list
    *  (newest last-user-message first within each status bucket). */
   lastUserMessageAt: string | null
+  /** Context occupancy of the most recent completed response (the provider's
+   *  reported `input + output` tokens), derived server-side from the whole
+   *  session's `entries.jsonl`. Null when no response has reported usage.
+   *  Optional so the SPA still works against an older server that omits the
+   *  field; `undefined` reads as "unknown" (rendered as 0). */
+  tokensUsed?: number | null
   /** Whether the harness injects its own front matter (static guidance
    *  blocks, the auto-loaded `seal-usage` skill, the codegraph skill, and
    *  the available-skills / available-agents catalogs) into the session's
@@ -543,6 +549,10 @@ export interface TranscriptEntry {
   payload: Record<string, unknown> | string
   harness: string | null
   model: string | null
+  /** The conversation length AFTER this entry's messages — the branch
+   *  anchor, rendered onto the derived `Message`. Null on legacy
+   *  `transcript.jsonl` rows, which carry no trustworthy position. */
+  convLen?: number | null
   /** The originating communications-channel label of this entry (e.g.
    *  "telegram", "web", "cli"), or null when the entry carries no channel
    *  (response entries, CLI TUI turns with no MessageSource, the
@@ -607,6 +617,30 @@ export interface FileContent {
   truncated: boolean
   linesRead: number
   isBinary: boolean
+}
+
+/** Image extensions the file explorer previews inline. Mirrors the backend
+ *  allowlist in `Seal.Gateway.MediaType`; the two must not drift, or the
+ *  viewer shows a broken image for a path the backend will not serve as an
+ *  image.
+ *
+ *  `.svg` IS included. SVG is scriptable, but the preview renders it through
+ *  an `<img>`, where browsers never execute SVG script or load its
+ *  subresources. The remaining risk — the file is also reachable as a
+ *  document at its own URL — is closed server-side by the hardening CSP that
+ *  the backend attaches to every inline SVG response, not here. */
+const INLINE_IMAGE_EXTENSIONS = [
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.bmp', '.ico', '.svg',
+] as const
+
+/** True when `path` names a file the backend will serve as an inline image.
+ *  Judged on the final extension, case-insensitively, and never when the
+ *  whole filename is the suffix (a `.png` dotfile is not an image). */
+export function isPreviewableImage(path: string): boolean {
+  const base = path.slice(path.lastIndexOf('/') + 1)
+  const dot = base.lastIndexOf('.')
+  if (dot <= 0) return false
+  return (INLINE_IMAGE_EXTENSIONS as readonly string[]).includes(base.slice(dot).toLowerCase())
 }
 
 /** The result of `GET /api/files/stat?path=<file>`. Mirrors the backend's
@@ -676,6 +710,14 @@ export interface Message {
    *  on branchable rows (user + assistant); absent on synthesized rows
    *  (e.g. the System prompt row). Used as the branch boundary key. */
   entryId?: string
+  /** The conversation length AFTER this row — the branch anchor. The
+   *  backend copies this many `conversation.jsonl` lines into a branched
+   *  session. Undefined means "no anchor": the row cannot be branched from
+   *  (legacy `transcript.jsonl` rows, and synthesized rows that have no
+   *  conversation position). The branch button is gated on this field
+   *  rather than `entryId`, because `entryId` is a render index while this
+   *  is a real position in the conversation file. */
+  convLen?: number
   agentName: string
   agentStatus: AgentStatus
   timestamp: string

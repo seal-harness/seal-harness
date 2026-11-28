@@ -101,7 +101,7 @@ export function mapDiscoverableWindow(wire: DiscoverableWindowWire): Discoverabl
   }
 }
 
-async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T | null> {
+export async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T | null> {
   try {
     const res = await fetch(url, signal ? { signal } : undefined)
     if (!res.ok) return null
@@ -1024,6 +1024,9 @@ export interface CreateTabBody {
   model?: string
   agent?: string
   branch_from?: string
+  /** Conversation length to inherit from `branch_from` (a parent SESSION
+   *  id). Sent only alongside `branch_from`. */
+  branch_conv_len?: number
   harness_id?: string
 }
 
