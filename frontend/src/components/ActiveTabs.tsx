@@ -185,12 +185,17 @@ const statusLabel: Record<TabStatus, string> = {
 /** Glyph + human label for the 3-state LLM-thinking indicator overlaid on
  *  live (non-dead) tabs. Distinct from the harness-liveness `tab.status`. */
 const kindIcon: Record<TabStatusKind, { char: string; color: string }> = {
+  'failed':      { char: '!', color: 'var(--danger, #e5534b)' },
   'thinking':    { char: '●', color: 'var(--accent-primary)' },
   'idle-unread': { char: '●', color: 'var(--accent-secondary)' },
   'idle-read':   { char: '○', color: 'var(--text-muted)' },
 }
 
 const kindLabel: Record<TabStatusKind, string> = {
+  // This label feeds aria-label on the tab strip -- it is the ONLY surface
+  // that exists for the not-focused case, i.e. exactly the case the
+  // requirement cares about.
+  'failed':      'Turn failed',
   'thinking':    'Thinking',
   'idle-unread': 'Idle Unread',
   'idle-read':   'Idle Read',

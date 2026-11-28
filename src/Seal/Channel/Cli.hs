@@ -349,7 +349,10 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
                   TurnEngine.buildStartWiring td sessionBackends sid appEnv' eCfg' opCeiling "cli"
               }
         outcome <- runSessionTurn td adapter meta Nothing t
-        for_ (toError outcome) (ccSend caps)
+        -- Requirement 5: the failure reads the same here as in the web
+        -- transcript (headline + cause + reference), and says so -- the
+        -- live path previously sent the message bare, with no prefix.
+        for_ (toError outcome) (\msg -> ccSend caps ("turn failed: " <> msg))
   runInputT hlSettings (loop caps plainHandler tabsH registryWithBg)
   where
     loop :: ChannelCaps -> (Text -> IO ()) -> TabsHandle -> Registry -> InputT IO ()

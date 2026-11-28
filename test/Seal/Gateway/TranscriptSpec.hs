@@ -21,7 +21,7 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BC
 import Data.ByteString.Lazy qualified as BL
 import Data.Map.Strict qualified as Map
-import Data.Maybe (mapMaybe)
+import Data.Maybe (isJust, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
@@ -107,6 +107,22 @@ setupRepoPayload = object
   , "result"   .= object ["status" .= String "cloned", "target" .= String "/path/to/workdir"]
   ]
 
+-- | The payload 'Seal.Transcript.Reconstruct.harnessPayload' produces for a
+-- turn-failure entry: a @failure@ object, with @harness@ = Just "turn-failure"
+-- and no @op@ key. Deliberately has no @op@ and no @approval@, because those
+-- are the two keys the filter normally lets through.
+turnFailurePayload :: Value
+turnFailurePayload = object
+  [ "messages" .= ([] :: [Value])
+  , "harness"  .= String "turn-failure"
+  , "op"       .= Null
+  , "failure"  .= object
+      [ "headline" .= String "invalid UTF-8 in tool output"
+      , "cause"    .= String "unicode"
+      , "ref"      .= String "1a2b3c4d"
+      ]
+  ]
+
 -- | A SHELL_EXEC harness payload (no approval key, op not whitelisted).
 -- Should be dropped by reconEntryToFrontend.
 shellExecPayload :: Value
@@ -166,6 +182,35 @@ spec = describe "Seal.Gateway.Transcript.reconEntryToFrontend" $ do
   -- serialize TranscriptEntry), so adding the field to the record alone
   -- leaves it off the wire: the branch button then renders nowhere, and
   -- the failure is invisible to tests that only inspect TranscriptEntry.
+  -- Turn-failure entries must survive FOUR gates before they reach the UI
+  -- (design §3.2). This test exists because each gate can silently swallow
+  -- the entry, and a test that only checks one of them passes while the row
+  -- renders blank:
+  --   1. 'harnessPayload' must project @failure@ out of erMeta
+  --   2. 'reconEntryToFrontend' must not filter it out (no @op@ key)
+  --   3. the frontend keys on @payload.failure@, NOT on @harness@ (which
+  --      'reconEntryToFrontend' hardcodes to null)
+  --   4. 'rewritePayload' must pass @failure@ through
+  describe "turn-failure entry survives all four wire gates" $ do
+    it "surfaces with its failure payload intact" $ do
+      let te = mkHarnessTe turnFailurePayload
+      case reconEntryToFrontend 0 te of
+        Nothing -> expectationFailure
+          "turn-failure entry was dropped -- gate 2 (the harness filter) is closed"
+        Just v -> do
+          -- gate 4: the payload must still carry `failure` after rewriting
+          let payload = getTopField "payload" v
+          payload `shouldSatisfy` \case
+            Just (Object o) -> KeyMap.member (Key.fromText "failure") o
+            _               -> False
+          -- gate 3: recognition must not depend on `harness`, which is null
+          getTopField "harness" v `shouldBe` Just Null
+
+    it "is NOT dropped even though it has no op key and no approval" $ do
+      -- the exact shape that the filter used to drop
+      let te = mkHarnessTe turnFailurePayload
+      reconEntryToFrontend 0 te `shouldSatisfy` isJust
+
   describe "branch anchor (convLen) on the wire" $ do
     it "reconEntryToFrontend emits convLen from teConvLen" $ do
       let te = (mkHarnessTe skillLoadPayload) { teConvLen = Just 7 }

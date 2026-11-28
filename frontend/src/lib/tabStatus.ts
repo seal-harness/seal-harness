@@ -49,13 +49,20 @@ export function formatAge(isoDate: string | null | undefined): string {
   return `${days}d`
 }
 
-export type TabStatusKind = 'thinking' | 'idle-unread' | 'idle-read'
+// A fourth state exists so a failed turn is visible from the sidebar when
+// the tab is NOT focused -- the case the requirement singles out. A failed
+// turn that only showed in the transcript would be invisible to a user
+// watching a different tab.
+export type TabStatusKind = 'thinking' | 'failed' | 'idle-unread' | 'idle-read'
 
-/** The display order of the three buckets in the Active Tabs list. */
+/** The display order of the buckets in the Active Tabs list. A failed turn
+ *  sorts first: it is the most urgent thing to surface, ahead of merely-new
+ *  text. */
 const BUCKET_ORDER: Record<TabStatusKind, number> = {
-  'idle-unread': 0,
-  'idle-read': 1,
-  'thinking': 2,
+  failed: 0,
+  'idle-unread': 1,
+  'idle-read': 2,
+  'thinking': 3,
 }
 
 /** Derive the 3-state tab status from the activity state. `activity` is
@@ -65,6 +72,10 @@ export function deriveTabStatusKind(
   activity: SessionActivityState | undefined,
 ): TabStatusKind {
   if (activity?.harness === 'thinking') return 'thinking'
+  // A failed turn outranks unread: the user needs to know the turn died, not
+  // that there is new text. Cleared by the same rules as unread (focus, or a
+  // subsequent successful turn), so it does not become permanent.
+  if (activity?.failed) return 'failed'
   // Idle Unread requires evidence of an unseen assistant entry: a last
   // entry timestamp strictly newer than the seen timestamp. Without
   // activity, or without a lastEntryAt, default to Idle Read.

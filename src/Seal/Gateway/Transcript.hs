@@ -728,6 +728,11 @@ reconEntryToFrontend idx te =
     -- surrounding user/assistant bubbles).
     A.Object o
       | KeyMap.member (Key.fromText "harness") o,
+        -- GATE 2 of 4: turn-failure entries always surface. They carry no
+        -- @op@ key, so 'isUserSurfacingOp' would drop them before the UI
+        -- ever sees them. Keyed on @failure@ (the payload field) rather than
+        -- @harness@, because gate 3 hardcodes @harness@ to null below.
+        not (KeyMap.member (Key.fromText "failure") o),
         not (KeyMap.member (Key.fromText "approval") o),
         not (isUserSurfacingOp o) -> Nothing
     payloadVal -> Just $
@@ -860,6 +865,10 @@ rewritePayload preserveSchemas val dir =
                <> passthrough (k "toolChoice")
                <> passthrough (k "maxTokens")
                <> passthrough (k "approval")
+               -- GATE 4 of 4: pass the failure payload through. Without
+               -- this the entry survives the filter and arrives with an
+               -- empty payload -- the row renders, but blank.
+               <> passthrough (k "failure")
                <> passthrough (k "op")
                -- Harness/opcode-invocation entries (EKHarness) carry the
                -- opcode's input + result under these keys (see

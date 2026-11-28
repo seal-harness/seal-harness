@@ -65,9 +65,26 @@ export function applyActivity(
           harness: event.status,
           unread: prev.unread + 1,
           lastEntryAt: now,
+          // A turn that reached idle successfully clears any earlier failure
+          // marker, so the sidebar state self-heals rather than sticking.
+          failed: false,
+          failedRef: undefined,
         }
       } else {
         next = { ...clearedToolCall, harness: event.status }
+      }
+      break
+    case 'turn-error':
+      // A failed turn. Record it so the sidebar can surface a session the
+      // user is NOT looking at -- without this the failure would only be
+      // visible in the transcript, i.e. only to someone already watching.
+      //
+      // The `switch` has a `default: return current` arm, so an unhandled
+      // kind silently no-ops; that is why this arm exists explicitly.
+      next = {
+        ...prev,
+        failed: true,
+        failedRef: typeof event.ref === 'string' ? event.ref : undefined,
       }
       break
     case 'tool-call':

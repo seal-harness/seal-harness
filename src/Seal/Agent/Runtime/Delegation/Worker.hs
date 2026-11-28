@@ -25,8 +25,10 @@ module Seal.Agent.Runtime.Delegation.Worker
   , resolveExitReason
   ) where
 
+import Control.Exception (SomeException, catch)
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (object, (.=))
+import Data.Aeson (Value (..), object, toJSON, (.=))
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Set qualified as Set
@@ -51,9 +53,9 @@ import Seal.Agent.Runtime.Delegation
 import Seal.Channel.Caps (ChannelCaps (..))
 import Data.Default (def)
 import Seal.Config.Paths (SealPaths, agentSessionDir, sessionDir)
-import Seal.Core.Types (ModelId (..), OpName (..), SessionId)
+import Seal.Core.Types (ModelId (..), OpName (..), SessionId, sessionIdText)
 import Seal.Handles.AskReply (ApprovalCache)
-import Seal.Handles.Transcript (IndexedTranscriptHandle, withIndexedTranscript)
+import Seal.Handles.Transcript (IndexedTranscriptHandle (..), IndexedTranscriptWrite (..), withIndexedTranscript)
 import Seal.ISA.Dispatch (dispatch, recordSetupRepoResult)
 import Seal.ISA.Opcode (localBackend)
 import Seal.ISA.Ops.Repo (setupRepoOp)
@@ -62,6 +64,10 @@ import Seal.ISA.RepeatDetect (RepeatTrack)
 import Seal.Logging.Global (globalLogIO)
 import Seal.Providers.Class (SomeProvider)
 import Seal.Security.Policy (AllowList (..), AutonomyLevel)
+import Seal.Harness.Id (harnessIdToText, newHarnessId)
+import Seal.Session.Log (appendSessionLog)
+import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
+import Seal.Transcript.TurnFailure (classify, renderForLog, renderForModel, tfHeadline, tfRef)
 import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
 import Seal.Session.Store (saveChildSessionMeta, saveSessionMeta)
 import Seal.SourceControl.Clone (CloneDeps)
@@ -380,8 +386,9 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
                , aeRepeatTrack = childRepeatTrack
                , aeToolTimeout = dwdToolTimeout deps
               }
-        catchChildSync (runApp (dwdAppEnv deps) (runTurn env (ctGoal task))) $ \_ ->
+        catchChildSync (runApp (dwdAppEnv deps) (runTurn env (ctGoal task))) $ \e -> do
           writeIORef terminalReasonRef (Just CerError)
+          reportChildFailure childTHandle childSid e
         summary <- readIORef summaryRef
         fanoutDone <- readIORef stopFanoutDoneRef
         terminalReason <- readIORef terminalReasonRef
@@ -578,3 +585,37 @@ writeHandoffMeta deps childSid agentDef taskRepo = do
     , smLastActive = now
     }
   pure repo
+
+-- | Record a crashed child worker's failure on its own transcript and log.
+--
+-- Deliberately minimal: the child has no 'TurnDeps' here, so this writes the
+-- durable entry and the operator-log line itself rather than going through
+-- 'Seal.Core.TurnEngine.reportTurnFailure'. Every step is best-effort --
+-- reporting a failure must never take the worker down with it.
+reportChildFailure
+  :: IndexedTranscriptHandle -> SessionId -> SomeException -> IO ()
+reportChildFailure childHandle childSid e = do
+  let failure = classify Nothing e "<worker>"
+  (do now <- getCurrentTime
+      hid <- newHarnessId
+      prior <- itwReadConversation childHandle
+      let entry = EntryRecord
+            { erId = harnessIdToText hid
+            , erTimestamp = now
+            , erKind = EKHarness
+            , erConvLen = 1
+            , erEnvelope = Nothing
+            , erUsage = Nothing
+            , erStop = Nothing
+            , erDurationMs = Nothing
+            , erHarness = Just "turn-failure"
+            , erCorrelation = Just (tfRef failure)
+            , erMeta = Map.fromList
+                [ ("headline", String (tfHeadline failure))
+                , ("failure", toJSON failure) ]
+            }
+      itwRecordAndAck childHandle
+        (IndexedTranscriptWrite (prior <> [renderForModel failure]) entry))
+    `catch` \(_ :: SomeException) -> pure ()
+  appendSessionLog Nothing "ERROR" (renderForLog failure <> "; child=" <> sessionIdText childSid)
+

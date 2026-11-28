@@ -100,6 +100,43 @@ function processEntry(e: TranscriptEntry, ctx: ProcessContext): Message[] {
   if (e.direction === 'request') {
     const parsed = tryParsePayload(e.payload)
     if (parsed) {
+      // Turn-failure entry (backend: Seal.Transcript.TurnFailure, written by
+      // reportTurnFailure). Rendered as its own message kind so it is visually
+      // distinct from assistant text and from tool results.
+      //
+      // Recognition keys on `payload.failure`, NOT on `harness`: the gateway
+      // hardcodes `harness` to null for reconstructed entries, and the
+      // backend already uses `harness` as an agent-label fallback.
+      //
+      // No `role="alert"` on this row: transcript rows render through
+      // useVirtualWindow, which unmounts and remounts them while scrolling,
+      // so a live region here would re-announce the failure on every pass.
+      // The live banner owns role="alert"; this durable entry is static text.
+      const failure = parsed.failure as
+        { headline?: string; cause?: string; ref?: string } | undefined
+      if (failure) {
+        const headline = typeof failure.headline === 'string' ? failure.headline : 'the turn failed'
+        const ref = typeof failure.ref === 'string' ? failure.ref : ''
+        // An unrecognised cause is rendered raw rather than dropped, so an
+        // older client against a newer server still shows something.
+        const cause = typeof failure.cause === 'string' ? renderCauseLabel(failure.cause) : ''
+        messages.push({
+          id: e.id + '-turn-failure',
+          entryId: e.id,
+          convLen: e.convLen ?? undefined,
+          agentName: 'Turn failed',
+          agentStatus: 'idle',
+          timestamp: ts,
+          kind: 'turn-failure',
+          blocks: [{
+            id: 'failure-' + e.id,
+            text: `\u26a0 Turn failed \u2014 ${headline}`,
+          }],
+          turnFailure: { headline, cause, ref },
+          rawJson,
+        })
+        return messages
+      }
       const opName = (parsed.op as { name?: string } | undefined)?.name
       const isSkillLoad = opName === 'SKILL_LOAD' || (opName === 'SKILL_MANAGE' && (parsed.input as { action?: string } | undefined)?.action === 'load')
       if (isSkillLoad && parsed.result) {
@@ -587,6 +624,24 @@ function getGlobalRendererCache(): RendererCache {
  *  its per-entry message cache intact — only new entries (arrived via WS
  *  since the last visit) need processing. The cache holds up to
  *  MAX_CACHED_RENDERERS sessions (LRU eviction). */
+/**
+ * The user-facing cause line for a failure entry.
+ *
+ * Mirrors the backend's `renderCause` (Seal.Transcript.TurnFailure). The wire
+ * carries a closed kebab-case vocabulary; an unknown value is returned as-is
+ * so a newer server's cause still displays against an older client.
+ */
+function renderCauseLabel(cause: string): string {
+  switch (cause) {
+    case 'unicode': return 'UnicodeException'
+    case 'no-space': return 'resource exhausted (No space left on device)'
+    case 'too-many-files': return 'resource exhausted (Too many open files)'
+    case 'transcript-dead': return 'session transcript unavailable'
+    case 'provider-unresolved': return 'model provider could not be resolved'
+    default: return cause.startsWith('other:') ? cause.slice('other:'.length) : cause
+  }
+}
+
 export function useTranscriptMessages(
   entries: TranscriptEntry[],
   sessionId: string | null,
