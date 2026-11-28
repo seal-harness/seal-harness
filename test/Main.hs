@@ -265,6 +265,7 @@ specs = do
   Seal.Gateway.EntryCursorSpec.spec
   Seal.Gateway.PatIngestionSpec.spec
   Seal.Gateway.SendSpec.spec
+  Seal.Gateway.SendSpec.turnFailureSpec
   Seal.Gateway.ServerSpec.spec
   Seal.Gateway.StreamBrokerSpec.spec
   Seal.Gateway.StreamSpec.spec

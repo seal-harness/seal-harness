@@ -905,6 +905,12 @@ recordFailure :: IndexedTranscriptHandle -> TurnFailure -> IO ()
 recordFailure tHandle failure = do
   now <- getCurrentTime
   hid <- newHarnessId
+  -- Pass the FULL conversation plus the new line, not just the new line.
+  -- 'writeOne' slices positionally: @take erConvLen (drop writtenLen msgs)@.
+  -- With only the new message, @drop writtenLen@ empties the list and nothing
+  -- is appended. 'recordHandoff' passes @prior <> completions@ for the same
+  -- reason.
+  prior <- itwReadConversation tHandle
   let entry = EntryRecord
         { erId = harnessIdToText hid
         , erTimestamp = now
@@ -922,7 +928,7 @@ recordFailure tHandle failure = do
             , ("failure", toJSON failure)
             ]
         }
-  itwRecordAndAck tHandle (IndexedTranscriptWrite [renderForModel failure] entry)
+  itwRecordAndAck tHandle (IndexedTranscriptWrite (prior <> [renderForModel failure]) entry)
 
 -- | Record a completed sub-agent's message as a durable handoff.
 --
@@ -1092,7 +1098,7 @@ fanoutLastReply replies mBroker paths sid = do
 -- The text is headline + reference only (see 'renderForChat'): this is the one
 -- surface that leaves the machine, so it carries the least detail.
 fanoutFailure :: ReplyRegistry -> SessionId -> Text -> IO ()
-fanoutFailure replies sid txt = replyFanout replies sid txt
+fanoutFailure = replyFanout
 
 -- | Extract the concatenated text content of the last 'Assistant' message.
 lastAssistantText :: [Message] -> Maybe Text
