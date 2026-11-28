@@ -2,6 +2,65 @@
 
 ## 0.1.0.0 — unreleased
 
+* **Untrusted tool calls can now run on several named machines.** A new
+  `~/.seal/machines.toml` declares execution machines by name, and a session
+  picks one. Every untrusted opcode (`SHELL_EXEC`, `BIN_EXEC`, `FILE_READ`,
+  `FILE_WRITE`, `FILE_PATCH`, `SEARCH_FILES`, `PROCESS_MANAGE`, `SETUP_REPO`)
+  accepts an optional `machine` argument, so one session can act on more than
+  one operating system.
+
+  The machine is chosen per call and is **not sticky**: a call that omits
+  `machine` uses the session's machine every time, never the last one named. An
+  unknown or unusable name is a tool error listing the valid choices, and it runs
+  nothing anywhere — there is no fallback to another machine, and none to
+  `local`.
+
+  `local` is implicit (never declared in the file) and selectable only when
+  `security.toml` sets `allow_localhost = true`, which is the default. A "remote"
+  machine may not be this machine: a loopback host is rejected at config load,
+  and a machine presenting the harness's own SSH host key is refused at connect.
+
+  Host keys are pinned in one harness-owned file, `~/.seal/exec-known-hosts`,
+  which Seal populates itself. The first connection to a machine shows its
+  fingerprint and asks you to confirm; a **changed** key is refused outright and
+  is never offered for re-adoption. Where no human is present (chat channels,
+  unattended runs) an unknown key is refused rather than adopted.
+
+  `seal` now has `/machine list`, showing the selectable machines, the default,
+  and any configured-but-unusable machine with the reason. The machine also
+  appears on the TUI tab line, the TUI session list, the startup banner, and the
+  web sidebar.
+
+  **Configuration schema change — `mode` is gone.** `~/.seal/security.toml`
+  loses `[untrusted_execution] mode` and gains `allow_localhost` (default
+  `true`). `mode = "remote"` becomes `allow_localhost = false`; an absent or
+  `mode = "local"` section becomes `allow_localhost = true`. The existing
+  `[untrusted_execution.remote]` table is migrated into `machines.toml` as a
+  machine named `default`, its `known_hosts` value is dropped, and the old block
+  is removed from `security.toml` once the new copy is written. An install with
+  none of these files keeps working exactly as it does today.
+
+  > **Downgrade warning.** The migration REMOVES `[untrusted_execution] mode`
+  > from `security.toml`. Rolling the binary back afterwards leaves no such
+  > section, and the older codec's default is `mode = "local"` — so a downgraded
+  > install silently reverts to running untrusted code on the harness machine
+  > even if you had configured a remote one. **Before downgrading, re-add the
+  > section by hand:**
+  >
+  > ```toml
+  > [untrusted_execution]
+  > mode = "remote"
+  > ```
+  >
+  > …with your remote coordinates back under `[untrusted_execution.remote]`.
+  > This is not mitigated in code: retaining `mode` alongside `allow_localhost`
+  > would mean two sources of truth for one security decision, which is the
+  > failure this change exists to remove.
+
+  The `-f remote-only-untrusted` build (no local executor in the artifact) now
+  requires `allow_localhost = false` and **refuses to start otherwise**, in both
+  boot paths. That refusal previously had no call site at all.
+
 * **"Branch session from here" now inherits history.** The button opened the
   new-tab composer with a branch field filled in, then produced a session with
   none of the parent's transcript. Two independent faults: the gateway had no
