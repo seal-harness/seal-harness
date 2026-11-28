@@ -221,6 +221,34 @@ You can either download a pre-built binary or build from source:
 
 #### Download a pre-built binary (no Nix required)
 
+**Recommended — the install script.** It detects your platform, verifies the
+download against the published SHA256, installs the whole `bin/` tree, and
+puts `seal` on your `PATH`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/seal-harness/seal-harness/main/scripts/install.sh | bash
+```
+
+The install lands in `~/.local/share/seal/` with a symlink at
+`~/.local/bin/seal`. Options:
+
+```bash
+... | bash -s -- --version 0.1.0     # a specific release instead of latest
+... | bash -s -- --no-modify-path    # don't touch shell config; print the line
+```
+
+Override locations with `XDG_DATA_HOME` / `XDG_BIN_HOME` (or
+`SEAL_INSTALL_ROOT` for the tree alone).
+
+**Why `curl` and not a browser download?** `curl` does not set the
+`com.apple.quarantine` attribute, so on macOS the installed binary runs
+without a Gatekeeper prompt even though it is not yet signed with an Apple
+Developer ID. A browser download *is* quarantined — see the Gatekeeper note
+below for that case.
+
+**Manual install.** If you would rather manage it yourself, the tarball is
+the same artifact the script installs:
+
 Pre-built binaries are available on the
 [Releases page](https://github.com/seal-harness/seal-harness/releases).
 
@@ -258,9 +286,13 @@ embeds no `/nix/store` paths, so it runs on any recent x86_64 Linux without Nix.
 `scripts/check-portability.sh` enforces this in CI: a dynamically linked Linux
 artifact, or one carrying an embedded store path, fails the build.
 
-**macOS Gatekeeper.** Release binaries are not yet signed with an Apple
-Developer ID, so a freshly downloaded `seal` is quarantined and macOS reports
-"Apple could not verify…". Clear the flag once:
+**macOS Gatekeeper.** Release binaries are not signed with an Apple Developer
+ID yet. That only matters for a **browser** download: browsers set the
+`com.apple.quarantine` attribute, and macOS then reports "Apple could not
+verify…". Installs done with `curl` (both the script above and the manual
+`tar` commands) never get that attribute and run immediately.
+
+If you did download through a browser, clear the flag once:
 
 ```bash
 xattr -dr com.apple.quarantine bin/
