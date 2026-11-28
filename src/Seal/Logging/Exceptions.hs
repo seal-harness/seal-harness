@@ -80,7 +80,7 @@ mkCorrelationId = do
 sanitizeException :: Text -> SomeException -> Text -> (Text, Text)
 sanitizeException whereLabel e correlationId =
   case (fromException e :: Maybe TranscriptError) of
-    Just (TranscriptError te) ->
+    Just (TranscriptError te _) ->
       ("transcript error: " <> te, "transcript error: " <> te <> " (" <> whereLabel <> ")")
     Nothing ->
       ( "internal error (" <> whereLabel <> ") [ref: " <> correlationId <> "]"

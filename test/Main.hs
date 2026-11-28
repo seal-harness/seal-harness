@@ -138,6 +138,7 @@ import qualified Seal.Transcript.ConvSpec
 import qualified Seal.Transcript.ConvIndexSpec
 import qualified Seal.Transcript.EntriesSpec
 import qualified Seal.Transcript.OriginSpec
+import qualified Seal.Transcript.TurnFailureSpec
 import qualified Seal.Transcript.ReconstructSpec
 import qualified Seal.Handles.AskReplySpec
 import qualified Seal.Handles.ChannelSpec
@@ -372,6 +373,7 @@ specs = do
   Seal.Transcript.ConvIndexSpec.spec
   Seal.Transcript.EntriesSpec.spec
   Seal.Transcript.OriginSpec.spec
+  Seal.Transcript.TurnFailureSpec.spec
   Seal.Transcript.ReconstructSpec.spec
   Seal.Handles.AskReplySpec.spec
   Seal.Handles.ChannelSpec.spec

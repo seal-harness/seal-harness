@@ -48,7 +48,7 @@ import Control.Concurrent.STM
   ( TMVar, atomically, newEmptyTMVarIO, newTQueueIO, newTVarIO
   , modifyTVar', orElse, putTMVar, readTQueue, readTVar, readTVarIO, retry
   , takeTMVar, tryPutTMVar, tryReadTQueue, writeTQueue, writeTVar )
-import Control.Exception (bracket, catch, Exception, IOException, SomeException, throwIO)
+import Control.Exception (bracket, catch, IOException, SomeException, throwIO)
 import Control.Monad (void, foldM, unless, when)
 import Data.Aeson (decode)
 import Data.ByteString qualified as BS
@@ -84,6 +84,7 @@ import Seal.Transcript.ConvIndex (buildIndex, writeIdxEntry)
 import Seal.Transcript.Entries
   ( EntryKind (..), EntryRecord (..), Envelope (..), EnvelopeDelta (..)
   , emptyEnvelopeDelta, applyDelta, encodeEntryRecordRaw )
+import Seal.Transcript.Error (TranscriptError (..))
 import Seal.Transcript.Types
   ( TranscriptEntry (..), encodeEntryRaw )
 
@@ -93,15 +94,6 @@ import Seal.Transcript.Types
 -- actually reach the reader that builds the model's context.
 completionHarnessTag :: Text
 completionHarnessTag = "subagent-completion"
-
--- | Exception raised by 'itwRecordAndAck' when the single-writer daemon has
--- died (an I/O error in @writeOne@ killed it). Without this, a dead daemon
--- leaves the ACK 'TMVar' empty and the caller blocks forever — the
--- root-cause of session @20260724-113851-844@ silently hanging mid-dispatch.
-newtype TranscriptError = TranscriptError T.Text
-  deriving newtype (Eq, Show)
-
-instance Exception TranscriptError
 
 -- | Handle to the legacy single-file transcript writer. All fields are
 -- functions so the type is uniform between the real (file-backed) and fake
@@ -618,7 +610,7 @@ withIndexedTranscript dir action = do
               notePendingInjection w
               alive <- readTVarIO aliveRef
               if not alive
-                then throwIO (TranscriptError "transcript writer daemon is dead")
+                then throwIO (TranscriptError "transcript writer daemon is dead" Nothing)
                 else do
                   tv <- newEmptyTMVarIO
                   timeoutVar <- newEmptyTMVarIO
@@ -637,8 +629,8 @@ withIndexedTranscript dir action = do
                     Left ()  -> do
                       stillAlive <- readTVarIO aliveRef
                       if stillAlive
-                        then throwIO (TranscriptError "transcript write timed out (daemon stuck)")
-                        else throwIO (TranscriptError "transcript writer daemon died during write")
+                        then throwIO (TranscriptError "transcript write timed out (daemon stuck)" Nothing)
+                        else throwIO (TranscriptError "transcript writer daemon died during write" Nothing)
         action IndexedTranscriptHandle
           { itwRecordAndAck = ackWrite
           , itwRecordAsync  = enqueue

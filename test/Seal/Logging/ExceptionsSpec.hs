@@ -52,7 +52,7 @@ spec = describe "Seal.Logging.Exceptions" $ do
     it "passes TranscriptError text through (not sanitized)" $ do
       logger <- testSealLogger
       result <- withExceptionLogging logger Nothing "test" $
-        throwIO (TranscriptError "transcript is dead")
+        throwIO (TranscriptError "transcript is dead" Nothing)
       closeSealLogger logger
       case result of
         Left msg ->
