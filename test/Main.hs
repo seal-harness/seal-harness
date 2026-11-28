@@ -465,6 +465,7 @@ specs = do
   Seal.ISA.RepeatDetectSpec.spec
   Seal.Logging.LoggerSpec.spec
   Seal.Logging.ExceptionsSpec.spec
+  Seal.Logging.ExceptionsSpec.forkIOLoggedSpec
   Seal.Audit.LogSpec.spec
   Seal.Tools.TimeoutSpec.spec
   Seal.Tools.Exec.AbortSpec.spec

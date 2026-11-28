@@ -1,6 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
-module Seal.Logging.ExceptionsSpec (spec) where
+module Seal.Logging.ExceptionsSpec (spec, forkIOLoggedSpec) where
 
+import Control.Concurrent (killThread, threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (throwIO, AsyncException (..))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
@@ -10,7 +12,7 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
-import Seal.Logging.Exceptions (withExceptionLogging)
+import Seal.Logging.Exceptions (forkIOLogged, withExceptionLogging)
 import Seal.Logging.Logger
   (testSealLogger, closeSealLogger, newSealLoggerWithScribe)
 import Seal.Handles.Transcript (TranscriptError (..))
@@ -27,6 +29,39 @@ mkCaptureScribe = do
         , scribeFinalizer = pure ()
         }
   pure (scribe, ref)
+
+-- | 'forkIOLogged' exists so a crash in a FORKED thread is not silent. Before
+-- it, an exception in any bare @forkIO@ site reached only the RTS default
+-- handler (stderr), leaving no session-log or user-visible trace.
+--
+-- The AsyncException half is the subtle one: this repo uses 'killThread' for
+-- ordinary shutdown ('Registry', 'Chat.Telegram', 'Chat.Signal'), so logging
+-- an 'AsyncException' would emit a spurious ERROR on every normal teardown.
+-- 'withExceptionLogging' rethrows it deliberately, and this must match.
+forkIOLoggedSpec :: Spec
+forkIOLoggedSpec = describe "forkIOLogged" $ do
+  it "logs a throwing action instead of letting it reach the RTS handler" $ do
+    (scribe, ref) <- mkCaptureScribe
+    logger <- newSealLoggerWithScribe scribe DebugS
+    _ <- forkIOLogged logger "test-label" (throwIO (userError "boom"))
+    threadDelay 200000
+    logs <- readIORef ref
+    closeSealLogger logger
+    logs `shouldSatisfy` not . null
+    T.intercalate "\n" logs `shouldSatisfy` T.isInfixOf "test-label"
+
+  it "does NOT log an AsyncException (a shutdown is not a failure)" $ do
+    (scribe, ref) <- mkCaptureScribe
+    logger <- newSealLoggerWithScribe scribe DebugS
+    started <- newEmptyMVar
+    tid <- forkIOLogged logger "shutdown-label"
+             (putMVar started () >> threadDelay 10000000)
+    takeMVar started
+    killThread tid
+    threadDelay 200000
+    logs <- readIORef ref
+    closeSealLogger logger
+    T.intercalate "\n" logs `shouldNotSatisfy` T.isInfixOf "shutdown-label"
 
 spec :: Spec
 spec = describe "Seal.Logging.Exceptions" $ do

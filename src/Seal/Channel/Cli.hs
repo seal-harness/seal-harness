@@ -15,7 +15,6 @@ module Seal.Channel.Cli
   , newBackends
   ) where
 
-import Control.Concurrent (forkIO)
 import Control.Monad (void)
 import Data.Foldable (for_)
 import Control.Monad.IO.Class (liftIO)
@@ -86,7 +85,7 @@ import Seal.Session.Store
   , newSession, resolveDefaultAgent, saveSessionMeta )
 import Seal.Types.App (runApp)
 import Seal.Logging.Logger (SealLogger)
-import Seal.Logging.Exceptions (withExceptionLogging)
+import Seal.Logging.Exceptions (forkIOLogged, withExceptionLogging)
 import Seal.Types.Env (Env, envLogger)
 import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import Seal.Vault.Commands (VaultRuntime (..))
@@ -257,7 +256,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , taStartWiring   = \sessionBackends sid appEnv' eCfg' opCeiling m ->
                   TurnEngine.buildStartWiring td sessionBackends sid appEnv' eCfg' opCeiling (smChannel m)
               }
-        void (forkIO (do
+        void (forkIOLogged (tdLogger td) "bg" (do
           outcome <- runSessionTurn td bgAdapter meta Nothing prompt
           case toError outcome of
             Just err -> ccSend caps ("bg failed: " <> err)
