@@ -1,9 +1,10 @@
 # Handoff — Multiple Execution Machines
 
-**Status**: 14 of 18 work units complete. Branch `wu-1-machine-config`, PR #354 (draft).
-**Last commit**: `185a528` — `feat(machines): WU-14 /machine list and the ~/.seal immutability guard`
-**`make check`**: green. 5062 examples, 0 failures, 41 pending, hlint "No hints".
-**`-f remote-only-untrusted`**: green. Builds, links, 5050 examples, 0 failures, 74 pending.
+**Status**: 18 of 18 work units complete. Branch `wu-1-machine-config`, PR #354 (draft).
+**Last commit**: `582caa9` — `feat(machines): WU-13 complete — post-SETUP_REPO hooks respect the machine`
+**`make check`**: green. 5099 examples, 0 failures, 41 pending, hlint "No hints";
+frontend `tsc --noEmit` 0 errors and 1193 vitest tests pass.
+**`-f remote-only-untrusted`**: green. Builds, links, 5087 examples, 0 failures, 74 pending.
 
 > **Read this first.** This feature has been through 4 design revisions, 7 plan
 > revisions, and 3 rounds of both review gates. The documents below are the
@@ -31,35 +32,38 @@
 | WU-4 | **Schema integration.** `machine` now advertised by all 8 machine-selectable opcodes as an enum of the selectable names. Schemas take `[Selectable]`, threaded from the session's routing. | `cd1e9ba` |
 | WU-5 | **Real routing in a session.** `mkSessionExecFor` builds the full routing table (was a singleton); lazy per-machine bootstrap with its own workdir and `CloneDeps`. | `04582fd` |
 | WU-6 | `allow_localhost` replaces `mode`; selector truth table; `enforceRemoteOnly` call sites. | `d7feb62` |
+| WU-6b | FileExplorer/`AgentMetaCache`/`handleSessionWorkdir` follow the session machine. (§6.7's `fileExplorerFollowsSessionMachine` is still not implementable — see below.) | `d7feb62` |
 | WU-7 | `loadMachinesConfig`/`saveMachinesConfig`, `resolveMachinesForBoot`, template seeding. | `7083e84` |
 | WU-8 | Migration of `[untrusted_execution.remote]` → machine `default`. | in `a279f9d` (base) |
 | WU-9 | `SessionMeta.smMachine`, `machineForSession`, `renderMachineConfigError`. | in `a279f9d` (base) |
 | WU-12 | **ACK record assertions.** 6 new cases incl. the P10 ordering proof (a FAILING machine still leaves an entry). | `4735b51` |
-| WU-13 | **`SETUP_REPO` reads `CloneDeps` from the env.** The per-call swap was inert for it; a cross-machine clone ran over the session machine's transport. | `0cffc9d` |
+| WU-13 | **`SETUP_REPO` reads `CloneDeps` from the env**, and the post-clone hooks respect the machine (`dispatchOn`). The per-call swap was inert for it; a cross-machine clone ran over the session machine's transport AND re-scanned the wrong workdir. | `0cffc9d`, `582caa9` |
 | WU-14 | **`/machine list`** + the `~/.seal` immutability guard extended to the new files. | `185a528` |
+| WU-10 | **Session selection plumbing.** `/new -x` (validated before minting), `naMachine` in `parseNewArgs`, `GET /api/machines` (all 5 route edits), and the web picker. | `d61f85d`, `c29960f`, `4b018be` |
+| WU-11 | **Five display surfaces.** `buildMachinePrompt` (T-STR-8), tab line, banner (T-STR-9), `sessionInfoJson` (T-STR-12), sidebar `TabLineField` on by default. | `d9212bc` + prior |
+| WU-15 | **Self-key guard + frozen adoption prompt (T-STR-7) + `execErrorToMachineError`** (closes a host/path leak to the model). | `5c1623f` |
 | WU-16 | **The hardened build links.** Shared subprocess primitives extracted to `Seal.Tools.Exec.Proc`; `make hardened` + CI gate step; `HardenedBuildSpec`. | `8bfa32b` |
+| WU-17 | `CHANGELOG.md` entry incl. the downgrade hazard. | `159d976` |
 
 ## What remains
 
-| WU | Content | Notes |
-|---|---|---|
-| WU-10 | TUI prompt, `/new -x`, `/api/machines`, persistence into `smMachine`. | `/api/machines` needs **5** registration edits. See the route note below. |
-| WU-11 | Five display surfaces. | `'machine'` must join `DEFAULT_TAB_LINE_FIELDS` or the sidebar won't show it. |
-| WU-15 | Host-key pinning, self-key guard, adoption copy, **and `seal machine pin`**. | Needs injected seams (`HostKeyPaths`, resolver) or its tests can't fail for the right reason. `machine pin` was deferred here from WU-14 because it needs those seams. |
-| WU-17 | `CHANGELOG.md` + `security.toml` template copy. | |
+Nothing. All 18 units are implemented and verified.
 
-### Partial units — read before claiming done
+`fileExplorerFollowsSessionMachine` (§6.7) is still **not implementable as
+written** — see the section below — and is recorded rather than claimed.
 
-**WU-13** has three DoD items; one is done. The other two are:
-- suppressing the post-`SETUP_REPO` auto-bind / re-scan / invalidation when the
-  call ran on a different machine, and
-- stating in the result text that follow-up relative paths resolve on the
-  **session** machine.
+## Estimate corrections (do not repeat these)
 
-Both need `dispatch` to report the resolved machine to its caller. That is a
-signature change on a hot path with 12+ call sites and the plan does not budget
-for it (§0 has no finding covering it). Deliberately deferred, recorded in the
-commit message. If you take it, that is the scope decision to make first.
+Two figures in the plan were wrong and I repeated one of them without checking:
+
+- **"~289 `uio*` call sites"** — the WU-3 rewrite that would have needed them
+  was replaced by the per-call env swap (§0 P20), so the churn never happened.
+- **"`dispatch`'s signature has 12+ call sites"** — I asserted this to justify
+  deferring WU-13's hook items. There are **3**. Verified with
+  `grep -rn '\bdispatch\b' src/`. The deferral was not warranted, and the work
+  took one commit once actually measured.
+
+If a plan states a fan-out count, count it before quoting it.
 
 ## Traps that cost me time — read before editing
 
