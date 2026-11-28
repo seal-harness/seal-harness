@@ -31,7 +31,7 @@ module Seal.Core.TurnEngine
   , broadcastSessionEntries
   ) where
 
-import Control.Exception (SomeException, bracket, catch)
+import Control.Exception (SomeException, bracket, catch, throwIO)
 import Control.Monad (unless, void, when)
 import Data.Aeson (Value (..), toJSON)
 import Data.Foldable (for_)
@@ -122,8 +122,8 @@ import Seal.ISA.Opcode (Opcode, OpResult (..), localBackend, opName, orIsError)
 import qualified Seal.ISA.Registry as ISA
 import Seal.Logging.Exceptions (withExceptionLoggingRef)
 import Seal.Transcript.TurnFailure
-  ( TurnFailure (..), classify, renderForChat, renderForLog, renderForModel
-  , renderForUser )
+  ( FailureCause (..), TurnFailure (..), classify, renderForChat, renderForLog
+  , renderForModel, renderForUser )
 import Seal.Logging.Logger (SealLogger)
 import Seal.Providers.Class
   (ContentBlock (..), Message (..), Role (..), SomeProvider, ToolChoice (..))
@@ -559,7 +559,24 @@ runSessionTurn td adapter meta mSrc t = do
       -- handle that subscribed but never sees the turn complete). The
       -- engine's bracket is NOT entered (no "thinking" signal was sent).
       taPreTurn adapter sid meta t
-      pure (TurnOutcome (Just err))
+      -- CP2 (design §2.2): report it. This path throws NOTHING -- it returns
+      -- an Either -- so CP1 never sees it, and a bad model name or a missing
+      -- vault key would otherwise still fail in total silence. That is the
+      -- highest-frequency production failure, and the requirements list
+      -- "a provider resolution failure" as in scope.
+      --
+      -- Reported in its own transcript bracket: the engine's bracket is not
+      -- entered, so there is no handle in scope. Best-effort by construction
+      -- (§3.6) -- a failure to report must not mask the original failure.
+      let failure = TurnFailure
+            "the model provider could not be resolved"
+            CauseProviderUnresolved
+            ""
+      withIndexedTranscript sessionDirPath (\tHandle ->
+         void (reportTurnFailure td tHandle sid paths failure))
+        `catch` \(_ :: SomeException) -> pure ()
+      appendSessionLog (Just (sessionLogPath paths sid)) "ERROR" err
+      pure (TurnOutcome (Just (renderForUser failure)))
     Right (prov, model) -> do
       createDirectoryIfMissing True sessionDirPath
       saveSessionMeta paths meta
@@ -629,8 +646,26 @@ runSessionTurn td adapter meta mSrc t = do
             aborted <- isAborted abortFlag
             unless aborted (onTurnEnd sid))
         (\_ -> withSessionLock (tdLocks td) sid $
-          withIndexedTranscript sessionDirPath $ \tHandle ->
-            runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandle)
+          withIndexedTranscript sessionDirPath $ \tHandle -> do
+            -- CP3 (design §2.3): 'runTurnBody' does real work BEFORE it
+            -- reaches CP1 -- mkEnv, the runtime/security config loads,
+            -- cachedWorkdirScan, resolveSystemPrompt, buildSessionRegistry.
+            -- A throw in that prologue would otherwise escape the engine and
+            -- be caught only by the caller's generic handler, which reports
+            -- no transcript entry. This wrap makes CP1 subsume the prologue,
+            -- so §3.7's "once per runTurnBody" is actually true.
+            --
+            -- CP1 still lives inside, and returns a 'Left' rather than
+            -- throwing, so this outer handler cannot double-report.
+            runTurnBody td adapter meta mSrc t sid paths prov model
+              stopFanoutDoneRef tHandle
+              `catch` \(e :: SomeException) -> do
+                     -- A prologue throw. Report it, then rethrow so the
+                     -- bracket cleanup and the caller still see it.
+                     mInner <- itwLastFailure tHandle
+                     void $ reportTurnFailure td tHandle sid paths
+                              (classify mInner e "")
+                     throwIO e)
       -- [engine] Auto-tab the session (idempotent; no-op if a tab already
       -- binds sid). Gated on shouldAutoTab so /bg sessions stay headless.
       when (shouldAutoTab meta) $
