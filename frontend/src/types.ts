@@ -758,6 +758,14 @@ export interface Message {
    *  keeps the default "command output — not saved"; an `ASK_HUMAN` answer
    *  confirmation says "sent as the answer — not saved". */
   slashBubbleLabel?: string
+  /** Discriminant for rows that are not ordinary conversation. Currently only
+   *  'turn-failure': a turn that died before producing a reply. Absent on
+   *  every other row, so existing consumers are unaffected. */
+  kind?: 'turn-failure'
+  /** Present iff `kind === 'turn-failure'`. `cause` is a closed kebab-case
+   *  vocabulary from the backend (already mapped to user-facing text by the
+   *  renderer), and `ref` joins this row to the full detail in seal.log. */
+  turnFailure?: { headline: string; cause: string; ref: string }
 }
 
 // ── Cron ───────────────────────────────────────────────────────────────

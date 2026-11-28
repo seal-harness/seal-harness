@@ -34,7 +34,6 @@ module Seal.Gateway.Send
   ) where
 
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar, tryTakeMVar, putMVar)
-import Control.Concurrent (forkIO)
 import Control.Concurrent.STM (TVar, newTVarIO, readTVar, readTVarIO, writeTVar, atomically)
 import Control.Exception (finally)
 import Control.Monad (unless, void, when)
@@ -111,7 +110,7 @@ import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption)
 import Seal.Tools.Exec.Remote (RemoteRunner)
 import Seal.ISA.Ops.Agent (AgentWorkerBuilder)
 import Seal.Logging.Logger (SealLogger)
-import Seal.Logging.Exceptions (withExceptionLogging)
+import Seal.Logging.Exceptions (forkIOLogged, withExceptionLogging)
 import Seal.Vault.Commands (VaultRuntime (..))
 
 import Katip (Severity (..), ls)
@@ -690,7 +689,7 @@ handleSend deps sid mSrc rawText = do
 startPlainTurn :: SendDeps -> SessionMeta -> Maybe MessageSource -> Text -> IO SendOutcome
 startPlainTurn deps meta mSrc t = do
   let sid' = smId meta
-  void (forkIO (do
+  void (forkIOLogged (sdLogger deps) "plainTurn" (do
     er <- withExceptionLogging (sdLogger deps) (Just (sessionLogPath (sdPaths deps) sid')) "plainTurn" $
       plainTurn deps meta mSrc t
     -- Report the outcome to whoever spawned this session (no-op unless someone
@@ -706,7 +705,8 @@ startPlainTurn deps meta mSrc t = do
         sdTurnComplete deps sid' (Right ())
         when (shouldAutoTab meta) $
           ensureTabForSession (sdTabsHandle deps) KindProvider sid'
-        triggerBroadcast deps))
+        triggerBroadcast deps
+    ))
   pure SendAssistant
 
 -- | Render the current tab for the web send endpoint: @<index>  <kind>  [label]@.

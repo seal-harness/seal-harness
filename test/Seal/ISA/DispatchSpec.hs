@@ -66,6 +66,7 @@ probe ref tl =
       , itwCloseTranscript = pure ()
       , itwIsAlive         = pure True
       , itwDiagnostics     = pure emptyTranscriptDiagnostics
+      , itwLastFailure     = pure Nothing
       , itwRecordedLength  = pure 0
       }
   , mkProbeOpcode ref tl
@@ -84,6 +85,7 @@ probeHandle ref =
     , itwCloseTranscript = pure ()
     , itwIsAlive         = pure True
     , itwDiagnostics     = pure emptyTranscriptDiagnostics
+    , itwLastFailure     = pure Nothing
     , itwRecordedLength  = pure 0
     }
 

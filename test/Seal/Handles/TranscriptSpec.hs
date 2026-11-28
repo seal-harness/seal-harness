@@ -4,14 +4,19 @@ module Seal.Handles.TranscriptSpec (spec) where
 
 import Control.Exception (try, evaluate, throwIO, fromException, SomeException)
 import Data.Aeson (object, (.=))
+import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
+import Data.Either (isLeft)
+import Data.Maybe (isJust, isNothing)
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Time (getCurrentTime, UTCTime)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.Timeout (timeout)
 import Test.Hspec
 
 import Seal.Providers.Class
@@ -22,6 +27,7 @@ import Seal.Transcript.Entries
   ( EntryKind (..), EntryRecord (..), EnvelopeDelta (..), emptyEnvelopeDelta )
 import Seal.Transcript.Types
 import Seal.Handles.Transcript
+import Seal.Transcript.TurnFailure (FailureCause (..), classify, tfCause)
 
 mkEntry :: IO TranscriptEntry
 mkEntry = do
@@ -220,11 +226,11 @@ spec = describe "Seal.Handles.Transcript" $ do
       alive `shouldBe` True
 
     it "TranscriptError is an Exception" $ do
-      let e = TranscriptError "test error"
+      let e = TranscriptError "test error" Nothing
       result <- try (evaluate (e :: TranscriptError) >> throwIO e) :: IO (Either SomeException ())
       case result of
         Left ex -> case fromException ex :: Maybe TranscriptError of
-          Just (TranscriptError msg) -> msg `shouldBe` "test error"
+          Just (TranscriptError msg _) -> msg `shouldBe` "test error"
           Nothing -> expectationFailure "exception was not a TranscriptError"
         Right _ -> expectationFailure "expected an exception but got none"
 
@@ -250,8 +256,65 @@ spec = describe "Seal.Handles.Transcript" $ do
           alive' `shouldBe` False
           r <- try (itwRecordAndAck h (IndexedTranscriptWrite [Message User [CbText "x"]] e))
           case r of
-            Left (TranscriptError msg) -> msg `shouldSatisfy` T.isInfixOf "dead"
+            Left (TranscriptError msg _) -> msg `shouldSatisfy` T.isInfixOf "dead"
             Right _ -> expectationFailure "expected a TranscriptError but got none"
+
+    it "itwLastFailure exposes the daemon's fatal cause after it dies" $
+      -- The motivating incident: the daemon died of a strict UTF-8 decode, but
+      -- the caller only ever saw "the writer died". Carrying the daemon's own
+      -- exception out of the bracket is what lets the failure report name the
+      -- real cause instead of the wrapper.
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        e <- mkEntryRecord 1
+        let badText = TE.decodeUtf8 (BS.pack [0xe8])
+        withIndexedTranscript dir $ \h -> do
+          _ <- try (itwRecordAndAck h (IndexedTranscriptWrite [Message User [CbText badText]] e))
+                 :: IO (Either SomeException ())
+          mInner <- itwLastFailure h
+          case mInner of
+            Nothing -> expectationFailure "expected the daemon's fatal cause to be recorded"
+            Just inner ->
+              tfCause (classify Nothing inner "r") `shouldBe` CauseUnicode
+
+    it "itwLastFailure is Nothing for a healthy writer" $
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        e <- mkEntryRecord 1
+        withIndexedTranscript dir $ \h -> do
+          itwRecordAndAck h (IndexedTranscriptWrite [Message User [CbText "ok"]] e)
+          itwLastFailure h >>= \m -> m `shouldSatisfy` isNothing
+
+    it "fakeIndexedTranscript reports no failure" $ do
+      (h, _) <- fakeIndexedTranscript
+      itwLastFailure h >>= \m -> m `shouldSatisfy` isNothing
+
+    it "leaving the bracket terminates promptly when the writer died mid-turn" $
+      -- Regression: when the writer daemon dies inside 'writeOne' it sets
+      -- 'aliveRef' False and exits, so NOTHING consumes the 'ITShutdown'
+      -- the bracket's release action queues. 'shutdown' used to block on
+      -- an unconditional 'takeTMVar done' and hung there forever. That
+      -- stranded the turn thread ("thread blocked indefinitely in an STM
+      -- transaction") and skipped the three 'closeFd' calls, leaking a
+      -- descriptor set per failed turn — a crashed session was observed
+      -- holding four leaked sets. The release action must observe the
+      -- dead daemon and close the handles regardless.
+      --
+      -- The daemon is killed the same way production killed it: a Text
+      -- thunk that throws when the writer forces it to encode the line.
+      -- (Production's thunk was a strict 'decodeUtf8' of non-UTF-8
+      -- process output; 'badText' is that exception, constructed
+      -- directly, so the test does not depend on a subprocess.)
+      withSystemTempDirectory "seal-indexed-tx" $ \dir -> do
+        e <- mkEntryRecord 1
+        let badText = TE.decodeUtf8 (BS.pack [0xe8])
+        outcome <- timeout 5000000 $
+          withIndexedTranscript dir $ \h -> do
+            -- The write is enqueued, so the throw lands in the daemon.
+            r <- try (itwRecordAndAck h (IndexedTranscriptWrite [Message User [CbText badText]] e)) :: IO (Either SomeException ())
+            r `shouldSatisfy` isLeft
+            alive <- itwIsAlive h
+            alive `shouldBe` False
+        -- 'Nothing' means the bracket never returned: the shutdown hang.
+        outcome `shouldSatisfy` isJust
 
     it "emits a minimal envelope delta (only changed fields) on the second request" $
       withSystemTempDirectory "seal-indexed-tx" $ \dir -> do

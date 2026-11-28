@@ -19,8 +19,12 @@
 --    defense).
 module Seal.Logging.Exceptions
   ( withExceptionLogging
+  , withExceptionLoggingRef
+  , forkIOLogged
+  , mkCorrelationId
   ) where
 
+import Control.Concurrent (ThreadId, forkIO)
 import Control.Exception
   ( catch, throwIO, fromException, SomeException, AsyncException (..) )
 import Data.Text (Text)
@@ -68,11 +72,74 @@ withExceptionLogging logger mLogPath whereLabel action =
         logTurnError mLogPath fullDetail
         pure (Left userMsg)
 
+-- | Like 'withExceptionLogging', but also hands the caller the exception and
+-- the correlation id it logged.
+--
+-- The three-part result exists because a failure report needs all three, and
+-- only one of them survives the plain variant:
+--
+-- * the /exception/ — so the report can classify the real cause. The plain
+--   variant consumes it into a sanitized 'Text', which is not recoverable.
+-- * the /ref/ — so the report's reference id is the SAME id as the log line.
+--   The plain variant mints it internally and only embeds it inside the
+--   returned 'Text', so a caller cannot use it to join to @seal.log@.
+-- * the /result/ — 'Right' on success, so the caller’s happy path is unchanged.
+--
+-- 'AsyncException' is rethrown after logging, exactly as in the plain variant:
+-- a shutdown is not a failure.
+withExceptionLoggingRef
+  :: SealLogger
+  -> Maybe FilePath
+  -> Text
+  -> IO a
+  -> IO (Either (SomeException, Text) a)
+withExceptionLoggingRef logger mLogPath whereLabel action =
+  (Right <$> action) `catch` \e -> do
+    case (fromException e :: Maybe AsyncException) of
+      Just asyncEx -> do
+        logIO logger InfoS (escapeNewlines (ls $
+          "shutdown signal in " <> whereLabel <> ": " <> showLs asyncEx))
+        logTurnError mLogPath ("shutdown signal in " <> whereLabel <> ": " <> showLs asyncEx)
+        throwIO e
+      Nothing -> do
+        correlationId <- mkCorrelationId
+        let (_userMsg, fullDetail) = sanitizeException whereLabel e correlationId
+        logIO logger ErrorS (escapeNewlines (ls fullDetail))
+        logTurnError mLogPath fullDetail
+        pure (Left (e, correlationId))
+
 -- | Generate a short correlation id (8 hex chars from a random nonce).
 mkCorrelationId :: IO Text
 mkCorrelationId = do
   n <- abs <$> randomIO :: IO Int
   pure (T.justifyRight 8 '0' (T.pack (show n)))
+
+-- | Fork a thread whose synchronous exceptions are LOGGED rather than left to
+-- the RTS default handler.
+--
+-- Every bare @forkIO@ site in the harness previously had this hole: an
+-- exception in the forked thread printed to stderr and left no trace in the
+-- session log or anywhere a user would look. In the failure that motivated
+-- this work, that is one of the ways a session could appear to simply stop.
+--
+-- 'AsyncException' is deliberately RETHROWN and NOT logged. This repo uses
+-- 'killThread' for ordinary shutdown (@Agent.Runtime.Registry@,
+-- @Chat.Telegram@, @Chat.Signal@), so logging it would emit a spurious ERROR
+-- on every normal teardown. This mirrors 'withExceptionLogging', which
+-- rethrows for the same reason, and the rule stated in the design: a shutdown
+-- is not a failure.
+--
+-- The log line carries the exception's @show@ at @ErrorS@ with a caller
+-- supplied label. It is an /operator/ log line, not a user-facing surface --
+-- the closed-vocabulary rule that governs 'Seal.Transcript.TurnFailure' is
+-- about what crosses to the model and to chat channels, neither of which this
+-- touches.
+forkIOLogged :: SealLogger -> Text -> IO () -> IO ThreadId
+forkIOLogged logger label action = forkIO $
+  action `catch` \e -> case fromException e :: Maybe AsyncException of
+    Just _  -> throwIO e
+    Nothing -> logIO logger ErrorS
+      (escapeNewlines (ls (label <> " thread crashed: " <> showLs e)))
 
 -- | Sanitize an exception for user-facing text. Returns:
 -- * (userMsg, fullDetail) where userMsg is safe to send to the user
@@ -80,7 +147,7 @@ mkCorrelationId = do
 sanitizeException :: Text -> SomeException -> Text -> (Text, Text)
 sanitizeException whereLabel e correlationId =
   case (fromException e :: Maybe TranscriptError) of
-    Just (TranscriptError te) ->
+    Just (TranscriptError te _) ->
       ("transcript error: " <> te, "transcript error: " <> te <> " (" <> whereLabel <> ")")
     Nothing ->
       ( "internal error (" <> whereLabel <> ") [ref: " <> correlationId <> "]"

@@ -6,7 +6,7 @@
 -- hardened build does not carry a symbol whose only user compiled out.
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
-module Seal.Gateway.SendSpec (spec) where
+module Seal.Gateway.SendSpec (spec, turnFailureSpec) where
 
 import Control.Exception (catch, SomeException, throwIO)
 import Seal.Session.ExecCache (newSessionExecCache)
@@ -85,7 +85,8 @@ import Seal.Transcript.Conv (readConversation)
 import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..))
 import Seal.Handles.Transcript
   ( IndexedTranscriptWrite (..), appendCompletionToSidecar, itwRecordAndAck
-  , pendingCompletionCount, withIndexedTranscript )
+  , itwReadConversation, itwReadEntries, pendingCompletionCount
+  , withIndexedTranscript )
 import Data.ByteString qualified as BS
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Session.Store (SessionRuntime (..), saveSessionMeta)
@@ -2151,6 +2152,108 @@ settlesTo readAction want = do
 -- | A minimal 'TurnAdapter' for the tests that drive 'runSessionTurn'
 -- directly (the gateway's 'mkWebTurnAdapter' is not exported). Every
 -- hook is a no-op; the start-wiring builder is the engine's own.
+-- | The load-bearing test for turn-failure visibility: a REAL exception driven
+-- through the real 'runSessionTurn' must leave exactly one @turn-failure@
+-- entry in the transcript, carrying a reference that joins to @seal.log@.
+--
+-- This proves the feature rather than the plumbing -- it would pass trivially
+-- if the choke point were wired to nothing, and it fails against the
+-- pre-change code, where the exception left no transcript trace at all.
+tfPaths :: FilePath -> SealPaths
+tfPaths tmp = SealPaths
+  { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+  , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+
+tfMeta :: SessionId -> SessionMeta
+-- Named construction, not positional: 15 fields with three adjacent
+-- `Maybe`s is exactly where a merge silently drops one.
+tfMeta sid = SessionMeta
+  { smId = sid
+  , smProvider = "ollama"
+  , smModel = "llama3.2"
+  , smChannel = "web"
+  , smParent = Nothing
+  , smAgent = Nothing
+  , smSystemOverride = Nothing
+  , smAgentName = Nothing
+  , smDescription = Nothing
+  , smSealFrontMatter = True
+  , smRepoUrl = Nothing
+  , smMachine = Nothing
+  , smRepoBranch = Nothing
+  , smCreatedAt = sampleTime
+  , smLastActive = sampleTime
+  }
+
+-- | Drive one turn whose provider throws, and hand back the entries written.
+tfRunFailingTurn :: FilePath -> SessionId -> IO [EntryRecord]
+tfRunFailingTurn tmp sid = do
+  let paths = tfPaths tmp
+  seedSession paths sid
+  let resolve _ =
+        pure (Right (SomeProvider ThrowingProvider, ModelId "llama3.2"))
+  baseDeps <- mkSendDepsWith paths resolve
+  tabsH <- newTabsHandle
+  let deps = baseDeps { sdTabsHandle = tabsH }
+      td = mkWebTurnDeps deps
+  _ <- runSessionTurn td (testTurnAdapter td) (tfMeta sid) Nothing "hello"
+  withIndexedTranscript (sessionDir paths sid) itwReadEntries
+
+turnFailureSpec :: Spec
+turnFailureSpec = describe "turn-failure visibility" $ do
+  it "records exactly one turn-failure entry when a turn throws" $
+    withSystemTempDirectory "seal-turn-failure" $ \tmp -> do
+      entries <- tfRunFailingTurn tmp (mkSid "sess-fail")
+      let failures = [ e | e <- entries, erHarness e == Just "turn-failure" ]
+      length failures `shouldBe` 1
+      -- The reference must be present, or the report cannot be joined to the
+      -- full detail in seal.log. (No @head@: the project forbids partial
+      -- functions, so pattern-match the single expected entry.)
+      case failures of
+        [f] -> erCorrelation f `shouldSatisfy` maybe False (not . T.null)
+        _   -> expectationFailure "expected exactly one failure entry"
+
+  it "reports the failure to the caller instead of swallowing it" $
+    withSystemTempDirectory "seal-turn-failure" $ \tmp -> do
+      let paths = tfPaths tmp
+          sid = mkSid "sess-fail-report"
+      seedSession paths sid
+      let resolve _ = pure (Right (SomeProvider ThrowingProvider, ModelId "llama3.2"))
+      baseDeps <- mkSendDepsWith paths resolve
+      tabsH <- newTabsHandle
+      let deps = baseDeps { sdTabsHandle = tabsH }
+          td = mkWebTurnDeps deps
+      outcome <- runSessionTurn td (testTurnAdapter td) (tfMeta sid) Nothing "hello"
+      toError outcome `shouldSatisfy` isJust
+
+  it "the model sees the failure on the NEXT turn (decision 1)" $
+    -- 'erConvLen = 1' is what makes this true: at 0 (every other EKHarness
+    -- entry) nothing is appended to the conversation and the model never
+    -- learns its prior turn failed.
+    withSystemTempDirectory "seal-turn-failure" $ \tmp -> do
+      let sid = mkSid "sess-fail-model"
+      _ <- tfRunFailingTurn tmp sid
+      msgs <- withIndexedTranscript (sessionDir (tfPaths tmp) sid) itwReadConversation
+      let texts = [ t | Message _ bs <- msgs, CbText t <- bs ]
+      any (T.isInfixOf "A previous turn failed") texts `shouldBe` True
+
+  it "does NOT record a failure entry for a successful turn" $
+    -- The control: reporting must not fire on the happy path. This is what
+    -- catches the "reporting lives in the bracket cleanup" mistake, which
+    -- would produce a spurious entry after every good turn.
+    withSystemTempDirectory "seal-turn-failure" $ \tmp -> do
+      let paths = tfPaths tmp
+          sid = mkSid "sess-ok"
+      seedSession paths sid
+      providerRef <- newIORef [ CompletionResponse [CbText "ok"] StopEnd (Usage 0 0) ]
+      baseDeps <- mkSendDeps paths providerRef
+      tabsH <- newTabsHandle
+      let deps = baseDeps { sdTabsHandle = tabsH }
+          td = mkWebTurnDeps deps
+      _ <- runSessionTurn td (testTurnAdapter td) (tfMeta sid) Nothing "hello"
+      entries <- withIndexedTranscript (sessionDir paths sid) itwReadEntries
+      [ e | e <- entries, erHarness e == Just "turn-failure" ] `shouldBe` []
+
 testTurnAdapter :: TurnDeps -> TurnAdapter
 testTurnAdapter td = TurnAdapter
   { taCaps = def

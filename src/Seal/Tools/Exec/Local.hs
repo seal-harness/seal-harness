@@ -148,9 +148,3 @@ runFixedArgv treat127AsMissing argv mCwd = do
 
 -- | Subprocess primitives — re-exported from "Seal.Tools.Exec.Proc".
 --
--- They live there rather than here because @-f remote-only-untrusted@ removes
--- THIS module from @exposed-modules@, and the remote arm, the remote
--- 'UntrustedIO' arm and the agent-metadata cache all need them to drive
--- their own local child processes (@ssh@, @rsync@). Importing them from here
--- made the hardened build fail to link. Re-exported so existing callers keep
--- working; new code should import "Seal.Tools.Exec.Proc" directly.

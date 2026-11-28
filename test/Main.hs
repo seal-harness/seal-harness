@@ -135,6 +135,7 @@ import qualified Seal.Channel.WiringSpec
 import qualified Seal.Channels.Chat.TypesSpec
 import qualified Seal.Channels.CursorSpec
 import qualified Seal.Channels.Chat.RouteSpec
+import qualified Seal.Channels.Chat.LastRenderSpec
 import qualified Seal.Channels.Chat.TabRenderSpec
 import qualified Seal.Channels.Chat.RateLimitSpec
 import qualified Seal.Channels.Chat.HttpClientSpec
@@ -150,6 +151,7 @@ import qualified Seal.Transcript.ConvSpec
 import qualified Seal.Transcript.ConvIndexSpec
 import qualified Seal.Transcript.EntriesSpec
 import qualified Seal.Transcript.OriginSpec
+import qualified Seal.Transcript.TurnFailureSpec
 import qualified Seal.Transcript.ReconstructSpec
 import qualified Seal.Handles.AskReplySpec
 import qualified Seal.Handles.ChannelSpec
@@ -276,6 +278,7 @@ specs = do
   Seal.Gateway.EntryCursorSpec.spec
   Seal.Gateway.PatIngestionSpec.spec
   Seal.Gateway.SendSpec.spec
+  Seal.Gateway.SendSpec.turnFailureSpec
   Seal.Gateway.ServerSpec.spec
   Seal.Gateway.StreamBrokerSpec.spec
   Seal.Gateway.StreamSpec.spec
@@ -381,6 +384,7 @@ specs = do
   Seal.Channels.Chat.TypesSpec.spec
   Seal.Channels.CursorSpec.spec
   Seal.Channels.Chat.RouteSpec.spec
+  Seal.Channels.Chat.LastRenderSpec.spec
   Seal.Channels.Chat.TabRenderSpec.spec
   Seal.Channels.Chat.RateLimitSpec.spec
   Seal.Channels.Chat.HttpClientSpec.spec
@@ -396,6 +400,7 @@ specs = do
   Seal.Transcript.ConvIndexSpec.spec
   Seal.Transcript.EntriesSpec.spec
   Seal.Transcript.OriginSpec.spec
+  Seal.Transcript.TurnFailureSpec.spec
   Seal.Transcript.ReconstructSpec.spec
   Seal.Handles.AskReplySpec.spec
   Seal.Handles.ChannelSpec.spec
@@ -486,6 +491,7 @@ specs = do
   Seal.ISA.RepeatDetectSpec.spec
   Seal.Logging.LoggerSpec.spec
   Seal.Logging.ExceptionsSpec.spec
+  Seal.Logging.ExceptionsSpec.forkIOLoggedSpec
   Seal.Audit.LogSpec.spec
   Seal.Tools.TimeoutSpec.spec
   Seal.Tools.Exec.AbortSpec.spec

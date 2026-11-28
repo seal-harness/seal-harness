@@ -32,6 +32,8 @@ module Seal.Transcript.Reconstruct
   , reconstructStreamingPage
   ) where
 
+import Data.Aeson.Key qualified as Key
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Aeson (Value (..), object, (.=))
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
@@ -232,6 +234,12 @@ responsePayload mEnv msgs e = object
 -- info so the frontend can render the confirmation decision.
 harnessPayload :: [Message] -> EntryRecord -> Value
 harnessPayload msgs e =
+  -- Only EMIT the key when a failure entry actually carries one. Writing
+  -- @"failure" .= Nothing@ would still put @"failure": null@ on the wire,
+  -- and the gateway filter (Gateway/Transcript.hs) keys on the key's
+  -- PRESENCE -- so every harness entry would have looked like a failure and
+  -- surfaced in the transcript. (Caught by ApiSpec's per-entry-timestamps
+  -- test, which asserts a MEMORY_READ harness entry is filtered out.)
   let base = object
         [ "messages" .= msgs
         , "harness"  .= erHarness e
@@ -239,9 +247,27 @@ harnessPayload msgs e =
         , "input"    .= (Map.lookup "input" (erMeta e) :: Maybe Value)
         , "result"   .= (Map.lookup "result" (erMeta e) :: Maybe Value)
         , "channel"  .= (Map.lookup "channel" (erMeta e) :: Maybe Value)
+        -- GATE 1 of 4 for turn-failure entries (design §3.2). Without this
+        -- projection the entry reaches the frontend with no data and renders
+        -- nothing -- the filter alone would let it through and still show a
+        -- blank row. @failure@ is a distinct key, not an overload of
+        -- @harness@: 'Seal.Gateway.Transcript.reconEntryToFrontend' hardcodes
+        -- @harness@ to null, and the frontend uses @harness@ as an
+        -- agent-label fallback.
         ]
+      -- Attach @failure@ ONLY when erMeta carries one. Writing
+      -- @"failure" .= Nothing@ would emit @"failure": null@, and the
+      -- gateway filter keys on the key's PRESENCE -- so every harness entry
+      -- would have looked like a failure. (Caught by ApiSpec's
+      -- per-entry-timestamps test, which asserts a MEMORY_READ harness entry
+      -- is filtered out.)
+      withFailure = case Map.lookup "failure" (erMeta e) of
+        Nothing -> base
+        Just v  -> case base of
+          Object o -> Object (KeyMap.insert (Key.fromText "failure") v o)
+          other    -> other
   in case Map.lookup "approval" (erMeta e) of
-       Nothing -> base
+       Nothing -> withFailure
        Just approvalVal -> object
          [ "messages" .= msgs
          , "harness"  .= erHarness e

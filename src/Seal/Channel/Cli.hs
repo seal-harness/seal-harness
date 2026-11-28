@@ -16,7 +16,6 @@ module Seal.Channel.Cli
   ) where
 
 import Control.Exception (IOException, try)
-import Control.Concurrent (forkIO)
 import Control.Monad (void)
 import Data.Foldable (for_)
 import Control.Monad.IO.Class (liftIO)
@@ -90,7 +89,7 @@ import Seal.Session.Store
   , newSession, resolveDefaultAgent, saveSessionMeta )
 import Seal.Types.App (runApp)
 import Seal.Logging.Logger (SealLogger)
-import Seal.Logging.Exceptions (withExceptionLogging)
+import Seal.Logging.Exceptions (forkIOLogged, withExceptionLogging)
 import Seal.Types.Env (Env, envLogger)
 import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import Seal.Vault.Commands (VaultRuntime (..))
@@ -289,7 +288,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
               , taStartWiring   = \sessionBackends sid appEnv' eCfg' opCeiling m ->
                   TurnEngine.buildStartWiring td sessionBackends sid appEnv' eCfg' opCeiling (smChannel m)
               }
-        void (forkIO (do
+        void (forkIOLogged (tdLogger td) "bg" (do
           outcome <- runSessionTurn td bgAdapter meta Nothing prompt
           case toError outcome of
             Just err -> ccSend caps ("bg failed: " <> err)
@@ -381,7 +380,10 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
                   TurnEngine.buildStartWiring td sessionBackends sid appEnv' eCfg' opCeiling "cli"
               }
         outcome <- runSessionTurn td adapter meta Nothing t
-        for_ (toError outcome) (ccSend caps)
+        -- Requirement 5: the failure reads the same here as in the web
+        -- transcript (headline + cause + reference), and says so -- the
+        -- live path previously sent the message bare, with no prefix.
+        for_ (toError outcome) (\msg -> ccSend caps ("turn failed: " <> msg))
   runInputT hlSettings (loop caps plainHandler tabsH registryWithBg)
   where
     loop :: ChannelCaps -> (Text -> IO ()) -> TabsHandle -> Registry -> InputT IO ()

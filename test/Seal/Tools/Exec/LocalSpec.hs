@@ -36,6 +36,42 @@ spec = describe "Seal.Tools.Exec.Local" $ do
   let wsRoot = WorkspaceRoot "."
       h = mkLocalExecHandle wsRoot
 
+  describe "readBounded with non-UTF-8 process output" $ do
+    -- Regression: a command whose output is not valid UTF-8 (a binary file,
+    -- a Latin-1 log line, a truncated multibyte sequence) used to throw
+    -- out of 'readBounded' via the STRICT 'TE.decodeUtf8'. The throw is
+    -- deferred past the tool dispatch, so it surfaced later — inside the
+    -- transcript writer daemon, which it killed for the rest of the turn
+    -- bracket. The session then failed every subsequent turn with
+    -- "transcript writer daemon died during write" and looked hung.
+    -- 'readBounded' must decode leniently, like the rest of the codebase.
+    it "decodes 0xe8 (a lone continuation byte) instead of throwing" $ do
+      -- \350 is octal for 0xe8 — the exact byte that killed the writer.
+      cmd <- requireRight "fixture" (mkShellCommand "printf 'a\\350b'")
+      res <- lehExecShell h cmd Nothing
+      case res of
+        Right out -> do
+          -- The decodable ASCII around the bad byte survives.
+          out `shouldSatisfy` T.isInfixOf "a"
+          out `shouldSatisfy` T.isInfixOf "b"
+          -- And the bad byte became U+FFFD rather than an exception.
+          out `shouldSatisfy` T.isInfixOf "\xFFFD"
+        Left e -> expectationFailure ("expected lenient decode, got Left " ++ show e)
+
+    it "decodes an embedded NUL byte (raw binary passthrough) without throwing" $ do
+      cmd <- requireRight "fixture" (mkShellCommand "printf 'ftypisom\\000\\350x'")
+      res <- lehExecShell h cmd Nothing
+      case res of
+        Right out -> out `shouldSatisfy` T.isInfixOf "ftypisom"
+        Left e -> expectationFailure ("expected lenient decode, got Left " ++ show e)
+
+    it "still returns valid UTF-8 unchanged (multi-byte sequences intact)" $ do
+      cmd <- requireRight "fixture" (mkShellCommand "printf 'h\\303\\251llo'")
+      res <- lehExecShell h cmd Nothing
+      case res of
+        Right out -> out `shouldSatisfy` T.isInfixOf "h\233llo"
+        Left e -> expectationFailure ("expected Right, got Left " ++ show e)
+
   describe "lehExecShell (real /bin/sh -c)" $ do
     it "returns stdout on exit 0" $ do
       cmd <- requireRight "invalid command" (mkShellCommand "echo hello")

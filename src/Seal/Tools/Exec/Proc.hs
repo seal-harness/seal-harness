@@ -39,6 +39,7 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Data.Text.Encoding.Error qualified as TEE
 import System.IO (Handle, hClose, hIsEOF)
 import System.Process
   ( CreateProcess (..), ProcessHandle, createProcess, getProcessExitCode )
@@ -182,11 +183,22 @@ pollExitBounded ph budgetMicros = go (budgetMicros `div` 10_000)
 -- causes the child's writes to fail (SIGPIPE/EPIPE), the child exits, and
 -- 'waitForProcess' returns. The truncation marker is the signal that output
 -- was lost.
+--
+-- __The decode is LENIENT on purpose (carried from @main@'s \`7b892fb\`).__ Process
+-- output is untrusted bytes: a command that cats a binary file, a log line in
+-- Latin-1, or a multibyte sequence cut at the truncation boundary all produce
+-- invalid UTF-8. A strict 'TE.decodeUtf8' here throws, and because the result is
+-- a lazy 'Text' the throw is deferred past the tool dispatch (so the tool
+-- reports "ok") and lands later, inside the transcript-writer daemon — killing
+-- it for the rest of the turn bracket. Every subsequent turn on that session
+-- then failed with "transcript writer daemon died during write" and the session
+-- looked hung. Malformed bytes become U+FFFD instead; the output is a
+-- diagnostic aid, so substitution is strictly better than a crash.
 readBounded :: Handle -> Int -> IO Text
 readBounded h maxBytes = do
   bs <- BS.hGet h maxBytes
   eof <- hIsEOF h
-  let content = TE.decodeUtf8 bs
+  let content = TE.decodeUtf8With TEE.lenientDecode bs
   if eof
     then pure content
     else do

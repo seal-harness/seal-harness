@@ -48,7 +48,7 @@ import Control.Concurrent.STM
   ( TMVar, atomically, newEmptyTMVarIO, newTQueueIO, newTVarIO
   , modifyTVar', orElse, putTMVar, readTQueue, readTVar, readTVarIO, retry
   , takeTMVar, tryPutTMVar, tryReadTQueue, writeTQueue, writeTVar )
-import Control.Exception (bracket, catch, Exception, IOException, SomeException, throwIO)
+import Control.Exception (bracket, catch, IOException, SomeException, throwIO)
 import Control.Monad (void, foldM, unless, when)
 import Data.Aeson (decode)
 import Data.ByteString qualified as BS
@@ -84,6 +84,7 @@ import Seal.Transcript.ConvIndex (buildIndex, writeIdxEntry)
 import Seal.Transcript.Entries
   ( EntryKind (..), EntryRecord (..), Envelope (..), EnvelopeDelta (..)
   , emptyEnvelopeDelta, applyDelta, encodeEntryRecordRaw )
+import Seal.Transcript.Error (TranscriptError (..))
 import Seal.Transcript.Types
   ( TranscriptEntry (..), encodeEntryRaw )
 
@@ -93,15 +94,6 @@ import Seal.Transcript.Types
 -- actually reach the reader that builds the model's context.
 completionHarnessTag :: Text
 completionHarnessTag = "subagent-completion"
-
--- | Exception raised by 'itwRecordAndAck' when the single-writer daemon has
--- died (an I/O error in @writeOne@ killed it). Without this, a dead daemon
--- leaves the ACK 'TMVar' empty and the caller blocks forever — the
--- root-cause of session @20260724-113851-844@ silently hanging mid-dispatch.
-newtype TranscriptError = TranscriptError T.Text
-  deriving newtype (Eq, Show)
-
-instance Exception TranscriptError
 
 -- | Handle to the legacy single-file transcript writer. All fields are
 -- functions so the type is uniform between the real (file-backed) and fake
@@ -251,6 +243,16 @@ data IndexedTranscriptHandle = IndexedTranscriptHandle
   -- writer's own view of the conversation — compare against
   -- @length <$> itwReadConversation@ to spot a reader that is behind the
   -- writer (a completion injection the model never saw).
+  , itwLastFailure :: IO (Maybe SomeException)
+  -- ^ The exception that killed the daemon, if it died. 'Nothing' for a
+  -- healthy writer (or a fake).
+  --
+  -- Without this the caller only ever learns that the transcript became
+  -- unavailable, which says nothing about /why/. In the incident that
+  -- motivated this field, the daemon died of a strict UTF-8 decode while the
+  -- caller saw only "the writer died" — so the report said the useless thing
+  -- instead of the actionable one. 'Seal.Transcript.TurnFailure.classify'
+  -- unwraps this to name the real cause.
   }
 
 -- | Invariant counters for the indexed transcript writer.
@@ -494,7 +496,20 @@ withIndexedTranscript dir action = do
             pure st'
       shutdown convFd entriesFd idxFd done = do
         atomically (writeTQueue q (ITShutdown done))
-        atomically (takeTMVar done)
+        -- Wait for the daemon to acknowledge the shutdown, but NEVER
+        -- unconditionally: if the writer died mid-turn, nothing remains to
+        -- consume the 'ITShutdown' we just queued, and a plain 'takeTMVar'
+        -- then blocks the bracket forever. That hang is not cosmetic — it
+        -- strands the turn thread ("thread blocked indefinitely in an STM
+        -- transaction") and skips the 'closeFd' calls below, leaking three
+        -- descriptors per failed turn (a crashed session leaked four handle
+        -- sets, one per dead turn). A dead-daemon shutdown takes the
+        -- 'aliveRef' branch instead and closes the fds unconditionally.
+        _ <- atomically $
+          (Just <$> takeTMVar done)
+            `orElse` (do
+               stillAlive <- readTVar aliveRef
+               if stillAlive then retry else pure Nothing)
         closeFd convFd
         closeFd entriesFd
         closeFd idxFd
@@ -529,6 +544,9 @@ withIndexedTranscript dir action = do
         shutdown convFd entriesFd idxFd done)
     $ \(convFd, entriesFd, idxFd) -> do
         secretOpsRef <- newIORef Set.empty
+        -- Set by the daemon's handler BEFORE it flips aliveRef, so any caller
+        -- that observes the death also sees the cause (no torn read).
+        lastFailureTv <- newTVarIO Nothing
         let st0 = IndexedTranscriptState convFd entriesFd idxFd existingConv secretOpsRef Nothing
             -- The daemon with an exception handler: if writeOne throws, mark
             -- the daemon dead, fail every queued ACK (so callers blocked on
@@ -536,6 +554,9 @@ withIndexedTranscript dir action = do
             -- then exits — no further writes are attempted.
             safeDaemon st =
               daemon st `catch` \e -> do
+                -- Order matters: record the cause, THEN mark dead. A caller
+                -- that sees aliveRef=False is guaranteed to find the cause.
+                atomically (writeTVar lastFailureTv (Just e))
                 atomically (writeTVar aliveRef False)
                 globalLogIO ErrorS ("[transcript] writer daemon died: " <> ls (T.pack (show (e :: SomeException))))
                 -- Drain remaining queue items WITHOUT filling their ACK slots
@@ -605,7 +626,7 @@ withIndexedTranscript dir action = do
               notePendingInjection w
               alive <- readTVarIO aliveRef
               if not alive
-                then throwIO (TranscriptError "transcript writer daemon is dead")
+                then throwIO (TranscriptError "transcript writer daemon is dead" Nothing)
                 else do
                   tv <- newEmptyTMVarIO
                   timeoutVar <- newEmptyTMVarIO
@@ -624,8 +645,8 @@ withIndexedTranscript dir action = do
                     Left ()  -> do
                       stillAlive <- readTVarIO aliveRef
                       if stillAlive
-                        then throwIO (TranscriptError "transcript write timed out (daemon stuck)")
-                        else throwIO (TranscriptError "transcript writer daemon died during write")
+                        then throwIO (TranscriptError "transcript write timed out (daemon stuck)" Nothing)
+                        else throwIO (TranscriptError "transcript writer daemon died during write" Nothing)
         action IndexedTranscriptHandle
           { itwRecordAndAck = ackWrite
           , itwRecordAsync  = enqueue
@@ -639,6 +660,7 @@ withIndexedTranscript dir action = do
           , itwIsAlive = readTVarIO aliveRef
           , itwDiagnostics = readTVarIO diagTv
           , itwRecordedLength = readTVarIO writtenLenTv
+          , itwLastFailure    = readTVarIO lastFailureTv
           }
 
 -- | Read back the entries file, skipping malformed lines.
@@ -684,6 +706,7 @@ fakeIndexedTranscript = do
         , itwIsAlive = pure True
         , itwDiagnostics = pure emptyTranscriptDiagnostics
         , itwRecordedLength = length <$> readMVar convRef
+        , itwLastFailure    = pure Nothing
         }
     , do cs <- readMVar convRef
          es <- readMVar entriesRef
