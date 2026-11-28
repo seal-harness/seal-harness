@@ -20,6 +20,7 @@
 module Seal.ISA.Dispatch
   ( DispatchError (..)
   , dispatch
+  , dispatchOn
   , recordSkillLoadResult
   , recordSetupRepoResult
   ) where
@@ -61,23 +62,44 @@ data DispatchError = OpNotFound OpName | Denied Text | ExecFailed Text
 -- the 'UntrustedIO' capability handle + the Git 'CloneDeps' surface);
 -- Trusted/Audited opcodes ignore it (they have no 'UIOEnv' in scope —
 -- type-level capability scoping, spec §4/§8).
-dispatch
-  :: Registry -> IndexedTranscriptHandle -> BackendExec -> UIOEnv
-  -> ToolTimeoutConfig -> AbortFlag
-  -> OpName -> Value
-  -> App (Either DispatchError OpResult)
-
 -- | The error class recorded when machine resolution fails, so the transcript
 -- shows why a call never ran without duplicating the rendered message.
 resolvedErrClass :: Text
 resolvedErrClass = "machine"
 
-dispatch reg h backend uioEnv toolTimeout abortFlag name input =
+-- | Dispatch an opcode. See 'dispatchOn' for the machine-reporting variant.
+dispatch
+  :: Registry -> IndexedTranscriptHandle -> BackendExec -> UIOEnv
+  -> ToolTimeoutConfig -> AbortFlag
+  -> OpName -> Value
+  -> App (Either DispatchError OpResult)
+dispatch reg h backend uioEnv tt abort name input =
+  fmap fst (dispatchOn reg h backend uioEnv tt abort name input)
+
+-- | 'dispatch', also reporting WHICH machine the call ran on.
+--
+-- The machine is resolved inside 'dispatch' anyway (to pick the handle and,
+-- for an untrusted call, to stamp the ACK). Callers that act on the result —
+-- notably the post-@SETUP_REPO@ hooks in 'Seal.Core.TurnEngine', which must not
+-- re-scan the SESSION machine's workdir after a clone landed on ANOTHER one —
+-- need that name, and re-deriving it outside would be a second resolution that
+-- could disagree.
+--
+-- 'Nothing' for a Trusted opcode (there is no machine) and for a call that
+-- never reached resolution (not found, denied). 'Just' the RESOLVED machine for
+-- an untrusted call that got as far as picking a target, including one whose
+-- bootstrap then failed: the caller still needs to know where it was aimed.
+dispatchOn
+  :: Registry -> IndexedTranscriptHandle -> BackendExec -> UIOEnv
+  -> ToolTimeoutConfig -> AbortFlag
+  -> OpName -> Value
+  -> App (Either DispatchError OpResult, Maybe MachineName)
+dispatchOn reg h backend uioEnv toolTimeout abortFlag name input =
   case lookupOp reg name of
-    Nothing -> pure (Left (OpNotFound name))
+    Nothing -> pure (Left (OpNotFound name), Nothing)
     Just op ->
       case opAuthorize op input of
-        Left why -> pure (Left (Denied why))
+        Left why -> pure (Left (Denied why), Nothing)
         Right () -> do
           let -- Extract the per-call timeout (in seconds → microseconds)
               -- from the input JSON, clamped to the max.
@@ -94,7 +116,7 @@ dispatch reg h backend uioEnv toolTimeout abortFlag name input =
                   let requested = machineField input
                   entry' <- liftIO (mkInvocationEntry name input (requested, Just resolvedErrClass))
                   liftIO (itwRecordAndAck h (IndexedTranscriptWrite [] entry'))
-                  pure (Left (ExecFailed (renderMachineError name merr)))
+                  pure (Left (ExecFailed (renderMachineError name merr)), Nothing)
                 Right resolved -> do
                   -- Fetch-or-bootstrap the machine's capabilities, then build
                   -- the per-call environment. Swapping BOTH fields is required:
@@ -105,7 +127,8 @@ dispatch reg h backend uioEnv toolTimeout abortFlag name input =
                     Left merr -> do
                       entry' <- liftIO (mkInvocationEntry name input (Just (machineNameText resolved), Just resolvedErrClass))
                       liftIO (itwRecordAndAck h (IndexedTranscriptWrite [] entry'))
-                      pure (Left (ExecFailed (renderMachineError name merr)))
+                      pure (Left (ExecFailed (renderMachineError name merr))
+                             , Just resolved)
                     Right (handle', deps') -> do
                       let callEnv = uioEnv { uieUntrustedIO = handle'
                                            , uieCloneDeps   = deps' }
@@ -117,23 +140,23 @@ dispatch reg h backend uioEnv toolTimeout abortFlag name input =
                             pure (Right r)
                       raced <- liftIO (runWithTimeoutAbortRetry toolTimeout abortFlag (Microseconds perCallMicros) ioAction)
                       case raced of
-                        Right opResult -> pure (Right opResult)
+                        Right opResult -> pure (Right opResult, Just resolved)
                         Left toolErr -> do
                           liftIO (recordToolError h name input toolErr perCallMicros)
-                          pure (Left (ExecFailed (renderToolError name toolErr)))
+                          pure (Left (ExecFailed (renderToolError name toolErr)), Just resolved)
             TrustedOpcode {} ->
               case opTrust op of
                 Trusted -> do
                   entry <- liftIO (mkInvocationEntry name input (Nothing, Nothing))
                   liftIO (itwRecordAsync h (IndexedTranscriptWrite [] entry))
-                  runTrustedOpcode h backend toolTimeout abortFlag op name input perCallMicros
+                  addNoMachine <$> runTrustedOpcode h backend toolTimeout abortFlag op name input perCallMicros
                 Audited -> do
                   entry <- liftIO (mkInvocationEntry name input (Nothing, Nothing))
                   -- No Audited log remains; treat as Trusted (record to the
                   -- session transcript, then run). The evolutionary-store
                   -- opcodes that used to be Audited are now Trusted file writes.
                   liftIO (itwRecordAsync h (IndexedTranscriptWrite [] entry))
-                  runTrustedOpcode h backend toolTimeout abortFlag op name input perCallMicros
+                  addNoMachine <$> runTrustedOpcode h backend toolTimeout abortFlag op name input perCallMicros
                 Untrusted ->
                   -- Unreachable: an UntrustedOpcode would have matched above.
                   -- Kept for exhaustiveness (the GADT already separates the
@@ -141,6 +164,10 @@ dispatch reg h backend uioEnv toolTimeout abortFlag name input =
                   -- which the Opcode invariants guarantee is Trusted or Audited).
                   error "dispatch: invariant violation — Untrusted trust on a TrustedOpcode"
   where
+    -- A Trusted opcode runs in-process on the control plane: there is no
+    -- execution machine to report.
+    addNoMachine r = (r, Nothing)
+
     -- | Run a Trusted opcode, conditionally wrapping it in the
     -- timeout/abort/retry race. Blocking opcodes (ASK_HUMAN) skip the
     -- race — they block on human input which can take arbitrarily long,

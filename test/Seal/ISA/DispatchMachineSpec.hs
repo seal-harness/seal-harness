@@ -18,7 +18,7 @@ import Seal.Config.Machines (MachineName, Selectable (..), mkMachineName)
 import Seal.Core.Types (OpName (..))
 import Seal.Handles.Transcript (IndexedTranscriptHandle, fakeIndexedTranscript)
 import Seal.Transcript.Entries (EntryRecord (..))
-import Seal.ISA.Dispatch (DispatchError (..), dispatch)
+import Seal.ISA.Dispatch (DispatchError (..), dispatch, dispatchOn)
 import Seal.ISA.Opcode
 import Seal.ISA.Registry (mkRegistry)
 import Seal.Providers.Class (ToolResultPart (..))
@@ -204,6 +204,49 @@ spec = describe "dispatch — per-call machine resolution" $ do
       rendered `shouldNotSatisfy` T.isInfixOf "host"
       rendered `shouldNotSatisfy` T.isInfixOf "/srv/"
       rendered `shouldNotSatisfy` T.isInfixOf "identity"
+
+  -- ---------------------------------------------------------------------
+  -- WU-13: dispatchOn reports WHICH machine ran, for the post-SETUP_REPO
+  -- hooks. They must not re-scan the session machine's workdir after a clone
+  -- landed on another one — so they need the name, and re-deriving it outside
+  -- dispatch would be a second resolution that could disagree.
+  -- ---------------------------------------------------------------------
+
+  describe "WU-13 dispatchOn reports the machine" $ do
+
+    it "reports the named machine for an untrusted call" $ do
+      ref <- newIORef 0
+      (h, _) <- fakeIndexedTranscript
+      seeded <- routingFor [(nm "session", countingIO ref), (nm "beta", countingIO ref)]
+      abort <- newAbortFlag
+      (_, mRanOn) <- runTestApp (dispatchOn (mkRegistry [shellOp]) h localBackend
+             (mkTestUIOEnvWith mkRemoteUntrustedIOStub stubCloneDeps seeded)
+             defaultToolTimeoutConfig abort (OpName "SHELL_EXEC")
+             (object ["machine" .= ("beta" :: Text)]))
+      mRanOn `shouldBe` Just (nm "beta")
+
+    it "reports the session machine when none is named" $ do
+      ref <- newIORef 0
+      (h, _) <- fakeIndexedTranscript
+      seeded <- routingFor [(nm "session", countingIO ref)]
+      abort <- newAbortFlag
+      (_, mRanOn) <- runTestApp (dispatchOn (mkRegistry [shellOp]) h localBackend
+             (mkTestUIOEnvWith mkRemoteUntrustedIOStub stubCloneDeps seeded)
+             defaultToolTimeoutConfig abort (OpName "SHELL_EXEC") (object []))
+      mRanOn `shouldBe` Just (nm "session")
+
+    it "reports Nothing when the call was denied before resolution" $ do
+      -- opAuthorize runs first, so a denied call has no machine — and the
+      -- caller must not act as though it ran somewhere.
+      ref <- newIORef 0
+      (h, _) <- fakeIndexedTranscript
+      seeded <- routingFor [(nm "session", countingIO ref)]
+      abort <- newAbortFlag
+      (res, mRanOn) <- runTestApp (dispatchOn (mkRegistry [denyingOp]) h localBackend
+             (mkTestUIOEnvWith mkRemoteUntrustedIOStub stubCloneDeps seeded)
+             defaultToolTimeoutConfig abort (OpName "SHELL_EXEC") (object []))
+      res `shouldSatisfy` isDenied
+      mRanOn `shouldBe` Nothing
 
 -- Helpers -----------------------------------------------------------------
 

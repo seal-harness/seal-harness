@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 -- | The unified turn engine — the single implementation of the ISA registry
 -- builder, the child registry builder, the system-prompt resolver, and the
 -- turn body ('runSessionTurn').
@@ -32,6 +33,7 @@ module Seal.Core.TurnEngine
 import Control.Exception (bracket, catch)
 import Control.Monad (unless, void, when)
 import Data.Aeson (Value)
+import Data.Aeson qualified as Aeson
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Set (member, fromList)
@@ -95,7 +97,7 @@ import Seal.Harness.Id (newHarnessId, harnessIdToText)
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
 import Seal.ISA.Dispatch
-  (DispatchError (..), dispatch, recordSetupRepoResult,
+  (DispatchError (..), dispatchOn, recordSetupRepoResult,
    recordSkillLoadResult)
 import Seal.ISA.Ops.Agent
   ( AgentStartGate (..), AgentStartWiring (..), AgentWorkerBuilder
@@ -122,7 +124,8 @@ import qualified Seal.ISA.Registry as ISA
 import Seal.Logging.Exceptions (withExceptionLogging)
 import Seal.Logging.Logger (SealLogger)
 import Seal.Providers.Class
-  (ContentBlock (..), Message (..), Role (..), SomeProvider, ToolChoice (..))
+  (ContentBlock (..), Message (..), pattern Message, Role (..), SomeProvider
+  , ToolChoice (..))
 import Seal.Transcript.Entries
   ( EntryKind (..), EntryRecord (..), EnvelopeDelta (..) )
 import Seal.Transcript.ConvIndex (convLineCount, ensureIndex, readConvLines)
@@ -157,7 +160,7 @@ import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption)
 import Seal.Tools.Exec.Remote (RemoteRunner, mkRealRemoteRunner)
-import Seal.Tools.Exec.Machine (resolveRegistryTarget, rtSelectable)
+import Seal.Tools.Exec.Machine (resolveRegistryTarget, rtSelectable, rtSession)
 import Seal.Tools.Exec.UIO.Internal (UIOEnv (..))
 import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs (..), snapIsDirectoryAt, snapTopDirs )
@@ -1157,14 +1160,24 @@ callDispatcher td caps sid channelLabel callOpName val = do
                    (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) caps onDemand
     itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
     callAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
-    res <- runApp appEnv (dispatch isaReg tHandle localBackend uioEnv (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
+    (res, mRanOn) <- runApp appEnv (dispatchOn isaReg tHandle localBackend uioEnv (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
     case res of
       Right r -> do
         let opNm = case callOpName of OpName n -> n
         if opNm == "SETUP_REPO"
           then do
             recordSetupRepoResult tHandle callOpName val r (Just channelLabel)
-            unless (orIsError r) $ do
+            -- The post-clone hooks act on the SESSION's workdir: they
+            -- invalidate its discovery scan, re-scan it, and re-bind the
+            -- repo's agents.md from the defs found there. If the clone ran on
+            -- ANOTHER machine, none of that applies — that machine's workdir
+            -- changed, and this session's did not. Running them anyway would
+            -- drop a warm cache for no reason and re-bind from defs on the
+            -- wrong filesystem (design §6.6).
+            let ranOnSessionMachine = case mRanOn of
+                  Nothing -> True   -- no machine reported: behave as before
+                  Just nm -> nm == rtSession (uieMachines uioEnv)
+            unless (orIsError r || not ranOnSessionMachine) $ do
               -- The clone changed the workdir's structure: drop the cached
               -- discovery scan, re-scan fresh, and bind from the fresh defs.
               -- Persist the cloned repo URL *and* the branch (or tag) to
@@ -1219,12 +1232,53 @@ callDispatcher td caps sid channelLabel callOpName val = do
                 let model = maybe (ModelId "") (ModelId . smModel) mMetaAfterBind
                 recordPreamble tHandle model mSystem isaReg
             broadcastAgentDefsChanged (tdBroker td)
+            -- Tell the model where its relative paths now resolve. A clone on
+            -- another machine puts the checkout on THAT machine's filesystem; a
+            -- follow-up FILE_READ of a relative path uses the SESSION's machine,
+            -- so the file will not be there. Saying so is the difference between
+            -- a model that adapts (names `machine` again) and one that thrashes.
+            -- Silent when the clone was local to the session, where the default
+            -- already does the right thing.
+            unless ranOnSessionMachine $
+              appendModelNote tHandle $
+                "Note: that clone ran on execution machine \""
+                  <> maybe "" machineNameText mRanOn <> "\". Follow-up relative "
+                  <> "paths resolve on this session's machine (\""
+                  <> machineNameText (rtSession (uieMachines uioEnv))
+                  <> "\"), where the checkout is NOT present. Name machine = "
+                  <> "\"" <> maybe "" machineNameText mRanOn
+                  <> "\" again on any call that needs those files."
           else recordSkillLoadResult tHandle callOpName val r (Just channelLabel)
         case mMeta of
           Just meta -> broadcastNewEntries (tdBroker td) paths sid (smModel meta) (smCreatedAt meta)
           Nothing   -> pure ()
       Left _  -> pure ()
     pure res
+
+-- | Record a harness note the model will see on its next turn.
+--
+-- An Assistant message with no tool call: the loop's next request includes the
+-- conversation, so this reaches the model exactly once and is visible in the
+-- transcript as a plain line. Used for the cross-machine SETUP_REPO divergence
+-- note — the model must learn that its clone landed elsewhere, and a note in
+-- the conversation is the only channel that is both model-visible and durable.
+appendModelNote :: IndexedTranscriptHandle -> Text -> IO ()
+appendModelNote tHandle note = do
+  now <- getCurrentTime
+  let entry = EntryRecord
+        { erId = ""
+        , erTimestamp = now
+        , erKind = EKHarness
+        , erConvLen = 1
+        , erEnvelope = Nothing
+        , erUsage = Nothing
+        , erStop = Nothing
+        , erDurationMs = Nothing
+        , erHarness = Nothing
+        , erCorrelation = Nothing
+        , erMeta = Map.fromList [("note", Aeson.String "machine-divergence")]
+        }
+  itwRecordAndAck tHandle (IndexedTranscriptWrite [Message Assistant [CbText note]] entry)
 
 -- | Build the 'AgentStartWiring' for a unified turn (design §5.3 — replaces
 -- @webStartWiring@, @channelStartWiring@, @cliStartWiring@). The
