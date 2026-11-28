@@ -1082,6 +1082,46 @@ spec = describe "Seal.Gateway.API" $ do
             , "synopsis" .= ("Beta synopsis" :: T.Text) ]
         ]
 
+  -- ── WU-10: GET /api/machines — the web new-tab picker's data source.
+  describe "GET /api/machines (WU-10)" $ do
+    it "returns 200 with a selectable list, the default, and unusable entries" $ do
+      app <- mkApp
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "machines"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          -- The shape the picker reads. A fresh install has `local` selectable
+          -- and no default, so the lists are present and well-typed rather
+          -- than absent — an absent key would make the UI code branch.
+          o `shouldSatisfy` KeyMap.member (Key.fromText "selectable")
+          o `shouldSatisfy` KeyMap.member (Key.fromText "default")
+          o `shouldSatisfy` KeyMap.member (Key.fromText "unusable")
+        other -> expectationFailure ("expected an object, got " <> show other)
+
+    it "lists `local` when allow_localhost is on (the default)" $ do
+      app <- mkApp
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "machines"])
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) ->
+          case KeyMap.lookup (Key.fromText "selectable") o of
+            Just (A.Array xs) ->
+              [ t | A.String t <- V.toList xs ] `shouldContain` ["local"]
+            other -> expectationFailure ("expected an array, got " <> show other)
+        other -> expectationFailure ("expected an object, got " <> show other)
+
+    it "never returns a host, user, path or key — negative" $ do
+      -- The requirements forbid a client being handed coordinates. Rendered
+      -- JSON is the right level to assert at: a field added later that carries
+      -- a host fails here even if nobody thought to update a typed decoder.
+      app <- mkApp
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "machines"])
+      let rendered = TE.decodeUtf8 (BL.toStrict body)
+      rendered `shouldNotSatisfy` T.isInfixOf "host"
+      rendered `shouldNotSatisfy` T.isInfixOf "user"
+      rendered `shouldNotSatisfy` T.isInfixOf "/srv/"
+      rendered `shouldNotSatisfy` T.isInfixOf "identity"
+      rendered `shouldNotSatisfy` T.isInfixOf "SHA256"
+
   it "GET /api/harnesses returns 200" $ do
     app <- mkApp
     status <- runAppStatus app (testRequest methodGet ["api", "harnesses"])

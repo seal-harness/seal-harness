@@ -84,7 +84,8 @@ import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
 
 import Seal.Config.Machines
-  ( MachineTarget (..), resolveRegistryForSecurity )
+  ( MachineRegistry (..), MachineTarget (..), machineNameText
+  , resolveRegistryForSecurity )
 import Seal.Session.ExecCache (cachedSessionExec, cachedWorkdirScan)
 import Seal.Session.Workdir
   ( mkSessionExecFor, remoteSessionWorkdirPath, SessionExec (..) )
@@ -142,7 +143,7 @@ import Seal.Providers.OllamaReadiness
   ( OllamaReadiness (..), readinessWire )
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
-import Seal.Session.Machine (machineForSession)
+import Seal.Session.Machine (machineForSession, renderMachineConfigError)
 import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
 import Seal.SourceControl.Repo
   ( RepoCredential (..), RepoId, SourceRepo (..), hostAllowed, mkRepoId
@@ -327,6 +328,13 @@ dispatchApi deps req respond =
     -- menu to report.
     (m', ["api", "commands"]) | m' == methodGet ->
       respond =<< handleCommands deps
+    -- GET /api/machines -> the execution machines the web new-tab picker
+    -- offers. NAMES AND REASONS ONLY: the requirements forbid the model (and,
+    -- for the picker's purposes, any client) from being handed a host, user,
+    -- address, key or path. 'handleMachines' is what enforces that, and the
+    -- negative assertion in 'ApiSpec' pins it.
+    (m', ["api", "machines"]) | m' == methodGet ->
+      respond =<< handleMachines deps
     (m', ["api", "tabs"]) | m' == methodGet -> do
       tl <- snapshotTabs (adTabsHandle deps)
       let tabsJson = map tabToJson (tlTabs tl)
@@ -1586,6 +1594,52 @@ handleCommands deps = case adSend deps of
         [ "name" .= n
         , "synopsis" .= csSynopsis spec
         ]
+
+-- | Handle @GET \/api\/machines@ — what the web new-tab picker offers.
+--
+-- __Names and reasons only.__ The response carries each selectable machine's
+-- NAME and the configured default; for a configured-but-unusable machine it
+-- carries the name plus a reason string. It never carries a host, user, path,
+-- key or fingerprint: the requirements forbid it, and a browser has no use for
+-- them. This is the same split as the model-facing renderer — the reason text
+-- comes from 'renderMachineConfigError', which is the OPERATOR-facing renderer,
+-- so a host is not present there either; only the condition.
+--
+-- A malformed @machines.toml@ yields an empty machine list rather than a 500.
+-- The picker's job is to show what may be chosen; if nothing can be resolved,
+-- showing nothing (and letting the first tool call explain why) is better than
+-- a request that fails in a way the UI cannot render.
+handleMachines :: ApiDeps -> IO Response
+handleMachines deps = do
+  eReg <- resolveRegistryForSecurity (srPaths (adSessionRuntime deps))
+                                     (adSecurityConfig deps)
+  case eReg of
+    Left _ -> pure (jsonLBS status200 (A.encode emptyPayload))
+    Right reg -> pure (jsonLBS status200 (A.encode (payload reg)))
+  where
+    emptyPayload = object
+      [ "selectable" .= ([] :: [Text])
+      , "default"    .= (Nothing :: Maybe Text)
+      , "unusable"   .= ([] :: [Value]) ]
+
+    payload reg = object
+      [ "selectable" .= map machineNameText (Map.keys (regMachines reg))
+      , "default"    .= fmap machineNameText (regDefault reg)
+      , "unusable"   .= [ object
+                            [ "name"   .= machineNameText nm
+                            , "reason" .= reasonFor nm r ]
+                        | (nm, r) <- Map.toList (regRejected reg) ]
+      ]
+
+    -- 'renderMachineConfigError' prefixes "machines.toml: machine \"x\" is
+    -- unusable: ". The name is already a field here, so the prefix is stripped
+    -- to keep the UI from repeating it.
+    reasonFor nm r =
+      let full = renderMachineConfigError nm r
+          marker = "is unusable: "
+      in case T.breakOn marker full of
+           (_, rest) | not (T.null rest) -> T.strip (T.drop (T.length marker) rest)
+           _                             -> full
 
 -- | Handle PUT /api/sessions/:id/archived. Sets or clears the archive flag
 -- via 'updateSessionArchived'. Returns 200 {ok:true} on success, 404 when
