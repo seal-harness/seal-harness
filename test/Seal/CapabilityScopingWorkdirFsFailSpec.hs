@@ -18,12 +18,14 @@
 module Seal.CapabilityScopingWorkdirFsFailSpec (spec) where
 
 import Control.Exception (IOException, catch)
+import Data.Either (isLeft)
+import System.FilePath ((</>))
+import Seal.Security.Path (WorkspaceRoot (..), mkSafePath)
 import Data.List (isSuffixOf)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
-import System.FilePath ((</>))
 import Test.Hspec
 
 spec :: Spec
@@ -63,6 +65,40 @@ spec = describe "Capability scoping — WorkdirFs/UIOEnv grep guard (W6 DoD)" $ 
   it "no module under src/Seal/ISA/Ops/ declares a UIOEnv field" $ do
     offenders <- collectOpModules
     bad <- filterM (\f -> hasFieldType <$> readSrc f <*> pure "UIOEnv") offenders
+    bad `shouldBe` []
+
+  -- -----------------------------------------------------------------------
+  -- WU-14: the ~/.seal agent-immutability guard, extended to the machines
+  -- feature's files. Rule 3: ~/.seal holds security-critical, agent-immutable
+  -- state. 'blockedNames' already covers ".seal", so mkSafePath refuses these
+  -- paths — these assertions pin that the NEW files inherit that refusal, and
+  -- that no opcode module can reach the config machinery that reads them.
+  -- -----------------------------------------------------------------------
+
+  it "mkSafePath refuses ~/.seal/machines.toml" $ do
+    -- A relative path whose segment list contains .seal is blocked before any
+    -- filesystem access, so this is deterministic and needs no fixture file.
+    res <- mkSafePath (WorkspaceRoot "/tmp/ws") ".seal/machines.toml"
+    res `shouldSatisfy` isLeft
+
+  it "mkSafePath refuses ~/.seal/exec-known-hosts" $ do
+    res <- mkSafePath (WorkspaceRoot "/tmp/ws") ".seal/exec-known-hosts"
+    res `shouldSatisfy` isLeft
+
+  it "mkSafePath refuses an ABSOLUTE path into ~/.seal" $ do
+    -- The AllowAbs variants canonicalise; the blocked-name check runs on the
+    -- requested segments first, so an absolute spelling is refused too.
+    res <- mkSafePath (WorkspaceRoot "/tmp/ws") "/home/someone/.seal/machines.toml"
+    res `shouldSatisfy` isLeft
+
+  it "no module under src/Seal/ISA/Ops/ imports Seal.Config.Machines" $ do
+    offenders <- collectOpModules
+    bad <- filterM (moduleImports "Seal.Config.Machines") offenders
+    bad `shouldBe` []
+
+  it "no module under src/Seal/ISA/Ops/ imports Seal.Config.Security" $ do
+    offenders <- collectOpModules
+    bad <- filterM (moduleImports "Seal.Config.Security") offenders
     bad `shouldBe` []
 
 -- | Read a source file as Text. Fail-soft to @""@ when the file is absent

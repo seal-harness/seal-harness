@@ -183,6 +183,7 @@ library
         Seal.Command.Tab
         Seal.Command.Agent
         Seal.Command.Background
+        Seal.Command.Machine
         Seal.Command.AccessControl
         Seal.Command.Call
         Seal.Command.New
@@ -602,6 +603,7 @@ test-suite tests
         Seal.Command.RepoSpec
         Seal.Command.AgentSpec
         Seal.Command.BackgroundSpec
+        Seal.Command.MachineSpec
         Seal.Command.CallSpec
         Seal.Command.AccessControlSpec
         Seal.Command.ChannelSpec

@@ -100,6 +100,7 @@ import qualified Seal.Command.SkillSpec
 import qualified Seal.Command.RepoSpec
 import qualified Seal.Command.AgentSpec
 import qualified Seal.Command.BackgroundSpec
+import qualified Seal.Command.MachineSpec
 import qualified Seal.Command.CallSpec
 import qualified Seal.Command.ChannelSpec
 import qualified Seal.Command.SpecSpec
@@ -341,6 +342,7 @@ specs = do
   Seal.Command.RepoSpec.spec
   Seal.Command.AgentSpec.spec
   Seal.Command.BackgroundSpec.spec
+  Seal.Command.MachineSpec.spec
   Seal.Command.CallSpec.spec
   Seal.Command.ChannelSpec.spec
   Seal.Command.SpecSpec.spec
