@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 -- | The @/new@ command: start a fresh session in a new tab.
 --
@@ -37,6 +38,7 @@ module Seal.Command.New
   ) where
 
 import Data.Maybe (fromMaybe, listToMaybe)
+import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Options.Applicative
@@ -45,6 +47,9 @@ import Options.Applicative
 
 import Seal.Channel.Caps (ChannelCaps (..))
 import Seal.Channel.Cli (Backends (..))
+import Seal.Config.Machines
+  ( MachineName, MachineRegistry (..), localMachineName, machineNameText
+  , mkMachineName )
 import Seal.Command.Spec
   ( Availability (..), CommandAction (..), CommandGroup (..), commandAction
   , CommandName (..), CommandSpec (..) )
@@ -108,6 +113,12 @@ data NewDeps = NewDeps
     -- ^ Optional repo-registry handle for resolving @-r@ repo IDs to URLs.
     -- 'Nothing' in contexts without a registry (tests); the @-r@ value is
     -- then treated as a raw URL.
+  , ndMachines     :: IO (Either Text MachineRegistry)
+    -- ^ The resolved machine registry, re-read per @/new@ so an operator who
+    -- edited @machines.toml@ mid-session gets the current answer. IO rather
+    -- than a value because a value captured at wiring time would report
+    -- machines that no longer exist — and @/new -x@ would then persist a name
+    -- the resolver rejects on the very next turn.
   }
 
 -- | The @/new@ command spec. Grouped under Sessions in @/help@. Always
@@ -129,6 +140,7 @@ newParserInfo deps =
         <$> optional providerOpt
         <*> optional modelOpt
         <*> optional repoOpt
+        <*> optional machineOpt
         <*> optional branchOpt
         <**> helper )
     (  progDesc "Start a new tab with a fresh session (optional -p/-m/-r/-b overrides)"
@@ -159,6 +171,14 @@ repoOpt = strOption
   <> help "Repo ID (from /repo list) or git URL to clone into the session (default: none)"
   )
 
+machineOpt :: Parser Text
+machineOpt = strOption
+  (  long "machine"
+  <> short 'x'
+  <> metavar "MACHINE"
+  <> help "Execution machine for this session (default: the configured default)"
+  )
+
 branchOpt :: Parser Text
 branchOpt = strOption
   (  long "branch"
@@ -170,29 +190,76 @@ branchOpt = strOption
 -- | The @/new@ action: read the old session, mint a fresh session using
 -- the given args (or config defaults when not specified), insert a new
 -- tab, optionally clone a repo, and send the confirmation line.
-newCmd :: NewDeps -> Maybe Text -> Maybe Text -> Maybe Text -> Maybe Text -> CommandAction
-newCmd deps mProvider mModel mRepo mBranch = commandAction $ \caps -> do
-  oldMeta <- ndOldMeta deps
-  let args = NewArgs
-        { naProvider = mProvider
-        , naModel    = mModel
-        , naRepo     = mRepo
-        , naBranch   = mBranch
-        }
-  meta <- mintNewSessionWith args oldMeta deps
-  oldSid <- ndInsertTab deps caps meta
-  case (naRepo args, ndSetupRepo deps) of
-    (Just repoVal, Just setupFn) -> do
-      repoUrl <- resolveRepoUrlMaybe deps repoVal
-      -- @-b\/--branch@ is passed through as-is: 'Nothing' asks for the
-      -- remote's default branch. @-b@ without @-r@ never reaches here (the
-      -- 'naRepo' guard above skips setup entirely).
-      eRes <- setupFn (smId meta) repoUrl (naBranch args)
-      case eRes of
-        Left err -> ccSend caps ("repo setup failed: " <> err)
-        Right _  -> pure ()
-    _ -> pure ()
-  ccSend caps (renderNewConfirmation meta oldSid)
+newCmd
+  :: NewDeps -> Maybe Text -> Maybe Text -> Maybe Text -> Maybe Text
+  -> Maybe Text -> CommandAction
+newCmd deps mProvider mModel mRepo mMachine mBranch = commandAction $ \caps -> do
+  -- Resolve the machine BEFORE minting: an unknown or forbidden name must
+  -- fail here, with the valid choices, rather than persist a name the next
+  -- turn's resolver rejects. This is the "fails at /new time" requirement.
+  eMachine <- resolveMachineArg deps mMachine
+  case eMachine of
+    Left err -> ccSend caps err
+    Right machine -> do
+      oldMeta <- ndOldMeta deps
+      let args = NewArgs
+            { naProvider = mProvider
+            , naModel    = mModel
+            , naRepo     = mRepo
+            , naMachine  = mMachine
+            , naBranch   = mBranch
+            }
+      meta <- mintNewSessionWith args oldMeta deps machine
+      oldSid <- ndInsertTab deps caps meta
+      case (naRepo args, ndSetupRepo deps) of
+        (Just repoVal, Just setupFn) -> do
+          repoUrl <- resolveRepoUrlMaybe deps repoVal
+          -- @-b\/--branch@ is passed through as-is: 'Nothing' asks for the
+          -- remote's default branch. @-b@ without @-r@ never reaches here (the
+          -- 'naRepo' guard above skips setup entirely).
+          eRes <- setupFn (smId meta) repoUrl (naBranch args)
+          case eRes of
+            Left err -> ccSend caps ("repo setup failed: " <> err)
+            Right _  -> pure ()
+        _ -> pure ()
+      ccSend caps (renderNewConfirmation meta oldSid)
+
+-- | Resolve the @-x\/--machine@ argument against the live registry.
+--
+-- 'Nothing' means no flag was given, which is the documented default: the
+-- configured @default@ decides at call time, so an operator who later changes
+-- the default moves sessions that never pinned one.
+--
+-- A supplied name is validated HERE, not at the first tool call, so
+-- @/new -x typo@ fails immediately with the valid choices instead of minting a
+-- session that cannot run anything. 'local' is refused under
+-- @allow_localhost = false@ by the same check, because it is not in
+-- 'regMachines' in that state.
+resolveMachineArg :: NewDeps -> Maybe Text -> IO (Either Text (Maybe MachineName))
+resolveMachineArg deps = \case
+  Nothing -> pure (Right Nothing)
+  Just raw -> do
+    eReg <- ndMachines deps
+    pure $ case eReg of
+      Left err -> Left ("could not read machines.toml: " <> err)
+      Right reg -> case mkMachineName raw of
+        Right nm
+          | Map.member nm (regMachines reg) -> Right (Just nm)
+          | nm == localMachineName -> Left (notSelectableMsg raw reg)
+          | otherwise -> Left (notSelectableMsg raw reg)
+        -- `local` is reserved: mkMachineName refuses to construct it, so it
+        -- can only arrive as raw text and needs its own branch.
+        Left _ | raw == "local" ->
+          if Map.member localMachineName (regMachines reg)
+            then Right (Just localMachineName)
+            else Left (notSelectableMsg raw reg)
+        Left _ -> Left (notSelectableMsg raw reg)
+  where
+    notSelectableMsg raw reg =
+      "unknown execution machine \"" <> raw <> "\". Selectable machines: "
+        <> T.intercalate ", "
+             ([ machineNameText nm | nm <- Map.keys (regMachines reg) ])
+        <> "."
 
 -- | Resolve the @-r@ value to a URL using the repo registry (if wired),
 -- falling back to the raw value.
@@ -207,9 +274,11 @@ resolveRepoUrlMaybe deps raw =
 -- @\/model use@ changes survive @\/new@), and ultimately to config
 -- defaults. Persisted to disk via 'newSession' so @/session list@ picks it
 -- up. Shared by the registry path (CLI/web) and the loop-level inbox path.
-mintNewSessionWith :: NewArgs -> SessionMeta -> NewDeps -> IO SessionMeta
+mintNewSessionWith
+  :: NewArgs -> SessionMeta -> NewDeps -> Maybe MachineName -> IO SessionMeta
 mintNewSessionWith args oldMeta deps =
-  newSession (ndPaths deps) provider model (ndChannelLabel deps) (smAgent oldMeta) Nothing
+  newSession (ndPaths deps) provider model (ndChannelLabel deps)
+             (smAgent oldMeta)
   where
     provider = fromMaybe (smProvider oldMeta) (naProvider args)
     model    = fromMaybe (smModel oldMeta) (naModel args)

@@ -26,6 +26,7 @@ import Seal.Providers.OllamaReadinessProbe
   ( mkOllamaProbes, defaultProbesConfig, oprReadiness )
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Templates (ensureConfigTemplates)
+import Seal.Config.Machines (resolveRegistryForSecurity)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
 import Seal.Config.Paths
   ( SealPaths (..)
@@ -198,6 +199,8 @@ runTui autonomy logger = do
             pure oldSid
         , ndSetupRepo = Nothing
         , ndRepoReg = Just repoReg
+        , ndMachines =
+            resolveRegistryForSecurity paths secCfg
         }
   let coreDeps = CoreCommandDeps
         { ccdVault       = rt

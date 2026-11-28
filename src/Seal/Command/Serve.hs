@@ -580,6 +580,8 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
             pure oldSid
         , ndSetupRepo = Just (handleSetupRepo sendDeps)
         , ndRepoReg = Just repoRegH
+        , ndMachines =
+            resolveRegistryForSecurity paths secCfg
         }
       -- The slash-command registry is built from the shared
       -- 'coreCommandSpecs' (the channel-agnostic core: vault, provider,

@@ -3,7 +3,8 @@ module Seal.Command.NewSpec (spec) where
 
 import Control.Monad (void)
 import Data.Default (def)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import System.IO.Unsafe (unsafePerformIO)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Options.Applicative (ParserResult (..), defaultPrefs, execParserPure)
@@ -16,12 +17,17 @@ import Seal.Command.Help (renderHelpIndex)
 import Seal.Command.New
   ( NewDeps (..), newCommandSpec, renderNewConfirmation
   , NewArgs (..), parseNewArgs, emptyNewArgs, resolveRepoUrl )
+import Data.Map.Strict qualified as Map
+import Seal.Config.Machines
+  ( MachineName, MachineRegistry (..), MachineTarget (..), localMachineName
+  , mkMachineName )
 import Seal.Config.Paths (SealPaths (..))
 import Seal.Gateway.Types.NewArgs (renderNewSessionConfirmation)
 import Seal.Command.Parse (ParseOutcome (..), parseSlash)
 import Seal.Command.Spec (CommandSpec (csParserInfo), mkRegistry, runCommandAction)
 import Seal.Core.Types (SessionId, mkSessionId)
 import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Store (listSessions)
 import Seal.SourceControl.Repo
   ( SourceRepo (..), RepoCredential (CredPat), VcsKind (VcsGitHub)
   , mkRepoId )
@@ -64,6 +70,7 @@ stubDeps =
     , ndInsertTab = \_caps _newMeta -> pure (mkSid "20260701-000000-000")
     , ndSetupRepo = Nothing
     , ndRepoReg = Nothing
+    , ndMachines = error "ndMachines: unused by parse/render tests"
     }
 
 -- | A throwaway 'SealPaths' under the system temp dir. The @\/new@ happy path
@@ -71,8 +78,13 @@ stubDeps =
 -- the end-to-end tests need a real, writable state tree.
 tempSealPaths :: IO SealPaths
 tempSealPaths = do
+  -- A UNIQUE directory per call. A fixed name leaked state between cases
+  -- ("no machine recorded" saw a session written by an earlier test), which is
+  -- a real hazard here because 'newSession' persists to disk and the assertions
+  -- read back every session under the root.
   tmp <- getTemporaryDirectory
-  let root = tmp </> "seal-new-spec"
+  uniq <- getUniqueSuffix
+  let root = tmp </> ("seal-new-spec-" <> uniq)
   pure SealPaths
     { spHome   = root
     , spConfig = root </> "config"
@@ -174,6 +186,7 @@ spec = describe "Seal.Command.New" $ do
           { naProvider = Just "anthropic"
           , naModel = Just "claude-sonnet-4"
           , naRepo = Just "https://github.com/foo/bar.git"
+          , naMachine = Nothing
           , naBranch = Nothing
           }
     it "parses long-form all three" $
@@ -182,6 +195,7 @@ spec = describe "Seal.Command.New" $ do
           { naProvider = Just "anthropic"
           , naModel = Just "claude-sonnet-4"
           , naRepo = Just "https://github.com/foo/bar.git"
+          , naMachine = Nothing
           , naBranch = Nothing
           }
     it "parses -b branch alongside -r repo" $
@@ -199,11 +213,81 @@ spec = describe "Seal.Command.New" $ do
           { naProvider = Just "anthropic"
           , naModel = Just "claude-sonnet-4"
           , naRepo = Just "seal"
+          , naMachine = Nothing
           , naBranch = Just "dev"
           }
     it "ignores unknown flags" $
       parseNewArgs "--unknown foo -p anthropic" `shouldBe`
         emptyNewArgs { naProvider = Just "anthropic" }
+    it "parses -x machine" $
+      parseNewArgs "-x mac-mini" `shouldBe` emptyNewArgs { naMachine = Just "mac-mini" }
+    it "parses --machine machine" $
+      parseNewArgs "--machine builder" `shouldBe` emptyNewArgs { naMachine = Just "builder" }
+
+  -- ── WU-10: /new -x — the machine override.
+  --
+  -- Two failure modes matter and neither is a crash: an unknown name must fail
+  -- AT /new TIME with the valid choices (not mint a session that cannot run
+  -- anything), and a session started without -x must record NOTHING so the
+  -- configured default keeps deciding — which is what makes an operator's later
+  -- change of `default` move sessions that never pinned one.
+  describe "WU-10 /new -x machine override" $ do
+
+    it "-x <selectable> persists that machine into session.json" $ do
+      paths <- tempSealPaths
+      sentRef <- newIORef ([] :: [Text])
+      let deps = (seamDeps paths newMeta Nothing)
+            { ndMachines = pure (Right twoMachineRegistry) }
+      runNewAction deps (recordingCaps sentRef) ["-x", "alpha"]
+      -- The id is minted from the clock, so read whatever landed rather than
+      -- guessing: the assertion is about the RECORDED machine, not the id.
+      metas <- listSessions paths
+      map smMachine metas `shouldBe` [Just (machineName "alpha")]
+
+    it "-x <unknown> fails before minting, listing the choices" $ do
+      paths <- tempSealPaths
+      sentRef <- newIORef ([] :: [Text])
+      let deps = (seamDeps paths newMeta Nothing)
+            { ndMachines = pure (Right twoMachineRegistry) }
+      runNewAction deps (recordingCaps sentRef) ["-x", "nope"]
+      sent <- readIORef sentRef
+      sent `shouldSatisfy` any (\t ->
+        "unknown execution machine \"nope\"" `T.isInfixOf` t
+          && "alpha" `T.isInfixOf` t)
+      -- Nothing minted: no confirmation line, and no session.json.
+      sent `shouldNotSatisfy` any (T.isPrefixOf "new session ")
+
+    it "-x local fails when allow_localhost is false" $ do
+      -- `local` is absent from regMachines in that state, so the same check
+      -- refuses it. Asserted separately because `local` is not constructible
+      -- via mkMachineName — it needs its own branch in the resolver, and that
+      -- branch is easy to get wrong.
+      paths <- tempSealPaths
+      sentRef <- newIORef ([] :: [Text])
+      let deps = (seamDeps paths newMeta Nothing)
+            { ndMachines = pure (Right noLocalRegistry) }
+      runNewAction deps (recordingCaps sentRef) ["-x", "local"]
+      sent <- readIORef sentRef
+      sent `shouldSatisfy` any (\t -> "unknown execution machine \"local\"" `T.isInfixOf` t)
+      sent `shouldNotSatisfy` any (T.isPrefixOf "new session ")
+
+    it "-x local succeeds when allow_localhost is true" $ do
+      paths <- tempSealPaths
+      sentRef <- newIORef ([] :: [Text])
+      let deps = (seamDeps paths newMeta Nothing)
+            { ndMachines = pure (Right twoMachineRegistry) }
+      runNewAction deps (recordingCaps sentRef) ["-x", "local"]
+      sent <- readIORef sentRef
+      sent `shouldSatisfy` any (T.isPrefixOf "new session ")
+
+    it "omitting -x records NO machine, so the default keeps deciding" $ do
+      paths <- tempSealPaths
+      sentRef <- newIORef ([] :: [Text])
+      let deps = (seamDeps paths newMeta Nothing)
+            { ndMachines = pure (Right twoMachineRegistry) }
+      runNewAction deps (recordingCaps sentRef) []
+      metas <- listSessions paths
+      map smMachine metas `shouldBe` [Nothing]
 
   describe "resolveRepoUrl" $ do
     let repos =
@@ -330,3 +414,32 @@ showPO (ParsedAction _)   = "ParsedAction"
 showPO (ParseHelp Nothing) = "ParseHelp nothing"
 showPO (ParseHelp (Just _)) = "ParseHelp just"
 showPO (ParseFailure _)   = "ParseFailure"
+
+-- | Two selectable machines plus the implicit `local` — the shape an install
+-- with @allow_localhost = true@ resolves to.
+twoMachineRegistry :: MachineRegistry
+twoMachineRegistry = MachineRegistry
+  { regMachines = Map.fromList
+      [ (machineName "alpha", MtLocal), (localMachineName, MtLocal) ]
+  , regRejected = Map.empty
+  , regDefault  = Just (machineName "alpha")
+  , regWarnings = []
+  }
+
+-- | The same machines with @allow_localhost = false@: no `local` entry.
+noLocalRegistry :: MachineRegistry
+noLocalRegistry = twoMachineRegistry
+  { regMachines = Map.fromList [ (machineName "alpha", MtLocal) ] }
+
+machineName :: Text -> MachineName
+machineName t = case mkMachineName t of
+  Right n -> n
+  Left e  -> error ("fixture: mkMachineName " <> T.unpack t <> ": " <> T.unpack e)
+
+-- | A per-call unique directory suffix.
+getUniqueSuffix :: IO String
+getUniqueSuffix = show <$> atomicModifyIORef' uniqueCounter (\n -> (n + 1, n))
+
+uniqueCounter :: IORef Int
+uniqueCounter = unsafePerformIO (newIORef 0)
+{-# NOINLINE uniqueCounter #-}
