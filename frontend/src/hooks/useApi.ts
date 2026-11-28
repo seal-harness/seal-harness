@@ -1028,6 +1028,10 @@ export interface CreateTabBody {
    *  id). Sent only alongside `branch_from`. */
   branch_conv_len?: number
   harness_id?: string
+  /** Execution machine for the new session. Omitted means "the configured
+   *  default", which is NOT the same as recording the current default: an
+   *  operator who later changes `default` moves sessions that never chose. */
+  machine?: string
 }
 
 /** Create a new tab via the unified POST /api/tabs/new endpoint. For

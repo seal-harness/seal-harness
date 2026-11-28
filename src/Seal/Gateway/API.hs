@@ -84,8 +84,8 @@ import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
 
 import Seal.Config.Machines
-  ( MachineRegistry (..), MachineTarget (..), machineNameText
-  , resolveRegistryForSecurity )
+  ( MachineName, MachineRegistry (..), MachineTarget (..), localMachineName
+  , machineNameText, mkMachineName, resolveRegistryForSecurity )
 import Seal.Session.ExecCache (cachedSessionExec, cachedWorkdirScan)
 import Seal.Session.Workdir
   ( mkSessionExecFor, remoteSessionWorkdirPath, SessionExec (..) )
@@ -1323,6 +1323,7 @@ handleTabNew deps v =
           mAgent = parseAgentField v
           mBranchFrom = parseBranchFrom v
           mBranchLen  = parseBranchConvLen v
+          mMachine    = parseMachineField v
       case (mBranchFrom, mBranchLen) of
         -- A client that sends branch_from IS branching. Silently handing
         -- it an empty session is the exact bug this feature fixes, so a
@@ -1332,13 +1333,13 @@ handleTabNew deps v =
           pure (errJson status400
                  "branch_from requires branch_conv_len (the conversation \
                  \length to inherit from the parent session)")
-        (Nothing, _) -> plainProviderSession deps paths provider model mAgent
+        (Nothing, _) -> plainProviderSession deps paths provider model mAgent mMachine
         (Just parentSid, Just n) -> do
           parentExists <- doesFileExist (sessionMetaPath paths parentSid)
           if not parentExists
             then pure (errJson status404 "session not found")
             else do
-              meta <- newSessionMeta paths provider model "web" mAgent Nothing
+              meta <- newSessionMeta paths provider model "web" mAgent mMachine
               let sid = smId meta
               eSeed <- branchSession paths parentSid sid n
               case eSeed of
@@ -1381,9 +1382,10 @@ handleTabNew deps v =
 -- stay readable. Mints, inserts the tab, then persists — the original
 -- ordering, unchanged.
 plainProviderSession
-  :: ApiDeps -> SealPaths -> Text -> Text -> Maybe AgentDefId -> IO Response
-plainProviderSession deps paths provider model mAgent = do
-  meta <- newSessionMeta paths provider model "web" mAgent Nothing
+  :: ApiDeps -> SealPaths -> Text -> Text -> Maybe AgentDefId
+  -> Maybe MachineName -> IO Response
+plainProviderSession deps paths provider model mAgent mMachine = do
+  meta <- newSessionMeta paths provider model "web" mAgent mMachine
   let sid = smId meta
   res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
   case res of
@@ -1400,6 +1402,28 @@ parseBranchFrom v = case v of
     Just (A.String t) -> either (const Nothing) Just (mkSessionId (T.strip t))
     _                 -> Nothing
   _ -> Nothing
+
+-- | Read the optional @machine@ field from a new-tab body.
+--
+-- Parsed as raw text and handed to 'mkMachineName' by the store; a name that
+-- does not validate is stored as-is and then rejected by the resolver on the
+-- first turn, which is the same treatment an unknown name gets from the model.
+-- The picker only ever offers names from @GET \/api\/machines@, so an invalid
+-- value here means a hand-written request.
+parseMachineField :: Value -> Maybe MachineName
+parseMachineField v =
+  case parseMaybe (withObject "body" (.:? "machine")) v
+         :: Maybe (Maybe Text) of
+    Just (Just raw) | not (T.null (T.strip raw)) -> toName (T.strip raw)
+    _                                           -> Nothing
+  where
+    toName t
+      -- `local` is reserved: 'mkMachineName' refuses it by design, so it comes
+      -- from the registry's own constant rather than a parse.
+      | t == "local" = Just localMachineName
+      | otherwise = case mkMachineName t of
+          Right nm -> Just nm
+          Left _   -> Nothing
 
 -- | Parse the optional @branch_conv_len@ field: a non-negative
 -- conversation length. Absent, non-numeric, or negative ⇒ 'Nothing'.
