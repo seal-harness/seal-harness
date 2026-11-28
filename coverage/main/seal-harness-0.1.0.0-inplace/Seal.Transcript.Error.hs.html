@@ -1,0 +1,76 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The transcript writer's exception type, in a leaf module.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- Lives here rather than in 'Seal.Handles.Transcript' so that
+<span class="lineno">    5 </span>-- 'Seal.Transcript.TurnFailure.classify' can probe it without the pure
+<span class="lineno">    6 </span>-- classification module depending on @Seal.Handles.*@. That keeps
+<span class="lineno">    7 </span>-- @Seal.Transcript.*@ a leaf layer (design §6, CTO suggestion 1): classifying
+<span class="lineno">    8 </span>-- from @Seal.Session.TurnFailure@ instead would have imported
+<span class="lineno">    9 </span>-- @Handles.Transcript@ into @Session.@, and @Handles.Transcript@ already
+<span class="lineno">   10 </span>-- imports @Session.Log@, so the next change wanting to log a failure would
+<span class="lineno">   11 </span>-- have closed the cycle.
+<span class="lineno">   12 </span>--
+<span class="lineno">   13 </span>-- The type is re-exported from 'Seal.Handles.Transcript' so every existing
+<span class="lineno">   14 </span>-- import site keeps working unchanged.
+<span class="lineno">   15 </span>module Seal.Transcript.Error
+<span class="lineno">   16 </span>  ( TranscriptError (..)
+<span class="lineno">   17 </span>  ) where
+<span class="lineno">   18 </span>
+<span class="lineno">   19 </span>import Control.Exception (Exception, SomeException)
+<span class="lineno">   20 </span>import Data.Text (Text)
+<span class="lineno">   21 </span>import Data.Text qualified as T
+<span class="lineno">   22 </span>
+<span class="lineno">   23 </span>-- | Raised by @itwRecordAndAck@ when the single-writer daemon has died (an I/O
+<span class="lineno">   24 </span>-- error in @writeOne@ killed it), or when a write cannot be acknowledged.
+<span class="lineno">   25 </span>--
+<span class="lineno">   26 </span>-- The optional inner exception is the daemon's own fatal cause, carried up so
+<span class="lineno">   27 </span>-- the user-facing failure report can name it. Without it the caller only ever
+<span class="lineno">   28 </span>-- sees &quot;the transcript became unavailable&quot;, which says nothing about /why/ —
+<span class="lineno">   29 </span>-- the exact problem that made session @20261127-133020-166@ look like a silent
+<span class="lineno">   30 </span>-- hang. See 'Seal.Handles.Transcript.itwLastFailure' for the read side.
+<span class="lineno">   31 </span>--
+<span class="lineno">   32 </span>-- 'Eq' and 'Show' are written by hand because 'SomeException' has neither, and
+<span class="lineno">   33 </span>-- the type must stay comparable for tests and for 'Control.Exception' idioms.
+<span class="lineno">   34 </span>-- Both instances deliberately look only at the /text/: two errors are equal
+<span class="lineno">   35 </span>-- when their messages are, and 'Show' renders the message plus the inner
+<span class="lineno">   36 </span>-- exception's own rendering (never a constructor dump, which for an arbitrary
+<span class="lineno">   37 </span>-- exception can be enormous).
+<span class="lineno">   38 </span>data TranscriptError = TranscriptError Text (Maybe SomeException)
+<span class="lineno">   39 </span>
+<span class="lineno">   40 </span>instance <span class="decl"><span class="nottickedoff">Eq TranscriptError</span></span> where
+<span class="lineno">   41 </span>  <span class="decl"><span class="nottickedoff">TranscriptError a ma == TranscriptError b mb = a == b &amp;&amp; fmap displayEx ma == fmap displayEx mb</span></span>
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show TranscriptError</span></span></span></span> where
+<span class="lineno">   44 </span>  <span class="decl"><span class="nottickedoff">show (TranscriptError msg Nothing)  = &quot;TranscriptError &quot; &lt;&gt; show msg</span>
+<span class="lineno">   45 </span><span class="spaces">  </span><span class="nottickedoff">show (TranscriptError msg (Just e)) =</span>
+<span class="lineno">   46 </span><span class="spaces">    </span><span class="nottickedoff">&quot;TranscriptError &quot; &lt;&gt; show msg &lt;&gt; &quot; (caused by: &quot; &lt;&gt; T.unpack (displayEx e) &lt;&gt; &quot;)&quot;</span></span>
+<span class="lineno">   47 </span>
+<span class="lineno">   48 </span>-- | Render an exception the way @displayException@ does, so the 'Show' output
+<span class="lineno">   49 </span>-- is a readable message rather than a nested constructor tree.
+<span class="lineno">   50 </span>displayEx :: SomeException -&gt; Text
+<span class="lineno">   51 </span><span class="decl"><span class="nottickedoff">displayEx = T.pack . show</span></span>
+<span class="lineno">   52 </span>
+<span class="lineno">   53 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">Exception TranscriptError</span></span></span></span></span></span></span></span>
+
+</pre>
+</body>
+</html>

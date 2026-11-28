@@ -1,0 +1,161 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Human-interaction opcodes (Trusted): SHOW_HUMAN emits a line to the user;
+<span class="lineno">    3 </span>-- ASK_HUMAN prompts and returns the reply. Both go through the channel handle —
+<span class="lineno">    4 </span>-- no shell, no provider.
+<span class="lineno">    5 </span>module Seal.ISA.Ops.Human
+<span class="lineno">    6 </span>  ( showHumanOp
+<span class="lineno">    7 </span>  , askHumanOp
+<span class="lineno">    8 </span>  ) where
+<span class="lineno">    9 </span>
+<span class="lineno">   10 </span>import Control.Monad.IO.Class (liftIO)
+<span class="lineno">   11 </span>import Data.Aeson (Value (..), object, withObject, (.:), (.:?), (.=))
+<span class="lineno">   12 </span>import Data.Aeson.Key (Key, fromText)
+<span class="lineno">   13 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   14 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   15 </span>import Data.Text (Text)
+<span class="lineno">   16 </span>
+<span class="lineno">   17 </span>import Seal.Channel.Caps
+<span class="lineno">   18 </span>import Seal.Core.Types
+<span class="lineno">   19 </span>import Seal.Handles.AskReply (QuestionOption (..), validateOptions)
+<span class="lineno">   20 </span>import Seal.ISA.Opcode
+<span class="lineno">   21 </span>import Seal.Providers.Class
+<span class="lineno">   22 </span>
+<span class="lineno">   23 </span>-- | Extract a Text value from a JSON object by key.
+<span class="lineno">   24 </span>-- Uses 'Key' (aeson 2.x) so string literals work directly via OverloadedStrings.
+<span class="lineno">   25 </span>strField :: Key -&gt; Value -&gt; Maybe Text
+<span class="lineno">   26 </span><span class="decl"><span class="istickedoff">strField k = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: k))</span></span>
+<span class="lineno">   27 </span>
+<span class="lineno">   28 </span>-- | Parse the optional @options@ array from an ASK_HUMAN input into a list
+<span class="lineno">   29 </span>-- of 'QuestionOption's. 'Nothing' when the field is absent (open-ended);
+<span class="lineno">   30 </span>-- 'Just opts' when present (including 'Just []', which 'validateOptions'
+<span class="lineno">   31 </span>-- rejects).
+<span class="lineno">   32 </span>parseOptions :: Value -&gt; Maybe (Maybe [QuestionOption])
+<span class="lineno">   33 </span><span class="decl"><span class="istickedoff">parseOptions = parseMaybe $ withObject <span class="nottickedoff">&quot;in&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">   34 </span><span class="spaces">  </span><span class="istickedoff">mOpts &lt;- o .:? fromText &quot;options&quot;</span>
+<span class="lineno">   35 </span><span class="spaces">  </span><span class="istickedoff">case mOpts of</span>
+<span class="lineno">   36 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure Nothing</span>
+<span class="lineno">   37 </span><span class="spaces">    </span><span class="istickedoff">Just arr -&gt; Just &lt;$&gt; traverse parseOption arr</span>
+<span class="lineno">   38 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   39 </span><span class="spaces">    </span><span class="istickedoff">parseOption = withObject <span class="nottickedoff">&quot;option&quot;</span> $ \oo -&gt;</span>
+<span class="lineno">   40 </span><span class="spaces">      </span><span class="istickedoff">QuestionOption &lt;$&gt; oo .: fromText &quot;label&quot;</span>
+<span class="lineno">   41 </span><span class="spaces">                     </span><span class="istickedoff">&lt;*&gt; (fromMaybe &quot;&quot; &lt;$&gt; (oo .:? fromText &quot;description&quot;))</span></span>
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>-- | Build a JSON-Schema object with a single required string property.
+<span class="lineno">   44 </span>singleStringSchema :: Text -&gt; Text -&gt; Value
+<span class="lineno">   45 </span><span class="decl"><span class="istickedoff">singleStringSchema fieldName fieldDesc =</span>
+<span class="lineno">   46 </span><span class="spaces">  </span><span class="istickedoff">object</span>
+<span class="lineno">   47 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">   48 </span><span class="spaces">    </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">   49 </span><span class="spaces">        </span><span class="istickedoff">[fromText fieldName .= object</span>
+<span class="lineno">   50 </span><span class="spaces">           </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">   51 </span><span class="spaces">           </span><span class="istickedoff">, &quot;description&quot; .= fieldDesc</span>
+<span class="lineno">   52 </span><span class="spaces">           </span><span class="istickedoff">]]</span>
+<span class="lineno">   53 </span><span class="spaces">    </span><span class="istickedoff">, &quot;required&quot; .= ([fieldName] :: [Text])</span>
+<span class="lineno">   54 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">   55 </span>
+<span class="lineno">   56 </span>-- | The JSON-Schema for ASK_HUMAN's input: a required @question@ string plus
+<span class="lineno">   57 </span>-- an optional @options@ array (max 8 items, each @{label, description}@).
+<span class="lineno">   58 </span>askHumanSchema :: Value
+<span class="lineno">   59 </span><span class="decl"><span class="istickedoff">askHumanSchema = object</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">   62 </span><span class="spaces">      </span><span class="istickedoff">[ fromText &quot;question&quot; .= object</span>
+<span class="lineno">   63 </span><span class="spaces">          </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">   64 </span><span class="spaces">          </span><span class="istickedoff">, &quot;description&quot; .= (&quot;The question to present to the human operator.&quot; :: Text)</span>
+<span class="lineno">   65 </span><span class="spaces">          </span><span class="istickedoff">]</span>
+<span class="lineno">   66 </span><span class="spaces">      </span><span class="istickedoff">, fromText &quot;options&quot; .= object</span>
+<span class="lineno">   67 </span><span class="spaces">          </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;array&quot; :: Text)</span>
+<span class="lineno">   68 </span><span class="spaces">          </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Optional discrete choices. When present, channels render one button per choice plus an 'Other' free-text option. When absent, the question is open-ended.&quot; :: Text)</span>
+<span class="lineno">   69 </span><span class="spaces">          </span><span class="istickedoff">, &quot;maxItems&quot; .= (8 :: Int)</span>
+<span class="lineno">   70 </span><span class="spaces">          </span><span class="istickedoff">, &quot;items&quot; .= object</span>
+<span class="lineno">   71 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">   72 </span><span class="spaces">              </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">   73 </span><span class="spaces">                  </span><span class="istickedoff">[ fromText &quot;label&quot; .= object</span>
+<span class="lineno">   74 </span><span class="spaces">                      </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">   75 </span><span class="spaces">                      </span><span class="istickedoff">, &quot;description&quot; .= (&quot;The value returned to the agent when picked (1-5 words, concise).&quot; :: Text)</span>
+<span class="lineno">   76 </span><span class="spaces">                      </span><span class="istickedoff">]</span>
+<span class="lineno">   77 </span><span class="spaces">                  </span><span class="istickedoff">, fromText &quot;description&quot; .= object</span>
+<span class="lineno">   78 </span><span class="spaces">                      </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">   79 </span><span class="spaces">                      </span><span class="istickedoff">, &quot;description&quot; .= (&quot;One-line explanation of the choice.&quot; :: Text)</span>
+<span class="lineno">   80 </span><span class="spaces">                      </span><span class="istickedoff">]</span>
+<span class="lineno">   81 </span><span class="spaces">                  </span><span class="istickedoff">]</span>
+<span class="lineno">   82 </span><span class="spaces">              </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;label&quot;] :: [Text])</span>
+<span class="lineno">   83 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">   84 </span><span class="spaces">          </span><span class="istickedoff">]</span>
+<span class="lineno">   85 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">   86 </span><span class="spaces">  </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;question&quot;] :: [Text])</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">   88 </span>
+<span class="lineno">   89 </span>-- | SHOW_HUMAN: emit @message@ to the human via the channel.
+<span class="lineno">   90 </span>-- Returns an empty, non-error result; the channel itself is the side-effect.
+<span class="lineno">   91 </span>showHumanOp :: ChannelCaps -&gt; Opcode
+<span class="lineno">   92 </span><span class="decl"><span class="istickedoff">showHumanOp caps = TrustedOpcode</span>
+<span class="lineno">   93 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;SHOW_HUMAN&quot;</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">   95 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Display a message to the human operator.&quot;</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = singleStringSchema &quot;message&quot; &quot;The message to display to the human operator.&quot;</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">   98 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize =</span>
+<span class="lineno">   99 </span><span class="spaces">      </span><span class="istickedoff">maybe <span class="nottickedoff">(Left &quot;SHOW_HUMAN requires {message:string}&quot;)</span> (const (Right ())) . strField &quot;message&quot;</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = False</span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; do</span>
+<span class="lineno">  102 </span><span class="spaces">      </span><span class="istickedoff">let msg = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (strField &quot;message&quot; v)</span>
+<span class="lineno">  103 </span><span class="spaces">      </span><span class="istickedoff">liftIO (ccShowHuman caps msg)</span>
+<span class="lineno">  104 </span><span class="spaces">      </span><span class="istickedoff">pure (OpResult <span class="nottickedoff">[]</span> False <span class="nottickedoff">Null</span>)</span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  106 </span>
+<span class="lineno">  107 </span>-- | ASK_HUMAN: send @question@ to the human and return their typed reply.
+<span class="lineno">  108 </span>-- When the optional @options@ array is present, the channel renders one
+<span class="lineno">  109 </span>-- button per choice plus an &quot;Other&quot; free-text option; the human's chosen
+<span class="lineno">  110 </span>-- text (a label or a typed reply) is returned.
+<span class="lineno">  111 </span>askHumanOp :: ChannelCaps -&gt; Opcode
+<span class="lineno">  112 </span><span class="decl"><span class="istickedoff">askHumanOp caps = TrustedOpcode</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;ASK_HUMAN&quot;</span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  115 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Ask the human operator a question and return their reply.&quot;</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = askHumanSchema</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">  118 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = True</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = \v -&gt;</span>
+<span class="lineno">  120 </span><span class="spaces">      </span><span class="istickedoff">case strField &quot;question&quot; v of</span>
+<span class="lineno">  121 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">Left &quot;ASK_HUMAN requires {question:string}&quot;</span></span>
+<span class="lineno">  122 </span><span class="spaces">        </span><span class="istickedoff">Just _ -&gt; case parseOptions v of</span>
+<span class="lineno">  123 </span><span class="spaces">          </span><span class="istickedoff">-- Malformed options field (not an array of objects) → reject.</span>
+<span class="lineno">  124 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">Left &quot;ASK_HUMAN: invalid 'options' field&quot;</span></span>
+<span class="lineno">  125 </span><span class="spaces">          </span><span class="istickedoff">-- Absent options field (Nothing inner) → open-ended (valid).</span>
+<span class="lineno">  126 </span><span class="spaces">          </span><span class="istickedoff">Just Nothing -&gt; Right ()</span>
+<span class="lineno">  127 </span><span class="spaces">          </span><span class="istickedoff">-- Present options → validate.</span>
+<span class="lineno">  128 </span><span class="spaces">          </span><span class="istickedoff">Just (Just opts) -&gt; case validateOptions opts of</span>
+<span class="lineno">  129 </span><span class="spaces">            </span><span class="istickedoff">Left e -&gt; Left <span class="nottickedoff">(&quot;ASK_HUMAN: &quot; &lt;&gt; e)</span></span>
+<span class="lineno">  130 </span><span class="spaces">            </span><span class="istickedoff">Right _ -&gt; Right ()</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_ v -&gt; do</span>
+<span class="lineno">  132 </span><span class="spaces">      </span><span class="istickedoff">let q = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (strField &quot;question&quot; v)</span>
+<span class="lineno">  133 </span><span class="spaces">          </span><span class="istickedoff">opts = case parseOptions v of</span>
+<span class="lineno">  134 </span><span class="spaces">            </span><span class="istickedoff">Just (Just os) -&gt; os</span>
+<span class="lineno">  135 </span><span class="spaces">            </span><span class="istickedoff">_ -&gt; []</span>
+<span class="lineno">  136 </span><span class="spaces">      </span><span class="istickedoff">ans &lt;- liftIO (ccPrompt caps (AskPrompt q opts))</span>
+<span class="lineno">  137 </span><span class="spaces">      </span><span class="istickedoff">pure (OpResult [TrpText ans] False <span class="nottickedoff">Null</span>)</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+
+</pre>
+</body>
+</html>

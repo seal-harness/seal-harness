@@ -1,0 +1,584 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Pure helpers for the chat channel's @\/last@ command: argument parsing,
+<span class="lineno">    3 </span>-- error text, and help.
+<span class="lineno">    4 </span>--
+<span class="lineno">    5 </span>-- This module is a leaf — it imports no chat-loop module, so
+<span class="lineno">    6 </span>-- &quot;Seal.Channels.Chat.Route&quot; can carry the raw argument text
+<span class="lineno">    7 </span>-- ('Seal.Channels.Chat.Route.ChatLast') without a module cycle.
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- The render half (extraction, resolution, and the user-visible strings) is
+<span class="lineno">   10 </span>-- added by WU-B; this module currently holds only what WU-A needs.
+<span class="lineno">   11 </span>module Seal.Channels.Chat.LastRender
+<span class="lineno">   12 </span>  ( lastHelp
+<span class="lineno">   13 </span>  , isLastHelpArg
+<span class="lineno">   14 </span>  , LastArgs (..)
+<span class="lineno">   15 </span>  , LastError (..)
+<span class="lineno">   16 </span>  , parseLastArgs
+<span class="lineno">   17 </span>  , renderLastError
+<span class="lineno">   18 </span>    -- * Extraction
+<span class="lineno">   19 </span>  , EntryFacts (..)
+<span class="lineno">   20 </span>  , ToolName (..)
+<span class="lineno">   21 </span>  , extractEntry
+<span class="lineno">   22 </span>  , safeOpLabel
+<span class="lineno">   23 </span>  , isLegacyPayload
+<span class="lineno">   24 </span>    -- * Items
+<span class="lineno">   25 </span>  , ToolState (..)
+<span class="lineno">   26 </span>  , ToolOutcome (..)
+<span class="lineno">   27 </span>  , AssistantItem (..)
+<span class="lineno">   28 </span>  , assistantItems
+<span class="lineno">   29 </span>    -- * Views
+<span class="lineno">   30 </span>  , TabHeading (..)
+<span class="lineno">   31 </span>  , PendingQuestion (..)
+<span class="lineno">   32 </span>  , LastView (..)
+<span class="lineno">   33 </span>  , ResolveInput (..)
+<span class="lineno">   34 </span>  , resolveLast
+<span class="lineno">   35 </span>  , viewTag
+<span class="lineno">   36 </span>  , renderedTools
+<span class="lineno">   37 </span>  , mostRecentToolLine
+<span class="lineno">   38 </span>    -- * Rendering
+<span class="lineno">   39 </span>  , renderLast
+<span class="lineno">   40 </span>  , quoteBody
+<span class="lineno">   41 </span>  , singleLine
+<span class="lineno">   42 </span>  ) where
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>import Data.Char (isDigit)
+<span class="lineno">   45 </span>import Data.Aeson (Value (..))
+<span class="lineno">   46 </span>import Data.Aeson.Key qualified as Key
+<span class="lineno">   47 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   48 </span>import Data.Maybe (fromMaybe, mapMaybe)
+<span class="lineno">   49 </span>import Data.Text (Text)
+<span class="lineno">   50 </span>import Data.Text qualified as T
+<span class="lineno">   51 </span>import Data.Vector qualified as V
+<span class="lineno">   52 </span>
+<span class="lineno">   53 </span>import Seal.Channels.Chat.Class (QuestionOption (..))
+<span class="lineno">   54 </span>import Seal.Channels.Chat.ToolRender (opEmoji)
+<span class="lineno">   55 </span>import Seal.Gateway.Types.Tab
+<span class="lineno">   56 </span>  ( TabIndex, tabIndexFromChar, tabIndexToChar )
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>-- | Parsed @\/last@ arguments.
+<span class="lineno">   59 </span>data LastArgs = LastArgs
+<span class="lineno">   60 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">laTab</span></span></span>   :: Maybe TabIndex  -- ^ 'Nothing' means the focused tab.
+<span class="lineno">   61 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">laCount</span></span></span> :: Int             -- ^ Always clamped to @1..5@.
+<span class="lineno">   62 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   63 </span>
+<span class="lineno">   64 </span>-- | Everything @\/last@ can tell the user went wrong.
+<span class="lineno">   65 </span>--
+<span class="lineno">   66 </span>-- A bespoke ADT rather than @Either Text@ because 'renderLastError' matches on
+<span class="lineno">   67 </span>-- the constructor to build a distinct string for each, and the tests assert
+<span class="lineno">   68 </span>-- every constructor.
+<span class="lineno">   69 </span>data LastError
+<span class="lineno">   70 </span>  = LENoSuchTab Text      -- ^ the token was not a tab index
+<span class="lineno">   71 </span>  | LEBadCount Text       -- ^ the second token was not a number
+<span class="lineno">   72 </span>  | LENoSession Char      -- ^ the tab is a harness tab (no session)
+<span class="lineno">   73 </span>  | LENoCurrentTab        -- ^ no focused tab to default to
+<span class="lineno">   74 </span>  | LETabs                -- ^ @GET \/api\/lists@ failed
+<span class="lineno">   75 </span>  | LETranscript Char     -- ^ the transcript fetch failed
+<span class="lineno">   76 </span>  | LEQuestions Char      -- ^ the pending-questions fetch failed
+<span class="lineno">   77 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- | Parse the raw argument text carried by
+<span class="lineno">   80 </span>-- 'Seal.Channels.Chat.Route.ChatLast'.
+<span class="lineno">   81 </span>--
+<span class="lineno">   82 </span>-- The first token is a tab iff it is exactly one character AND
+<span class="lineno">   83 </span>-- 'tabIndexFromChar' accepts it. That is stricter than 'parseTabFocus' (which
+<span class="lineno">   84 </span>-- takes the first character of an arbitrary token): @\/last bb@ naming a bad
+<span class="lineno">   85 </span>-- token back is better than silently meaning tab @b@.
+<span class="lineno">   86 </span>parseLastArgs :: Text -&gt; Either LastError LastArgs
+<span class="lineno">   87 </span><span class="decl"><span class="istickedoff">parseLastArgs raw =</span>
+<span class="lineno">   88 </span><span class="spaces">  </span><span class="istickedoff">case T.words (T.strip raw) of</span>
+<span class="lineno">   89 </span><span class="spaces">    </span><span class="istickedoff">[] -&gt; Right (LastArgs Nothing 1)</span>
+<span class="lineno">   90 </span><span class="spaces">    </span><span class="istickedoff">[tabTok] -&gt; LastArgs &lt;$&gt; (Just &lt;$&gt; tabOf tabTok) &lt;*&gt; pure 1</span>
+<span class="lineno">   91 </span><span class="spaces">    </span><span class="istickedoff">(tabTok : countTok : _) -&gt;</span>
+<span class="lineno">   92 </span><span class="spaces">      </span><span class="istickedoff">LastArgs &lt;$&gt; (Just &lt;$&gt; tabOf tabTok) &lt;*&gt; countOf countTok</span>
+<span class="lineno">   93 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   94 </span><span class="spaces">    </span><span class="istickedoff">tabOf tok = case T.uncons tok of</span>
+<span class="lineno">   95 </span><span class="spaces">      </span><span class="istickedoff">Just (c, rest)</span>
+<span class="lineno">   96 </span><span class="spaces">        </span><span class="istickedoff">| T.null rest -&gt; either <span class="nottickedoff">(const (Left (LENoSuchTab tok)))</span> Right (tabIndexFromChar c)</span>
+<span class="lineno">   97 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; Left (LENoSuchTab tok)</span>
+<span class="lineno">   98 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">   99 </span><span class="spaces">    </span><span class="istickedoff">countOf tok</span>
+<span class="lineno">  100 </span><span class="spaces">      </span><span class="istickedoff">| T.null t || not (T.all isDigit t) = Left (LEBadCount tok)</span>
+<span class="lineno">  101 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Right (clamp (T.foldl' step 0 t))</span>
+<span class="lineno">  102 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno">  103 </span><span class="spaces">        </span><span class="istickedoff">t = T.strip tok</span>
+<span class="lineno">  104 </span><span class="spaces">        </span><span class="istickedoff">step acc c = acc * 10 + (fromEnum c - fromEnum '0')</span></span>
+<span class="lineno">  105 </span>
+<span class="lineno">  106 </span>-- | Clamp a requested count into the supported @1..5@ range.
+<span class="lineno">  107 </span>clamp :: Int -&gt; Int
+<span class="lineno">  108 </span><span class="decl"><span class="istickedoff">clamp = max 1 . min 5</span></span>
+<span class="lineno">  109 </span>
+<span class="lineno">  110 </span>-- | Is this @\/last@'s help flag? Only as the sole argument, matching
+<span class="lineno">  111 </span>-- @\/watch -h@ (which is not help either — see @handleWatchToggle@).
+<span class="lineno">  112 </span>isLastHelpArg :: Text -&gt; Bool
+<span class="lineno">  113 </span><span class="decl"><span class="istickedoff">isLastHelpArg raw = T.strip raw `elem` [&quot;-h&quot;, &quot;--help&quot;]</span></span>
+<span class="lineno">  114 </span>
+<span class="lineno">  115 </span>-- | The @\/last@ help text, in the same @T.unlines@ shape as @bgHelp@ and
+<span class="lineno">  116 </span>-- @watchHelp@.
+<span class="lineno">  117 </span>lastHelp :: Text
+<span class="lineno">  118 </span><span class="decl"><span class="istickedoff">lastHelp = T.unlines</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;Show a tab's last message without switching to it&quot;</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">, &quot;Usage: /last [tab] [n]&quot;</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">, &quot;  tab     A tab (0-9a-z). Defaults to the tab you are on.&quot;</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">, &quot;  n       How many messages, 1-5. Defaults to 1.&quot;</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  126 </span><span class="spaces">  </span><span class="istickedoff">, &quot;The first argument is always the tab, so /last 3 means tab 3, not&quot;</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="istickedoff">, &quot;three messages.&quot;</span>
+<span class="lineno">  128 </span><span class="spaces">  </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  129 </span><span class="spaces">  </span><span class="istickedoff">, &quot;/last never changes the tab you are focused on.&quot;</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">, &quot;If the tab is waiting on a question, /last shows it. Answer it with&quot;</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">, &quot;/N &lt;answer&gt; - for example /b 1 or /b yes - which goes to that tab&quot;</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="istickedoff">, &quot;without switching to it.&quot;</span>
+<span class="lineno">  134 </span><span class="spaces">  </span><span class="istickedoff">, &quot;&quot;</span>
+<span class="lineno">  135 </span><span class="spaces">  </span><span class="istickedoff">, &quot;Options:&quot;</span>
+<span class="lineno">  136 </span><span class="spaces">  </span><span class="istickedoff">, &quot;  -h, --help  Show this help&quot;</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">  138 </span>
+<span class="lineno">  139 </span>-- | Render an error for display on the channel.
+<span class="lineno">  140 </span>--
+<span class="lineno">  141 </span>-- The four strings the requirements specify are used verbatim; errors the
+<span class="lineno">  142 </span>-- requirements do not cover follow the same @last failed:@ shape as the
+<span class="lineno">  143 </span>-- existing @focus failed:@ / @inject failed:@ / @tab list failed:@ family.
+<span class="lineno">  144 </span>renderLastError :: LastError -&gt; Text
+<span class="lineno">  145 </span><span class="decl"><span class="istickedoff">renderLastError err = case err of</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">LENoSuchTab t   -&gt; &quot;last failed: no such tab &quot; &lt;&gt; singleLine t &lt;&gt; &quot; \8212 /tab list&quot;</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="istickedoff">LEBadCount t    -&gt; &quot;last failed: \&quot;&quot; &lt;&gt; singleLine t</span>
+<span class="lineno">  148 </span><span class="spaces">                     </span><span class="istickedoff">&lt;&gt; &quot;\&quot; isn't a number \8212 use /last &lt;tab&gt; 1-5&quot;</span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="istickedoff">LENoSession c   -&gt; &quot;last failed: tab &quot; &lt;&gt; T.singleton c</span>
+<span class="lineno">  150 </span><span class="spaces">                     </span><span class="istickedoff">&lt;&gt; &quot; has no session (harness tab)&quot;</span>
+<span class="lineno">  151 </span><span class="spaces">  </span><span class="istickedoff">LENoCurrentTab  -&gt; &quot;last failed: no current tab&quot;</span>
+<span class="lineno">  152 </span><span class="spaces">  </span><span class="istickedoff">LETabs          -&gt; &quot;last failed: couldn't read the tab list \8212 try again in a moment&quot;</span>
+<span class="lineno">  153 </span><span class="spaces">  </span><span class="istickedoff">LETranscript c  -&gt; &quot;last failed: couldn't read tab &quot; &lt;&gt; T.singleton c</span>
+<span class="lineno">  154 </span><span class="spaces">                     </span><span class="istickedoff">&lt;&gt; &quot;'s transcript \8212 try again in a moment&quot;</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">LEQuestions c   -&gt; &quot;last failed: couldn't read tab &quot; &lt;&gt; T.singleton c</span>
+<span class="lineno">  156 </span><span class="spaces">                     </span><span class="istickedoff">&lt;&gt; &quot;'s question \8212 try again in a moment&quot;</span></span>
+<span class="lineno">  157 </span>
+<span class="lineno">  158 </span>-- | Flatten and bound text that came from the user, before it is echoed back.
+<span class="lineno">  159 </span>--
+<span class="lineno">  160 </span>-- Without this an inbound message of arbitrary length could be echoed into the
+<span class="lineno">  161 </span>-- chat, and its newlines would let a user spoof a harness-authored line (the
+<span class="lineno">  162 </span>-- same argument that motivates block-quoting a question). 16 characters is
+<span class="lineno">  163 </span>-- enough to show which token was rejected.
+<span class="lineno">  164 </span>singleLine :: Text -&gt; Text
+<span class="lineno">  165 </span><span class="decl"><span class="istickedoff">singleLine t =</span>
+<span class="lineno">  166 </span><span class="spaces">  </span><span class="istickedoff">let flattened = T.unwords (T.words (T.map newlineToSpace t))</span>
+<span class="lineno">  167 </span><span class="spaces">  </span><span class="istickedoff">in if T.length flattened &gt; 16</span>
+<span class="lineno">  168 </span><span class="spaces">       </span><span class="istickedoff">then T.take 16 flattened &lt;&gt; &quot;\8230&quot;</span>
+<span class="lineno">  169 </span><span class="spaces">       </span><span class="istickedoff">else flattened</span>
+<span class="lineno">  170 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  171 </span><span class="spaces">    </span><span class="istickedoff">newlineToSpace c = if c == '\n' || c == '\r' || c == '\t' then ' ' else c</span></span>
+<span class="lineno">  172 </span>
+<span class="lineno">  173 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  174 </span>-- Extraction
+<span class="lineno">  175 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  176 </span>
+<span class="lineno">  177 </span>-- | A tool call as the renderer sees it: an id (for the pass/fail join) and a
+<span class="lineno">  178 </span>-- shape-gated name. The newtype keeps a raw model-authored string from
+<span class="lineno">  179 </span>-- reaching the renderer by accident.
+<span class="lineno">  180 </span>data ToolName = ToolName
+<span class="lineno">  181 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">tnId</span></span></span>   :: Text          -- ^ @tool_use.id@, the join key (never rendered)
+<span class="lineno">  182 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tnName</span></span></span> :: Maybe Text    -- ^ 'safeOpLabel' result; 'Nothing' ⇒ render as unknown
+<span class="lineno">  183 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>)
+<span class="lineno">  184 </span>
+<span class="lineno">  185 </span>-- | What one transcript entry contributes. Deliberately has **no** field able
+<span class="lineno">  186 </span>-- to hold a tool input, a tool-result body, the system prompt, or a thinking
+<span class="lineno">  187 </span>-- block: the &quot;never tool inputs&quot; guarantee is structural, not testimonial.
+<span class="lineno">  188 </span>data EntryFacts = EntryFacts
+<span class="lineno">  189 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">lefText</span></span></span>    :: Text                 -- ^ response text blocks, joined &quot;\n\n&quot;
+<span class="lineno">  190 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lefTools</span></span></span>   :: [ToolName]           -- ^ tool_use names, no inputs
+<span class="lineno">  191 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lefResults</span></span></span> :: [(Text, Bool)]       -- ^ (tool_use_id, is_error) from requests
+<span class="lineno">  192 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">lefLegacy</span></span></span>  :: Bool                 -- ^ payload has neither content nor messages
+<span class="lineno">  193 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>)
+<span class="lineno">  194 </span>
+<span class="lineno">  195 </span>-- | Shape-gate a model-authored tool name.
+<span class="lineno">  196 </span>--
+<span class="lineno">  197 </span>-- @tool_use.name@ arrives straight from the provider response with no
+<span class="lineno">  198 </span>-- validation, so rendering it unbounded would let a model put arbitrary
+<span class="lineno">  199 </span>-- content (JSON, paths, URLs, keys, newlines) into a trusted-looking tool
+<span class="lineno">  200 </span>-- line. Every real opcode name matches @[A-Z][A-Z0-9_]{0,31}@; anything else
+<span class="lineno">  201 </span>-- is rejected and rendered as @(unknown opcode)@.
+<span class="lineno">  202 </span>--
+<span class="lineno">  203 </span>-- This is a shape gate, not an allowlist: a model can still emit a real
+<span class="lineno">  204 </span>-- opcode's name. It stops content injection, not lying.
+<span class="lineno">  205 </span>safeOpLabel :: Text -&gt; Maybe Text
+<span class="lineno">  206 </span><span class="decl"><span class="istickedoff">safeOpLabel t</span>
+<span class="lineno">  207 </span><span class="spaces">  </span><span class="istickedoff">| T.null t = Nothing</span>
+<span class="lineno">  208 </span><span class="spaces">  </span><span class="istickedoff">| T.length t &gt; 32 = Nothing</span>
+<span class="lineno">  209 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> =</span>
+<span class="lineno">  210 </span><span class="spaces">      </span><span class="istickedoff">let (h, rest) = T.splitAt 1 t</span>
+<span class="lineno">  211 </span><span class="spaces">      </span><span class="istickedoff">in if T.all isUpperish h &amp;&amp; T.all isNameChar rest then Just t else Nothing</span>
+<span class="lineno">  212 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  213 </span><span class="spaces">    </span><span class="istickedoff">isUpperish c = c &gt;= 'A' &amp;&amp; c &lt;= 'Z'</span>
+<span class="lineno">  214 </span><span class="spaces">    </span><span class="istickedoff">isNameChar c = isUpperish c || (c &gt;= '0' &amp;&amp; c &lt;= '9') || c == '_'</span></span>
+<span class="lineno">  215 </span>
+<span class="lineno">  216 </span>-- | Extract the facts one frontend-shaped transcript entry carries.
+<span class="lineno">  217 </span>--
+<span class="lineno">  218 </span>-- Rules, all allowlist-based:
+<span class="lineno">  219 </span>--
+<span class="lineno">  220 </span>-- * only @direction == &quot;response&quot;@ contributes text, and only from a block
+<span class="lineno">  221 </span>--   whose @type@ is @\&quot;text\&quot;@ carrying a string @text@ — a @\&quot;thinking\&quot;@
+<span class="lineno">  222 </span>--   block is dropped, and every other type is dropped with no fallback;
+<span class="lineno">  223 </span>-- * only @direction == &quot;request&quot;@ contributes the pass/fail join, from
+<span class="lineno">  224 </span>--   @type == \&quot;tool_result\&quot;@ blocks keyed by @tool_use_id@.
+<span class="lineno">  225 </span>--
+<span class="lineno">  226 </span>-- Tool inputs are never read into 'EntryFacts'.
+<span class="lineno">  227 </span>extractEntry :: Value -&gt; EntryFacts
+<span class="lineno">  228 </span><span class="decl"><span class="istickedoff">extractEntry val =</span>
+<span class="lineno">  229 </span><span class="spaces">  </span><span class="istickedoff">case val of</span>
+<span class="lineno">  230 </span><span class="spaces">    </span><span class="istickedoff">Object o -&gt;</span>
+<span class="lineno">  231 </span><span class="spaces">      </span><span class="istickedoff">let dir = strField &quot;direction&quot; o</span>
+<span class="lineno">  232 </span><span class="spaces">          </span><span class="istickedoff">payload = fromMaybe <span class="nottickedoff">Null</span> (KeyMap.lookup (Key.fromText &quot;payload&quot;) o)</span>
+<span class="lineno">  233 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">legacy = isLegacyPayload val</span></span>
+<span class="lineno">  234 </span><span class="spaces">      </span><span class="istickedoff">in case dir of</span>
+<span class="lineno">  235 </span><span class="spaces">           </span><span class="istickedoff">Just &quot;response&quot; -&gt; EntryFacts</span>
+<span class="lineno">  236 </span><span class="spaces">             </span><span class="istickedoff">{ lefText = textOf payload</span>
+<span class="lineno">  237 </span><span class="spaces">             </span><span class="istickedoff">, lefTools = toolsOf payload</span>
+<span class="lineno">  238 </span><span class="spaces">             </span><span class="istickedoff">, lefResults = []</span>
+<span class="lineno">  239 </span><span class="spaces">             </span><span class="istickedoff">, lefLegacy = <span class="nottickedoff">legacy</span></span>
+<span class="lineno">  240 </span><span class="spaces">             </span><span class="istickedoff">}</span>
+<span class="lineno">  241 </span><span class="spaces">           </span><span class="istickedoff">Just &quot;request&quot; -&gt; EntryFacts &quot;&quot; [] (resultsOf payload) <span class="nottickedoff">legacy</span></span>
+<span class="lineno">  242 </span><span class="spaces">           </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">EntryFacts &quot;&quot; [] [] legacy</span></span>
+<span class="lineno">  243 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">EntryFacts &quot;&quot; [] [] False</span></span></span>
+<span class="lineno">  244 </span>
+<span class="lineno">  245 </span>-- | Does this entry use the legacy payload shape (no @content@, no
+<span class="lineno">  246 </span>-- @messages@)? Those predate the current encoding; the renderer reports that
+<span class="lineno">  247 </span>-- honestly rather than claiming the session is empty.
+<span class="lineno">  248 </span>isLegacyPayload :: Value -&gt; Bool
+<span class="lineno">  249 </span><span class="decl"><span class="istickedoff">isLegacyPayload val = case val of</span>
+<span class="lineno">  250 </span><span class="spaces">  </span><span class="istickedoff">Object o -&gt; case KeyMap.lookup (Key.fromText &quot;payload&quot;) o of</span>
+<span class="lineno">  251 </span><span class="spaces">    </span><span class="istickedoff">Just (Object p) -&gt;</span>
+<span class="lineno">  252 </span><span class="spaces">      </span><span class="istickedoff">not (KeyMap.member (Key.fromText &quot;content&quot;) p)</span>
+<span class="lineno">  253 </span><span class="spaces">        </span><span class="istickedoff">&amp;&amp; not (KeyMap.member (Key.fromText &quot;messages&quot;) p)</span>
+<span class="lineno">  254 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">False</span></span>
+<span class="lineno">  255 </span><span class="spaces">  </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">False</span></span></span>
+<span class="lineno">  256 </span>
+<span class="lineno">  257 </span>-- | The response text: @text@ blocks joined with a blank line. Deliberately
+<span class="lineno">  258 </span>-- not @extractEntryText@'s 'T.concat', which runs paragraphs together.
+<span class="lineno">  259 </span>textOf :: Value -&gt; Text
+<span class="lineno">  260 </span><span class="decl"><span class="istickedoff">textOf payload = case blockArray payload of</span>
+<span class="lineno">  261 </span><span class="spaces">  </span><span class="istickedoff">Just blocks -&gt; T.intercalate &quot;\n\n&quot;</span>
+<span class="lineno">  262 </span><span class="spaces">    </span><span class="istickedoff">[ t | b &lt;- blocks, blockType b == Just &quot;text&quot;</span>
+<span class="lineno">  263 </span><span class="spaces">        </span><span class="istickedoff">, Just t &lt;- [strField &quot;text&quot; =&lt;&lt; asObject b] ]</span>
+<span class="lineno">  264 </span><span class="spaces">  </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">&quot;&quot;</span></span></span>
+<span class="lineno">  265 </span>
+<span class="lineno">  266 </span>-- | The @tool_use@ calls in a response, shape-gated.
+<span class="lineno">  267 </span>toolsOf :: Value -&gt; [ToolName]
+<span class="lineno">  268 </span><span class="decl"><span class="istickedoff">toolsOf payload = case blockArray payload of</span>
+<span class="lineno">  269 </span><span class="spaces">  </span><span class="istickedoff">Just blocks -&gt;</span>
+<span class="lineno">  270 </span><span class="spaces">    </span><span class="istickedoff">[ ToolName (fromMaybe <span class="nottickedoff">&quot;&quot;</span> tid) (safeOpLabel raw)</span>
+<span class="lineno">  271 </span><span class="spaces">    </span><span class="istickedoff">| b &lt;- blocks</span>
+<span class="lineno">  272 </span><span class="spaces">    </span><span class="istickedoff">, <span class="tickonlytrue">blockType b == Just &quot;tool_use&quot;</span></span>
+<span class="lineno">  273 </span><span class="spaces">    </span><span class="istickedoff">, Object bo &lt;- [b]</span>
+<span class="lineno">  274 </span><span class="spaces">    </span><span class="istickedoff">, let raw = fromMaybe <span class="nottickedoff">&quot;&quot;</span> (strField &quot;name&quot; bo)</span>
+<span class="lineno">  275 </span><span class="spaces">    </span><span class="istickedoff">, let tid = strField &quot;id&quot; bo</span>
+<span class="lineno">  276 </span><span class="spaces">    </span><span class="istickedoff">]</span>
+<span class="lineno">  277 </span><span class="spaces">  </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">[]</span></span></span>
+<span class="lineno">  278 </span>
+<span class="lineno">  279 </span>-- | The @(tool_use_id, is_error)@ pairs a request entry carries. This is the
+<span class="lineno">  280 </span>-- only thing read from tool-result blocks — never their content.
+<span class="lineno">  281 </span>resultsOf :: Value -&gt; [(Text, Bool)]
+<span class="lineno">  282 </span><span class="decl"><span class="istickedoff">resultsOf payload =</span>
+<span class="lineno">  283 </span><span class="spaces">  </span><span class="istickedoff">case KeyMap.lookup (Key.fromText &quot;messages&quot;) =&lt;&lt; asObject payload of</span>
+<span class="lineno">  284 </span><span class="spaces">    </span><span class="istickedoff">Just (Array msgs) -&gt; concatMap fromMessage (V.toList msgs)</span>
+<span class="lineno">  285 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">[]</span></span>
+<span class="lineno">  286 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  287 </span><span class="spaces">    </span><span class="istickedoff">fromMessage (Object m) = case KeyMap.lookup (Key.fromText &quot;content&quot;) m of</span>
+<span class="lineno">  288 </span><span class="spaces">      </span><span class="istickedoff">Just (Array blocks) -&gt; mapMaybe fromBlock (V.toList blocks)</span>
+<span class="lineno">  289 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">[]</span></span>
+<span class="lineno">  290 </span><span class="spaces">    </span><span class="istickedoff">fromMessage _ = <span class="nottickedoff">[]</span></span>
+<span class="lineno">  291 </span><span class="spaces">    </span><span class="istickedoff">fromBlock (Object b)</span>
+<span class="lineno">  292 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">blockType (Object b) == Just &quot;tool_result&quot;</span></span>
+<span class="lineno">  293 </span><span class="spaces">      </span><span class="istickedoff">, Just tid &lt;- strField &quot;tool_use_id&quot; b =</span>
+<span class="lineno">  294 </span><span class="spaces">          </span><span class="istickedoff">Just (tid, fromMaybe <span class="nottickedoff">False</span> (boolField &quot;is_error&quot; b))</span>
+<span class="lineno">  295 </span><span class="spaces">      </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span> = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  296 </span><span class="spaces">    </span><span class="istickedoff">fromBlock _ = <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  297 </span>
+<span class="lineno">  298 </span>blockArray :: Value -&gt; Maybe [Value]
+<span class="lineno">  299 </span><span class="decl"><span class="istickedoff">blockArray payload = case KeyMap.lookup (Key.fromText &quot;content&quot;) =&lt;&lt; asObject payload of</span>
+<span class="lineno">  300 </span><span class="spaces">  </span><span class="istickedoff">Just (Array arr) -&gt; Just (V.toList arr)</span>
+<span class="lineno">  301 </span><span class="spaces">  </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  302 </span>
+<span class="lineno">  303 </span>blockType :: Value -&gt; Maybe Text
+<span class="lineno">  304 </span><span class="decl"><span class="istickedoff">blockType b = strField &quot;type&quot; =&lt;&lt; asObject b</span></span>
+<span class="lineno">  305 </span>
+<span class="lineno">  306 </span>asObject :: Value -&gt; Maybe (KeyMap.KeyMap Value)
+<span class="lineno">  307 </span><span class="decl"><span class="istickedoff">asObject (Object o) = Just o</span>
+<span class="lineno">  308 </span><span class="spaces"></span><span class="istickedoff">asObject _ = <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  309 </span>
+<span class="lineno">  310 </span>strField :: Text -&gt; KeyMap.KeyMap Value -&gt; Maybe Text
+<span class="lineno">  311 </span><span class="decl"><span class="istickedoff">strField k o = case KeyMap.lookup (Key.fromText k) o of</span>
+<span class="lineno">  312 </span><span class="spaces">  </span><span class="istickedoff">Just (String t) -&gt; Just t</span>
+<span class="lineno">  313 </span><span class="spaces">  </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  314 </span>
+<span class="lineno">  315 </span>boolField :: Text -&gt; KeyMap.KeyMap Value -&gt; Maybe Bool
+<span class="lineno">  316 </span><span class="decl"><span class="istickedoff">boolField k o = case KeyMap.lookup (Key.fromText k) o of</span>
+<span class="lineno">  317 </span><span class="spaces">  </span><span class="istickedoff">Just (Bool b) -&gt; Just b</span>
+<span class="lineno">  318 </span><span class="spaces">  </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  319 </span>
+<span class="lineno">  320 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  321 </span>-- Items
+<span class="lineno">  322 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  323 </span>
+<span class="lineno">  324 </span>-- | Whether a tool call succeeded. Tri-state because a 'Bool' cannot express
+<span class="lineno">  325 </span>-- &quot;no result in the window&quot;: a tool-only response must still name what ran
+<span class="lineno">  326 </span>-- (DoD 2 wants the opcode), and rendering an unfinished call bare would
+<span class="lineno">  327 </span>-- silently assert success.
+<span class="lineno">  328 </span>data ToolState = LtsOk | LtsFailed | LtsUnfinished
+<span class="lineno">  329 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  330 </span>
+<span class="lineno">  331 </span>data ToolOutcome = ToolOutcome
+<span class="lineno">  332 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">lsaName</span></span></span>  :: Maybe Text   -- ^ 'safeOpLabel' result; 'Nothing' ⇒ unknown opcode
+<span class="lineno">  333 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lsaState</span></span></span> :: !ToolState
+<span class="lineno">  334 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>)      -- no Show, as a rule for content-bearing types
+<span class="lineno">  335 </span>
+<span class="lineno">  336 </span>data AssistantItem
+<span class="lineno">  337 </span>  = LriText Text
+<span class="lineno">  338 </span>  | LriToolOnly ToolOutcome
+<span class="lineno">  339 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>)
+<span class="lineno">  340 </span>
+<span class="lineno">  341 </span>-- | Pair responses with their text or their tool calls, chronologically,
+<span class="lineno">  342 </span>-- resolving each tool's pass/fail by joining on @tool_use_id@.
+<span class="lineno">  343 </span>--
+<span class="lineno">  344 </span>-- The join needs both halves: @tool_use@ ids live in responses, their results
+<span class="lineno">  345 </span>-- in requests. A @tool_use@ with no matching result is 'LtsUnfinished'.
+<span class="lineno">  346 </span>assistantItems :: [Value] -&gt; [AssistantItem]
+<span class="lineno">  347 </span><span class="decl"><span class="istickedoff">assistantItems entries = mapMaybe toItem facts</span>
+<span class="lineno">  348 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  349 </span><span class="spaces">    </span><span class="istickedoff">facts = map extractEntry entries</span>
+<span class="lineno">  350 </span><span class="spaces">    </span><span class="istickedoff">results = concatMap lefResults facts</span>
+<span class="lineno">  351 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  352 </span><span class="spaces">    </span><span class="istickedoff">toItem f</span>
+<span class="lineno">  353 </span><span class="spaces">      </span><span class="istickedoff">| not (T.null (lefText f)) = Just (LriText (lefText f))</span>
+<span class="lineno">  354 </span><span class="spaces">      </span><span class="istickedoff">| (t : _) &lt;- lefTools f = Just (LriToolOnly (outcome t))</span>
+<span class="lineno">  355 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Nothing</span>
+<span class="lineno">  356 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  357 </span><span class="spaces">    </span><span class="istickedoff">outcome t = ToolOutcome (tnName t) (stateOf (tnId t))</span>
+<span class="lineno">  358 </span><span class="spaces">    </span><span class="istickedoff">stateOf tid = case lookup tid results of</span>
+<span class="lineno">  359 </span><span class="spaces">      </span><span class="istickedoff">Just True  -&gt; LtsFailed</span>
+<span class="lineno">  360 </span><span class="spaces">      </span><span class="istickedoff">Just False -&gt; LtsOk</span>
+<span class="lineno">  361 </span><span class="spaces">      </span><span class="istickedoff">Nothing    -&gt; LtsUnfinished</span></span>
+<span class="lineno">  362 </span>
+<span class="lineno">  363 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  364 </span>-- Views
+<span class="lineno">  365 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  366 </span>
+<span class="lineno">  367 </span>data TabHeading = TabHeading
+<span class="lineno">  368 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">lthIndex</span></span></span> :: TabIndex
+<span class="lineno">  369 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lthTitle</span></span></span> :: Maybe Text   -- ^ may be a user snippet; never logged
+<span class="lineno">  370 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>)      -- no Show: lthTitle is content
+<span class="lineno">  371 </span>
+<span class="lineno">  372 </span>data PendingQuestion = PendingQuestion
+<span class="lineno">  373 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">lqText</span></span></span>    :: Text
+<span class="lineno">  374 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lqOptions</span></span></span> :: [QuestionOption]
+<span class="lineno">  375 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>)      -- no Show: holds question text
+<span class="lineno">  376 </span>
+<span class="lineno">  377 </span>data LastView
+<span class="lineno">  378 </span>  = LastMessages TabHeading [AssistantItem]
+<span class="lineno">  379 </span>  | LastQuestion TabHeading PendingQuestion
+<span class="lineno">  380 </span>  | LastWorking  TabHeading (Maybe ToolOutcome)
+<span class="lineno">  381 </span>  | LastEmpty    TabHeading
+<span class="lineno">  382 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>)        -- no Show, as a rule for content-bearing types
+<span class="lineno">  383 </span>
+<span class="lineno">  384 </span>data ResolveInput = ResolveInput
+<span class="lineno">  385 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">lriHeading</span></span></span>   :: TabHeading
+<span class="lineno">  386 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lriItems</span></span></span>     :: [AssistantItem]
+<span class="lineno">  387 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lriThinking</span></span></span>  :: Bool
+<span class="lineno">  388 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lriQuestion</span></span></span>  :: Maybe PendingQuestion
+<span class="lineno">  389 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lriCount</span></span></span>     :: Int        -- ^ requested n, already clamped 1..5
+<span class="lineno">  390 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">lriLegacy</span></span></span>    :: Bool
+<span class="lineno">  391 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>)        -- no Show: holds AssistantItem/PendingQuestion
+<span class="lineno">  392 </span>
+<span class="lineno">  393 </span>-- | Pick the one view that describes this tab right now.
+<span class="lineno">  394 </span>--
+<span class="lineno">  395 </span>-- Precedence, and why: a pending question is the most actionable state and a
+<span class="lineno">  396 </span>-- blocked turn is *also* thinking, so it must win or it is unreachable;
+<span class="lineno">  397 </span>-- thinking beats messages so a busy tab never implies it finished; anything
+<span class="lineno">  398 </span>-- else with items is 'LastMessages'; otherwise 'LastEmpty'. Pure.
+<span class="lineno">  399 </span>resolveLast :: ResolveInput -&gt; LastView
+<span class="lineno">  400 </span><span class="decl"><span class="istickedoff">resolveLast ri</span>
+<span class="lineno">  401 </span><span class="spaces">  </span><span class="istickedoff">| Just q &lt;- lriQuestion ri = LastQuestion (lriHeading ri) q</span>
+<span class="lineno">  402 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">lriLegacy ri</span>, <span class="nottickedoff">null (lriItems ri)</span> = <span class="nottickedoff">LastEmpty (lriHeading ri)</span></span>
+<span class="lineno">  403 </span><span class="spaces">  </span><span class="istickedoff">| lriThinking ri =</span>
+<span class="lineno">  404 </span><span class="spaces">      </span><span class="istickedoff">LastWorking (lriHeading ri) (lastCompleted (lriItems ri))</span>
+<span class="lineno">  405 </span><span class="spaces">  </span><span class="istickedoff">| not (null (lriItems ri)) =</span>
+<span class="lineno">  406 </span><span class="spaces">      </span><span class="istickedoff">LastMessages (lriHeading ri) (takeLast (lriCount ri) (lriItems ri))</span>
+<span class="lineno">  407 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = LastEmpty (lriHeading ri)</span>
+<span class="lineno">  408 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  409 </span><span class="spaces">    </span><span class="istickedoff">-- The newest *completed* tool, so &quot;last completed&quot; is never a lie.</span>
+<span class="lineno">  410 </span><span class="spaces">    </span><span class="istickedoff">lastCompleted items =</span>
+<span class="lineno">  411 </span><span class="spaces">      </span><span class="istickedoff">case [ o | LriToolOnly o &lt;- items, lsaState o /= LtsUnfinished ] of</span>
+<span class="lineno">  412 </span><span class="spaces">        </span><span class="istickedoff">[] -&gt; Nothing</span>
+<span class="lineno">  413 </span><span class="spaces">        </span><span class="istickedoff">os -&gt; Just (last os)</span></span>
+<span class="lineno">  414 </span>
+<span class="lineno">  415 </span>-- | The newest @n@ items, in chronological order.
+<span class="lineno">  416 </span>takeLast :: Int -&gt; [AssistantItem] -&gt; [AssistantItem]
+<span class="lineno">  417 </span><span class="decl"><span class="istickedoff">takeLast n xs = drop (max 0 (length xs - n)) xs</span></span>
+<span class="lineno">  418 </span>
+<span class="lineno">  419 </span>-- | A stable tag for a view, for tests and callers that branch without
+<span class="lineno">  420 </span>-- rendering. The view types carry no 'Show', so this is how structure is
+<span class="lineno">  421 </span>-- asserted.
+<span class="lineno">  422 </span>viewTag :: LastView -&gt; Text
+<span class="lineno">  423 </span><span class="decl"><span class="istickedoff">viewTag v = case v of</span>
+<span class="lineno">  424 </span><span class="spaces">  </span><span class="istickedoff">LastMessages {} -&gt; &quot;messages&quot;</span>
+<span class="lineno">  425 </span><span class="spaces">  </span><span class="istickedoff">LastQuestion {} -&gt; &quot;question&quot;</span>
+<span class="lineno">  426 </span><span class="spaces">  </span><span class="istickedoff">LastWorking {}  -&gt; &quot;working&quot;</span>
+<span class="lineno">  427 </span><span class="spaces">  </span><span class="istickedoff">LastEmpty {}    -&gt; &quot;empty&quot;</span></span>
+<span class="lineno">  428 </span>
+<span class="lineno">  429 </span>-- | The tool lines a view contains, in order.
+<span class="lineno">  430 </span>renderedTools :: LastView -&gt; [Text]
+<span class="lineno">  431 </span><span class="decl"><span class="istickedoff">renderedTools v = case v of</span>
+<span class="lineno">  432 </span><span class="spaces">  </span><span class="istickedoff">LastMessages _ items -&gt; <span class="nottickedoff">[ toolLine o | LriToolOnly o &lt;- items ]</span></span>
+<span class="lineno">  433 </span><span class="spaces">  </span><span class="istickedoff">LastWorking _ (Just o) -&gt; [ toolLine o ]</span>
+<span class="lineno">  434 </span><span class="spaces">  </span><span class="istickedoff">LastWorking _ Nothing -&gt; []</span>
+<span class="lineno">  435 </span><span class="spaces">  </span><span class="istickedoff">LastQuestion {} -&gt; <span class="nottickedoff">[]</span></span>
+<span class="lineno">  436 </span><span class="spaces">  </span><span class="istickedoff">LastEmpty {} -&gt; <span class="nottickedoff">[]</span></span></span>
+<span class="lineno">  437 </span>
+<span class="lineno">  438 </span>-- | The tool line for the newest tool in a turn, or 'Nothing' when the turn
+<span class="lineno">  439 </span>-- ran no tool. Used by the watch notification, so a bodyless notification
+<span class="lineno">  440 </span>-- names what ran instead of being empty.
+<span class="lineno">  441 </span>--
+<span class="lineno">  442 </span>-- Deliberately the same 3-state rendering as 'renderedTools', so a tool reads
+<span class="lineno">  443 </span>-- identically wherever it appears.
+<span class="lineno">  444 </span>mostRecentToolLine :: [AssistantItem] -&gt; Maybe Text
+<span class="lineno">  445 </span><span class="decl"><span class="istickedoff">mostRecentToolLine items = case [ <span class="nottickedoff">o</span> | LriToolOnly o &lt;- items ] of</span>
+<span class="lineno">  446 </span><span class="spaces">  </span><span class="istickedoff">[] -&gt; Nothing</span>
+<span class="lineno">  447 </span><span class="spaces">  </span><span class="istickedoff">os -&gt; <span class="nottickedoff">Just (toolLine (last os))</span></span></span>
+<span class="lineno">  448 </span>
+<span class="lineno">  449 </span>-- | One tool line. 'LtsUnfinished' is rendered distinctly from 'LtsOk',
+<span class="lineno">  450 </span>-- because it means &quot;no result in the window&quot; — i.e. unknown — and a bare name
+<span class="lineno">  451 </span>-- would assert success.
+<span class="lineno">  452 </span>toolLine :: ToolOutcome -&gt; Text
+<span class="lineno">  453 </span><span class="decl"><span class="istickedoff">toolLine o =</span>
+<span class="lineno">  454 </span><span class="spaces">  </span><span class="istickedoff">opEmoji nameText &lt;&gt; &quot; &quot; &lt;&gt; nameText &lt;&gt; suffix</span>
+<span class="lineno">  455 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  456 </span><span class="spaces">    </span><span class="istickedoff">nameText = fromMaybe &quot;(unknown opcode)&quot; (lsaName o)</span>
+<span class="lineno">  457 </span><span class="spaces">    </span><span class="istickedoff">suffix = case lsaState o of</span>
+<span class="lineno">  458 </span><span class="spaces">      </span><span class="istickedoff">LtsOk         -&gt; &quot;&quot;</span>
+<span class="lineno">  459 </span><span class="spaces">      </span><span class="istickedoff">LtsFailed     -&gt; &quot; (failed)&quot;</span>
+<span class="lineno">  460 </span><span class="spaces">      </span><span class="istickedoff">LtsUnfinished -&gt; &quot; (no result)&quot;</span></span>
+<span class="lineno">  461 </span>
+<span class="lineno">  462 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  463 </span>-- Rendering
+<span class="lineno">  464 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  465 </span>
+<span class="lineno">  466 </span>-- | Render a view to the exact bytes the channel sends.
+<span class="lineno">  467 </span>--
+<span class="lineno">  468 </span>-- One contract: a heading ends with @:@ iff a body follows, and the body
+<span class="lineno">  469 </span>-- begins after exactly one blank line. A heading with no body ends with @.@.
+<span class="lineno">  470 </span>renderLast :: LastView -&gt; Text
+<span class="lineno">  471 </span><span class="decl"><span class="istickedoff">renderLast view = case view of</span>
+<span class="lineno">  472 </span><span class="spaces">  </span><span class="istickedoff">LastEmpty h -&gt; heading h &lt;&gt; &quot; \8212 no messages yet.&quot;</span>
+<span class="lineno">  473 </span><span class="spaces">  </span><span class="istickedoff">LastMessages h [] -&gt; renderLast (LastEmpty h)</span>
+<span class="lineno">  474 </span><span class="spaces">  </span><span class="istickedoff">LastMessages h items -&gt;</span>
+<span class="lineno">  475 </span><span class="spaces">    </span><span class="istickedoff">heading h &lt;&gt; &quot; \8212 &quot; &lt;&gt; countLabel (length items) &lt;&gt; &quot;:\n\n&quot;</span>
+<span class="lineno">  476 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; renderItems (lthIndex h) items &lt;&gt; hintFor (lthIndex h) (length items) items</span>
+<span class="lineno">  477 </span><span class="spaces">  </span><span class="istickedoff">LastWorking h mt -&gt;</span>
+<span class="lineno">  478 </span><span class="spaces">    </span><span class="istickedoff">heading h &lt;&gt; &quot; \8212 still working:\n\n&quot;</span>
+<span class="lineno">  479 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; maybe &quot;no tools have completed yet&quot; (\o -&gt; &quot;last completed: &quot; &lt;&gt; toolLine o) mt</span>
+<span class="lineno">  480 </span><span class="spaces">  </span><span class="istickedoff">LastQuestion h q -&gt;</span>
+<span class="lineno">  481 </span><span class="spaces">    </span><span class="istickedoff">heading h &lt;&gt; &quot; \8212 waiting on your answer:\n\n&quot;</span>
+<span class="lineno">  482 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; quoteBody (formatQ q) &lt;&gt; &quot;\n\n&quot; &lt;&gt; answerFooter (lthIndex h) q</span>
+<span class="lineno">  483 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  484 </span><span class="spaces">    </span><span class="istickedoff">formatQ q = case lqOptions q of</span>
+<span class="lineno">  485 </span><span class="spaces">      </span><span class="istickedoff">[] -&gt; lqText q</span>
+<span class="lineno">  486 </span><span class="spaces">      </span><span class="istickedoff">os -&gt; lqText q &lt;&gt; &quot;\n\n&quot;</span>
+<span class="lineno">  487 </span><span class="spaces">              </span><span class="istickedoff">&lt;&gt; T.intercalate &quot;\n&quot; (zipWith optLine [1 :: Int ..] os)</span>
+<span class="lineno">  488 </span><span class="spaces">    </span><span class="istickedoff">optLine n (QuestionOption lbl desc)</span>
+<span class="lineno">  489 </span><span class="spaces">      </span><span class="istickedoff">| T.null desc = T.pack (show n) &lt;&gt; &quot;) &quot; &lt;&gt; lbl</span>
+<span class="lineno">  490 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>   = T.pack (show n) &lt;&gt; &quot;) &quot; &lt;&gt; lbl &lt;&gt; &quot; \8212 &quot; &lt;&gt; desc</span></span>
+<span class="lineno">  491 </span>
+<span class="lineno">  492 </span>-- | @📔 Tab b (title)@ — the title is omitted when empty.
+<span class="lineno">  493 </span>heading :: TabHeading -&gt; Text
+<span class="lineno">  494 </span><span class="decl"><span class="istickedoff">heading h =</span>
+<span class="lineno">  495 </span><span class="spaces">  </span><span class="istickedoff">&quot;\128212 Tab &quot; &lt;&gt; T.singleton (tabIndexToChar (lthIndex h)) &lt;&gt; titlePart</span>
+<span class="lineno">  496 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  497 </span><span class="spaces">    </span><span class="istickedoff">titlePart = case lthTitle h of</span>
+<span class="lineno">  498 </span><span class="spaces">      </span><span class="istickedoff">Just t | <span class="tickonlytrue">not (T.null (T.strip t))</span> -&gt; &quot; (&quot; &lt;&gt; t &lt;&gt; &quot;)&quot;</span>
+<span class="lineno">  499 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; &quot;&quot;</span></span>
+<span class="lineno">  500 </span>
+<span class="lineno">  501 </span>countLabel :: Int -&gt; Text
+<span class="lineno">  502 </span><span class="decl"><span class="istickedoff">countLabel 1 = &quot;last message&quot;</span>
+<span class="lineno">  503 </span><span class="spaces"></span><span class="istickedoff">countLabel n = &quot;last &quot; &lt;&gt; T.pack (show n) &lt;&gt; &quot; messages&quot;</span></span>
+<span class="lineno">  504 </span>
+<span class="lineno">  505 </span>-- | Items, each attributed with the tab char when there is more than one
+<span class="lineno">  506 </span>-- (a chunk boundary then lands inside or between attributed items).
+<span class="lineno">  507 </span>renderItems :: TabIndex -&gt; [AssistantItem] -&gt; Text
+<span class="lineno">  508 </span><span class="decl"><span class="istickedoff">renderItems idx items = T.intercalate &quot;\n\n&quot; (map renderItem items)</span>
+<span class="lineno">  509 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  510 </span><span class="spaces">    </span><span class="istickedoff">-- More than one item ⇒ each is attributed, so a chunk boundary that falls</span>
+<span class="lineno">  511 </span><span class="spaces">    </span><span class="istickedoff">-- between items still tells the reader which tab the text came from.</span>
+<span class="lineno">  512 </span><span class="spaces">    </span><span class="istickedoff">prefix = if length items &gt; 1 then T.singleton (tabIndexToChar idx) &lt;&gt; &quot;: &quot; else &quot;&quot;</span>
+<span class="lineno">  513 </span><span class="spaces">    </span><span class="istickedoff">renderItem item = prefix &lt;&gt; case item of</span>
+<span class="lineno">  514 </span><span class="spaces">      </span><span class="istickedoff">LriText t -&gt; t</span>
+<span class="lineno">  515 </span><span class="spaces">      </span><span class="istickedoff">LriToolOnly o -&gt; toolLine o &lt;&gt; &quot; \8212 no reply text.&quot;</span></span>
+<span class="lineno">  516 </span>
+<span class="lineno">  517 </span>-- | The &quot;for more&quot; hint, for a text-free block whose window was saturated (so
+<span class="lineno">  518 </span>-- more may exist). Without the saturation gate the hint repeats forever, which
+<span class="lineno">  519 </span>-- is the dead end it exists to avoid. It names the actual tab char, and never
+<span class="lineno">  520 </span>-- re-offers the same count.
+<span class="lineno">  521 </span>hintFor :: TabIndex -&gt; Int -&gt; [AssistantItem] -&gt; Text
+<span class="lineno">  522 </span><span class="decl"><span class="istickedoff">hintFor idx n items</span>
+<span class="lineno">  523 </span><span class="spaces">  </span><span class="istickedoff">| any isText items = &quot;&quot;</span>
+<span class="lineno">  524 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">n &gt;= 5</span> = <span class="nottickedoff">&quot; /b to switch to that tab.&quot;</span></span>
+<span class="lineno">  525 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = &quot; /last &quot; &lt;&gt; T.singleton (tabIndexToChar idx) &lt;&gt; &quot; 5 for more.&quot;</span>
+<span class="lineno">  526 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  527 </span><span class="spaces">    </span><span class="istickedoff">isText (LriText _) = True</span>
+<span class="lineno">  528 </span><span class="spaces">    </span><span class="istickedoff">isText _ = False</span></span>
+<span class="lineno">  529 </span>
+<span class="lineno">  530 </span>-- | Quote model-authored text so it cannot be mistaken for harness output.
+<span class="lineno">  531 </span>--
+<span class="lineno">  532 </span>-- Every non-blank line gets @&quot;&gt; &quot;@; a blank line becomes a bare @&quot;&gt;&quot;@ (no
+<span class="lineno">  533 </span>-- trailing space). Line separators other than @\n@ are normalised first,
+<span class="lineno">  534 </span>-- because @\r@, U+0085, U+2028 and U+2029 render as line breaks but would
+<span class="lineno">  535 </span>-- otherwise slip past 'T.lines' and escape the quote.
+<span class="lineno">  536 </span>quoteBody :: Text -&gt; Text
+<span class="lineno">  537 </span><span class="decl"><span class="istickedoff">quoteBody t =</span>
+<span class="lineno">  538 </span><span class="spaces">  </span><span class="istickedoff">T.intercalate &quot;\n&quot;</span>
+<span class="lineno">  539 </span><span class="spaces">    </span><span class="istickedoff">[ if T.null l then &quot;&gt;&quot; else &quot;&gt; &quot; &lt;&gt; l | l &lt;- T.lines (normalizeNewlines t) ]</span></span>
+<span class="lineno">  540 </span>
+<span class="lineno">  541 </span>-- | Fold the line separators that clients render as breaks into @\n@.
+<span class="lineno">  542 </span>--
+<span class="lineno">  543 </span>-- @\r\n@ collapses to a single newline first, so a CRLF does not become two
+<span class="lineno">  544 </span>-- blank lines. The remaining separators are handled per character.
+<span class="lineno">  545 </span>normalizeNewlines :: Text -&gt; Text
+<span class="lineno">  546 </span><span class="decl"><span class="istickedoff">normalizeNewlines = T.map other . T.replace &quot;\r\n&quot; &quot;\n&quot;</span>
+<span class="lineno">  547 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  548 </span><span class="spaces">    </span><span class="istickedoff">other '\r' = <span class="nottickedoff">'\n'</span></span>
+<span class="lineno">  549 </span><span class="spaces">    </span><span class="istickedoff">other '\x85' = <span class="nottickedoff">'\n'</span></span>
+<span class="lineno">  550 </span><span class="spaces">    </span><span class="istickedoff">other '\x2028' = '\n'</span>
+<span class="lineno">  551 </span><span class="spaces">    </span><span class="istickedoff">other '\x2029' = <span class="nottickedoff">'\n'</span></span>
+<span class="lineno">  552 </span><span class="spaces">    </span><span class="istickedoff">other c = c</span></span>
+<span class="lineno">  553 </span>
+<span class="lineno">  554 </span>-- | The answer footer. Both ask kinds get the same one, because a gate ask and
+<span class="lineno">  555 </span>-- an open-ended ask are indistinguishable on the wire (both carry no options).
+<span class="lineno">  556 </span>answerFooter :: TabIndex -&gt; PendingQuestion -&gt; Text
+<span class="lineno">  557 </span><span class="decl"><span class="istickedoff">answerFooter idx q = case lqOptions q of</span>
+<span class="lineno">  558 </span><span class="spaces">  </span><span class="istickedoff">[] -&gt; &quot;Answer with /&quot; &lt;&gt; c &lt;&gt; &quot; &lt;your answer&gt;.&quot;</span>
+<span class="lineno">  559 </span><span class="spaces">  </span><span class="istickedoff">_  -&gt; &quot;Answer with /&quot; &lt;&gt; c &lt;&gt; &quot; 1 or /&quot; &lt;&gt; c &lt;&gt; &quot; &lt;your answer&gt;.&quot;</span>
+<span class="lineno">  560 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  561 </span><span class="spaces">    </span><span class="istickedoff">c = T.singleton (tabIndexToChar idx)</span></span>
+
+</pre>
+</body>
+</html>

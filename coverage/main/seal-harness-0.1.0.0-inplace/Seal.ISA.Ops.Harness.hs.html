@@ -1,0 +1,212 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The Harness opcode group: HARNESS_LIST, HARNESS_START, HARNESS_STOP.
+<span class="lineno">    3 </span>-- All Trusted — harness lifecycle is a control-plane action, not
+<span class="lineno">    4 </span>-- agent-supplied arbitrary execution. The opcodes drive the
+<span class="lineno">    5 </span>-- 'HarnessRegistry' + the 'TmuxRunner' seam; 'orRecorded' carries the
+<span class="lineno">    6 </span>-- secret-free 'HarnessId' + op metadata.
+<span class="lineno">    7 </span>module Seal.ISA.Ops.Harness
+<span class="lineno">    8 </span>  ( harnessListOp
+<span class="lineno">    9 </span>  , harnessStartOp
+<span class="lineno">   10 </span>  , harnessStopOp
+<span class="lineno">   11 </span>  ) where
+<span class="lineno">   12 </span>
+<span class="lineno">   13 </span>import Control.Concurrent.STM (atomically)
+<span class="lineno">   14 </span>import Control.Monad.IO.Class (liftIO)
+<span class="lineno">   15 </span>import Data.Aeson (Value (..), object, (.=))
+<span class="lineno">   16 </span>import Data.Aeson.Key (fromText)
+<span class="lineno">   17 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   18 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   19 </span>import Data.Text (Text)
+<span class="lineno">   20 </span>import Data.Text qualified as T
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>import Seal.Core.Types (OpName (..), TrustLevel (..))
+<span class="lineno">   23 </span>import Seal.Harness.Id (HarnessId, harnessIdToText, parseHarnessId)
+<span class="lineno">   24 </span>import Seal.Harness.Registry
+<span class="lineno">   25 </span>  ( HarnessEntry (..), HarnessOrigin (..), HarnessRegistry, Liveness (..)
+<span class="lineno">   26 </span>  , insert, lookupById, modify, snapshot )
+<span class="lineno">   27 </span>import Seal.Harness.Tmux
+<span class="lineno">   28 </span>  ( TmuxIdent, TmuxRunner, addHarnessWindowNamed, mkTmuxIdent
+<span class="lineno">   29 </span>  , startTmuxSessionStatus, stopHarnessWindowNamed, tmuxIdentText )
+<span class="lineno">   30 </span>import Seal.ISA.Opcode
+<span class="lineno">   31 </span>import Seal.Providers.Class (ToolResultPart (..))
+<span class="lineno">   32 </span>import Seal.Session.Kind (HarnessFlavour (..))
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>-- | HARNESS_LIST: return the registry snapshot as a JSON array of
+<span class="lineno">   35 </span>-- {id, label, liveness, flavour} objects.
+<span class="lineno">   36 </span>harnessListOp :: HarnessRegistry -&gt; Opcode
+<span class="lineno">   37 </span><span class="decl"><span class="istickedoff">harnessListOp reg = TrustedOpcode</span>
+<span class="lineno">   38 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;HARNESS_LIST&quot;</span>
+<span class="lineno">   39 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">   40 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;List the live harnesses registered with the harness backend.&quot;</span>
+<span class="lineno">   41 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = object</span>
+<span class="lineno">   42 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">   43 </span><span class="spaces">      </span><span class="istickedoff">, &quot;properties&quot; .= object []</span>
+<span class="lineno">   44 </span><span class="spaces">      </span><span class="istickedoff">, &quot;required&quot; .= ([] :: [Text])</span>
+<span class="lineno">   45 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">   46 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object</span></span>
+<span class="lineno">   47 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;array&quot; :: Text)</span></span>
+<span class="lineno">   48 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;items&quot; .= object</span></span>
+<span class="lineno">   49 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span></span>
+<span class="lineno">   50 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">, &quot;properties&quot; .= object</span></span>
+<span class="lineno">   51 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">[ fromText &quot;id&quot; .= object [&quot;type&quot; .= (&quot;string&quot; :: Text)]</span></span>
+<span class="lineno">   52 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, fromText &quot;label&quot; .= object [&quot;type&quot; .= (&quot;string&quot; :: Text)]</span></span>
+<span class="lineno">   53 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">, fromText &quot;liveness&quot; .= object [&quot;type&quot; .= (&quot;string&quot; :: Text)]</span></span>
+<span class="lineno">   54 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">   55 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">   56 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = const (Right ())</span>
+<span class="lineno">   58 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = False</span>
+<span class="lineno">   59 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_back _input -&gt; liftIO $ do</span>
+<span class="lineno">   60 </span><span class="spaces">      </span><span class="istickedoff">entries &lt;- snapshot reg</span>
+<span class="lineno">   61 </span><span class="spaces">      </span><span class="istickedoff">let <span class="nottickedoff">arr = map entryToJson entries</span></span>
+<span class="lineno">   62 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">recorded = object [&quot;harnesses&quot; .= arr]</span></span>
+<span class="lineno">   63 </span><span class="spaces">      </span><span class="istickedoff">pure (OpResult [<span class="nottickedoff">TrpText (T.pack (show arr))</span>] False <span class="nottickedoff">recorded</span>)</span>
+<span class="lineno">   64 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>-- | HARNESS_START: spawn a harness in a tmux window, stamp the @seal_id
+<span class="lineno">   67 </span>-- marker, insert a HarnessEntry (OriginSpawned), return the HarnessId.
+<span class="lineno">   68 </span>-- The tmux session/window idents + the flavour are supplied by the caller
+<span class="lineno">   69 </span>-- (the 6b wiring resolves them); 'mintId' mints the fresh durable id.
+<span class="lineno">   70 </span>harnessStartOp
+<span class="lineno">   71 </span>  :: HarnessRegistry -&gt; TmuxRunner -&gt; TmuxIdent -&gt; TmuxIdent
+<span class="lineno">   72 </span>  -&gt; HarnessFlavour -&gt; IO HarnessId -&gt; Opcode
+<span class="lineno">   73 </span><span class="decl"><span class="istickedoff">harnessStartOp reg runner session window flavour mintId = TrustedOpcode</span>
+<span class="lineno">   74 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;HARNESS_START&quot;</span>
+<span class="lineno">   75 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">   76 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Start a harness in a tmux window and register it.&quot;</span>
+<span class="lineno">   77 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = object</span>
+<span class="lineno">   78 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">   79 </span><span class="spaces">      </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">   80 </span><span class="spaces">          </span><span class="istickedoff">[ fromText &quot;flavour&quot; .= object</span>
+<span class="lineno">   81 </span><span class="spaces">              </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">   82 </span><span class="spaces">              </span><span class="istickedoff">, &quot;description&quot; .= (&quot;claude-code | codex | generic | &lt;custom&gt;&quot; :: Text)</span>
+<span class="lineno">   83 </span><span class="spaces">              </span><span class="istickedoff">]</span>
+<span class="lineno">   84 </span><span class="spaces">          </span><span class="istickedoff">]</span>
+<span class="lineno">   85 </span><span class="spaces">      </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;flavour&quot;] :: [Text])</span>
+<span class="lineno">   86 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object</span></span>
+<span class="lineno">   88 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span></span>
+<span class="lineno">   89 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;properties&quot; .= object [fromText &quot;id&quot; .= object [&quot;type&quot; .= (&quot;string&quot; :: Text)]]</span></span>
+<span class="lineno">   90 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">, &quot;required&quot; .= ([&quot;id&quot;] :: [Text])</span></span>
+<span class="lineno">   91 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">]</span></span>
+<span class="lineno">   92 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = const (Right ())</span>
+<span class="lineno">   93 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = False</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_back _input -&gt; liftIO $ do</span>
+<span class="lineno">   95 </span><span class="spaces">      </span><span class="istickedoff">hid &lt;- mintId</span>
+<span class="lineno">   96 </span><span class="spaces">      </span><span class="istickedoff">r1 &lt;- startTmuxSessionStatus runner session</span>
+<span class="lineno">   97 </span><span class="spaces">      </span><span class="istickedoff">case r1 of</span>
+<span class="lineno">   98 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (opErr (T.pack (show e)))</span></span>
+<span class="lineno">   99 </span><span class="spaces">        </span><span class="istickedoff">Right _ -&gt; do</span>
+<span class="lineno">  100 </span><span class="spaces">          </span><span class="istickedoff">r2 &lt;- addHarnessWindowNamed runner session window <span class="nottickedoff">hid</span></span>
+<span class="lineno">  101 </span><span class="spaces">          </span><span class="istickedoff">case r2 of</span>
+<span class="lineno">  102 </span><span class="spaces">            </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (opErr (T.pack (show e)))</span></span>
+<span class="lineno">  103 </span><span class="spaces">            </span><span class="istickedoff">Right _ -&gt; do</span>
+<span class="lineno">  104 </span><span class="spaces">              </span><span class="istickedoff">let entry = HarnessEntry</span>
+<span class="lineno">  105 </span><span class="spaces">                    </span><span class="istickedoff">{ heId = hid</span>
+<span class="lineno">  106 </span><span class="spaces">                    </span><span class="istickedoff">, heLabel = <span class="nottickedoff">flavourLabel flavour</span></span>
+<span class="lineno">  107 </span><span class="spaces">                    </span><span class="istickedoff">, heOrigin = HoSpawned</span>
+<span class="lineno">  108 </span><span class="spaces">                    </span><span class="istickedoff">, heLiveness = LvIdle</span>
+<span class="lineno">  109 </span><span class="spaces">                    </span><span class="istickedoff">, heTmuxCoord = <span class="nottickedoff">Just (tmuxIdentText session &lt;&gt; &quot;:&quot; &lt;&gt; tmuxIdentText window)</span></span>
+<span class="lineno">  110 </span><span class="spaces">                    </span><span class="istickedoff">, heFlavour = <span class="nottickedoff">Just (flavourLabel flavour)</span></span>
+<span class="lineno">  111 </span><span class="spaces">                    </span><span class="istickedoff">, heOrphanTicks = <span class="nottickedoff">0</span></span>
+<span class="lineno">  112 </span><span class="spaces">                    </span><span class="istickedoff">}</span>
+<span class="lineno">  113 </span><span class="spaces">              </span><span class="istickedoff">atomically (insert reg entry)</span>
+<span class="lineno">  114 </span><span class="spaces">              </span><span class="istickedoff">let <span class="nottickedoff">recorded = object [&quot;id&quot; .= harnessIdToText hid, &quot;flavour&quot; .= flavourLabel flavour]</span></span>
+<span class="lineno">  115 </span><span class="spaces">              </span><span class="istickedoff">pure (OpResult <span class="nottickedoff">[TrpText (harnessIdToText hid)]</span> False <span class="nottickedoff">recorded</span>)</span>
+<span class="lineno">  116 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  117 </span>
+<span class="lineno">  118 </span>-- | HARNESS_STOP: stop a harness (kill the tmux window) + mark the entry
+<span class="lineno">  119 </span>-- LvExited. Takes the harness id in the input.
+<span class="lineno">  120 </span>harnessStopOp :: HarnessRegistry -&gt; TmuxRunner -&gt; Opcode
+<span class="lineno">  121 </span><span class="decl"><span class="istickedoff">harnessStopOp reg runner = TrustedOpcode</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">{ toName = OpName &quot;HARNESS_STOP&quot;</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">, toTrust = Trusted</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">, toDesc = &quot;Stop a harness (kill its tmux window) and mark it exited.&quot;</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="istickedoff">, toInSchema = object</span>
+<span class="lineno">  126 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  127 </span><span class="spaces">      </span><span class="istickedoff">, &quot;properties&quot; .= object [fromText &quot;id&quot; .= object [&quot;type&quot; .= (&quot;string&quot; :: Text)]]</span>
+<span class="lineno">  128 </span><span class="spaces">      </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;id&quot;] :: [Text])</span>
+<span class="lineno">  129 </span><span class="spaces">      </span><span class="istickedoff">]</span>
+<span class="lineno">  130 </span><span class="spaces">  </span><span class="istickedoff">, toOutSchema = <span class="nottickedoff">object [&quot;type&quot; .= (&quot;object&quot; :: Text), &quot;properties&quot; .= object []]</span></span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">, toAuthorize = const (Right ())</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">, toBlocking = False</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="istickedoff">, toRun = \_back input -&gt; liftIO $ do</span>
+<span class="lineno">  134 </span><span class="spaces">      </span><span class="istickedoff">case idField input of</span>
+<span class="lineno">  135 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (opErr &quot;missing id&quot;)</span></span>
+<span class="lineno">  136 </span><span class="spaces">        </span><span class="istickedoff">Just hidText -&gt; case parseHarnessId hidText of</span>
+<span class="lineno">  137 </span><span class="spaces">          </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (opErr e)</span></span>
+<span class="lineno">  138 </span><span class="spaces">          </span><span class="istickedoff">Right hid -&gt; do</span>
+<span class="lineno">  139 </span><span class="spaces">            </span><span class="istickedoff">mEntry &lt;- atomically (lookupById reg hid)</span>
+<span class="lineno">  140 </span><span class="spaces">            </span><span class="istickedoff">case mEntry of</span>
+<span class="lineno">  141 </span><span class="spaces">              </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure (opErr &quot;harness not found&quot;)</span></span>
+<span class="lineno">  142 </span><span class="spaces">              </span><span class="istickedoff">Just _entry -&gt; do</span>
+<span class="lineno">  143 </span><span class="spaces">                </span><span class="istickedoff">-- The coord-&gt;TmuxIdent split is simplified for 6a (the</span>
+<span class="lineno">  144 </span><span class="spaces">                </span><span class="istickedoff">-- real 6b wiring splits &quot;session:window&quot;); use the window</span>
+<span class="lineno">  145 </span><span class="spaces">                </span><span class="istickedoff">-- ident the entry was spawned with. For 6a's capstone the</span>
+<span class="lineno">  146 </span><span class="spaces">                </span><span class="istickedoff">-- test passes a known window.</span>
+<span class="lineno">  147 </span><span class="spaces">                </span><span class="istickedoff">let <span class="nottickedoff">win = fromMaybe (either (error &quot;ident&quot;) id (mkTmuxIdent &quot;win&quot;)) Nothing</span></span>
+<span class="lineno">  148 </span><span class="spaces">                </span><span class="istickedoff">r &lt;- stopHarnessWindowNamed runner <span class="nottickedoff">win</span></span>
+<span class="lineno">  149 </span><span class="spaces">                </span><span class="istickedoff">case r of</span>
+<span class="lineno">  150 </span><span class="spaces">                  </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (opErr (T.pack (show e)))</span></span>
+<span class="lineno">  151 </span><span class="spaces">                  </span><span class="istickedoff">Right _ -&gt; do</span>
+<span class="lineno">  152 </span><span class="spaces">                    </span><span class="istickedoff">atomically (modify reg hid (\e -&gt; e { heLiveness = LvExited }))</span>
+<span class="lineno">  153 </span><span class="spaces">                    </span><span class="istickedoff">pure (OpResult [TrpText &quot;stopped&quot;] False <span class="nottickedoff">(object [&quot;id&quot; .= harnessIdToText hid])</span>)</span>
+<span class="lineno">  154 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  155 </span>
+<span class="lineno">  156 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  157 </span>-- Helpers
+<span class="lineno">  158 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  159 </span>
+<span class="lineno">  160 </span>opErr :: Text -&gt; OpResult
+<span class="lineno">  161 </span><span class="decl"><span class="nottickedoff">opErr t = OpResult [TrpText t] True (object [&quot;error&quot; .= t])</span></span>
+<span class="lineno">  162 </span>
+<span class="lineno">  163 </span>entryToJson :: HarnessEntry -&gt; Value
+<span class="lineno">  164 </span><span class="decl"><span class="nottickedoff">entryToJson e = object</span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="nottickedoff">[ &quot;id&quot; .= harnessIdToText (heId e)</span>
+<span class="lineno">  166 </span><span class="spaces">  </span><span class="nottickedoff">, &quot;label&quot; .= heLabel e</span>
+<span class="lineno">  167 </span><span class="spaces">  </span><span class="nottickedoff">, &quot;liveness&quot; .= livenessText (heLiveness e)</span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="nottickedoff">, &quot;flavour&quot; .= heFlavour e</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="nottickedoff">]</span></span>
+<span class="lineno">  170 </span>
+<span class="lineno">  171 </span>livenessText :: Liveness -&gt; Text
+<span class="lineno">  172 </span><span class="decl"><span class="nottickedoff">livenessText LvIdle          = &quot;idle&quot;</span>
+<span class="lineno">  173 </span><span class="spaces"></span><span class="nottickedoff">livenessText LvThinking      = &quot;thinking&quot;</span>
+<span class="lineno">  174 </span><span class="spaces"></span><span class="nottickedoff">livenessText LvAwaitingInput = &quot;awaiting_input&quot;</span>
+<span class="lineno">  175 </span><span class="spaces"></span><span class="nottickedoff">livenessText LvExited        = &quot;exited&quot;</span>
+<span class="lineno">  176 </span><span class="spaces"></span><span class="nottickedoff">livenessText LvOrphaned      = &quot;orphaned&quot;</span></span>
+<span class="lineno">  177 </span>
+<span class="lineno">  178 </span>flavourLabel :: HarnessFlavour -&gt; Text
+<span class="lineno">  179 </span><span class="decl"><span class="nottickedoff">flavourLabel HfClaudeCode = &quot;claude-code&quot;</span>
+<span class="lineno">  180 </span><span class="spaces"></span><span class="nottickedoff">flavourLabel HfCodex      = &quot;codex&quot;</span>
+<span class="lineno">  181 </span><span class="spaces"></span><span class="nottickedoff">flavourLabel HfGeneric    = &quot;generic&quot;</span>
+<span class="lineno">  182 </span><span class="spaces"></span><span class="nottickedoff">flavourLabel (HCustom t)  = t</span></span>
+<span class="lineno">  183 </span>
+<span class="lineno">  184 </span>idField :: Value -&gt; Maybe Text
+<span class="lineno">  185 </span><span class="decl"><span class="istickedoff">idField v = case v of</span>
+<span class="lineno">  186 </span><span class="spaces">  </span><span class="istickedoff">Data.Aeson.Object o -&gt; case KeyMap.lookup (fromText &quot;id&quot;) o of</span>
+<span class="lineno">  187 </span><span class="spaces">    </span><span class="istickedoff">Just (Data.Aeson.String t) -&gt; Just t</span>
+<span class="lineno">  188 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  189 </span><span class="spaces">  </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span></span>
+
+</pre>
+</body>
+</html>

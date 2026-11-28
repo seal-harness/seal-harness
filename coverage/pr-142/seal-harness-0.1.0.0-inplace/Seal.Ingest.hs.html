@@ -1,0 +1,102 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Single-door ingest chokepoint: preprocess chain → Disposition classifier.
+<span class="lineno">    3 </span>module Seal.Ingest
+<span class="lineno">    4 </span>  ( RawInbound (..)
+<span class="lineno">    5 </span>  , PreprocessStage
+<span class="lineno">    6 </span>  , PreprocessChain (..)
+<span class="lineno">    7 </span>  , emptyChain
+<span class="lineno">    8 </span>  , runChain
+<span class="lineno">    9 </span>  , Disposition (..)
+<span class="lineno">   10 </span>  , ingest
+<span class="lineno">   11 </span>  ) where
+<span class="lineno">   12 </span>
+<span class="lineno">   13 </span>import Data.Text (Text)
+<span class="lineno">   14 </span>import qualified Data.Text as T
+<span class="lineno">   15 </span>
+<span class="lineno">   16 </span>import Seal.Command.Help (renderHelpFor, renderHelpIndex)
+<span class="lineno">   17 </span>import Seal.Command.Parse (ParseOutcome (..), parseSlash)
+<span class="lineno">   18 </span>import Seal.Command.Spec (CommandAction, Registry)
+<span class="lineno">   19 </span>
+<span class="lineno">   20 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   21 </span>-- Raw input
+<span class="lineno">   22 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>newtype RawInbound = RawInbound Text
+<span class="lineno">   25 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   28 </span>-- Preprocess chain
+<span class="lineno">   29 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   30 </span>
+<span class="lineno">   31 </span>-- | A single preprocess stage. 'Left' aborts the chain with a rejection message.
+<span class="lineno">   32 </span>type PreprocessStage = RawInbound -&gt; IO (Either Text RawInbound)
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>-- | An ordered sequence of 'PreprocessStage's run before classification.
+<span class="lineno">   35 </span>newtype PreprocessChain = PreprocessChain [PreprocessStage]
+<span class="lineno">   36 </span>
+<span class="lineno">   37 </span>-- | The empty chain: all input passes through unchanged.
+<span class="lineno">   38 </span>emptyChain :: PreprocessChain
+<span class="lineno">   39 </span><span class="decl"><span class="istickedoff">emptyChain = PreprocessChain []</span></span>
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>-- | Run every stage in order, short-circuiting on the first 'Left'.
+<span class="lineno">   42 </span>runChain :: PreprocessChain -&gt; RawInbound -&gt; IO (Either Text RawInbound)
+<span class="lineno">   43 </span><span class="decl"><span class="istickedoff">runChain (PreprocessChain stages) = go stages</span>
+<span class="lineno">   44 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   45 </span><span class="spaces">    </span><span class="istickedoff">go []       r = pure (Right r)</span>
+<span class="lineno">   46 </span><span class="spaces">    </span><span class="istickedoff">go (s : ss) r = s r &gt;&gt;= \case</span>
+<span class="lineno">   47 </span><span class="spaces">      </span><span class="istickedoff">Left err -&gt; pure (Left err)</span>
+<span class="lineno">   48 </span><span class="spaces">      </span><span class="istickedoff">Right r' -&gt; go ss r'</span></span>
+<span class="lineno">   49 </span>
+<span class="lineno">   50 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   51 </span>-- Disposition
+<span class="lineno">   52 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   53 </span>
+<span class="lineno">   54 </span>data Disposition
+<span class="lineno">   55 </span>  = DispatchAction CommandAction  -- ^ a parsed command to run
+<span class="lineno">   56 </span>  | ShowText Text                 -- ^ help text or parse error to echo
+<span class="lineno">   57 </span>  | PlainMessage Text             -- ^ non-slash input (MVP stub)
+<span class="lineno">   58 </span>  | Rejected Text                 -- ^ preprocess chain rejected the input
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>-- | Classify one inbound line. The chain runs FIRST; if it rejects the
+<span class="lineno">   61 </span>-- input the result is 'Rejected' regardless of content.
+<span class="lineno">   62 </span>--
+<span class="lineno">   63 </span>-- Classification (after chain passes):
+<span class="lineno">   64 </span>--
+<span class="lineno">   65 </span>-- * Leading @\/@  → 'parseSlash' → 'DispatchAction' | 'ShowText'
+<span class="lineno">   66 </span>-- * Otherwise     → 'PlainMessage'
+<span class="lineno">   67 </span>ingest :: Registry -&gt; PreprocessChain -&gt; RawInbound -&gt; IO Disposition
+<span class="lineno">   68 </span><span class="decl"><span class="istickedoff">ingest registry chain raw = do</span>
+<span class="lineno">   69 </span><span class="spaces">  </span><span class="istickedoff">chainResult &lt;- runChain chain raw</span>
+<span class="lineno">   70 </span><span class="spaces">  </span><span class="istickedoff">case chainResult of</span>
+<span class="lineno">   71 </span><span class="spaces">    </span><span class="istickedoff">Left msg             -&gt; pure (Rejected msg)</span>
+<span class="lineno">   72 </span><span class="spaces">    </span><span class="istickedoff">Right (RawInbound t) -&gt;</span>
+<span class="lineno">   73 </span><span class="spaces">      </span><span class="istickedoff">if T.isPrefixOf &quot;/&quot; t</span>
+<span class="lineno">   74 </span><span class="spaces">        </span><span class="istickedoff">then pure $ case parseSlash registry t of</span>
+<span class="lineno">   75 </span><span class="spaces">          </span><span class="istickedoff">ParsedAction a     -&gt; DispatchAction a</span>
+<span class="lineno">   76 </span><span class="spaces">          </span><span class="istickedoff">ParseHelp Nothing  -&gt; ShowText (renderHelpIndex registry)</span>
+<span class="lineno">   77 </span><span class="spaces">          </span><span class="istickedoff">ParseHelp (Just n) -&gt; ShowText (renderHelpFor registry n)</span>
+<span class="lineno">   78 </span><span class="spaces">          </span><span class="istickedoff">ParseFailure txt   -&gt; ShowText <span class="nottickedoff">txt</span></span>
+<span class="lineno">   79 </span><span class="spaces">        </span><span class="istickedoff">else pure (PlainMessage t)</span></span>
+
+</pre>
+</body>
+</html>

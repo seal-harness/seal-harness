@@ -1,0 +1,182 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Unified exception handling helper. Replaces the 6 duplicated @catch@
+<span class="lineno">    3 </span>-- patterns across 'Seal.Gateway.Send', and
+<span class="lineno">    4 </span>-- 'Seal.Channel.Cli' with a single function that:
+<span class="lineno">    5 </span>--
+<span class="lineno">    6 </span>-- 1. Catches /synchronous/ exceptions only. 'AsyncException' (including
+<span class="lineno">    7 </span>--    'ThreadKilled') is rethrown after logging at 'InfoS' — shutdown must
+<span class="lineno">    8 </span>--    propagate to the bracket, not be swallowed.
+<span class="lineno">    9 </span>-- 2. Logs the full exception to the operator log via 'logIO' at 'ErrorS',
+<span class="lineno">   10 </span>--    including the 'where' label and the logger's 'ChannelContext'.
+<span class="lineno">   11 </span>-- 3. Returns a /sanitized/ 'Text' for the user (via 'Left'): a generic
+<span class="lineno">   12 </span>--    message (@\&quot;internal error (\&lt;where\&gt;) [ref: \&lt;correlationId\&gt;]&quot;@)
+<span class="lineno">   13 </span>--    with a short correlation id so the operator can correlate the user's
+<span class="lineno">   14 </span>--    report to the log entry. 'TranscriptError' text passes through
+<span class="lineno">   15 </span>--    unchanged (it's already user-facing).
+<span class="lineno">   16 </span>-- 4. Calls the optional session-log path ('logTurnError') alongside the
+<span class="lineno">   17 </span>--    katip emission, so the per-session @seal.log@ audit trail is kept.
+<span class="lineno">   18 </span>-- 5. Escapes newlines in the exception text before logging (log-injection
+<span class="lineno">   19 </span>--    defense).
+<span class="lineno">   20 </span>module Seal.Logging.Exceptions
+<span class="lineno">   21 </span>  ( withExceptionLogging
+<span class="lineno">   22 </span>  , withExceptionLoggingRef
+<span class="lineno">   23 </span>  , forkIOLogged
+<span class="lineno">   24 </span>  , mkCorrelationId
+<span class="lineno">   25 </span>  ) where
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>import Control.Concurrent (ThreadId, forkIO)
+<span class="lineno">   28 </span>import Control.Exception
+<span class="lineno">   29 </span>  ( catch, throwIO, fromException, SomeException, AsyncException (..) )
+<span class="lineno">   30 </span>import Data.Text (Text)
+<span class="lineno">   31 </span>import Data.Text qualified as T
+<span class="lineno">   32 </span>import System.Random (randomIO)
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>import Seal.Logging.Logger (SealLogger, logIO, escapeNewlines)
+<span class="lineno">   35 </span>import Seal.Session.Log (logTurnError)
+<span class="lineno">   36 </span>import Seal.Handles.Transcript (TranscriptError (..))
+<span class="lineno">   37 </span>
+<span class="lineno">   38 </span>import Katip (Severity (..), ls)
+<span class="lineno">   39 </span>
+<span class="lineno">   40 </span>-- | Run an 'IO' action, catching synchronous exceptions. Logs the exception
+<span class="lineno">   41 </span>-- with the logger's context + the given 'where' label, calls the optional
+<span class="lineno">   42 </span>-- session-log fallback, and returns either a sanitized error text (for the
+<span class="lineno">   43 </span>-- caller to send to the user) or the original result.
+<span class="lineno">   44 </span>--
+<span class="lineno">   45 </span>-- 'AsyncException' (including 'ThreadKilled') is NOT caught — it is
+<span class="lineno">   46 </span>-- rethrown after logging at 'InfoS', so shutdown propagates to the
+<span class="lineno">   47 </span>-- bracket.
+<span class="lineno">   48 </span>withExceptionLogging
+<span class="lineno">   49 </span>  :: SealLogger
+<span class="lineno">   50 </span>  -&gt; Maybe FilePath          -- ^ session log path (for seal.log fallback)
+<span class="lineno">   51 </span>  -&gt; Text                    -- ^ 'where' label (e.g. &quot;slash command&quot;, &quot;turn&quot;)
+<span class="lineno">   52 </span>  -&gt; IO a
+<span class="lineno">   53 </span>  -&gt; IO (Either Text a)
+<span class="lineno">   54 </span><span class="decl"><span class="istickedoff">withExceptionLogging logger mLogPath whereLabel action =</span>
+<span class="lineno">   55 </span><span class="spaces">  </span><span class="istickedoff">(Right &lt;$&gt; action) `catch` \e -&gt; do</span>
+<span class="lineno">   56 </span><span class="spaces">    </span><span class="istickedoff">case (fromException e :: Maybe AsyncException) of</span>
+<span class="lineno">   57 </span><span class="spaces">      </span><span class="istickedoff">Just asyncEx -&gt; do</span>
+<span class="lineno">   58 </span><span class="spaces">        </span><span class="istickedoff">logIO logger InfoS <span class="nottickedoff">(escapeNewlines (ls $</span></span>
+<span class="lineno">   59 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">&quot;shutdown signal in &quot; &lt;&gt; whereLabel &lt;&gt; &quot;: &quot; &lt;&gt; showLs asyncEx))</span></span>
+<span class="lineno">   60 </span><span class="spaces">        </span><span class="istickedoff">-- Also record the shutdown in the per-session log so an operator</span>
+<span class="lineno">   61 </span><span class="spaces">        </span><span class="istickedoff">-- inspecting seal.log after a hung session can see WHY the turn</span>
+<span class="lineno">   62 </span><span class="spaces">        </span><span class="istickedoff">-- died (e.g. ThreadKilled) rather than just a dangling [TURN]</span>
+<span class="lineno">   63 </span><span class="spaces">        </span><span class="istickedoff">-- start with no matching end. Best-effort (logTurnError swallows</span>
+<span class="lineno">   64 </span><span class="spaces">        </span><span class="istickedoff">-- IO errors) and rethrown after logging so the bracket cleanup</span>
+<span class="lineno">   65 </span><span class="spaces">        </span><span class="istickedoff">-- (idle broadcast) still fires.</span>
+<span class="lineno">   66 </span><span class="spaces">        </span><span class="istickedoff">logTurnError mLogPath (&quot;shutdown signal in &quot; &lt;&gt; whereLabel &lt;&gt; &quot;: &quot; &lt;&gt; showLs asyncEx)</span>
+<span class="lineno">   67 </span><span class="spaces">        </span><span class="istickedoff">throwIO e</span>
+<span class="lineno">   68 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">   69 </span><span class="spaces">        </span><span class="istickedoff">correlationId &lt;- mkCorrelationId</span>
+<span class="lineno">   70 </span><span class="spaces">        </span><span class="istickedoff">let (userMsg, fullDetail) = sanitizeException whereLabel e correlationId</span>
+<span class="lineno">   71 </span><span class="spaces">        </span><span class="istickedoff">logIO logger ErrorS (escapeNewlines (ls fullDetail))</span>
+<span class="lineno">   72 </span><span class="spaces">        </span><span class="istickedoff">logTurnError mLogPath fullDetail</span>
+<span class="lineno">   73 </span><span class="spaces">        </span><span class="istickedoff">pure (Left userMsg)</span></span>
+<span class="lineno">   74 </span>
+<span class="lineno">   75 </span>-- | Like 'withExceptionLogging', but also hands the caller the exception and
+<span class="lineno">   76 </span>-- the correlation id it logged.
+<span class="lineno">   77 </span>--
+<span class="lineno">   78 </span>-- The three-part result exists because a failure report needs all three, and
+<span class="lineno">   79 </span>-- only one of them survives the plain variant:
+<span class="lineno">   80 </span>--
+<span class="lineno">   81 </span>-- * the /exception/ — so the report can classify the real cause. The plain
+<span class="lineno">   82 </span>--   variant consumes it into a sanitized 'Text', which is not recoverable.
+<span class="lineno">   83 </span>-- * the /ref/ — so the report's reference id is the SAME id as the log line.
+<span class="lineno">   84 </span>--   The plain variant mints it internally and only embeds it inside the
+<span class="lineno">   85 </span>--   returned 'Text', so a caller cannot use it to join to @seal.log@.
+<span class="lineno">   86 </span>-- * the /result/ — 'Right' on success, so the caller’s happy path is unchanged.
+<span class="lineno">   87 </span>--
+<span class="lineno">   88 </span>-- 'AsyncException' is rethrown after logging, exactly as in the plain variant:
+<span class="lineno">   89 </span>-- a shutdown is not a failure.
+<span class="lineno">   90 </span>withExceptionLoggingRef
+<span class="lineno">   91 </span>  :: SealLogger
+<span class="lineno">   92 </span>  -&gt; Maybe FilePath
+<span class="lineno">   93 </span>  -&gt; Text
+<span class="lineno">   94 </span>  -&gt; IO a
+<span class="lineno">   95 </span>  -&gt; IO (Either (SomeException, Text) a)
+<span class="lineno">   96 </span><span class="decl"><span class="istickedoff">withExceptionLoggingRef logger mLogPath whereLabel action =</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">(Right &lt;$&gt; action) `catch` \e -&gt; do</span>
+<span class="lineno">   98 </span><span class="spaces">    </span><span class="istickedoff">case (fromException e :: Maybe AsyncException) of</span>
+<span class="lineno">   99 </span><span class="spaces">      </span><span class="istickedoff">Just asyncEx -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  100 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">logIO logger InfoS (escapeNewlines (ls $</span></span>
+<span class="lineno">  101 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">&quot;shutdown signal in &quot; &lt;&gt; whereLabel &lt;&gt; &quot;: &quot; &lt;&gt; showLs asyncEx))</span></span>
+<span class="lineno">  102 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">logTurnError mLogPath (&quot;shutdown signal in &quot; &lt;&gt; whereLabel &lt;&gt; &quot;: &quot; &lt;&gt; showLs asyncEx)</span></span>
+<span class="lineno">  103 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">throwIO e</span></span>
+<span class="lineno">  104 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  105 </span><span class="spaces">        </span><span class="istickedoff">correlationId &lt;- mkCorrelationId</span>
+<span class="lineno">  106 </span><span class="spaces">        </span><span class="istickedoff">let (_userMsg, fullDetail) = sanitizeException whereLabel e correlationId</span>
+<span class="lineno">  107 </span><span class="spaces">        </span><span class="istickedoff">logIO logger ErrorS <span class="nottickedoff">(escapeNewlines (ls fullDetail))</span></span>
+<span class="lineno">  108 </span><span class="spaces">        </span><span class="istickedoff">logTurnError mLogPath fullDetail</span>
+<span class="lineno">  109 </span><span class="spaces">        </span><span class="istickedoff">pure (Left (e, correlationId))</span></span>
+<span class="lineno">  110 </span>
+<span class="lineno">  111 </span>-- | Generate a short correlation id (8 hex chars from a random nonce).
+<span class="lineno">  112 </span>mkCorrelationId :: IO Text
+<span class="lineno">  113 </span><span class="decl"><span class="istickedoff">mkCorrelationId = do</span>
+<span class="lineno">  114 </span><span class="spaces">  </span><span class="istickedoff">n &lt;- abs &lt;$&gt; randomIO :: IO Int</span>
+<span class="lineno">  115 </span><span class="spaces">  </span><span class="istickedoff">pure (T.justifyRight 8 <span class="nottickedoff">'0'</span> (T.pack (show n)))</span></span>
+<span class="lineno">  116 </span>
+<span class="lineno">  117 </span>-- | Fork a thread whose synchronous exceptions are LOGGED rather than left to
+<span class="lineno">  118 </span>-- the RTS default handler.
+<span class="lineno">  119 </span>--
+<span class="lineno">  120 </span>-- Every bare @forkIO@ site in the harness previously had this hole: an
+<span class="lineno">  121 </span>-- exception in the forked thread printed to stderr and left no trace in the
+<span class="lineno">  122 </span>-- session log or anywhere a user would look. In the failure that motivated
+<span class="lineno">  123 </span>-- this work, that is one of the ways a session could appear to simply stop.
+<span class="lineno">  124 </span>--
+<span class="lineno">  125 </span>-- 'AsyncException' is deliberately RETHROWN and NOT logged. This repo uses
+<span class="lineno">  126 </span>-- 'killThread' for ordinary shutdown (@Agent.Runtime.Registry@,
+<span class="lineno">  127 </span>-- @Chat.Telegram@, @Chat.Signal@), so logging it would emit a spurious ERROR
+<span class="lineno">  128 </span>-- on every normal teardown. This mirrors 'withExceptionLogging', which
+<span class="lineno">  129 </span>-- rethrows for the same reason, and the rule stated in the design: a shutdown
+<span class="lineno">  130 </span>-- is not a failure.
+<span class="lineno">  131 </span>--
+<span class="lineno">  132 </span>-- The log line carries the exception's @show@ at @ErrorS@ with a caller
+<span class="lineno">  133 </span>-- supplied label. It is an /operator/ log line, not a user-facing surface --
+<span class="lineno">  134 </span>-- the closed-vocabulary rule that governs 'Seal.Transcript.TurnFailure' is
+<span class="lineno">  135 </span>-- about what crosses to the model and to chat channels, neither of which this
+<span class="lineno">  136 </span>-- touches.
+<span class="lineno">  137 </span>forkIOLogged :: SealLogger -&gt; Text -&gt; IO () -&gt; IO ThreadId
+<span class="lineno">  138 </span><span class="decl"><span class="istickedoff">forkIOLogged logger label action = forkIO $</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">action `catch` \e -&gt; case fromException e :: Maybe AsyncException of</span>
+<span class="lineno">  140 </span><span class="spaces">    </span><span class="istickedoff">Just _  -&gt; throwIO e</span>
+<span class="lineno">  141 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; logIO logger ErrorS</span>
+<span class="lineno">  142 </span><span class="spaces">      </span><span class="istickedoff">(escapeNewlines (ls (label &lt;&gt; &quot; thread crashed: &quot; &lt;&gt; showLs e)))</span></span>
+<span class="lineno">  143 </span>
+<span class="lineno">  144 </span>-- | Sanitize an exception for user-facing text. Returns:
+<span class="lineno">  145 </span>-- * (userMsg, fullDetail) where userMsg is safe to send to the user
+<span class="lineno">  146 </span>--   and fullDetail is the complete exception text for the operator log.
+<span class="lineno">  147 </span>sanitizeException :: Text -&gt; SomeException -&gt; Text -&gt; (Text, Text)
+<span class="lineno">  148 </span><span class="decl"><span class="istickedoff">sanitizeException whereLabel e correlationId =</span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="istickedoff">case (fromException e :: Maybe TranscriptError) of</span>
+<span class="lineno">  150 </span><span class="spaces">    </span><span class="istickedoff">Just (TranscriptError te _) -&gt;</span>
+<span class="lineno">  151 </span><span class="spaces">      </span><span class="istickedoff">(&quot;transcript error: &quot; &lt;&gt; te, <span class="nottickedoff">&quot;transcript error: &quot; &lt;&gt; te &lt;&gt; &quot; (&quot; &lt;&gt; whereLabel &lt;&gt; &quot;)&quot;</span>)</span>
+<span class="lineno">  152 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt;</span>
+<span class="lineno">  153 </span><span class="spaces">      </span><span class="istickedoff">( &quot;internal error (&quot; &lt;&gt; whereLabel &lt;&gt; &quot;) [ref: &quot; &lt;&gt; correlationId &lt;&gt; &quot;]&quot;</span>
+<span class="lineno">  154 </span><span class="spaces">      </span><span class="istickedoff">, whereLabel &lt;&gt; &quot; failed: &quot; &lt;&gt; T.pack (show e) &lt;&gt; &quot; [ref: &quot; &lt;&gt; correlationId &lt;&gt; &quot;]&quot;</span>
+<span class="lineno">  155 </span><span class="spaces">      </span><span class="istickedoff">)</span></span>
+<span class="lineno">  156 </span>
+<span class="lineno">  157 </span>-- | Helper to show something as LogStr-compatible Text.
+<span class="lineno">  158 </span>showLs :: Show a =&gt; a -&gt; Text
+<span class="lineno">  159 </span><span class="decl"><span class="istickedoff">showLs = T.pack . show</span></span>
+
+</pre>
+</body>
+</html>

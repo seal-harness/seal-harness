@@ -1,0 +1,889 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE CPP #-}
+<span class="lineno">    2 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    3 </span>-- | The security-critical, boot-only configuration that lives in
+<span class="lineno">    4 </span>-- @~\/.seal\/security.toml@ — a separate file from @config.toml@ (which holds
+<span class="lineno">    5 </span>-- the agent/operator-tunable 'RuntimeConfig'). No opcode can reach this module.
+<span class="lineno">    6 </span>--
+<span class="lineno">    7 </span>-- It is re-read through exactly two narrow writers, both reachable from the
+<span class="lineno">    8 </span>-- gateway and from the CLI:
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- * 'updateAccessControlSection' rewrites the @[access_control]@ table when the
+<span class="lineno">   11 </span>--   operator enrolls a passkey, waives the requirement, or manages credentials
+<span class="lineno">   12 </span>--   from the authenticated web UI. Its callback sees only
+<span class="lineno">   13 </span>--   'AccessControlFileConfig'.
+<span class="lineno">   14 </span>-- * 'updateVaultKeySection' records the three vault-key fields
+<span class="lineno">   15 </span>--   (@vault_recipient@, @vault_identity@, @vault_key_type@) when a vault is
+<span class="lineno">   16 </span>--   created from the web setup wizard. Its callback sees the current
+<span class="lineno">   17 </span>--   'SecurityConfig' but may only return 'VaultKeyFields'.
+<span class="lineno">   18 </span>--
+<span class="lineno">   19 </span>-- Neither callback can express a change to the other's section, nor to
+<span class="lineno">   20 </span>-- @untrusted_execution@: the type split (design §4 Approach E) keeps its
+<span class="lineno">   21 </span>-- guarantee, and it is a compile error, not a convention. Both run under
+<span class="lineno">   22 </span>-- 'securityWriteLock' and verify the re-encoded document before committing.
+<span class="lineno">   23 </span>--
+<span class="lineno">   24 </span>-- The file is therefore reachable from the HTTP gateway — but only through
+<span class="lineno">   25 </span>-- those two writers, only on a loopback-origin-guarded route, and only behind
+<span class="lineno">   26 </span>-- the passkey middleware (default-deny). Nothing here is an opcode surface.
+<span class="lineno">   27 </span>--
+<span class="lineno">   28 </span>-- Moving @untrusted_execution@ and the vault settings here means a future
+<span class="lineno">   29 </span>-- @CONFIG_UPDATE@ opcode (which operates on 'RuntimeConfig') and the Gateway's
+<span class="lineno">   30 </span>-- @updateRuntimeConfig@ caller physically cannot express a change to these
+<span class="lineno">   31 </span>-- fields — the type split makes it a compile error (design §4 Approach E).
+<span class="lineno">   32 </span>--
+<span class="lineno">   33 </span>-- @[gateway]@ joined them for the same reason: its bind host and port decide
+<span class="lineno">   34 </span>-- who can reach the agent, and its Origin allowlist and TLS paths decide how.
+<span class="lineno">   35 </span>-- The two narrow writers below assert it unchanged across their round-trip, so
+<span class="lineno">   36 </span>-- an enrollment or a vault-key write cannot move the listener either.
+<span class="lineno">   37 </span>--
+<span class="lineno">   38 </span>-- Every field is optional; a missing key decodes as 'Nothing' and a
+<span class="lineno">   39 </span>-- 'Nothing' value is omitted from the encoded output.
+<span class="lineno">   40 </span>module Seal.Config.Security
+<span class="lineno">   41 </span>  ( SecurityConfig (..)
+<span class="lineno">   42 </span>  , UntrustedExecFileConfig (..)
+<span class="lineno">   43 </span>  , UntrustedExecRemoteFileConfig (..)
+<span class="lineno">   44 </span>  , AccessControlFileConfig (..)
+<span class="lineno">   45 </span>  , CredentialFileConfig (..)
+<span class="lineno">   46 </span>  , accessControlCodec
+<span class="lineno">   47 </span>  , credentialCodec
+<span class="lineno">   48 </span>  , normalizeAccessControlTable
+<span class="lineno">   49 </span>  , fixNode
+<span class="lineno">   50 </span>  , hasLegacyLayout
+<span class="lineno">   51 </span>  , readLegacyCredentials
+<span class="lineno">   52 </span>  , tomlKeyPaths
+<span class="lineno">   53 </span>  , WriteMode (..)
+<span class="lineno">   54 </span>  , ModeRaise
+<span class="lineno">   55 </span>  , raiseMode
+<span class="lineno">   56 </span>  , restoreMode
+<span class="lineno">   57 </span>  , updateAccessControlSection
+<span class="lineno">   58 </span>  , VaultKeyFields (..)
+<span class="lineno">   59 </span>  , updateVaultKeySection
+<span class="lineno">   60 </span>  , clearAccessControlSection
+<span class="lineno">   61 </span>  , gatewayConfigFromSecurity
+<span class="lineno">   62 </span>  , writeSecretFile
+<span class="lineno">   63 </span>  , openUniqueTemp
+<span class="lineno">   64 </span>  , securityWriteLock
+<span class="lineno">   65 </span>  , defaultSecurityConfig
+<span class="lineno">   66 </span>  , securityConfigCodec
+<span class="lineno">   67 </span>  , loadSecurityConfig
+<span class="lineno">   68 </span>  , decodeSecurityConfig
+<span class="lineno">   69 </span>  , saveSecurityConfig
+<span class="lineno">   70 </span>  , updateSecurityConfig
+<span class="lineno">   71 </span>  , untrustedExecConfigFromSecurity
+<span class="lineno">   72 </span>  ) where
+<span class="lineno">   73 </span>
+<span class="lineno">   74 </span>import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+<span class="lineno">   75 </span>import Control.Exception (IOException, bracketOnError, try)
+<span class="lineno">   76 </span>import Control.Monad (void)
+<span class="lineno">   77 </span>import Data.ByteString qualified as BS
+<span class="lineno">   78 </span>import Data.HashMap.Strict qualified as HashMap
+<span class="lineno">   79 </span>import Data.Functor ((&lt;&amp;&gt;))
+<span class="lineno">   80 </span>import Data.List.NonEmpty qualified as NonEmpty
+<span class="lineno">   81 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   82 </span>import Data.Map.Strict (Map)
+<span class="lineno">   83 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   84 </span>import Data.Text (Text)
+<span class="lineno">   85 </span>import Data.Text qualified as T
+<span class="lineno">   86 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   87 </span>import Data.Text.IO qualified as TIO
+<span class="lineno">   88 </span>import System.Directory (doesFileExist, removeFile, renameFile)
+<span class="lineno">   89 </span>import System.FilePath (takeDirectory, takeFileName)
+<span class="lineno">   90 </span>import System.IO (Handle, hClose, openBinaryTempFile)
+<span class="lineno">   91 </span>import System.IO.Unsafe (unsafePerformIO)
+<span class="lineno">   92 </span>import System.Posix.Files (setFileMode)
+<span class="lineno">   93 </span>import System.Posix.IO
+<span class="lineno">   94 </span>  ( OpenFileFlags (creat, nofollow, trunc), OpenMode (WriteOnly), closeFd
+<span class="lineno">   95 </span>  , defaultFileFlags, fdToHandle, openFd )
+<span class="lineno">   96 </span>import Validation (Validation (..))
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>import Toml ((.=))
+<span class="lineno">   99 </span>import Toml qualified
+<span class="lineno">  100 </span>
+<span class="lineno">  101 </span>import Seal.Gateway.Config
+<span class="lineno">  102 </span>  ( GatewayConfig, PartialGatewayConfig, defaultGatewayConfig, gatewayTableCodec
+<span class="lineno">  103 </span>  , withGatewayDefaults )
+<span class="lineno">  104 </span>import Seal.Tools.Exec.Types
+<span class="lineno">  105 </span>  ( SshConfig (..), mkSshHost, mkSshUser, mkRemotePath )
+<span class="lineno">  106 </span>import Seal.Tools.Exec.Untrusted
+<span class="lineno">  107 </span>  ( UntrustedExecConfig (..), UntrustedExecMode (..) )
+<span class="lineno">  108 </span>
+<span class="lineno">  109 </span>-- | The boot-only, agent-immutable security configuration. Carries the
+<span class="lineno">  110 </span>-- @untrusted_execution@ section (remote-only enforcement) and the vault
+<span class="lineno">  111 </span>-- settings. Loaded once at boot from @security.toml@; never passed to any
+<span class="lineno">  112 </span>-- opcode or the Gateway.
+<span class="lineno">  113 </span>data SecurityConfig = SecurityConfig
+<span class="lineno">  114 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">scVaultPath</span></span></span> :: Maybe Text
+<span class="lineno">  115 </span>    -- ^ Absolute path to the vault file (default: @~\/.seal\/config\/vault\/vault.age@).
+<span class="lineno">  116 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scVaultRecipient</span></span></span> :: Maybe Text
+<span class="lineno">  117 </span>    -- ^ age public key: @age1…@ or @age1yubikey1…@.
+<span class="lineno">  118 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scVaultIdentity</span></span></span> :: Maybe Text
+<span class="lineno">  119 </span>    -- ^ Path to the identity file under @keys\/@, or a user-supplied path.
+<span class="lineno">  120 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scVaultUnlock</span></span></span> :: Maybe Text
+<span class="lineno">  121 </span>    -- ^ @\&quot;startup\&quot;@ | @\&quot;on_demand\&quot;@ | @\&quot;per_access\&quot;@.
+<span class="lineno">  122 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scVaultKeyType</span></span></span> :: Maybe Text
+<span class="lineno">  123 </span>    -- ^ Display label: @\&quot;x25519\&quot;@ | @\&quot;yubikey\&quot;@ | @\&quot;user\&quot;@.
+<span class="lineno">  124 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scUntrustedExec</span></span></span> :: Maybe UntrustedExecFileConfig
+<span class="lineno">  125 </span>    -- ^ Optional @[untrusted_execution]@ section (remote-only untrusted
+<span class="lineno">  126 </span>    -- execution). Absent means @mode=local@ (default). @mode=remote@
+<span class="lineno">  127 </span>    -- fail-closes at call time when the remote block is absent or
+<span class="lineno">  128 </span>    -- unreachable (boot still succeeds).
+<span class="lineno">  129 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scAccessControl</span></span></span> :: Maybe AccessControlFileConfig
+<span class="lineno">  130 </span>    -- ^ Optional @[access_control]@ section. Absent means *unconfigured*: the
+<span class="lineno">  131 </span>    -- gateway serves only the setup screen until the operator enrolls a
+<span class="lineno">  132 </span>    -- passkey or explicitly waives (design §4). This is the ONE section the
+<span class="lineno">  133 </span>    -- gateway may write, via 'updateAccessControlSection'.
+<span class="lineno">  134 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scGateway</span></span></span> :: Maybe PartialGatewayConfig
+<span class="lineno">  135 </span>    -- ^ Optional @[gateway]@ section: bind host/port, the WS Origin allowlist,
+<span class="lineno">  136 </span>    -- the static-dir override and the TLS settings. Boot-only and
+<span class="lineno">  137 </span>    -- agent-immutable like the rest of this file — a bind address is not a
+<span class="lineno">  138 </span>    -- setting to guess from, and no opcode or gateway config writer can
+<span class="lineno">  139 </span>    -- express a change to it (the type split makes that a compile error).
+<span class="lineno">  140 </span>    -- 'Seal.Gateway.Config.gatewayConfigFromSecurity' resolves it.
+<span class="lineno">  141 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  142 </span>
+<span class="lineno">  143 </span>-- | The @[untrusted_execution]@ section (spec §3 Layer A). @mode@ is
+<span class="lineno">  144 </span>-- @\&quot;local\&quot;@ (default) or @\&quot;remote\&quot;@ (fail-closed). The optional
+<span class="lineno">  145 </span>-- @[untrusted_execution.remote]@ sub-table carries the SSH coordinates;
+<span class="lineno">  146 </span>-- absent under @mode=local@ (no remote needed), and @mode=remote@ parses
+<span class="lineno">  147 </span>-- OK without it (fail-closed is at call time, not parse time — spec §7
+<span class="lineno">  148 </span>-- row 1).
+<span class="lineno">  149 </span>data UntrustedExecFileConfig = UntrustedExecFileConfig
+<span class="lineno">  150 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">uefcMode</span></span></span>   :: Text
+<span class="lineno">  151 </span>    -- ^ @\&quot;local\&quot;@ | @\&quot;remote\&quot;@
+<span class="lineno">  152 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uefcRemote</span></span></span> :: Maybe UntrustedExecRemoteFileConfig
+<span class="lineno">  153 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  154 </span>
+<span class="lineno">  155 </span>-- | The @[untrusted_execution.remote]@ sub-table (spec §5). Every field is
+<span class="lineno">  156 </span>-- optional at the TOML layer; the call site validates that the required
+<span class="lineno">  157 </span>-- fields (@host@/@user@/@known_hosts@/@workspace@) are present when
+<span class="lineno">  158 </span>-- @mode=remote@ (absent ⇒ fail-closed at call time).
+<span class="lineno">  159 </span>data UntrustedExecRemoteFileConfig = UntrustedExecRemoteFileConfig
+<span class="lineno">  160 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">uerfcHost</span></span></span>       :: Maybe Text
+<span class="lineno">  161 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uerfcUser</span></span></span>       :: Maybe Text
+<span class="lineno">  162 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uerfcPort</span></span></span>       :: Maybe Int
+<span class="lineno">  163 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uerfcIdentity</span></span></span>   :: Maybe FilePath
+<span class="lineno">  164 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uerfcKnownHosts</span></span></span> :: Maybe FilePath
+<span class="lineno">  165 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">uerfcWorkspace</span></span></span>  :: Maybe Text
+<span class="lineno">  166 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  167 </span>
+<span class="lineno">  168 </span>-- | The @[access_control]@ section (design §4). @mode@ is @\&quot;passkey\&quot;@ or
+<span class="lineno">  169 </span>-- @\&quot;none\&quot;@; the section being absent means *unconfigured*, which is not the
+<span class="lineno">  170 </span>-- same as @none@ — unconfigured closes the API and shows the setup screen,
+<span class="lineno">  171 </span>-- whereas @none@ is the operator's explicit waiver.
+<span class="lineno">  172 </span>--
+<span class="lineno">  173 </span>-- @origin@/@rp_id@ are only needed when the browser reaches the gateway
+<span class="lineno">  174 </span>-- through a TLS reverse proxy; otherwise the origin is derived from
+<span class="lineno">  175 </span>-- @[gateway]@ at boot ('Seal.Security.AccessControl.resolveAccessControl').
+<span class="lineno">  176 </span>data AccessControlFileConfig = AccessControlFileConfig
+<span class="lineno">  177 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">acfcMode</span></span></span>        :: Maybe Text
+<span class="lineno">  178 </span>    -- ^ Optional. Absent means &quot;passkey&quot; when credentials are present and
+<span class="lineno">  179 </span>    -- &quot;unconfigured&quot; otherwise. Only @\&quot;none\&quot;@ can open the gateway, and it
+<span class="lineno">  180 </span>    -- has to be written out — an open gateway is never inferred.
+<span class="lineno">  181 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">acfcOrigin</span></span></span>      :: Maybe Text
+<span class="lineno">  182 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">acfcRpId</span></span></span>        :: Maybe Text
+<span class="lineno">  183 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  184 </span>
+<span class="lineno">  185 </span>-- | One @[access_control.credentials.\&lt;id\&gt;]@ table.
+<span class="lineno">  186 </span>data CredentialFileConfig = CredentialFileConfig
+<span class="lineno">  187 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">cfcPublicKey</span></span></span> :: Text
+<span class="lineno">  188 </span>    -- ^ Base64url of the 64-byte uncompressed @x || y@ P-256 point.
+<span class="lineno">  189 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cfcSignCount</span></span></span> :: Int
+<span class="lineno">  190 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cfcLabel</span></span></span>     :: Text
+<span class="lineno">  191 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cfcCreatedAt</span></span></span> :: Text
+<span class="lineno">  192 </span>    -- ^ ISO-8601. Kept as text here and parsed on resolution, so a malformed
+<span class="lineno">  193 </span>    -- value is a boot-time error rather than a decode-time surprise.
+<span class="lineno">  194 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cfcRpId</span></span></span>      :: Text
+<span class="lineno">  195 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cfcAddedVia</span></span></span>  :: Maybe Text
+<span class="lineno">  196 </span>    -- ^ How the credential was enrolled: @\&quot;cli_token\&quot;@ | @\&quot;cli_window\&quot;@ |
+<span class="lineno">  197 </span>    -- @\&quot;assertion\&quot;@ | @\&quot;legacy\&quot;@. Shares its vocabulary with the grant's
+<span class="lineno">  198 </span>    -- @minted_via@ plus @legacy@. Absent or unrecognised reads as
+<span class="lineno">  199 </span>    -- @\&quot;legacy\&quot;@ — the safe label, since it claims nothing about the
+<span class="lineno">  200 </span>    -- authority that created the credential.
+<span class="lineno">  201 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  202 </span>
+<span class="lineno">  203 </span>-- | Bidirectional codec for the @[access_control]@ section.
+<span class="lineno">  204 </span>accessControlCodec :: Toml.TomlCodec AccessControlFileConfig
+<span class="lineno">  205 </span><span class="decl"><span class="istickedoff">accessControlCodec = AccessControlFileConfig</span>
+<span class="lineno">  206 </span><span class="spaces">  </span><span class="istickedoff">&lt;$&gt; Toml.dioptional (Toml.text &quot;mode&quot;) .= acfcMode</span>
+<span class="lineno">  207 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;origin&quot;) .= acfcOrigin</span>
+<span class="lineno">  208 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;rp_id&quot;) .= acfcRpId</span></span>
+<span class="lineno">  209 </span>
+<span class="lineno">  210 </span>-- | Codec for one credential table.
+<span class="lineno">  211 </span>credentialCodec :: Toml.TomlCodec CredentialFileConfig
+<span class="lineno">  212 </span><span class="decl"><span class="istickedoff">credentialCodec = CredentialFileConfig</span>
+<span class="lineno">  213 </span><span class="spaces">  </span><span class="istickedoff">&lt;$&gt; Toml.text &quot;public_key&quot; .= cfcPublicKey</span>
+<span class="lineno">  214 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.int &quot;sign_count&quot; .= cfcSignCount</span>
+<span class="lineno">  215 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.text &quot;label&quot; .= cfcLabel</span>
+<span class="lineno">  216 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.text &quot;created_at&quot; .= cfcCreatedAt</span>
+<span class="lineno">  217 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.text &quot;rp_id&quot; .= cfcRpId</span>
+<span class="lineno">  218 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;added_via&quot;) .= cfcAddedVia</span></span>
+<span class="lineno">  219 </span>
+<span class="lineno">  220 </span>-- | Every /value-bearing/ key path in a parsed document, as a list of pieces.
+<span class="lineno">  221 </span>--
+<span class="lineno">  222 </span>-- Table nodes are deliberately not emitted on their own. A table is a prefix
+<span class="lineno">  223 </span>-- of the paths underneath it, and whether it appears as a node or as a prefix
+<span class="lineno">  224 </span>-- depends only on spelling — a header or a dotted key. Emitting both would
+<span class="lineno">  225 </span>-- make &quot;the document's data&quot; mean two different things, and a rewrite that
+<span class="lineno">  226 </span>-- normalises a dotted key into a header would look like damage.
+<span class="lineno">  227 </span>--
+<span class="lineno">  228 </span>-- The three shapes tomland produces all have to be walked, or a path
+<span class="lineno">  229 </span>-- comparison silently misses one of them:
+<span class="lineno">  230 </span>--
+<span class="lineno">  231 </span>-- * an explicit table header — a prefix-tree 'Toml.Branch' whose prefix /is/
+<span class="lineno">  232 </span>--   the path;
+<span class="lineno">  233 </span>-- * a table's own keys — a 'Toml.TOML' payload reached through a
+<span class="lineno">  234 </span>--   'Toml.Branch' or 'Toml.Leaf';
+<span class="lineno">  235 </span>-- * a /dotted key/ — which tomland does NOT expand into nested tables. It
+<span class="lineno">  236 </span>--   keeps the whole path in one 'Toml.tomlPairs' key, so
+<span class="lineno">  237 </span>--   @credentials.\&lt;id\&gt;.public_key@ under @[access_control]@ arrives as the
+<span class="lineno">  238 </span>--   single pair key @(\&quot;credentials\&quot; :| [\&quot;\&lt;id\&gt;\&quot;,\&quot;public_key\&quot;])@ and no
+<span class="lineno">  239 </span>--   prefix tree ever holds a @credentials@ node. This is why the check below
+<span class="lineno">  240 </span>--   cannot be a codec.
+<span class="lineno">  241 </span>tomlKeyPaths :: Toml.TOML -&gt; [[Toml.Piece]]
+<span class="lineno">  242 </span><span class="decl"><span class="istickedoff">tomlKeyPaths = go []</span>
+<span class="lineno">  243 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  244 </span><span class="spaces">    </span><span class="istickedoff">go prefix toml =</span>
+<span class="lineno">  245 </span><span class="spaces">         </span><span class="istickedoff">[ prefix &lt;&gt; keyPieces key</span>
+<span class="lineno">  246 </span><span class="spaces">         </span><span class="istickedoff">| key &lt;- HashMap.keys (Toml.tomlPairs toml) ]</span>
+<span class="lineno">  247 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; concatMap nodePaths (HashMap.elems (Toml.tomlTables toml))</span>
+<span class="lineno">  248 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  249 </span><span class="spaces">    </span><span class="istickedoff">-- A node's own prefix is the authoritative absolute path: an implicit</span>
+<span class="lineno">  250 </span><span class="spaces">    </span><span class="istickedoff">-- table header arrives as one multi-piece prefix under a single-piece</span>
+<span class="lineno">  251 </span><span class="spaces">    </span><span class="istickedoff">-- map key, so the map key alone loses path segments.</span>
+<span class="lineno">  252 </span><span class="spaces">    </span><span class="istickedoff">nodePaths tree = case tree of</span>
+<span class="lineno">  253 </span><span class="spaces">      </span><span class="istickedoff">Toml.Branch pref mValue children -&gt;</span>
+<span class="lineno">  254 </span><span class="spaces">           </span><span class="istickedoff"><span class="nottickedoff">maybe [] (go (keyPieces pref)) mValue</span></span>
+<span class="lineno">  255 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; concatMap nodePaths (HashMap.elems children)</span></span>
+<span class="lineno">  256 </span><span class="spaces">      </span><span class="istickedoff">Toml.Leaf pref value -&gt; go (keyPieces pref) value</span></span>
+<span class="lineno">  257 </span>
+<span class="lineno">  258 </span>keyPieces :: Toml.Key -&gt; [Toml.Piece]
+<span class="lineno">  259 </span><span class="decl"><span class="istickedoff">keyPieces = NonEmpty.toList . Toml.unKey</span></span>
+<span class="lineno">  260 </span>
+<span class="lineno">  261 </span>-- | Expand dotted keys into nested tables.
+<span class="lineno">  262 </span>--
+<span class="lineno">  263 </span>-- tomland keeps a dotted key as one flat pair whose key carries the whole
+<span class="lineno">  264 </span>-- path: @untrusted_execution.mode = \&quot;local\&quot;@ becomes
+<span class="lineno">  265 </span>-- @(\&quot;untrusted_execution\&quot; :| [\&quot;mode\&quot;], …)@ in 'Toml.tomlPairs', and no
+<span class="lineno">  266 </span>-- @untrusted_execution@ node exists anywhere in the prefix tree. A codec looks
+<span class="lineno">  267 </span>-- up tables, so it finds nothing, decodes the section as absent — and the next
+<span class="lineno">  268 </span>-- write drops it. Silently: the document still parses, so nothing reports it.
+<span class="lineno">  269 </span>--
+<span class="lineno">  270 </span>-- Expanding first makes the document look the way the codec expects, so both
+<span class="lineno">  271 </span>-- spellings decode and re-encode identically. (tomland's own
+<span class="lineno">  272 </span>-- 'Toml.Type.TOML.insertKeyAnyVal' does not help: it stores the value at the
+<span class="lineno">  273 </span>-- full multi-piece key, which is exactly where it already was. The nesting has
+<span class="lineno">  274 </span>-- to be built.)
+<span class="lineno">  275 </span>expandDottedKeys :: Toml.TOML -&gt; Toml.TOML
+<span class="lineno">  276 </span><span class="decl"><span class="istickedoff">expandDottedKeys toml = foldl' insert base dottedPaths</span>
+<span class="lineno">  277 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  278 </span><span class="spaces">    </span><span class="istickedoff">pairs       = HashMap.toList (Toml.tomlPairs toml)</span>
+<span class="lineno">  279 </span><span class="spaces">    </span><span class="istickedoff">dottedPaths = [(keyPieces key, value) | (key, value) &lt;- pairs, isDotted key]</span>
+<span class="lineno">  280 </span><span class="spaces">    </span><span class="istickedoff">base = toml</span>
+<span class="lineno">  281 </span><span class="spaces">      </span><span class="istickedoff">{ Toml.tomlPairs  = HashMap.fromList</span>
+<span class="lineno">  282 </span><span class="spaces">          </span><span class="istickedoff">[(key, value) | (key, value) &lt;- pairs, not (isDotted key)]</span>
+<span class="lineno">  283 </span><span class="spaces">      </span><span class="istickedoff">, Toml.tomlTables = fmap expandNode (Toml.tomlTables toml)</span>
+<span class="lineno">  284 </span><span class="spaces">      </span><span class="istickedoff">}</span>
+<span class="lineno">  285 </span><span class="spaces">    </span><span class="istickedoff">insert acc (pieces, value) = insertDotted pieces value acc</span>
+<span class="lineno">  286 </span><span class="spaces">    </span><span class="istickedoff">isDotted key = case keyPieces key of</span>
+<span class="lineno">  287 </span><span class="spaces">      </span><span class="istickedoff">_ : _ : _ -&gt; True</span>
+<span class="lineno">  288 </span><span class="spaces">      </span><span class="istickedoff">_         -&gt; False</span>
+<span class="lineno">  289 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  290 </span><span class="spaces">    </span><span class="istickedoff">expandNode node = case node of</span>
+<span class="lineno">  291 </span><span class="spaces">      </span><span class="istickedoff">Toml.Branch pref mValue children -&gt;</span>
+<span class="lineno">  292 </span><span class="spaces">        </span><span class="istickedoff">Toml.Branch pref (fmap <span class="nottickedoff">expandDottedKeys</span> mValue) (fmap expandNode children)</span>
+<span class="lineno">  293 </span><span class="spaces">      </span><span class="istickedoff">Toml.Leaf pref value -&gt; Toml.Leaf pref (expandDottedKeys value)</span>
+<span class="lineno">  294 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  295 </span><span class="spaces">    </span><span class="istickedoff">-- Insert the value at the dotted path, creating the intermediate tables as</span>
+<span class="lineno">  296 </span><span class="spaces">    </span><span class="istickedoff">-- explicit 'Toml.Leaf' nodes — the form 'Toml.table' and 'Toml.tableMap'</span>
+<span class="lineno">  297 </span><span class="spaces">    </span><span class="istickedoff">-- look up. The payload type is tomland's GADT-indexed 'Toml.Value', so it</span>
+<span class="lineno">  298 </span><span class="spaces">    </span><span class="istickedoff">-- is inferred rather than named.</span>
+<span class="lineno">  299 </span><span class="spaces">    </span><span class="istickedoff">insertDotted [] _ target = <span class="nottickedoff">target</span></span>
+<span class="lineno">  300 </span><span class="spaces">    </span><span class="istickedoff">insertDotted (piece : rest) value target = case rest of</span>
+<span class="lineno">  301 </span><span class="spaces">      </span><span class="istickedoff">[] -&gt; target { Toml.tomlPairs = HashMap.insert (piece Toml.:|| []) value</span>
+<span class="lineno">  302 </span><span class="spaces">                                            </span><span class="istickedoff">(Toml.tomlPairs target) }</span>
+<span class="lineno">  303 </span><span class="spaces">      </span><span class="istickedoff">_  -&gt; target</span>
+<span class="lineno">  304 </span><span class="spaces">        </span><span class="istickedoff">{ Toml.tomlTables = HashMap.insert piece</span>
+<span class="lineno">  305 </span><span class="spaces">            </span><span class="istickedoff">(Toml.Leaf (piece Toml.:|| []) (insertDotted rest value (nodeValue existing)))</span>
+<span class="lineno">  306 </span><span class="spaces">            </span><span class="istickedoff">(Toml.tomlTables target) }</span>
+<span class="lineno">  307 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno">  308 </span><span class="spaces">        </span><span class="istickedoff">existing = HashMap.lookupDefault (Toml.Leaf (<span class="nottickedoff">piece</span> Toml.:|| <span class="nottickedoff">[]</span>) mempty) piece</span>
+<span class="lineno">  309 </span><span class="spaces">                     </span><span class="istickedoff">(Toml.tomlTables target)</span>
+<span class="lineno">  310 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  311 </span><span class="spaces">    </span><span class="istickedoff">-- A node's own payload with any child nodes folded into it: the canonical</span>
+<span class="lineno">  312 </span><span class="spaces">    </span><span class="istickedoff">-- explicit form, and the one 'fixNode' produces.</span>
+<span class="lineno">  313 </span><span class="spaces">    </span><span class="istickedoff">nodeValue node = case node of</span>
+<span class="lineno">  314 </span><span class="spaces">      </span><span class="istickedoff">Toml.Leaf _ value -&gt; value</span>
+<span class="lineno">  315 </span><span class="spaces">      </span><span class="istickedoff">Toml.Branch _ mValue children -&gt;</span>
+<span class="lineno">  316 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">maybe mempty (\value -&gt; value { Toml.tomlTables = children }) mValue</span></span></span>
+<span class="lineno">  317 </span>
+<span class="lineno">  318 </span>-- | Everything 'loadSecurityConfig' does to a parsed document before decoding.
+<span class="lineno">  319 </span>normalizeSecurityToml :: Toml.TOML -&gt; Toml.TOML
+<span class="lineno">  320 </span><span class="decl"><span class="istickedoff">normalizeSecurityToml = normalizeAccessControlTable . expandDottedKeys</span></span>
+<span class="lineno">  321 </span>
+<span class="lineno">  322 </span>-- | The pre-split @[access_control]@ shape, read back only by
+<span class="lineno">  323 </span>-- @migrate-credentials@.
+<span class="lineno">  324 </span>--
+<span class="lineno">  325 </span>-- Detection ('hasLegacyLayout') walks key paths because no codec can see the
+<span class="lineno">  326 </span>-- dotted-key spelling. /Reading/ is different: 'normalizeSecurityToml' expands
+<span class="lineno">  327 </span>-- dotted keys into nodes first, so by the time this codec runs both spellings
+<span class="lineno">  328 </span>-- look the same and a codec is the right tool.
+<span class="lineno">  329 </span>newtype LegacyAccessControlFileConfig = LegacyAccessControlFileConfig
+<span class="lineno">  330 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">lacfcCredentials</span></span></span> :: Map Text CredentialFileConfig
+<span class="lineno">  331 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  332 </span>
+<span class="lineno">  333 </span>legacyAccessControlCodec :: Toml.TomlCodec LegacyAccessControlFileConfig
+<span class="lineno">  334 </span><span class="decl"><span class="istickedoff">legacyAccessControlCodec = LegacyAccessControlFileConfig</span>
+<span class="lineno">  335 </span><span class="spaces">  </span><span class="istickedoff">&lt;$&gt; Toml.tableMap Toml._KeyText (Toml.table credentialCodec) &quot;credentials&quot;</span>
+<span class="lineno">  336 </span><span class="spaces">        </span><span class="istickedoff">.= <span class="nottickedoff">lacfcCredentials</span></span></span>
+<span class="lineno">  337 </span>
+<span class="lineno">  338 </span>-- | Read the credential tables that still live in a pre-split @security.toml@.
+<span class="lineno">  339 </span>--
+<span class="lineno">  340 </span>-- An absent section is an empty map, not an error: that is the idempotent case.
+<span class="lineno">  341 </span>-- A document that does not parse is an error, because the caller is about to
+<span class="lineno">  342 </span>-- rewrite it and must not do so on a guess.
+<span class="lineno">  343 </span>readLegacyCredentials :: Text -&gt; Either Text (Map Text CredentialFileConfig)
+<span class="lineno">  344 </span><span class="decl"><span class="istickedoff">readLegacyCredentials raw = case Toml.parse raw of</span>
+<span class="lineno">  345 </span><span class="spaces">  </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">Left (Toml.unTomlParseError err)</span></span>
+<span class="lineno">  346 </span><span class="spaces">  </span><span class="istickedoff">Right toml -&gt; case Toml.runTomlCodec legacySectionCodec</span>
+<span class="lineno">  347 </span><span class="spaces">                     </span><span class="istickedoff">(normalizeSecurityToml toml) of</span>
+<span class="lineno">  348 </span><span class="spaces">    </span><span class="istickedoff">Success Nothing          -&gt; <span class="nottickedoff">Right Map.empty</span></span>
+<span class="lineno">  349 </span><span class="spaces">    </span><span class="istickedoff">Success (Just section)   -&gt; Right (lacfcCredentials section)</span>
+<span class="lineno">  350 </span><span class="spaces">    </span><span class="istickedoff">Failure errs             -&gt; <span class="nottickedoff">Left (Toml.prettyTomlDecodeErrors errs)</span></span></span>
+<span class="lineno">  351 </span>
+<span class="lineno">  352 </span>legacySectionCodec :: Toml.TomlCodec (Maybe LegacyAccessControlFileConfig)
+<span class="lineno">  353 </span><span class="decl"><span class="istickedoff">legacySectionCodec = Toml.dioptional (Toml.table legacyAccessControlCodec &quot;access_control&quot;)</span></span>
+<span class="lineno">  354 </span>
+<span class="lineno">  355 </span>-- | Does this raw @security.toml@ still carry the pre-split credential tables?
+<span class="lineno">  356 </span>--
+<span class="lineno">  357 </span>-- Once the store moved to @credentials.toml@, a write that rewrites
+<span class="lineno">  358 </span>-- @security.toml@ without noticing the old tables would drop every credential —
+<span class="lineno">  359 </span>-- silently, on a document whose next boot then reads as unconfigured.
+<span class="lineno">  360 </span>--
+<span class="lineno">  361 </span>-- Detection walks the parsed key paths, it does not grep the text. A substring
+<span class="lineno">  362 </span>-- scan for @[access_control.credentials.@ misses the dotted-key spelling of the
+<span class="lineno">  363 </span>-- same document (@[access_control]@ plus @credentials.\&lt;id\&gt;.public_key = …@),
+<span class="lineno">  364 </span>-- and — as 'tomlKeyPaths' explains — so does anything that goes through the
+<span class="lineno">  365 </span>-- prefix tree, which is why this is not a codec either.
+<span class="lineno">  366 </span>--
+<span class="lineno">  367 </span>-- An unparseable document answers 'False': it is refused earlier, as
+<span class="lineno">  368 </span>-- @BrSecurityUnparseable@, so it can never reach the writer this guard protects.
+<span class="lineno">  369 </span>--
+<span class="lineno">  370 </span>-- Detection is not reading. Decoding the credentials back out for
+<span class="lineno">  371 </span>-- @migrate-credentials@ is a separate concern, and it must handle the
+<span class="lineno">  372 </span>-- dotted-key spelling too: 'normalizeAccessControlTable' only makes
+<span class="lineno">  373 </span>-- /prefix-tree/ nodes explicit, so a dotted-key file currently decodes to an
+<span class="lineno">  374 </span>-- empty credential map. A migration that reads through the codec alone would
+<span class="lineno">  375 </span>-- therefore move nothing and then report success.
+<span class="lineno">  376 </span>hasLegacyLayout :: Text -&gt; Bool
+<span class="lineno">  377 </span><span class="decl"><span class="istickedoff">hasLegacyLayout raw = case Toml.parse raw of</span>
+<span class="lineno">  378 </span><span class="spaces">  </span><span class="istickedoff">Left _     -&gt; False</span>
+<span class="lineno">  379 </span><span class="spaces">  </span><span class="istickedoff">Right toml -&gt; any isCredentialPath (tomlKeyPaths toml)</span>
+<span class="lineno">  380 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  381 </span><span class="spaces">    </span><span class="istickedoff">isCredentialPath (p1 : p2 : _) = p1 == &quot;access_control&quot; &amp;&amp; p2 == &quot;credentials&quot;</span>
+<span class="lineno">  382 </span><span class="spaces">    </span><span class="istickedoff">isCredentialPath _             = False</span></span>
+<span class="lineno">  383 </span>
+<span class="lineno">  384 </span>-- | Make the implicit @access_control@ node explicit before decoding.
+<span class="lineno">  385 </span>--
+<span class="lineno">  386 </span>-- tomland's 'Toml.tableMap' looks the section up under its @[access_control]@
+<span class="lineno">  387 </span>-- header, so an idiomatic hand-written file containing only
+<span class="lineno">  388 </span>-- @[access_control.credentials.\&lt;id\&gt;]@ sub-tables decodes as an EMPTY map
+<span class="lineno">  389 </span>-- (learnings 2026-08-02 §4). Mirrors
+<span class="lineno">  390 </span>-- 'Seal.SourceControl.Repo.normalizeReposTable'.
+<span class="lineno">  391 </span>normalizeAccessControlTable :: Toml.TOML -&gt; Toml.TOML
+<span class="lineno">  392 </span><span class="decl"><span class="istickedoff">normalizeAccessControlTable t =</span>
+<span class="lineno">  393 </span><span class="spaces">  </span><span class="istickedoff">t { Toml.tomlTables = HashMap.adjust fixAccessControl &quot;access_control&quot; (Toml.tomlTables t) }</span>
+<span class="lineno">  394 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  395 </span><span class="spaces">    </span><span class="istickedoff">-- Two levels are implicit in an idiomatic file: `access_control` and the</span>
+<span class="lineno">  396 </span><span class="spaces">    </span><span class="istickedoff">-- `credentials` table beneath it. Both must be made explicit, or the</span>
+<span class="lineno">  397 </span><span class="spaces">    </span><span class="istickedoff">-- nested `Toml.tableMap` lookup silently yields an empty map and the</span>
+<span class="lineno">  398 </span><span class="spaces">    </span><span class="istickedoff">-- operator's passkeys disappear.</span>
+<span class="lineno">  399 </span><span class="spaces">    </span><span class="istickedoff">fixAccessControl tree = fixChildIn &quot;credentials&quot; (fixNode &quot;access_control&quot; tree)</span>
+<span class="lineno">  400 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  401 </span><span class="spaces">    </span><span class="istickedoff">fixChildIn child tree = case tree of</span>
+<span class="lineno">  402 </span><span class="spaces">      </span><span class="istickedoff">Toml.Branch pref mv children -&gt;</span>
+<span class="lineno">  403 </span><span class="spaces">        </span><span class="istickedoff"><span class="nottickedoff">Toml.Branch pref mv (HashMap.adjust (fixNode child) child children)</span></span>
+<span class="lineno">  404 </span><span class="spaces">      </span><span class="istickedoff">Toml.Leaf pref v -&gt;</span>
+<span class="lineno">  405 </span><span class="spaces">        </span><span class="istickedoff">Toml.Leaf pref v { Toml.tomlTables =</span>
+<span class="lineno">  406 </span><span class="spaces">                             </span><span class="istickedoff">HashMap.adjust (fixNode <span class="nottickedoff">child</span>) child (Toml.tomlTables v) }</span></span>
+<span class="lineno">  407 </span>
+<span class="lineno">  408 </span>-- | Collapse whatever implicit path the parser produced under @root@ into a
+<span class="lineno">  409 </span>-- single explicit table node named @root@.
+<span class="lineno">  410 </span>fixNode :: Toml.Piece -&gt; Toml.PrefixTree Toml.TOML -&gt; Toml.PrefixTree Toml.TOML
+<span class="lineno">  411 </span><span class="decl"><span class="istickedoff">fixNode root tree = case tree of</span>
+<span class="lineno">  412 </span><span class="spaces">  </span><span class="istickedoff">Toml.Branch pref Nothing children -&gt;</span>
+<span class="lineno">  413 </span><span class="spaces">    </span><span class="istickedoff">Toml.Leaf pref (mempty { Toml.tomlTables = children })</span>
+<span class="lineno">  414 </span><span class="spaces">  </span><span class="istickedoff">Toml.Branch _ (Just _) _ -&gt; <span class="nottickedoff">tree</span></span>
+<span class="lineno">  415 </span><span class="spaces">  </span><span class="istickedoff">Toml.Leaf (_ Toml.:|| []) _ -&gt; tree</span>
+<span class="lineno">  416 </span><span class="spaces">  </span><span class="istickedoff">Toml.Leaf (_ Toml.:|| (p : ps)) v -&gt;</span>
+<span class="lineno">  417 </span><span class="spaces">    </span><span class="istickedoff">Toml.Leaf (root Toml.:|| [])</span>
+<span class="lineno">  418 </span><span class="spaces">      </span><span class="istickedoff">(mempty { Toml.tomlTables = Toml.single (p Toml.:|| ps) v })</span></span>
+<span class="lineno">  419 </span>
+<span class="lineno">  420 </span>-- | Starting state: all fields absent.
+<span class="lineno">  421 </span>defaultSecurityConfig :: SecurityConfig
+<span class="lineno">  422 </span><span class="decl"><span class="istickedoff">defaultSecurityConfig = SecurityConfig</span>
+<span class="lineno">  423 </span><span class="spaces">  </span><span class="istickedoff">{ scVaultPath      = Nothing</span>
+<span class="lineno">  424 </span><span class="spaces">  </span><span class="istickedoff">, scVaultRecipient = Nothing</span>
+<span class="lineno">  425 </span><span class="spaces">  </span><span class="istickedoff">, scVaultIdentity  = Nothing</span>
+<span class="lineno">  426 </span><span class="spaces">  </span><span class="istickedoff">, scVaultUnlock    = Nothing</span>
+<span class="lineno">  427 </span><span class="spaces">  </span><span class="istickedoff">, scVaultKeyType   = Nothing</span>
+<span class="lineno">  428 </span><span class="spaces">  </span><span class="istickedoff">, scUntrustedExec  = Nothing</span>
+<span class="lineno">  429 </span><span class="spaces">  </span><span class="istickedoff">, scAccessControl  = Nothing</span>
+<span class="lineno">  430 </span><span class="spaces">  </span><span class="istickedoff">, scGateway        = Nothing</span>
+<span class="lineno">  431 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  432 </span>
+<span class="lineno">  433 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  434 </span>-- Codec
+<span class="lineno">  435 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  436 </span>
+<span class="lineno">  437 </span>-- | Bidirectional tomland codec for 'SecurityConfig'.
+<span class="lineno">  438 </span>securityConfigCodec :: Toml.TomlCodec SecurityConfig
+<span class="lineno">  439 </span><span class="decl"><span class="istickedoff">securityConfigCodec = SecurityConfig</span>
+<span class="lineno">  440 </span><span class="spaces">  </span><span class="istickedoff">&lt;$&gt; Toml.dioptional (Toml.text &quot;vault_path&quot;)     .= scVaultPath</span>
+<span class="lineno">  441 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;vault_recipient&quot;) .= scVaultRecipient</span>
+<span class="lineno">  442 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;vault_identity&quot;)  .= scVaultIdentity</span>
+<span class="lineno">  443 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;vault_unlock&quot;)    .= scVaultUnlock</span>
+<span class="lineno">  444 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;vault_key_type&quot;)  .= scVaultKeyType</span>
+<span class="lineno">  445 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.table untrustedExecConfigCodec &quot;untrusted_execution&quot;) .= scUntrustedExec</span>
+<span class="lineno">  446 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.table accessControlCodec &quot;access_control&quot;)</span>
+<span class="lineno">  447 </span><span class="spaces">        </span><span class="istickedoff">.= scAccessControl</span>
+<span class="lineno">  448 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; gatewayTableCodec .= scGateway</span></span>
+<span class="lineno">  449 </span>
+<span class="lineno">  450 </span>-- | Bidirectional tomland codec for the @[untrusted_execution]@ section.
+<span class="lineno">  451 </span>untrustedExecConfigCodec :: Toml.TomlCodec UntrustedExecFileConfig
+<span class="lineno">  452 </span><span class="decl"><span class="istickedoff">untrustedExecConfigCodec = UntrustedExecFileConfig</span>
+<span class="lineno">  453 </span><span class="spaces">  </span><span class="istickedoff">&lt;$&gt; Toml.text &quot;mode&quot; .= uefcMode</span>
+<span class="lineno">  454 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.table untrustedExecRemoteConfigCodec &quot;remote&quot;) .= uefcRemote</span></span>
+<span class="lineno">  455 </span>
+<span class="lineno">  456 </span>-- | Bidirectional tomland codec for the @[untrusted_execution.remote]@
+<span class="lineno">  457 </span>-- sub-table. Every field is optional at the TOML layer.
+<span class="lineno">  458 </span>untrustedExecRemoteConfigCodec :: Toml.TomlCodec UntrustedExecRemoteFileConfig
+<span class="lineno">  459 </span><span class="decl"><span class="istickedoff">untrustedExecRemoteConfigCodec = UntrustedExecRemoteFileConfig</span>
+<span class="lineno">  460 </span><span class="spaces">  </span><span class="istickedoff">&lt;$&gt; Toml.dioptional (Toml.text &quot;host&quot;)        .= uerfcHost</span>
+<span class="lineno">  461 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;user&quot;)        .= uerfcUser</span>
+<span class="lineno">  462 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.int &quot;port&quot;)         .= uerfcPort</span>
+<span class="lineno">  463 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.string &quot;identity&quot;)  .= uerfcIdentity</span>
+<span class="lineno">  464 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.string &quot;known_hosts&quot;) .= uerfcKnownHosts</span>
+<span class="lineno">  465 </span><span class="spaces">  </span><span class="istickedoff">&lt;*&gt; Toml.dioptional (Toml.text &quot;workspace&quot;)   .= uerfcWorkspace</span></span>
+<span class="lineno">  466 </span>
+<span class="lineno">  467 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  468 </span>-- Public API
+<span class="lineno">  469 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  470 </span>
+<span class="lineno">  471 </span>-- | Load the security config file at @path@.
+<span class="lineno">  472 </span>--
+<span class="lineno">  473 </span>-- * File absent  → @Right 'defaultSecurityConfig'@
+<span class="lineno">  474 </span>-- * Parse error  → @Left@ with the rendered tomland diagnostics
+<span class="lineno">  475 </span>loadSecurityConfig :: FilePath -&gt; IO (Either Text SecurityConfig)
+<span class="lineno">  476 </span><span class="decl"><span class="istickedoff">loadSecurityConfig path = do</span>
+<span class="lineno">  477 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  478 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  479 </span><span class="spaces">    </span><span class="istickedoff">then pure (Right defaultSecurityConfig)</span>
+<span class="lineno">  480 </span><span class="spaces">    </span><span class="istickedoff">else TIO.readFile path &lt;&amp;&gt; decodeSecurityConfig</span></span>
+<span class="lineno">  481 </span>
+<span class="lineno">  482 </span>-- | Decode @security.toml@ from its text.
+<span class="lineno">  483 </span>--
+<span class="lineno">  484 </span>-- The I/O-free half of 'loadSecurityConfig', exported because the boot
+<span class="lineno">  485 </span>-- preflight needs the document as text (for the legacy-layout check) /and/ the
+<span class="lineno">  486 </span>-- decoded section at the same time, and reading the file twice could see two
+<span class="lineno">  487 </span>-- different documents.
+<span class="lineno">  488 </span>decodeSecurityConfig :: Text -&gt; Either Text SecurityConfig
+<span class="lineno">  489 </span><span class="decl"><span class="istickedoff">decodeSecurityConfig contents = case Toml.parse contents of</span>
+<span class="lineno">  490 </span><span class="spaces">  </span><span class="istickedoff">Left err   -&gt; Left (Toml.unTomlParseError err)</span>
+<span class="lineno">  491 </span><span class="spaces">  </span><span class="istickedoff">Right toml -&gt; case Toml.runTomlCodec securityConfigCodec</span>
+<span class="lineno">  492 </span><span class="spaces">                     </span><span class="istickedoff">(normalizeSecurityToml toml) of</span>
+<span class="lineno">  493 </span><span class="spaces">    </span><span class="istickedoff">Success cfg  -&gt; Right cfg</span>
+<span class="lineno">  494 </span><span class="spaces">    </span><span class="istickedoff">Failure errs -&gt; <span class="nottickedoff">Left (Toml.prettyTomlDecodeErrors errs)</span></span></span>
+<span class="lineno">  495 </span>
+<span class="lineno">  496 </span>-- | Whether a write is allowed to discard the pre-split credential tables.
+<span class="lineno">  497 </span>--
+<span class="lineno">  498 </span>-- A credential table in @security.toml@ is only ever a leftover from the
+<span class="lineno">  499 </span>-- layout before credentials moved to @credentials.toml@, and rewriting the
+<span class="lineno">  500 </span>-- document without migrating it first destroys it: the next boot then reads as
+<span class="lineno">  501 </span>-- unconfigured and every enrolled passkey is gone. So the exemption is a
+<span class="lineno">  502 </span>-- value, not a convention — the two callers that may pass 'DropCredentials'
+<span class="lineno">  503 </span>-- are @migrate-credentials@ and @reset --yes@, both CLI-only and both
+<span class="lineno">  504 </span>-- @--yes@-gated.
+<span class="lineno">  505 </span>data WriteMode = PreserveCredentials | DropCredentials
+<span class="lineno">  506 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  507 </span>
+<span class="lineno">  508 </span>-- | Save @cfg@ to @path@ atomically.
+<span class="lineno">  509 </span>--
+<span class="lineno">  510 </span>-- The temp file is created with mode @0600@ at creation time (not chmod'ed
+<span class="lineno">  511 </span>-- afterwards), so there is never a window in which the vault recipient or a
+<span class="lineno">  512 </span>-- passkey public key is world-readable. It is then renamed over @path@, which
+<span class="lineno">  513 </span>-- is atomic on every filesystem this project supports.
+<span class="lineno">  514 </span>--
+<span class="lineno">  515 </span>-- Every writer funnels through here, so this is where the credential-preserving
+<span class="lineno">  516 </span>-- refusal lives. It reads the document /as it is on disk/, not the value being
+<span class="lineno">  517 </span>-- written: the caller has already decoded it, and decoding is exactly what
+<span class="lineno">  518 </span>-- loses a legacy table it does not understand.
+<span class="lineno">  519 </span>saveSecurityConfig :: FilePath -&gt; SecurityConfig -&gt; WriteMode -&gt; IO (Either Text ())
+<span class="lineno">  520 </span><span class="decl"><span class="istickedoff">saveSecurityConfig path cfg mode = do</span>
+<span class="lineno">  521 </span><span class="spaces">  </span><span class="istickedoff">refusal &lt;- legacyCredentialRefusal path mode</span>
+<span class="lineno">  522 </span><span class="spaces">  </span><span class="istickedoff">case refusal of</span>
+<span class="lineno">  523 </span><span class="spaces">    </span><span class="istickedoff">Just err -&gt; pure (Left err)</span>
+<span class="lineno">  524 </span><span class="spaces">    </span><span class="istickedoff">Nothing  -&gt; do</span>
+<span class="lineno">  525 </span><span class="spaces">      </span><span class="istickedoff">let encoded = Toml.encode securityConfigCodec cfg</span>
+<span class="lineno">  526 </span><span class="spaces">      </span><span class="istickedoff">outcome &lt;- try (writeAtomicText path encoded) :: IO (Either IOException ())</span>
+<span class="lineno">  527 </span><span class="spaces">      </span><span class="istickedoff">pure $ case outcome of</span>
+<span class="lineno">  528 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">Left (&quot;could not write &quot; &lt;&gt; T.pack path &lt;&gt; &quot;: &quot;</span></span>
+<span class="lineno">  529 </span><span class="spaces">                            </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; T.pack (show err))</span></span>
+<span class="lineno">  530 </span><span class="spaces">        </span><span class="istickedoff">Right () -&gt; Right ()</span></span>
+<span class="lineno">  531 </span>
+<span class="lineno">  532 </span>-- | Open a unique temp file in @path@'s directory, at mode 0600.
+<span class="lineno">  533 </span>--
+<span class="lineno">  534 </span>-- 'openBinaryTempFile' is @mkstemp@-style: it creates with @O_CREAT|O_EXCL@ and
+<span class="lineno">  535 </span>-- mode 0600, so a pre-created symlink or a colliding name makes the open fail
+<span class="lineno">  536 </span>-- rather than being followed. That is why no separate @O_NOFOLLOW@ is needed.
+<span class="lineno">  537 </span>-- Two writers targeting the same destination therefore never share a temp path.
+<span class="lineno">  538 </span>openUniqueTemp :: FilePath -&gt; IO (FilePath, Handle)
+<span class="lineno">  539 </span><span class="decl"><span class="istickedoff">openUniqueTemp path =</span>
+<span class="lineno">  540 </span><span class="spaces">  </span><span class="istickedoff">openBinaryTempFile (takeDirectory path) (takeFileName path &lt;&gt; &quot;.tmp&quot;)</span></span>
+<span class="lineno">  541 </span>
+<span class="lineno">  542 </span>-- | Write UTF-8 bytes through a unique temp file and rename into place.
+<span class="lineno">  543 </span>--
+<span class="lineno">  544 </span>-- Binary mode is deliberate: 'openBinaryTempFile' returns a binary handle, and
+<span class="lineno">  545 </span>-- encoding explicitly keeps non-ASCII paths/hosts from being written as latin1.
+<span class="lineno">  546 </span>writeAtomicText :: FilePath -&gt; Text -&gt; IO ()
+<span class="lineno">  547 </span><span class="decl"><span class="istickedoff">writeAtomicText path contents =</span>
+<span class="lineno">  548 </span><span class="spaces">  </span><span class="istickedoff">bracketOnError (openUniqueTemp path) <span class="nottickedoff">cleanup</span> $ \(tmp, h) -&gt; do</span>
+<span class="lineno">  549 </span><span class="spaces">    </span><span class="istickedoff">BS.hPutStr h (TE.encodeUtf8 contents)</span>
+<span class="lineno">  550 </span><span class="spaces">    </span><span class="istickedoff">hClose h</span>
+<span class="lineno">  551 </span><span class="spaces">    </span><span class="istickedoff">setFileMode tmp 0o600</span>
+<span class="lineno">  552 </span><span class="spaces">    </span><span class="istickedoff">renameFile tmp path</span>
+<span class="lineno">  553 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  554 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">cleanup (tmp, h) = do</span></span>
+<span class="lineno">  555 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">ignoreIO (hClose h)</span></span>
+<span class="lineno">  556 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">ignoreIO (removeFile tmp)</span></span>
+<span class="lineno">  557 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">ignoreIO action = void (try action :: IO (Either IOException ()))</span></span></span>
+<span class="lineno">  558 </span>
+<span class="lineno">  559 </span>legacyCredentialRefusal :: FilePath -&gt; WriteMode -&gt; IO (Maybe Text)
+<span class="lineno">  560 </span><span class="decl"><span class="istickedoff">legacyCredentialRefusal _    DropCredentials   = pure Nothing</span>
+<span class="lineno">  561 </span><span class="spaces"></span><span class="istickedoff">legacyCredentialRefusal path PreserveCredentials = do</span>
+<span class="lineno">  562 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  563 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  564 </span><span class="spaces">    </span><span class="istickedoff">then pure Nothing</span>
+<span class="lineno">  565 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  566 </span><span class="spaces">      </span><span class="istickedoff">raw &lt;- TIO.readFile path</span>
+<span class="lineno">  567 </span><span class="spaces">      </span><span class="istickedoff">pure $ if hasLegacyLayout raw</span>
+<span class="lineno">  568 </span><span class="spaces">        </span><span class="istickedoff">then Just (&quot;refusing to rewrite &quot; &lt;&gt; T.pack path &lt;&gt; &quot;: it still holds the &quot;</span>
+<span class="lineno">  569 </span><span class="spaces">                    </span><span class="istickedoff">&lt;&gt; &quot;pre-split [access_control.credentials] tables. Run &quot;</span>
+<span class="lineno">  570 </span><span class="spaces">                    </span><span class="istickedoff">&lt;&gt; &quot;`seal access-control migrate-credentials` first.&quot;)</span>
+<span class="lineno">  571 </span><span class="spaces">        </span><span class="istickedoff">else Nothing</span></span>
+<span class="lineno">  572 </span>
+<span class="lineno">  573 </span>-- | Write a text file whose permissions are restricted from the moment it
+<span class="lineno">  574 </span>-- exists: @0600@ is applied at creation (via @openFd@'s @creat@ mode) and again
+<span class="lineno">  575 </span>-- afterwards to defeat a permissive umask, so there is never a window in which
+<span class="lineno">  576 </span>-- the contents are world-readable. Used for @security.toml@ and for the
+<span class="lineno">  577 </span>-- per-boot setup code.
+<span class="lineno">  578 </span>writeSecretFile :: FilePath -&gt; Text -&gt; IO ()
+<span class="lineno">  579 </span><span class="decl"><span class="istickedoff">writeSecretFile path contents =</span>
+<span class="lineno">  580 </span><span class="spaces">  </span><span class="istickedoff">bracketOnError</span>
+<span class="lineno">  581 </span><span class="spaces">    </span><span class="istickedoff">(openFd path WriteOnly defaultFileFlags</span>
+<span class="lineno">  582 </span><span class="spaces">       </span><span class="istickedoff">{ trunc = True, creat = Just 0o600, nofollow = True })</span>
+<span class="lineno">  583 </span><span class="spaces">    </span><span class="istickedoff"><span class="nottickedoff">closeFd</span></span>
+<span class="lineno">  584 </span><span class="spaces">                 </span><span class="istickedoff">(\fd -&gt; do</span>
+<span class="lineno">  585 </span><span class="spaces">                     </span><span class="istickedoff">h &lt;- fdToHandle fd</span>
+<span class="lineno">  586 </span><span class="spaces">                     </span><span class="istickedoff">TIO.hPutStr h contents</span>
+<span class="lineno">  587 </span><span class="spaces">                     </span><span class="istickedoff">hClose h</span>
+<span class="lineno">  588 </span><span class="spaces">                     </span><span class="istickedoff">setFileMode path 0o600)</span></span>
+<span class="lineno">  589 </span>
+<span class="lineno">  590 </span>-- | Process-wide lock serializing security config writes (design V7).
+<span class="lineno">  591 </span>--
+<span class="lineno">  592 </span>-- Exported because the credential store shares it: a credential write and a
+<span class="lineno">  593 </span>-- @security.toml@ write must not interleave (an enrollment raises the mode and
+<span class="lineno">  594 </span>-- writes a credential as one operation — design §6.1). It is
+<span class="lineno">  595 </span>-- /non-reentrant/: a caller that already holds it must use the unlocked
+<span class="lineno">  596 </span>-- primitives, never a writer that takes it. 'Seal.Config.Credentials'\\'s
+<span class="lineno">  597 </span>-- writers take it; nothing else may call them from inside it.
+<span class="lineno">  598 </span>{-# NOINLINE securityWriteLock #-}
+<span class="lineno">  599 </span>securityWriteLock :: MVar ()
+<span class="lineno">  600 </span><span class="decl"><span class="istickedoff">securityWriteLock = unsafePerformIO (newMVar <span class="nottickedoff">()</span>)</span></span>
+<span class="lineno">  601 </span>
+<span class="lineno">  602 </span>-- | Load the security config at @path@, apply @f@, save. Propagates any load
+<span class="lineno">  603 </span>-- error as @Left Text@ without writing. This is the admin/boot path (e.g.
+<span class="lineno">  604 </span>-- @\/vault setup@); it is NEVER called by an opcode or the HTTP Gateway
+<span class="lineno">  605 </span>-- (those operate on 'RuntimeConfig' and physically cannot reach
+<span class="lineno">  606 </span>-- 'SecurityConfig' — design §4 E). Serialized behind 'securityWriteLock'
+<span class="lineno">  607 </span>-- to prevent lost-update races (design V7).
+<span class="lineno">  608 </span>updateSecurityConfig :: FilePath -&gt; (SecurityConfig -&gt; SecurityConfig) -&gt; IO (Either Text ())
+<span class="lineno">  609 </span><span class="decl"><span class="istickedoff">updateSecurityConfig path f = withMVar securityWriteLock $ \_ -&gt; do</span>
+<span class="lineno">  610 </span><span class="spaces">  </span><span class="istickedoff">result &lt;- loadSecurityConfig path</span>
+<span class="lineno">  611 </span><span class="spaces">  </span><span class="istickedoff">case result of</span>
+<span class="lineno">  612 </span><span class="spaces">    </span><span class="istickedoff">Left err  -&gt; <span class="nottickedoff">pure (Left err)</span></span>
+<span class="lineno">  613 </span><span class="spaces">    </span><span class="istickedoff">Right cfg -&gt; saveSecurityConfig path (f cfg) PreserveCredentials</span></span>
+<span class="lineno">  614 </span>
+<span class="lineno">  615 </span>-- | One of the TWO narrow writers of @security.toml@ reachable from the
+<span class="lineno">  616 </span>-- gateway (the other is 'updateVaultKeySection'; they deliberately cannot touch
+<span class="lineno">  617 </span>-- each other's fields).
+<span class="lineno">  618 </span>--
+<span class="lineno">  619 </span>-- It loads the file, applies @f@ to the @[access_control]@ section alone, and
+<span class="lineno">  620 </span>-- re-encodes. The callback's type is @AccessControlFileConfig -&gt;
+<span class="lineno">  621 </span>-- AccessControlFileConfig@, so no value the gateway can build will ever name a
+<span class="lineno">  622 </span>-- vault or @untrusted_execution@ field: rewriting those is a compile error,
+<span class="lineno">  623 </span>-- exactly as the 'RuntimeConfig' split intends.
+<span class="lineno">  624 </span>--
+<span class="lineno">  625 </span>-- The write is verified before it is committed: the freshly encoded document
+<span class="lineno">  626 </span>-- is decoded again and compared with the intended section, so a codec change
+<span class="lineno">  627 </span>-- that silently drops a field surfaces as @Left@ instead of as data loss.
+<span class="lineno">  628 </span>-- Serialized behind 'securityWriteLock' (the same lock the vault commands use
+<span class="lineno">  629 </span>-- for lost-update protection).
+<span class="lineno">  630 </span>updateAccessControlSection
+<span class="lineno">  631 </span>  :: FilePath
+<span class="lineno">  632 </span>  -&gt; (AccessControlFileConfig -&gt; AccessControlFileConfig)
+<span class="lineno">  633 </span>  -&gt; IO (Either Text AccessControlFileConfig)
+<span class="lineno">  634 </span><span class="decl"><span class="istickedoff">updateAccessControlSection path f = withMVar securityWriteLock $ \_ -&gt; do</span>
+<span class="lineno">  635 </span><span class="spaces">  </span><span class="istickedoff">loaded &lt;- loadSecurityConfig path</span>
+<span class="lineno">  636 </span><span class="spaces">  </span><span class="istickedoff">case loaded of</span>
+<span class="lineno">  637 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; pure (Left <span class="nottickedoff">err</span>)</span>
+<span class="lineno">  638 </span><span class="spaces">    </span><span class="istickedoff">Right cfg -&gt; do</span>
+<span class="lineno">  639 </span><span class="spaces">      </span><span class="istickedoff">let updated = f (fromMaybe emptyAccessControl (scAccessControl cfg))</span>
+<span class="lineno">  640 </span><span class="spaces">          </span><span class="istickedoff">newCfg = cfg { scAccessControl = Just updated }</span>
+<span class="lineno">  641 </span><span class="spaces">          </span><span class="istickedoff">encoded = Toml.encode securityConfigCodec newCfg</span>
+<span class="lineno">  642 </span><span class="spaces">      </span><span class="istickedoff">case reDecode encoded of</span>
+<span class="lineno">  643 </span><span class="spaces">        </span><span class="istickedoff">Just roundTripped</span>
+<span class="lineno">  644 </span><span class="spaces">          </span><span class="istickedoff">| <span class="tickonlytrue">scAccessControl roundTripped == Just updated</span></span>
+<span class="lineno">  645 </span><span class="spaces">          </span><span class="istickedoff">, <span class="tickonlytrue">scGateway       roundTripped == scGateway cfg</span> -&gt;</span>
+<span class="lineno">  646 </span><span class="spaces">              </span><span class="istickedoff">-- The section writer never discards credentials: enrollment</span>
+<span class="lineno">  647 </span><span class="spaces">              </span><span class="istickedoff">-- moves them out, it does not drop them.</span>
+<span class="lineno">  648 </span><span class="spaces">              </span><span class="istickedoff">fmap (&gt;&gt; Right updated)</span>
+<span class="lineno">  649 </span><span class="spaces">                </span><span class="istickedoff">(saveSecurityConfig path newCfg PreserveCredentials)</span>
+<span class="lineno">  650 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">pure (Left &quot;refusing to write security.toml: the encoded document does not round-trip the new [access_control] section&quot;)</span></span>
+<span class="lineno">  651 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  652 </span><span class="spaces">    </span><span class="istickedoff">reDecode encoded = case Toml.parse encoded of</span>
+<span class="lineno">  653 </span><span class="spaces">      </span><span class="istickedoff">Left _     -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  654 </span><span class="spaces">      </span><span class="istickedoff">Right toml -&gt; case Toml.runTomlCodec securityConfigCodec toml of</span>
+<span class="lineno">  655 </span><span class="spaces">        </span><span class="istickedoff">Success c -&gt; Just c</span>
+<span class="lineno">  656 </span><span class="spaces">        </span><span class="istickedoff">Failure _ -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  657 </span>
+<span class="lineno">  658 </span>-- | The vault-key triple, and nothing else. The gateway's setup wizard writes
+<span class="lineno">  659 </span>-- exactly these three fields when it creates a vault.
+<span class="lineno">  660 </span>data VaultKeyFields = VaultKeyFields
+<span class="lineno">  661 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">vkfRecipient</span></span></span> :: !Text
+<span class="lineno">  662 </span>    -- ^ age public key (@age1…@ \/ @age1yubikey1…@).
+<span class="lineno">  663 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">vkfIdentity</span></span></span>  :: !FilePath
+<span class="lineno">  664 </span>    -- ^ Absolute path to the identity file.
+<span class="lineno">  665 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">vkfKeyType</span></span></span>   :: !Text
+<span class="lineno">  666 </span>    -- ^ Display label: @&quot;x25519&quot;@ \/ @&quot;yubikey&quot;@ \/ @&quot;user&quot;@.
+<span class="lineno">  667 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  668 </span>
+<span class="lineno">  669 </span>-- | The other narrow writer: the vault-key triple, and nothing else.
+<span class="lineno">  670 </span>--
+<span class="lineno">  671 </span>-- The callback sees the *current* config and returns either a rejection (which
+<span class="lineno">  672 </span>-- is how the setup wizard refuses to overwrite a key that appeared between its
+<span class="lineno">  673 </span>-- pre-check and this write — a compare-and-swap across processes, since the
+<span class="lineno">  674 </span>-- read and the write happen inside 'securityWriteLock') or the triple to
+<span class="lineno">  675 </span>-- record.
+<span class="lineno">  676 </span>--
+<span class="lineno">  677 </span>-- Like 'updateAccessControlSection' the write is verified before it is
+<span class="lineno">  678 </span>-- committed: the encoded document is decoded again and compared, so a codec
+<span class="lineno">  679 </span>-- change that silently drops a field surfaces as @Left@ instead of data loss.
+<span class="lineno">  680 </span>-- The @[access_control]@ and @[untrusted_execution]@ sections are asserted
+<span class="lineno">  681 </span>-- unchanged, so this writer cannot become a back door for them.
+<span class="lineno">  682 </span>updateVaultKeySection
+<span class="lineno">  683 </span>  :: FilePath
+<span class="lineno">  684 </span>  -&gt; (SecurityConfig -&gt; Either e VaultKeyFields)
+<span class="lineno">  685 </span>  -&gt; IO (Either Text (Either e VaultKeyFields))
+<span class="lineno">  686 </span><span class="decl"><span class="istickedoff">updateVaultKeySection path f = withMVar securityWriteLock $ \_ -&gt; do</span>
+<span class="lineno">  687 </span><span class="spaces">  </span><span class="istickedoff">loaded &lt;- loadSecurityConfig path</span>
+<span class="lineno">  688 </span><span class="spaces">  </span><span class="istickedoff">case loaded of</span>
+<span class="lineno">  689 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; pure (Left <span class="nottickedoff">err</span>)</span>
+<span class="lineno">  690 </span><span class="spaces">    </span><span class="istickedoff">Right cfg -&gt; case f cfg of</span>
+<span class="lineno">  691 </span><span class="spaces">      </span><span class="istickedoff">Left rejection -&gt; pure (Right (Left rejection))</span>
+<span class="lineno">  692 </span><span class="spaces">      </span><span class="istickedoff">Right fields -&gt; do</span>
+<span class="lineno">  693 </span><span class="spaces">        </span><span class="istickedoff">let newCfg = cfg</span>
+<span class="lineno">  694 </span><span class="spaces">              </span><span class="istickedoff">{ scVaultRecipient = Just (vkfRecipient fields)</span>
+<span class="lineno">  695 </span><span class="spaces">              </span><span class="istickedoff">, scVaultIdentity  = Just (T.pack (vkfIdentity fields))</span>
+<span class="lineno">  696 </span><span class="spaces">              </span><span class="istickedoff">, scVaultKeyType   = Just (vkfKeyType fields)</span>
+<span class="lineno">  697 </span><span class="spaces">              </span><span class="istickedoff">}</span>
+<span class="lineno">  698 </span><span class="spaces">            </span><span class="istickedoff">encoded = Toml.encode securityConfigCodec newCfg</span>
+<span class="lineno">  699 </span><span class="spaces">        </span><span class="istickedoff">case reDecode encoded of</span>
+<span class="lineno">  700 </span><span class="spaces">          </span><span class="istickedoff">Just roundTripped</span>
+<span class="lineno">  701 </span><span class="spaces">            </span><span class="istickedoff">| <span class="tickonlytrue">scVaultRecipient roundTripped == scVaultRecipient newCfg</span></span>
+<span class="lineno">  702 </span><span class="spaces">            </span><span class="istickedoff">, <span class="tickonlytrue">scVaultIdentity  roundTripped == scVaultIdentity newCfg</span></span>
+<span class="lineno">  703 </span><span class="spaces">            </span><span class="istickedoff">, <span class="tickonlytrue">scVaultKeyType   roundTripped == scVaultKeyType newCfg</span></span>
+<span class="lineno">  704 </span><span class="spaces">            </span><span class="istickedoff">, <span class="tickonlytrue">scAccessControl  roundTripped == scAccessControl cfg</span></span>
+<span class="lineno">  705 </span><span class="spaces">            </span><span class="istickedoff">, <span class="tickonlytrue">scUntrustedExec  roundTripped == scUntrustedExec cfg</span></span>
+<span class="lineno">  706 </span><span class="spaces">            </span><span class="istickedoff">, <span class="tickonlytrue">scGateway        roundTripped == scGateway cfg</span></span>
+<span class="lineno">  707 </span><span class="spaces">            </span><span class="istickedoff">, <span class="tickonlytrue">scVaultPath      roundTripped == scVaultPath cfg</span></span>
+<span class="lineno">  708 </span><span class="spaces">            </span><span class="istickedoff">, <span class="tickonlytrue">scVaultUnlock    roundTripped == scVaultUnlock cfg</span> -&gt;</span>
+<span class="lineno">  709 </span><span class="spaces">                </span><span class="istickedoff">fmap (&gt;&gt; Right (Right <span class="nottickedoff">fields</span>))</span>
+<span class="lineno">  710 </span><span class="spaces">                  </span><span class="istickedoff">(saveSecurityConfig path newCfg PreserveCredentials)</span>
+<span class="lineno">  711 </span><span class="spaces">          </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">pure (Left &quot;refusing to write security.toml: the encoded document does not round-trip the new vault key fields&quot;)</span></span>
+<span class="lineno">  712 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  713 </span><span class="spaces">    </span><span class="istickedoff">reDecode encoded = case Toml.parse encoded of</span>
+<span class="lineno">  714 </span><span class="spaces">      </span><span class="istickedoff">Left _     -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  715 </span><span class="spaces">      </span><span class="istickedoff">Right toml -&gt; case Toml.runTomlCodec securityConfigCodec toml of</span>
+<span class="lineno">  716 </span><span class="spaces">        </span><span class="istickedoff">Success c -&gt; Just c</span>
+<span class="lineno">  717 </span><span class="spaces">        </span><span class="istickedoff">Failure _ -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  718 </span>
+<span class="lineno">  719 </span>-- | Remove the @[access_control]@ table entirely, returning the gateway to the
+<span class="lineno">  720 </span>-- unconfigured state. Reachable only from the @seal access-control reset@ CLI
+<span class="lineno">  721 </span>-- command (the human-driven path); no opcode and no HTTP route can call it.
+<span class="lineno">  722 </span>clearAccessControlSection :: FilePath -&gt; WriteMode -&gt; IO (Either Text ())
+<span class="lineno">  723 </span><span class="decl"><span class="istickedoff">clearAccessControlSection path mode = withMVar securityWriteLock $ \_ -&gt; do</span>
+<span class="lineno">  724 </span><span class="spaces">  </span><span class="istickedoff">loaded &lt;- loadSecurityConfig path</span>
+<span class="lineno">  725 </span><span class="spaces">  </span><span class="istickedoff">case loaded of</span>
+<span class="lineno">  726 </span><span class="spaces">    </span><span class="istickedoff">Left err  -&gt; <span class="nottickedoff">pure (Left err)</span></span>
+<span class="lineno">  727 </span><span class="spaces">    </span><span class="istickedoff">Right cfg -&gt; saveSecurityConfig path (cfg { scAccessControl = Nothing }) mode</span></span>
+<span class="lineno">  728 </span>
+<span class="lineno">  729 </span>-- | Resolve the @[gateway]@ section to the 'GatewayConfig' the boot path and
+<span class="lineno">  730 </span>-- the CLI consume. An absent section yields
+<span class="lineno">  731 </span>-- 'Seal.Gateway.Config.defaultGatewayConfig' (loopback, port 8080); present
+<span class="lineno">  732 </span>-- keys override it field by field.
+<span class="lineno">  733 </span>gatewayConfigFromSecurity :: SecurityConfig -&gt; GatewayConfig
+<span class="lineno">  734 </span><span class="decl"><span class="istickedoff">gatewayConfigFromSecurity cfg =</span>
+<span class="lineno">  735 </span><span class="spaces">  </span><span class="istickedoff">maybe defaultGatewayConfig withGatewayDefaults (scGateway cfg)</span></span>
+<span class="lineno">  736 </span>
+<span class="lineno">  737 </span>-- | The section a first write starts from when the file has none.
+<span class="lineno">  738 </span>--
+<span class="lineno">  739 </span>-- 'acfcMode' is deliberately 'Nothing', not @Just \&quot;none\&quot;@. Any write to a
+<span class="lineno">  740 </span>-- section-less file would otherwise record an /implicit/ waiver, and invariant
+<span class="lineno">  741 </span>-- 1 says absence never means off: an open gateway has to be written out by a
+<span class="lineno">  742 </span>-- human. With 'Nothing', the write leaves the mode unstated, and boot resolves
+<span class="lineno">  743 </span>-- it from whether credentials exist — @passkey@ if they do, @unconfigured@ if
+<span class="lineno">  744 </span>-- they do not.
+<span class="lineno">  745 </span>emptyAccessControl :: AccessControlFileConfig
+<span class="lineno">  746 </span><span class="decl"><span class="istickedoff">emptyAccessControl = AccessControlFileConfig</span>
+<span class="lineno">  747 </span><span class="spaces">  </span><span class="istickedoff">{ acfcMode = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  748 </span><span class="spaces">  </span><span class="istickedoff">, acfcOrigin = Nothing</span>
+<span class="lineno">  749 </span><span class="spaces">  </span><span class="istickedoff">, acfcRpId = Nothing</span>
+<span class="lineno">  750 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  751 </span>
+<span class="lineno">  752 </span>-- | Resolve the 'SecurityConfig'\'s @[untrusted_execution]@ section to the
+<span class="lineno">  753 </span>-- typed 'UntrustedExecConfig' the dispatcher consumes. Returns
+<span class="lineno">  754 </span>-- 'Nothing' when the section is absent OR @mode=local@ (the default —
+<span class="lineno">  755 </span>-- no remote needed, the local executor is wired by the call site).
+<span class="lineno">  756 </span>-- Returns @Just (UemRemote, ...remote...)@ when @mode=remote@,
+<span class="lineno">  757 </span>-- with the remote 'SshConfig' if the remote block is fully present
+<span class="lineno">  758 </span>-- (host/user/known_hosts/workspace all set). A @mode=remote@ with a
+<span class="lineno">  759 </span>-- missing/incomplete remote block returns @Just (UemRemote, Nothing)@
+<span class="lineno">  760 </span>-- — fail-closed is at call time (spec §7 row 1), not at config resolution.
+<span class="lineno">  761 </span>untrustedExecConfigFromSecurity :: SecurityConfig -&gt; Maybe UntrustedExecConfig
+<span class="lineno">  762 </span><span class="decl"><span class="istickedoff">untrustedExecConfigFromSecurity cfg =</span>
+<span class="lineno">  763 </span><span class="spaces">  </span><span class="istickedoff">resolveByMode =&lt;&lt; scUntrustedExec cfg</span></span>
+<span class="lineno">  764 </span>
+<span class="lineno">  765 </span>resolveByMode :: UntrustedExecFileConfig -&gt; Maybe UntrustedExecConfig
+<span class="lineno">  766 </span><span class="decl"><span class="istickedoff">resolveByMode uec =</span>
+<span class="lineno">  767 </span><span class="spaces">  </span><span class="istickedoff">let mode = if uefcMode uec == &quot;remote&quot; then UemRemote else UemLocal</span>
+<span class="lineno">  768 </span><span class="spaces">  </span><span class="istickedoff">in case mode of</span>
+<span class="lineno">  769 </span><span class="spaces">       </span><span class="istickedoff">UemRemote -&gt; Just (UntrustedExecConfig UemRemote (resolveRemoteSsh uec))</span>
+<span class="lineno">  770 </span><span class="spaces">       </span><span class="istickedoff">UemLocal  -&gt; localModeResult <span class="nottickedoff">uec</span></span></span>
+<span class="lineno">  771 </span>
+<span class="lineno">  772 </span>-- | Resolve the [untrusted_execution.remote] sub-table to an 'SshConfig'.
+<span class="lineno">  773 </span>-- Shared by both the UemRemote branch and the hardened-build localModeResult.
+<span class="lineno">  774 </span>resolveRemoteSsh :: UntrustedExecFileConfig -&gt; Maybe SshConfig
+<span class="lineno">  775 </span><span class="decl"><span class="istickedoff">resolveRemoteSsh uec = uefcRemote uec &gt;&gt;= \r -&gt;</span>
+<span class="lineno">  776 </span><span class="spaces">  </span><span class="istickedoff">uerfcHost r &gt;&gt;= \host -&gt;</span>
+<span class="lineno">  777 </span><span class="spaces">  </span><span class="istickedoff">uerfcUser r &gt;&gt;= \user -&gt;</span>
+<span class="lineno">  778 </span><span class="spaces">  </span><span class="istickedoff">uerfcKnownHosts r &gt;&gt;= \knownHosts -&gt;</span>
+<span class="lineno">  779 </span><span class="spaces">  </span><span class="istickedoff">uerfcWorkspace r &gt;&gt;= \workspace -&gt;</span>
+<span class="lineno">  780 </span><span class="spaces">  </span><span class="istickedoff">let port = fromMaybe 22 (uerfcPort r)</span>
+<span class="lineno">  781 </span><span class="spaces">      </span><span class="istickedoff">identity = uerfcIdentity r</span>
+<span class="lineno">  782 </span><span class="spaces">  </span><span class="istickedoff">in case ( mkSshHost host</span>
+<span class="lineno">  783 </span><span class="spaces">          </span><span class="istickedoff">, mkSshUser user</span>
+<span class="lineno">  784 </span><span class="spaces">          </span><span class="istickedoff">, mkRemotePath workspace</span>
+<span class="lineno">  785 </span><span class="spaces">          </span><span class="istickedoff">) of</span>
+<span class="lineno">  786 </span><span class="spaces">       </span><span class="istickedoff">(Right h, Right u, Right w) -&gt; Just SshConfig</span>
+<span class="lineno">  787 </span><span class="spaces">         </span><span class="istickedoff">{ scHost       = h</span>
+<span class="lineno">  788 </span><span class="spaces">         </span><span class="istickedoff">, scUser       = u</span>
+<span class="lineno">  789 </span><span class="spaces">         </span><span class="istickedoff">, scPort       = port</span>
+<span class="lineno">  790 </span><span class="spaces">         </span><span class="istickedoff">, scIdentity   = identity</span>
+<span class="lineno">  791 </span><span class="spaces">         </span><span class="istickedoff">, scKnownHosts = knownHosts</span>
+<span class="lineno">  792 </span><span class="spaces">         </span><span class="istickedoff">, scWorkspace  = w</span>
+<span class="lineno">  793 </span><span class="spaces">         </span><span class="istickedoff">}</span>
+<span class="lineno">  794 </span><span class="spaces">       </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Nothing</span></span></span>
+<span class="lineno">  795 </span>
+<span class="lineno">  796 </span>#if defined(REMOTE_ONLY_UNTRUSTED)
+<span class="lineno">  797 </span>localModeResult :: UntrustedExecFileConfig -&gt; Maybe UntrustedExecConfig
+<span class="lineno">  798 </span>localModeResult uec =
+<span class="lineno">  799 </span>  Just (UntrustedExecConfig UemRemote (resolveRemoteSsh uec))
+<span class="lineno">  800 </span>#else
+<span class="lineno">  801 </span>localModeResult :: UntrustedExecFileConfig -&gt; Maybe UntrustedExecConfig
+<span class="lineno">  802 </span><span class="decl"><span class="istickedoff">localModeResult _ = Nothing</span></span>
+<span class="lineno">  803 </span>#endif
+<span class="lineno">  804 </span>
+<span class="lineno">  805 </span>--------------------------------------------------------------------------------
+<span class="lineno">  806 </span>-- The one-way mode writer (design §6.1)
+<span class="lineno">  807 </span>--------------------------------------------------------------------------------
+<span class="lineno">  808 </span>
+<span class="lineno">  809 </span>-- | What a mode raise needs in order to be undone.
+<span class="lineno">  810 </span>--
+<span class="lineno">  811 </span>-- The constructor is deliberately not exported. @RaisedFrom@ is the only value
+<span class="lineno">  812 </span>-- 'restoreMode' accepts as proof that /this/ code path raised the mode, so a
+<span class="lineno">  813 </span>-- caller cannot conjure one and lower the mode to @none@: the web path can turn
+<span class="lineno">  814 </span>-- access control on, and cannot turn it off, as a type fact rather than a
+<span class="lineno">  815 </span>-- convention. @AlreadyRaised@ restores nothing.
+<span class="lineno">  816 </span>data ModeRaise
+<span class="lineno">  817 </span>  = AlreadyRaised
+<span class="lineno">  818 </span>  | RaisedFrom !(Maybe Text)
+<span class="lineno">  819 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  820 </span>
+<span class="lineno">  821 </span>-- | Raise @access_control.mode@ to @passkey@, remembering what it was.
+<span class="lineno">  822 </span>--
+<span class="lineno">  823 </span>-- __The caller must hold 'securityWriteLock'.__ It is not taken here because the
+<span class="lineno">  824 </span>-- only caller that needs it ('Seal.Config.Credentials.enrollCredential') takes
+<span class="lineno">  825 </span>-- it once around the raise /and/ the credential write, and the lock is
+<span class="lineno">  826 </span>-- non-reentrant.
+<span class="lineno">  827 </span>--
+<span class="lineno">  828 </span>-- @mode@ is the only field this touches; origin, rp_id and @untrusted_execution@
+<span class="lineno">  829 </span>-- are unreachable from here by construction.
+<span class="lineno">  830 </span>raiseMode :: FilePath -&gt; IO (Either Text ModeRaise)
+<span class="lineno">  831 </span><span class="decl"><span class="istickedoff">raiseMode path = do</span>
+<span class="lineno">  832 </span><span class="spaces">  </span><span class="istickedoff">loaded &lt;- loadSecurityConfig path</span>
+<span class="lineno">  833 </span><span class="spaces">  </span><span class="istickedoff">case loaded of</span>
+<span class="lineno">  834 </span><span class="spaces">    </span><span class="istickedoff">Left err  -&gt; <span class="nottickedoff">pure (Left err)</span></span>
+<span class="lineno">  835 </span><span class="spaces">    </span><span class="istickedoff">Right cfg -&gt; do</span>
+<span class="lineno">  836 </span><span class="spaces">      </span><span class="istickedoff">let section = fromMaybe <span class="nottickedoff">emptyAccessControl</span> (scAccessControl cfg)</span>
+<span class="lineno">  837 </span><span class="spaces">      </span><span class="istickedoff">case acfcMode section of</span>
+<span class="lineno">  838 </span><span class="spaces">        </span><span class="istickedoff">Just &quot;passkey&quot; -&gt; pure (Right <span class="nottickedoff">AlreadyRaised</span>)</span>
+<span class="lineno">  839 </span><span class="spaces">        </span><span class="istickedoff">previous -&gt; do</span>
+<span class="lineno">  840 </span><span class="spaces">          </span><span class="istickedoff">written &lt;- saveSecurityConfig path</span>
+<span class="lineno">  841 </span><span class="spaces">                       </span><span class="istickedoff">(cfg { scAccessControl = Just (section { acfcMode = Just &quot;passkey&quot; }) })</span>
+<span class="lineno">  842 </span><span class="spaces">                       </span><span class="istickedoff">PreserveCredentials</span>
+<span class="lineno">  843 </span><span class="spaces">          </span><span class="istickedoff">pure (RaisedFrom previous &lt;$ written)</span></span>
+<span class="lineno">  844 </span>
+<span class="lineno">  845 </span>-- | Undo a raise — but only if the on-disk mode is still the @passkey@ the
+<span class="lineno">  846 </span>-- raise wrote.
+<span class="lineno">  847 </span>--
+<span class="lineno">  848 </span>-- Compare-and-swap, not a blind write: if anything else moved the mode in the
+<span class="lineno">  849 </span>-- meantime (an operator running @disable --yes@, another ceremony), restoring
+<span class="lineno">  850 </span>-- would silently undo their decision. Leaving it alone is the safe direction —
+<span class="lineno">  851 </span>-- the gateway stays closed and the operator can still enroll.
+<span class="lineno">  852 </span>--
+<span class="lineno">  853 </span>-- __The caller must hold 'securityWriteLock'.__
+<span class="lineno">  854 </span>restoreMode :: FilePath -&gt; ModeRaise -&gt; IO (Either Text ())
+<span class="lineno">  855 </span><span class="decl"><span class="istickedoff">restoreMode _ AlreadyRaised = <span class="nottickedoff">pure (Right ())</span></span>
+<span class="lineno">  856 </span><span class="spaces"></span><span class="istickedoff">restoreMode path (RaisedFrom previous) = do</span>
+<span class="lineno">  857 </span><span class="spaces">  </span><span class="istickedoff">loaded &lt;- loadSecurityConfig path</span>
+<span class="lineno">  858 </span><span class="spaces">  </span><span class="istickedoff">case loaded of</span>
+<span class="lineno">  859 </span><span class="spaces">    </span><span class="istickedoff">Left err  -&gt; <span class="nottickedoff">pure (Left err)</span></span>
+<span class="lineno">  860 </span><span class="spaces">    </span><span class="istickedoff">Right cfg -&gt; case scAccessControl cfg &gt;&gt;= acfcMode of</span>
+<span class="lineno">  861 </span><span class="spaces">      </span><span class="istickedoff">Just &quot;passkey&quot; -&gt;</span>
+<span class="lineno">  862 </span><span class="spaces">        </span><span class="istickedoff">saveSecurityConfig path</span>
+<span class="lineno">  863 </span><span class="spaces">          </span><span class="istickedoff">(cfg { scAccessControl =</span>
+<span class="lineno">  864 </span><span class="spaces">                   </span><span class="istickedoff">fmap (\section -&gt; section { acfcMode = previous }) (scAccessControl cfg) })</span>
+<span class="lineno">  865 </span><span class="spaces">          </span><span class="istickedoff">PreserveCredentials</span>
+<span class="lineno">  866 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">pure (Right ())</span></span></span>
+
+</pre>
+</body>
+</html>

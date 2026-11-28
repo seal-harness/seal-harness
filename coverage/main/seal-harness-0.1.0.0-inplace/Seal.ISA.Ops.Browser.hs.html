@@ -1,0 +1,366 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | BROWSER_MANAGE (Untrusted): consolidated action-based entry point for
+<span class="lineno">    3 </span>-- all browser automation via the @agent-browser@ CLI
+<span class="lineno">    4 </span>-- (&lt;https://github.com/vercel-labs/agent-browser&gt;). The opcode shells out
+<span class="lineno">    5 </span>-- to @agent-browser@ via 'uioBinExec' — the existing 'UntrustedIO' capability
+<span class="lineno">    6 </span>-- seam for named binaries with validated argv. This module never imports
+<span class="lineno">    7 </span>-- 'System.Process'; all IO goes through the capability handle.
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- agent-browser manages its own daemon + Chromium lifecycle. Seal Harness
+<span class="lineno">   10 </span>-- treats it as a black-box CLI that returns text or JSON on stdout. The
+<span class="lineno">   11 </span>-- @--json@ flag is always passed so output is structured. The @--max-output@
+<span class="lineno">   12 </span>-- flag bounds the response size (operator-configurable, default 15000 chars).
+<span class="lineno">   13 </span>module Seal.ISA.Ops.Browser
+<span class="lineno">   14 </span>  ( browserManageOp
+<span class="lineno">   15 </span>  , BrowserAction (..)
+<span class="lineno">   16 </span>  , NetworkFilters (..)
+<span class="lineno">   17 </span>  , HarAction (..)
+<span class="lineno">   18 </span>  , parseBrowserAction
+<span class="lineno">   19 </span>  , buildBrowserArgs
+<span class="lineno">   20 </span>  ) where
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>import Data.Aeson (Value, object, withObject, (.:), (.:?), (.=))
+<span class="lineno">   23 </span>import Data.Aeson.Key (fromText)
+<span class="lineno">   24 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   25 </span>import Data.Maybe (maybeToList)
+<span class="lineno">   26 </span>import Data.Text (Text)
+<span class="lineno">   27 </span>import Data.Text qualified as T
+<span class="lineno">   28 </span>
+<span class="lineno">   29 </span>import Seal.Core.Types (OpName (..))
+<span class="lineno">   30 </span>import Seal.ISA.Opcode
+<span class="lineno">   31 </span>import Seal.Providers.Class (ToolResultPart (..))
+<span class="lineno">   32 </span>import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
+<span class="lineno">   33 </span>import Seal.Tools.Args (BinArg, BinName, mkBinArg, mkBinName)
+<span class="lineno">   34 </span>import Seal.Tools.Exec.UIO (renderUntrustedErr, uioBinExec)
+<span class="lineno">   35 </span>
+<span class="lineno">   36 </span>-- | The action enum — discriminates between browser operations.
+<span class="lineno">   37 </span>data BrowserAction
+<span class="lineno">   38 </span>  = BaOpen       Text           -- ^ url
+<span class="lineno">   39 </span>  | BaSnapshot
+<span class="lineno">   40 </span>  | BaClick      Text           -- ^ ref (@eN) or CSS selector
+<span class="lineno">   41 </span>  | BaFill       Text Text      -- ^ ref/selector, text
+<span class="lineno">   42 </span>  | BaType       Text Text      -- ^ ref/selector, text
+<span class="lineno">   43 </span>  | BaPress      Text           -- ^ key (Enter, Tab, etc.)
+<span class="lineno">   44 </span>  | BaScroll     Text           -- ^ direction (up/down/left/right)
+<span class="lineno">   45 </span>  | BaRead       (Maybe Text)   -- ^ optional URL
+<span class="lineno">   46 </span>  | BaScreenshot (Maybe Text)   -- ^ optional path
+<span class="lineno">   47 </span>  | BaEval       Text           -- ^ JavaScript
+<span class="lineno">   48 </span>  | BaWait       Text           -- ^ selector or condition
+<span class="lineno">   49 </span>  | BaClose
+<span class="lineno">   50 </span>  | BaSession
+<span class="lineno">   51 </span>  | BaNetworkRequests NetworkFilters  -- ^ network requests with optional filters
+<span class="lineno">   52 </span>  | BaNetworkRequest  Text            -- ^ requestId for a single request detail
+<span class="lineno">   53 </span>  | BaNetworkHar       HarAction      -- ^ HAR recording start/stop
+<span class="lineno">   54 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   55 </span>
+<span class="lineno">   56 </span>-- | Optional filter flags for @network requests@.
+<span class="lineno">   57 </span>data NetworkFilters = NetworkFilters
+<span class="lineno">   58 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">nfFilter</span></span></span> :: Maybe Text   -- ^ @--filter &lt;pattern&gt;@: URL substring or pattern
+<span class="lineno">   59 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">nfType</span></span></span>   :: Maybe Text   -- ^ @--type &lt;csv&gt;@: resource type (script, image, xhr, fetch, ...)
+<span class="lineno">   60 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">nfMethod</span></span></span> :: Maybe Text   -- ^ @--method &lt;method&gt;@: HTTP method (GET, POST, ...)
+<span class="lineno">   61 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">nfStatus</span></span></span> :: Maybe Text   -- ^ @--status &lt;status&gt;@: exact status, family (2xx), or range
+<span class="lineno">   62 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">nfClear</span></span></span>  :: Bool          -- ^ @--clear@: clear the tracked request log
+<span class="lineno">   63 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   64 </span>
+<span class="lineno">   65 </span>-- | Discriminates between HAR start and stop sub-actions.
+<span class="lineno">   66 </span>data HarAction
+<span class="lineno">   67 </span>  = HarStart (Maybe Text)  -- ^ start recording; optional @--content@ mode (text, all, none)
+<span class="lineno">   68 </span>  | HarStop  (Maybe Text)  -- ^ stop recording; optional output file path
+<span class="lineno">   69 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   70 </span>
+<span class="lineno">   71 </span>-- | The default max-output ceiling (characters). Operator-configurable
+<span class="lineno">   72 </span>-- via config in a future task.
+<span class="lineno">   73 </span>defaultMaxOutput :: Int
+<span class="lineno">   74 </span><span class="decl"><span class="istickedoff">defaultMaxOutput = 15000</span></span>
+<span class="lineno">   75 </span>
+<span class="lineno">   76 </span>-- | BROWSER_MANAGE opcode. Input: @{ action: string, ...action-specific fields }@.
+<span class="lineno">   77 </span>browserManageOp :: SecurityPolicy -&gt; Opcode
+<span class="lineno">   78 </span><span class="decl"><span class="istickedoff">browserManageOp policy = UntrustedOpcode</span>
+<span class="lineno">   79 </span><span class="spaces">  </span><span class="istickedoff">{ uoName = OpName &quot;BROWSER_MANAGE&quot;</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">, uoDesc = &quot;Browser automation via agent-browser CLI. Action: open (url), snapshot (interactive elements), click (ref/selector), fill (ref+text), type (ref+text), press (key), scroll (dir), read (url?), screenshot (path?), eval (js), wait (selector), close, session (list current), network-requests (filters?), network-request (requestId), network-har (harAction).&quot;</span>
+<span class="lineno">   81 </span><span class="spaces">  </span><span class="istickedoff">, uoInSchema = browserManageSchema</span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="istickedoff">, uoOutSchema = <span class="nottickedoff">object []</span></span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">, uoAuthorize = \v -&gt;</span>
+<span class="lineno">   84 </span><span class="spaces">      </span><span class="istickedoff">case parseBrowserAction v of</span>
+<span class="lineno">   85 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; Left e</span>
+<span class="lineno">   86 </span><span class="spaces">        </span><span class="istickedoff">Right _ -&gt; checkAutonomy</span>
+<span class="lineno">   87 </span><span class="spaces">  </span><span class="istickedoff">, uoRun = \v -&gt; do</span>
+<span class="lineno">   88 </span><span class="spaces">      </span><span class="istickedoff">let <span class="nottickedoff">recorded = object [ &quot;action&quot; .= actionField v ]</span></span>
+<span class="lineno">   89 </span><span class="spaces">      </span><span class="istickedoff">case parseBrowserAction v of</span>
+<span class="lineno">   90 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (OpResult [TrpText e] True recorded)</span></span>
+<span class="lineno">   91 </span><span class="spaces">        </span><span class="istickedoff">Right action -&gt; do</span>
+<span class="lineno">   92 </span><span class="spaces">          </span><span class="istickedoff">let mSession = sessionField v</span>
+<span class="lineno">   93 </span><span class="spaces">              </span><span class="istickedoff">maxOut = defaultMaxOutput</span>
+<span class="lineno">   94 </span><span class="spaces">          </span><span class="istickedoff">case buildBrowserArgs action mSession maxOut of</span>
+<span class="lineno">   95 </span><span class="spaces">            </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">pure (OpResult [TrpText e] True recorded)</span></span>
+<span class="lineno">   96 </span><span class="spaces">            </span><span class="istickedoff">Right (binName, binArgs) -&gt; do</span>
+<span class="lineno">   97 </span><span class="spaces">              </span><span class="istickedoff">res &lt;- uioBinExec <span class="nottickedoff">binName</span> <span class="nottickedoff">binArgs</span> <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">   98 </span><span class="spaces">              </span><span class="istickedoff">pure $ case res of</span>
+<span class="lineno">   99 </span><span class="spaces">                </span><span class="istickedoff">Left err -&gt; OpResult <span class="nottickedoff">[TrpText (renderUntrustedErr err)]</span> True <span class="nottickedoff">recorded</span></span>
+<span class="lineno">  100 </span><span class="spaces">                </span><span class="istickedoff">Right out -&gt; <span class="nottickedoff">OpResult [TrpText out] False recorded</span></span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="istickedoff">}</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  103 </span><span class="spaces">    </span><span class="istickedoff">checkAutonomy = case spAutonomy policy of</span>
+<span class="lineno">  104 </span><span class="spaces">      </span><span class="istickedoff">Deny -&gt; Left &quot;BROWSER_MANAGE denied by autonomy policy&quot;</span>
+<span class="lineno">  105 </span><span class="spaces">      </span><span class="istickedoff">_    -&gt; Right ()</span></span>
+<span class="lineno">  106 </span>
+<span class="lineno">  107 </span>-- | Parse the action + action-specific fields from the input JSON.
+<span class="lineno">  108 </span>parseBrowserAction :: Value -&gt; Either Text BrowserAction
+<span class="lineno">  109 </span><span class="decl"><span class="istickedoff">parseBrowserAction v =</span>
+<span class="lineno">  110 </span><span class="spaces">  </span><span class="istickedoff">case actionField v of</span>
+<span class="lineno">  111 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; Left &quot;BROWSER_MANAGE requires {action:string}&quot;</span>
+<span class="lineno">  112 </span><span class="spaces">    </span><span class="istickedoff">Just a</span>
+<span class="lineno">  113 </span><span class="spaces">      </span><span class="istickedoff">| a == &quot;open&quot;             -&gt; BaOpen &lt;$&gt; requireField a v &quot;url&quot;</span>
+<span class="lineno">  114 </span><span class="spaces">      </span><span class="istickedoff">| a == &quot;snapshot&quot;         -&gt; Right BaSnapshot</span>
+<span class="lineno">  115 </span><span class="spaces">      </span><span class="istickedoff">| a == &quot;click&quot;            -&gt; <span class="nottickedoff">BaClick</span> &lt;$&gt; refOrSelector a v</span>
+<span class="lineno">  116 </span><span class="spaces">      </span><span class="istickedoff">| a == &quot;fill&quot;             -&gt; <span class="nottickedoff">BaFill</span> &lt;$&gt; refOrSelector <span class="nottickedoff">a</span> v &lt;*&gt; requireField a v &quot;text&quot;</span>
+<span class="lineno">  117 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">a == &quot;type&quot;</span>             -&gt; <span class="nottickedoff">BaType &lt;$&gt; refOrSelector a v &lt;*&gt; requireField a v &quot;text&quot;</span></span>
+<span class="lineno">  118 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">a == &quot;press&quot;</span>            -&gt; <span class="nottickedoff">BaPress &lt;$&gt; requireField a v &quot;key&quot;</span></span>
+<span class="lineno">  119 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">a == &quot;scroll&quot;</span>           -&gt; <span class="nottickedoff">BaScroll &lt;$&gt; requireField a v &quot;dir&quot;</span></span>
+<span class="lineno">  120 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">a == &quot;read&quot;</span>             -&gt; <span class="nottickedoff">Right (BaRead (optionalField v &quot;url&quot;))</span></span>
+<span class="lineno">  121 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">a == &quot;screenshot&quot;</span>       -&gt; <span class="nottickedoff">Right (BaScreenshot (optionalField v &quot;path&quot;))</span></span>
+<span class="lineno">  122 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">a == &quot;eval&quot;</span>             -&gt; <span class="nottickedoff">BaEval &lt;$&gt; requireField a v &quot;js&quot;</span></span>
+<span class="lineno">  123 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">a == &quot;wait&quot;</span>             -&gt; <span class="nottickedoff">BaWait &lt;$&gt; requireField a v &quot;selector&quot;</span></span>
+<span class="lineno">  124 </span><span class="spaces">      </span><span class="istickedoff">| a == &quot;close&quot;            -&gt; Right BaClose</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">a == &quot;session&quot;</span>          -&gt; <span class="nottickedoff">Right BaSession</span></span>
+<span class="lineno">  126 </span><span class="spaces">      </span><span class="istickedoff">| a == &quot;network-requests&quot; -&gt; Right (BaNetworkRequests (parseNetworkFilters v))</span>
+<span class="lineno">  127 </span><span class="spaces">      </span><span class="istickedoff">| a == &quot;network-request&quot;  -&gt; BaNetworkRequest &lt;$&gt; requireField a v &quot;requestId&quot;</span>
+<span class="lineno">  128 </span><span class="spaces">      </span><span class="istickedoff">| a == &quot;network-har&quot;      -&gt; <span class="nottickedoff">BaNetworkHar</span> &lt;$&gt; parseHarAction v</span>
+<span class="lineno">  129 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>               -&gt; Left (&quot;BROWSER_MANAGE: unknown action \&quot;&quot; &lt;&gt; a &lt;&gt; &quot;\&quot;&quot;)</span></span>
+<span class="lineno">  130 </span>
+<span class="lineno">  131 </span>-- | Build the agent-browser argv from the parsed action.
+<span class="lineno">  132 </span>-- Returns (binary name, argv args) or an error if a BinArg fails validation.
+<span class="lineno">  133 </span>buildBrowserArgs :: BrowserAction -&gt; Maybe Text -&gt; Int
+<span class="lineno">  134 </span>                -&gt; Either Text (BinName, [BinArg])
+<span class="lineno">  135 </span><span class="decl"><span class="istickedoff">buildBrowserArgs action mSession maxOut = do</span>
+<span class="lineno">  136 </span><span class="spaces">  </span><span class="istickedoff">binName &lt;- mkBinName &quot;agent-browser&quot;</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="istickedoff">baseArgs &lt;- traverse mkBinArg baseArgTexts</span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="istickedoff">cmdArgs &lt;- traverse mkBinArg cmdArgTexts</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">Right (<span class="nottickedoff">binName</span>, baseArgs ++ cmdArgs)</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  141 </span><span class="spaces">    </span><span class="istickedoff">baseArgTexts :: [Text]</span>
+<span class="lineno">  142 </span><span class="spaces">    </span><span class="istickedoff">baseArgTexts =</span>
+<span class="lineno">  143 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;--json&quot;, &quot;--max-output&quot;, T.pack (show maxOut) ]</span>
+<span class="lineno">  144 </span><span class="spaces">      </span><span class="istickedoff">++ sessionArgs</span>
+<span class="lineno">  145 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  146 </span><span class="spaces">    </span><span class="istickedoff">sessionArgs :: [Text]</span>
+<span class="lineno">  147 </span><span class="spaces">    </span><span class="istickedoff">sessionArgs = case mSession of</span>
+<span class="lineno">  148 </span><span class="spaces">      </span><span class="istickedoff">Just s -&gt; [&quot;--session&quot;, s]</span>
+<span class="lineno">  149 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; []</span>
+<span class="lineno">  150 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  151 </span><span class="spaces">    </span><span class="istickedoff">cmdArgTexts :: [Text]</span>
+<span class="lineno">  152 </span><span class="spaces">    </span><span class="istickedoff">cmdArgTexts = case action of</span>
+<span class="lineno">  153 </span><span class="spaces">      </span><span class="istickedoff">BaOpen url         -&gt; [&quot;open&quot;, url]</span>
+<span class="lineno">  154 </span><span class="spaces">      </span><span class="istickedoff">BaSnapshot         -&gt; [&quot;snapshot&quot;, &quot;-i&quot;]</span>
+<span class="lineno">  155 </span><span class="spaces">      </span><span class="istickedoff">BaClick ref        -&gt; [&quot;click&quot;, ref]</span>
+<span class="lineno">  156 </span><span class="spaces">      </span><span class="istickedoff">BaFill ref text    -&gt; [&quot;fill&quot;, ref, text]</span>
+<span class="lineno">  157 </span><span class="spaces">      </span><span class="istickedoff">BaType ref text    -&gt; <span class="nottickedoff">[&quot;type&quot;, ref, text]</span></span>
+<span class="lineno">  158 </span><span class="spaces">      </span><span class="istickedoff">BaPress key        -&gt; <span class="nottickedoff">[&quot;press&quot;, key]</span></span>
+<span class="lineno">  159 </span><span class="spaces">      </span><span class="istickedoff">BaScroll dir       -&gt; <span class="nottickedoff">[&quot;scroll&quot;, dir]</span></span>
+<span class="lineno">  160 </span><span class="spaces">      </span><span class="istickedoff">BaRead mUrl        -&gt; <span class="nottickedoff">case mUrl of</span></span>
+<span class="lineno">  161 </span><span class="spaces">                             </span><span class="istickedoff"><span class="nottickedoff">Just url -&gt; [&quot;read&quot;, url]</span></span>
+<span class="lineno">  162 </span><span class="spaces">                             </span><span class="istickedoff"><span class="nottickedoff">Nothing  -&gt; [&quot;read&quot;]</span></span>
+<span class="lineno">  163 </span><span class="spaces">      </span><span class="istickedoff">BaScreenshot mPath -&gt; <span class="nottickedoff">case mPath of</span></span>
+<span class="lineno">  164 </span><span class="spaces">                             </span><span class="istickedoff"><span class="nottickedoff">Just path -&gt; [&quot;screenshot&quot;, path]</span></span>
+<span class="lineno">  165 </span><span class="spaces">                             </span><span class="istickedoff"><span class="nottickedoff">Nothing   -&gt; [&quot;screenshot&quot;]</span></span>
+<span class="lineno">  166 </span><span class="spaces">      </span><span class="istickedoff">BaEval js          -&gt; <span class="nottickedoff">[&quot;eval&quot;, js]</span></span>
+<span class="lineno">  167 </span><span class="spaces">      </span><span class="istickedoff">BaWait sel         -&gt; <span class="nottickedoff">[&quot;wait&quot;, sel]</span></span>
+<span class="lineno">  168 </span><span class="spaces">      </span><span class="istickedoff">BaClose            -&gt; [&quot;close&quot;]</span>
+<span class="lineno">  169 </span><span class="spaces">      </span><span class="istickedoff">BaSession          -&gt; <span class="nottickedoff">[&quot;session&quot;, &quot;list&quot;]</span></span>
+<span class="lineno">  170 </span><span class="spaces">      </span><span class="istickedoff">BaNetworkRequests f -&gt; [&quot;network&quot;, &quot;requests&quot;] ++ filterArgTexts f</span>
+<span class="lineno">  171 </span><span class="spaces">      </span><span class="istickedoff">BaNetworkRequest rid -&gt; [&quot;network&quot;, &quot;request&quot;, rid]</span>
+<span class="lineno">  172 </span><span class="spaces">      </span><span class="istickedoff">BaNetworkHar hAction -&gt; case hAction of</span>
+<span class="lineno">  173 </span><span class="spaces">        </span><span class="istickedoff">HarStart mContent -&gt; [&quot;network&quot;, &quot;har&quot;, &quot;start&quot;] ++ contentArgTexts mContent</span>
+<span class="lineno">  174 </span><span class="spaces">        </span><span class="istickedoff">HarStop  mPath    -&gt; [&quot;network&quot;, &quot;har&quot;, &quot;stop&quot;]  ++ maybeToList mPath</span></span>
+<span class="lineno">  175 </span>
+<span class="lineno">  176 </span>-- | The input schema — a flat object with an action enum and action-specific
+<span class="lineno">  177 </span>-- fields. All fields are optional except @action@; the authorize gate
+<span class="lineno">  178 </span>-- validates per-action requirements.
+<span class="lineno">  179 </span>browserManageSchema :: Value
+<span class="lineno">  180 </span><span class="decl"><span class="istickedoff">browserManageSchema =</span>
+<span class="lineno">  181 </span><span class="spaces">  </span><span class="istickedoff">object</span>
+<span class="lineno">  182 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;object&quot; :: Text)</span>
+<span class="lineno">  183 </span><span class="spaces">    </span><span class="istickedoff">, &quot;properties&quot; .= object</span>
+<span class="lineno">  184 </span><span class="spaces">        </span><span class="istickedoff">[ fromText &quot;action&quot; .= object</span>
+<span class="lineno">  185 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  186 </span><span class="spaces">            </span><span class="istickedoff">, &quot;enum&quot; .= (actionEnum :: [Text])</span>
+<span class="lineno">  187 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Browser operation to perform.&quot; :: Text)</span>
+<span class="lineno">  188 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  189 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;url&quot; .= object</span>
+<span class="lineno">  190 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  191 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;URL to open or read (open, read).&quot; :: Text)</span>
+<span class="lineno">  192 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  193 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;ref&quot; .= object</span>
+<span class="lineno">  194 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  195 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Element ref from snapshot, e.g. @e1 (click, fill, type).&quot; :: Text)</span>
+<span class="lineno">  196 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  197 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;selector&quot; .= object</span>
+<span class="lineno">  198 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  199 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;CSS selector (click, fill, type, wait — alternative to ref).&quot; :: Text)</span>
+<span class="lineno">  200 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  201 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;text&quot; .= object</span>
+<span class="lineno">  202 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  203 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Text to fill or type (fill, type).&quot; :: Text)</span>
+<span class="lineno">  204 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  205 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;key&quot; .= object</span>
+<span class="lineno">  206 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  207 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Key to press, e.g. Enter, Tab, Control+a (press).&quot; :: Text)</span>
+<span class="lineno">  208 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  209 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;dir&quot; .= object</span>
+<span class="lineno">  210 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  211 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Scroll direction: up, down, left, right (scroll).&quot; :: Text)</span>
+<span class="lineno">  212 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  213 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;path&quot; .= object</span>
+<span class="lineno">  214 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  215 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;File path for screenshot or HAR output (screenshot, network-har stop).&quot; :: Text)</span>
+<span class="lineno">  216 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  217 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;js&quot; .= object</span>
+<span class="lineno">  218 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  219 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;JavaScript to evaluate in page (eval).&quot; :: Text)</span>
+<span class="lineno">  220 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  221 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;session&quot; .= object</span>
+<span class="lineno">  222 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  223 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;agent-browser session name for isolation. Optional; defaults to the agent-browser default session.&quot; :: Text)</span>
+<span class="lineno">  224 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  225 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;requestId&quot; .= object</span>
+<span class="lineno">  226 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  227 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Request ID from network-requests output (network-request).&quot; :: Text)</span>
+<span class="lineno">  228 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  229 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;harAction&quot; .= object</span>
+<span class="lineno">  230 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  231 </span><span class="spaces">            </span><span class="istickedoff">, &quot;enum&quot; .= ([&quot;start&quot;, &quot;stop&quot;] :: [Text])</span>
+<span class="lineno">  232 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;HAR sub-action: start or stop recording (network-har).&quot; :: Text)</span>
+<span class="lineno">  233 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  234 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;content&quot; .= object</span>
+<span class="lineno">  235 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  236 </span><span class="spaces">            </span><span class="istickedoff">, &quot;enum&quot; .= ([&quot;text&quot;, &quot;all&quot;, &quot;none&quot;] :: [Text])</span>
+<span class="lineno">  237 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;HAR body capture mode: text (default), all (base64), none (network-har start).&quot; :: Text)</span>
+<span class="lineno">  238 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  239 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;filter&quot; .= object</span>
+<span class="lineno">  240 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  241 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Filter requests by URL substring or pattern (network-requests).&quot; :: Text)</span>
+<span class="lineno">  242 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  243 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;type&quot; .= object</span>
+<span class="lineno">  244 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  245 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Filter by resource type, comma-separated: script, image, font, xhr, fetch (network-requests).&quot; :: Text)</span>
+<span class="lineno">  246 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  247 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;method&quot; .= object</span>
+<span class="lineno">  248 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  249 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Filter by HTTP method, e.g. GET, POST (network-requests).&quot; :: Text)</span>
+<span class="lineno">  250 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  251 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;status&quot; .= object</span>
+<span class="lineno">  252 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;string&quot; :: Text)</span>
+<span class="lineno">  253 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Filter by status: exact (200), family (2xx), or range (200-299) (network-requests).&quot; :: Text)</span>
+<span class="lineno">  254 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  255 </span><span class="spaces">        </span><span class="istickedoff">, fromText &quot;clear&quot; .= object</span>
+<span class="lineno">  256 </span><span class="spaces">            </span><span class="istickedoff">[ &quot;type&quot; .= (&quot;boolean&quot; :: Text)</span>
+<span class="lineno">  257 </span><span class="spaces">            </span><span class="istickedoff">, &quot;description&quot; .= (&quot;Clear the tracked request log (network-requests).&quot; :: Text)</span>
+<span class="lineno">  258 </span><span class="spaces">            </span><span class="istickedoff">]</span>
+<span class="lineno">  259 </span><span class="spaces">        </span><span class="istickedoff">]</span>
+<span class="lineno">  260 </span><span class="spaces">    </span><span class="istickedoff">, &quot;required&quot; .= ([&quot;action&quot;] :: [Text])</span>
+<span class="lineno">  261 </span><span class="spaces">    </span><span class="istickedoff">]</span>
+<span class="lineno">  262 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  263 </span><span class="spaces">    </span><span class="istickedoff">actionEnum =</span>
+<span class="lineno">  264 </span><span class="spaces">      </span><span class="istickedoff">[ &quot;open&quot;, &quot;snapshot&quot;, &quot;click&quot;, &quot;fill&quot;, &quot;type&quot;, &quot;press&quot;</span>
+<span class="lineno">  265 </span><span class="spaces">      </span><span class="istickedoff">, &quot;scroll&quot;, &quot;read&quot;, &quot;screenshot&quot;, &quot;eval&quot;, &quot;wait&quot;, &quot;close&quot;, &quot;session&quot;</span>
+<span class="lineno">  266 </span><span class="spaces">      </span><span class="istickedoff">, &quot;network-requests&quot;, &quot;network-request&quot;, &quot;network-har&quot;</span>
+<span class="lineno">  267 </span><span class="spaces">      </span><span class="istickedoff">]</span></span>
+<span class="lineno">  268 </span>
+<span class="lineno">  269 </span>-- ── Network parsing helpers ──────────────────────────────────────────────
+<span class="lineno">  270 </span>
+<span class="lineno">  271 </span>-- | Parse the optional filter fields for @network-requests@.
+<span class="lineno">  272 </span>parseNetworkFilters :: Value -&gt; NetworkFilters
+<span class="lineno">  273 </span><span class="decl"><span class="istickedoff">parseNetworkFilters v = NetworkFilters</span>
+<span class="lineno">  274 </span><span class="spaces">  </span><span class="istickedoff">{ nfFilter = optionalField v &quot;filter&quot;</span>
+<span class="lineno">  275 </span><span class="spaces">  </span><span class="istickedoff">, nfType   = optionalField v &quot;type&quot;</span>
+<span class="lineno">  276 </span><span class="spaces">  </span><span class="istickedoff">, nfMethod = optionalField v &quot;method&quot;</span>
+<span class="lineno">  277 </span><span class="spaces">  </span><span class="istickedoff">, nfStatus = optionalField v &quot;status&quot;</span>
+<span class="lineno">  278 </span><span class="spaces">  </span><span class="istickedoff">, nfClear  = boolField v &quot;clear&quot;</span>
+<span class="lineno">  279 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">  280 </span>
+<span class="lineno">  281 </span>-- | Parse the @harAction@ discriminator and its sub-fields for @network-har@.
+<span class="lineno">  282 </span>parseHarAction :: Value -&gt; Either Text HarAction
+<span class="lineno">  283 </span><span class="decl"><span class="istickedoff">parseHarAction v =</span>
+<span class="lineno">  284 </span><span class="spaces">  </span><span class="istickedoff">case optionalField v &quot;harAction&quot; of</span>
+<span class="lineno">  285 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; Left &quot;BROWSER_MANAGE: network-har requires {harAction:string}&quot;</span>
+<span class="lineno">  286 </span><span class="spaces">    </span><span class="istickedoff">Just ha</span>
+<span class="lineno">  287 </span><span class="spaces">      </span><span class="istickedoff">| ha == &quot;start&quot; -&gt; Right <span class="nottickedoff">(HarStart (optionalField v &quot;content&quot;))</span></span>
+<span class="lineno">  288 </span><span class="spaces">      </span><span class="istickedoff">| ha == &quot;stop&quot;  -&gt; Right <span class="nottickedoff">(HarStop (optionalField v &quot;path&quot;))</span></span>
+<span class="lineno">  289 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>     -&gt; Left (&quot;BROWSER_MANAGE: network-har requires harAction \&quot;start\&quot; or \&quot;stop\&quot;, got \&quot;&quot; &lt;&gt; ha &lt;&gt; &quot;\&quot;&quot;)</span></span>
+<span class="lineno">  290 </span>
+<span class="lineno">  291 </span>-- | Build the @--flag value@ argv tokens from 'NetworkFilters'.
+<span class="lineno">  292 </span>filterArgTexts :: NetworkFilters -&gt; [Text]
+<span class="lineno">  293 </span><span class="decl"><span class="istickedoff">filterArgTexts f = concat</span>
+<span class="lineno">  294 </span><span class="spaces">  </span><span class="istickedoff">[ maybe [] (\x -&gt; [&quot;--filter&quot;, x]) (nfFilter f)</span>
+<span class="lineno">  295 </span><span class="spaces">  </span><span class="istickedoff">, maybe [] (\x -&gt; [&quot;--type&quot;, x])   (nfType f)</span>
+<span class="lineno">  296 </span><span class="spaces">  </span><span class="istickedoff">, maybe [] (\x -&gt; [&quot;--method&quot;, x]) (nfMethod f)</span>
+<span class="lineno">  297 </span><span class="spaces">  </span><span class="istickedoff">, maybe [] (\x -&gt; [&quot;--status&quot;, x]) (nfStatus f)</span>
+<span class="lineno">  298 </span><span class="spaces">  </span><span class="istickedoff">, [&quot;--clear&quot; | nfClear f]</span>
+<span class="lineno">  299 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">  300 </span>
+<span class="lineno">  301 </span>-- | Build the @--content@ argv token from an optional content mode.
+<span class="lineno">  302 </span>contentArgTexts :: Maybe Text -&gt; [Text]
+<span class="lineno">  303 </span><span class="decl"><span class="istickedoff">contentArgTexts = maybe [] (\c -&gt; [&quot;--content&quot;, c])</span></span>
+<span class="lineno">  304 </span>
+<span class="lineno">  305 </span>-- ── Field accessors ──────────────────────────────────────────────────────
+<span class="lineno">  306 </span>
+<span class="lineno">  307 </span>actionField :: Value -&gt; Maybe Text
+<span class="lineno">  308 </span><span class="decl"><span class="istickedoff">actionField = parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: &quot;action&quot;))</span></span>
+<span class="lineno">  309 </span>
+<span class="lineno">  310 </span>sessionField :: Value -&gt; Maybe Text
+<span class="lineno">  311 </span><span class="decl"><span class="istickedoff">sessionField v = case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? &quot;session&quot;)) v :: Maybe (Maybe Text) of</span>
+<span class="lineno">  312 </span><span class="spaces">  </span><span class="istickedoff">Just (Just s) | <span class="nottickedoff">not (T.null s)</span> -&gt; <span class="nottickedoff">Just s</span></span>
+<span class="lineno">  313 </span><span class="spaces">  </span><span class="istickedoff">_                              -&gt; Nothing</span></span>
+<span class="lineno">  314 </span>
+<span class="lineno">  315 </span>requireField :: Text -&gt; Value -&gt; Text -&gt; Either Text Text
+<span class="lineno">  316 </span><span class="decl"><span class="istickedoff">requireField act v field =</span>
+<span class="lineno">  317 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.: fromText field)) v of</span>
+<span class="lineno">  318 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; Left (&quot;BROWSER_MANAGE: &quot; &lt;&gt; act &lt;&gt; &quot; requires {&quot; &lt;&gt; field &lt;&gt; &quot;:string}&quot;)</span>
+<span class="lineno">  319 </span><span class="spaces">    </span><span class="istickedoff">Just s</span>
+<span class="lineno">  320 </span><span class="spaces">      </span><span class="istickedoff">| T.null s -&gt; Left (&quot;BROWSER_MANAGE: &quot; &lt;&gt; field &lt;&gt; &quot; is empty&quot;)</span>
+<span class="lineno">  321 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; Right s</span></span>
+<span class="lineno">  322 </span>
+<span class="lineno">  323 </span>optionalField :: Value -&gt; Text -&gt; Maybe Text
+<span class="lineno">  324 </span><span class="decl"><span class="istickedoff">optionalField v field =</span>
+<span class="lineno">  325 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? fromText field)) v :: Maybe (Maybe Text) of</span>
+<span class="lineno">  326 </span><span class="spaces">    </span><span class="istickedoff">Just (Just s) | <span class="tickonlytrue">not (T.null s)</span> -&gt; Just s</span>
+<span class="lineno">  327 </span><span class="spaces">    </span><span class="istickedoff">_                              -&gt; Nothing</span></span>
+<span class="lineno">  328 </span>
+<span class="lineno">  329 </span>-- | Read a boolean field from the input JSON (defaults to False).
+<span class="lineno">  330 </span>boolField :: Value -&gt; Text -&gt; Bool
+<span class="lineno">  331 </span><span class="decl"><span class="istickedoff">boolField v field =</span>
+<span class="lineno">  332 </span><span class="spaces">  </span><span class="istickedoff">case parseMaybe (withObject <span class="nottickedoff">&quot;in&quot;</span> (.:? fromText field)) v :: Maybe (Maybe Bool) of</span>
+<span class="lineno">  333 </span><span class="spaces">    </span><span class="istickedoff">Just (Just b) -&gt; <span class="nottickedoff">b</span></span>
+<span class="lineno">  334 </span><span class="spaces">    </span><span class="istickedoff">_             -&gt; False</span></span>
+<span class="lineno">  335 </span>
+<span class="lineno">  336 </span>-- | Get the ref or selector for click/fill/type actions.
+<span class="lineno">  337 </span>refOrSelector :: Text -&gt; Value -&gt; Either Text Text
+<span class="lineno">  338 </span><span class="decl"><span class="istickedoff">refOrSelector act v =</span>
+<span class="lineno">  339 </span><span class="spaces">  </span><span class="istickedoff">case optionalField v &quot;ref&quot; of</span>
+<span class="lineno">  340 </span><span class="spaces">    </span><span class="istickedoff">Just r -&gt; Right <span class="nottickedoff">r</span></span>
+<span class="lineno">  341 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; case optionalField v &quot;selector&quot; of</span>
+<span class="lineno">  342 </span><span class="spaces">      </span><span class="istickedoff">Just s -&gt; <span class="nottickedoff">Right s</span></span>
+<span class="lineno">  343 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; Left (&quot;BROWSER_MANAGE: &quot; &lt;&gt; act &lt;&gt; &quot; requires {ref:string} or {selector:string}&quot;)</span></span>
+
+</pre>
+</body>
+</html>

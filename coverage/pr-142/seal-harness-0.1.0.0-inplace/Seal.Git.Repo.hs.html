@@ -1,0 +1,225 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Git-backed versioning for @~\/.seal\/config@. The config directory is a
+<span class="lineno">    3 </span>-- git repo (initialized on first run if absent). Skills, agent defs, and
+<span class="lineno">    4 </span>-- memory entries live as Markdown files under @config\/skills@,
+<span class="lineno">    5 </span>-- @config\/agents@, @config\/memory@; disk is canonical and git is the
+<span class="lineno">    6 </span>-- versioning + audit layer. Model-authored writes auto-commit; human
+<span class="lineno">    7 </span>-- file-drops are committed by the human via @git -C ~/.seal/config@ as usual.
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- The vault file (@config\/vault\/vault.age@) is ciphertext — it lives in the
+<span class="lineno">   10 </span>-- repo safely; the age identity stays under @keys\/@ (off-repo). A default
+<span class="lineno">   11 </span>-- @\@gitignore@ is NOT installed (the whole config dir is versioned, including
+<span class="lineno">   12 </span>-- the vault ciphertext).
+<span class="lineno">   13 </span>module Seal.Git.Repo
+<span class="lineno">   14 </span>  ( ConfigRepo (..)
+<span class="lineno">   15 </span>  , openConfigRepo
+<span class="lineno">   16 </span>  , ensureConfigRepo
+<span class="lineno">   17 </span>  , gitAdd
+<span class="lineno">   18 </span>  , gitCommit
+<span class="lineno">   19 </span>  , gitCommitAll
+<span class="lineno">   20 </span>  , gitHasCommits
+<span class="lineno">   21 </span>  , readProcessBinaryCwdEnv
+<span class="lineno">   22 </span>  ) where
+<span class="lineno">   23 </span>
+<span class="lineno">   24 </span>import Control.Exception (try, SomeException)
+<span class="lineno">   25 </span>import Data.ByteString (ByteString)
+<span class="lineno">   26 </span>import Data.ByteString qualified as BS
+<span class="lineno">   27 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   28 </span>import Data.Text (Text)
+<span class="lineno">   29 </span>import Data.Text qualified as T
+<span class="lineno">   30 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   31 </span>import System.Directory (createDirectoryIfMissing, doesDirectoryExist)
+<span class="lineno">   32 </span>import System.Environment (getEnvironment)
+<span class="lineno">   33 </span>import System.Exit (ExitCode (..))
+<span class="lineno">   34 </span>import System.FilePath ((&lt;/&gt;))
+<span class="lineno">   35 </span>import System.IO (hClose, hFlush)
+<span class="lineno">   36 </span>import System.Process
+<span class="lineno">   37 </span>  ( CreateProcess (..), StdStream (..), proc, waitForProcess, withCreateProcess )
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>-- | A handle to the config git repo. The repo root is the @config@ directory.
+<span class="lineno">   40 </span>newtype ConfigRepo = ConfigRepo
+<span class="lineno">   41 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">crRoot</span></span></span> :: FilePath
+<span class="lineno">   42 </span>  -- ^ Absolute path to the git repo (= the @config@ / directory).
+<span class="lineno">   43 </span>  }
+<span class="lineno">   44 </span>
+<span class="lineno">   45 </span>-- | Open the config repo handle (no IO validation). The caller is responsible
+<span class="lineno">   46 </span>-- for ensuring the repo exists via 'ensureConfigRepo' at startup.
+<span class="lineno">   47 </span>openConfigRepo :: FilePath -&gt; ConfigRepo
+<span class="lineno">   48 </span><span class="decl"><span class="istickedoff">openConfigRepo = ConfigRepo</span></span>
+<span class="lineno">   49 </span>
+<span class="lineno">   50 </span>-- | Ensure @config\/@ is a git repo: @git init@ if @.git@ is absent, make
+<span class="lineno">   51 </span>-- an initial empty commit if the repo has no commits yet (so commit-on-write
+<span class="lineno">   52 </span>-- has a base to build on), and create the three store subdirectories
+<span class="lineno">   53 </span>-- (@skills@, @agents@, @memory@) so the Markdown backends can write files
+<span class="lineno">   54 </span>-- into them. Idempotent.
+<span class="lineno">   55 </span>ensureConfigRepo :: FilePath -&gt; IO ()
+<span class="lineno">   56 </span><span class="decl"><span class="istickedoff">ensureConfigRepo root = do</span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="istickedoff">-- The root may not exist yet (first run); create it so `git init` has a</span>
+<span class="lineno">   58 </span><span class="spaces">  </span><span class="istickedoff">-- working directory. createDirectoryIfMissing True creates all parents.</span>
+<span class="lineno">   59 </span><span class="spaces">  </span><span class="istickedoff">createDirectoryIfMissing True root</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="istickedoff">let gitDir = root &lt;/&gt; &quot;.git&quot;</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesDirectoryExist gitDir</span>
+<span class="lineno">   62 </span><span class="spaces">  </span><span class="istickedoff">if exists</span>
+<span class="lineno">   63 </span><span class="spaces">    </span><span class="istickedoff">then ensureInitialCommit root</span>
+<span class="lineno">   64 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">   65 </span><span class="spaces">      </span><span class="istickedoff">_ &lt;- runGit root [&quot;init&quot;]</span>
+<span class="lineno">   66 </span><span class="spaces">      </span><span class="istickedoff">-- Set a local identity so commits succeed in environments without a</span>
+<span class="lineno">   67 </span><span class="spaces">      </span><span class="istickedoff">-- global git config (e.g. CI runners). Local config is scoped to this</span>
+<span class="lineno">   68 </span><span class="spaces">      </span><span class="istickedoff">-- repo and never touches the user's global settings.</span>
+<span class="lineno">   69 </span><span class="spaces">      </span><span class="istickedoff">_ &lt;- runGit root [&quot;config&quot;, &quot;user.name&quot;, &quot;seal&quot;]</span>
+<span class="lineno">   70 </span><span class="spaces">      </span><span class="istickedoff">_ &lt;- runGit root [&quot;config&quot;, &quot;user.email&quot;, &quot;seal@localhost&quot;]</span>
+<span class="lineno">   71 </span><span class="spaces">      </span><span class="istickedoff">ensureInitialCommit root</span>
+<span class="lineno">   72 </span><span class="spaces">  </span><span class="istickedoff">-- The three evolutionary-store subdirectories. Created here (not in the</span>
+<span class="lineno">   73 </span><span class="spaces">  </span><span class="istickedoff">-- backends) so a hand-edit user who drops a file finds the dirs ready, and</span>
+<span class="lineno">   74 </span><span class="spaces">  </span><span class="istickedoff">-- so the backends' TIO.writeFile never hits a missing-parent-dir error.</span>
+<span class="lineno">   75 </span><span class="spaces">  </span><span class="istickedoff">mapM_ (createDirectoryIfMissing True . (root &lt;/&gt;)) [&quot;skills&quot;, &quot;agents&quot;, &quot;memory&quot;]</span></span>
+<span class="lineno">   76 </span>
+<span class="lineno">   77 </span>-- | Make an initial empty commit if the repo has no commits yet. Without one,
+<span class="lineno">   78 </span>-- @git commit@ on the first real write fails (nothing to commit against, and
+<span class="lineno">   79 </span>-- @HEAD@ is unborn). Idempotent.
+<span class="lineno">   80 </span>ensureInitialCommit :: FilePath -&gt; IO ()
+<span class="lineno">   81 </span><span class="decl"><span class="istickedoff">ensureInitialCommit root = do</span>
+<span class="lineno">   82 </span><span class="spaces">  </span><span class="istickedoff">has &lt;- gitHasCommits' root</span>
+<span class="lineno">   83 </span><span class="spaces">  </span><span class="istickedoff">if has</span>
+<span class="lineno">   84 </span><span class="spaces">    </span><span class="istickedoff">then pure <span class="nottickedoff">()</span></span>
+<span class="lineno">   85 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">   86 </span><span class="spaces">      </span><span class="istickedoff">-- Commit an empty tree so HEAD is born. -m with --allow-empty.</span>
+<span class="lineno">   87 </span><span class="spaces">      </span><span class="istickedoff">_ &lt;- runGit root [&quot;commit&quot;, &quot;--allow-empty&quot;, &quot;-m&quot;, &quot;seal: initialize config repo&quot;]</span>
+<span class="lineno">   88 </span><span class="spaces">      </span><span class="istickedoff">pure <span class="nottickedoff">()</span></span></span>
+<span class="lineno">   89 </span>
+<span class="lineno">   90 </span>-- | True if the repo has at least one commit on HEAD.
+<span class="lineno">   91 </span>gitHasCommits :: ConfigRepo -&gt; IO Bool
+<span class="lineno">   92 </span><span class="decl"><span class="istickedoff">gitHasCommits = gitHasCommits' . crRoot</span></span>
+<span class="lineno">   93 </span>
+<span class="lineno">   94 </span>gitHasCommits' :: FilePath -&gt; IO Bool
+<span class="lineno">   95 </span><span class="decl"><span class="istickedoff">gitHasCommits' root = do</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">(ec, _out, _err) &lt;- runGit root [&quot;rev-parse&quot;, &quot;--verify&quot;, &quot;HEAD&quot;]</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">pure (ec == ExitSuccess)</span></span>
+<span class="lineno">   98 </span>
+<span class="lineno">   99 </span>-- | Stage one path (relative to the repo root). @git add &lt;path&gt;@.
+<span class="lineno">  100 </span>gitAdd :: ConfigRepo -&gt; FilePath -&gt; IO ()
+<span class="lineno">  101 </span><span class="decl"><span class="istickedoff">gitAdd repo path = do</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">(ec, _out, err) &lt;- runGit (crRoot repo) [&quot;add&quot;, &quot;--&quot;, path]</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">case ec of</span>
+<span class="lineno">  104 </span><span class="spaces">    </span><span class="istickedoff">ExitSuccess -&gt; pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  105 </span><span class="spaces">    </span><span class="istickedoff">ExitFailure n -&gt; ioError <span class="nottickedoff">(userError (&quot;git add failed (&quot; &lt;&gt; show n &lt;&gt; &quot;): &quot; &lt;&gt; T.unpack err))</span></span></span>
+<span class="lineno">  106 </span>
+<span class="lineno">  107 </span>-- | Commit staged changes with a message. Fails if nothing is staged (the
+<span class="lineno">  108 </span>-- caller is responsible for staging via 'gitAdd' first). Returns @True@ if a
+<span class="lineno">  109 </span>-- commit was created, @False@ if there was nothing to commit.
+<span class="lineno">  110 </span>gitCommit :: ConfigRepo -&gt; Text -&gt; IO Bool
+<span class="lineno">  111 </span><span class="decl"><span class="istickedoff">gitCommit repo msg = do</span>
+<span class="lineno">  112 </span><span class="spaces">  </span><span class="istickedoff">(ec, _out, err) &lt;- runGit (crRoot repo) [&quot;commit&quot;, &quot;-m&quot;, T.unpack msg]</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">case ec of</span>
+<span class="lineno">  114 </span><span class="spaces">    </span><span class="istickedoff">ExitSuccess   -&gt; pure <span class="nottickedoff">True</span></span>
+<span class="lineno">  115 </span><span class="spaces">    </span><span class="istickedoff">-- git exits 1 when there is nothing staged; treat as &quot;nothing to commit&quot;.</span>
+<span class="lineno">  116 </span><span class="spaces">    </span><span class="istickedoff">ExitFailure 1 -&gt; <span class="nottickedoff">pure False</span></span>
+<span class="lineno">  117 </span><span class="spaces">    </span><span class="istickedoff">ExitFailure n -&gt; <span class="nottickedoff">ioError (userError (&quot;git commit failed (&quot; &lt;&gt; show n &lt;&gt; &quot;): &quot; &lt;&gt; T.unpack err))</span></span></span>
+<span class="lineno">  118 </span>
+<span class="lineno">  119 </span>-- | Stage one path and commit it with a message. Returns @True@ if a commit
+<span class="lineno">  120 </span>-- was created. The convenience wrapper for the model-authored write path
+<span class="lineno">  121 </span>-- (each opcode mutation is one file → one commit).
+<span class="lineno">  122 </span>gitCommitAll :: ConfigRepo -&gt; FilePath -&gt; Text -&gt; IO Bool
+<span class="lineno">  123 </span><span class="decl"><span class="istickedoff">gitCommitAll repo path msg = do</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">gitAdd repo path</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="istickedoff">gitCommit repo msg</span></span>
+<span class="lineno">  126 </span>
+<span class="lineno">  127 </span>-- | Run @git@ in @root@ with the given args. Returns the exit code, stdout,
+<span class="lineno">  128 </span>-- and stderr (as decoded Text). Catches process-launch failures (git not on
+<span class="lineno">  129 </span>-- PATH) as an ExitFailure-like result rather than throwing.
+<span class="lineno">  130 </span>runGit :: FilePath -&gt; [String] -&gt; IO (ExitCode, Text, Text)
+<span class="lineno">  131 </span><span class="decl"><span class="istickedoff">runGit root args = do</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">res &lt;- try @SomeException (readProcessBinaryCwd (Just root) &quot;git&quot; args BS.empty)</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="istickedoff">case res of</span>
+<span class="lineno">  134 </span><span class="spaces">    </span><span class="istickedoff">Right (ec, out, err) -&gt;</span>
+<span class="lineno">  135 </span><span class="spaces">      </span><span class="istickedoff">pure (ec, <span class="nottickedoff">TE.decodeUtf8Lenient out</span>, <span class="nottickedoff">TE.decodeUtf8Lenient err</span>)</span>
+<span class="lineno">  136 </span><span class="spaces">    </span><span class="istickedoff">Left e -&gt;</span>
+<span class="lineno">  137 </span><span class="spaces">      </span><span class="istickedoff">pure (ExitFailure <span class="nottickedoff">127</span>, <span class="nottickedoff">&quot;&quot;</span>, <span class="nottickedoff">T.pack (show e)</span>)</span></span>
+<span class="lineno">  138 </span>
+<span class="lineno">  139 </span>-- | Run a process with an optional working directory and a strict
+<span class="lineno">  140 </span>-- 'ByteString' stdin, capturing stdout and stderr as strict 'ByteString's.
+<span class="lineno">  141 </span>-- Used by the git seam (commit messages may carry non-ASCII bytes).
+<span class="lineno">  142 </span>readProcessBinaryCwd :: Maybe FilePath -&gt; FilePath -&gt; [String] -&gt; ByteString
+<span class="lineno">  143 </span>                     -&gt; IO (ExitCode, ByteString, ByteString)
+<span class="lineno">  144 </span><span class="decl"><span class="istickedoff">readProcessBinaryCwd mCwd cmdPath args input =</span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="istickedoff">withCreateProcess</span>
+<span class="lineno">  146 </span><span class="spaces">    </span><span class="istickedoff">( (proc cmdPath args)</span>
+<span class="lineno">  147 </span><span class="spaces">        </span><span class="istickedoff">{ cwd = mCwd</span>
+<span class="lineno">  148 </span><span class="spaces">        </span><span class="istickedoff">, std_in = CreatePipe, std_out = CreatePipe, std_err = CreatePipe</span>
+<span class="lineno">  149 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">  150 </span><span class="spaces">    </span><span class="istickedoff">) $ \mIn mOut mErr ph -&gt; do</span>
+<span class="lineno">  151 </span><span class="spaces">      </span><span class="istickedoff">(hIn, hOut, hErr) &lt;- case (mIn, mOut, mErr) of</span>
+<span class="lineno">  152 </span><span class="spaces">        </span><span class="istickedoff">(Just a, Just b, Just c) -&gt; pure (a, b, c)</span>
+<span class="lineno">  153 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">error &quot;readProcessBinaryCwd: pipe creation failed (unreachable)&quot;</span></span>
+<span class="lineno">  154 </span><span class="spaces">      </span><span class="istickedoff">BS.hPutStr <span class="nottickedoff">hIn</span> input</span>
+<span class="lineno">  155 </span><span class="spaces">      </span><span class="istickedoff">hFlush hIn</span>
+<span class="lineno">  156 </span><span class="spaces">      </span><span class="istickedoff">hClose hIn</span>
+<span class="lineno">  157 </span><span class="spaces">      </span><span class="istickedoff">out &lt;- BS.hGetContents hOut</span>
+<span class="lineno">  158 </span><span class="spaces">      </span><span class="istickedoff">err &lt;- BS.hGetContents hErr</span>
+<span class="lineno">  159 </span><span class="spaces">      </span><span class="istickedoff">ec  &lt;- waitForProcess ph</span>
+<span class="lineno">  160 </span><span class="spaces">      </span><span class="istickedoff">let !_ = BS.length out</span>
+<span class="lineno">  161 </span><span class="spaces">          </span><span class="istickedoff">!_ = BS.length err</span>
+<span class="lineno">  162 </span><span class="spaces">      </span><span class="istickedoff">pure (ec, <span class="nottickedoff">out</span>, <span class="nottickedoff">err</span>)</span></span>
+<span class="lineno">  163 </span>
+<span class="lineno">  164 </span>-- | Like 'readProcessBinaryCwd' but with an explicit environment override.
+<span class="lineno">  165 </span>-- The given @[(String,String)]@ is MERGED over the current process
+<span class="lineno">  166 </span>-- environment ('System.Environment.getEnvironment'), so the child still
+<span class="lineno">  167 </span>-- inherits @PATH@, @HOME@, etc. Used by the clone seam
+<span class="lineno">  168 </span>-- ('Seal.SourceControl.Clone') to inject @GIT_ASKPASS@ / @GIT_SSH_COMMAND@ /
+<span class="lineno">  169 </span>-- @GIT_TERMINAL_PROMPT@ without re-implementing 'withCreateProcess'.
+<span class="lineno">  170 </span>--
+<span class="lineno">  171 </span>-- Security invariant: the @extras@ MUST carry only non-secret values (paths
+<span class="lineno">  172 </span>-- + flags) — the clone seam ensures the secret bytes live only in the temp
+<span class="lineno">  173 </span>-- files referenced by those paths, never in the env values themselves.
+<span class="lineno">  174 </span>readProcessBinaryCwdEnv
+<span class="lineno">  175 </span>  :: Maybe FilePath
+<span class="lineno">  176 </span>  -&gt; [(String, String)]
+<span class="lineno">  177 </span>  -&gt; FilePath
+<span class="lineno">  178 </span>  -&gt; [String]
+<span class="lineno">  179 </span>  -&gt; ByteString
+<span class="lineno">  180 </span>  -&gt; IO (ExitCode, ByteString, ByteString)
+<span class="lineno">  181 </span><span class="decl"><span class="nottickedoff">readProcessBinaryCwdEnv mCwd extras cmdPath args input = do</span>
+<span class="lineno">  182 </span><span class="spaces">  </span><span class="nottickedoff">inherited &lt;- getEnvironment</span>
+<span class="lineno">  183 </span><span class="spaces">  </span><span class="nottickedoff">let mergedEnv = Map.toList (Map.union (Map.fromList extras) (Map.fromList inherited))</span>
+<span class="lineno">  184 </span><span class="spaces">  </span><span class="nottickedoff">withCreateProcess</span>
+<span class="lineno">  185 </span><span class="spaces">    </span><span class="nottickedoff">( (proc cmdPath args)</span>
+<span class="lineno">  186 </span><span class="spaces">        </span><span class="nottickedoff">{ cwd = mCwd</span>
+<span class="lineno">  187 </span><span class="spaces">        </span><span class="nottickedoff">, env = Just mergedEnv</span>
+<span class="lineno">  188 </span><span class="spaces">        </span><span class="nottickedoff">, std_in = CreatePipe, std_out = CreatePipe, std_err = CreatePipe</span>
+<span class="lineno">  189 </span><span class="spaces">        </span><span class="nottickedoff">}</span>
+<span class="lineno">  190 </span><span class="spaces">    </span><span class="nottickedoff">) $ \mIn mOut mErr ph -&gt; do</span>
+<span class="lineno">  191 </span><span class="spaces">      </span><span class="nottickedoff">(hIn, hOut, hErr) &lt;- case (mIn, mOut, mErr) of</span>
+<span class="lineno">  192 </span><span class="spaces">        </span><span class="nottickedoff">(Just a, Just b, Just c) -&gt; pure (a, b, c)</span>
+<span class="lineno">  193 </span><span class="spaces">        </span><span class="nottickedoff">_ -&gt; error &quot;readProcessBinaryCwdEnv: pipe creation failed (unreachable)&quot;</span>
+<span class="lineno">  194 </span><span class="spaces">      </span><span class="nottickedoff">BS.hPutStr hIn input</span>
+<span class="lineno">  195 </span><span class="spaces">      </span><span class="nottickedoff">hFlush hIn</span>
+<span class="lineno">  196 </span><span class="spaces">      </span><span class="nottickedoff">hClose hIn</span>
+<span class="lineno">  197 </span><span class="spaces">      </span><span class="nottickedoff">out &lt;- BS.hGetContents hOut</span>
+<span class="lineno">  198 </span><span class="spaces">      </span><span class="nottickedoff">err &lt;- BS.hGetContents hErr</span>
+<span class="lineno">  199 </span><span class="spaces">      </span><span class="nottickedoff">ec  &lt;- waitForProcess ph</span>
+<span class="lineno">  200 </span><span class="spaces">      </span><span class="nottickedoff">let !_ = BS.length out</span>
+<span class="lineno">  201 </span><span class="spaces">          </span><span class="nottickedoff">!_ = BS.length err</span>
+<span class="lineno">  202 </span><span class="spaces">      </span><span class="nottickedoff">pure (ec, out, err)</span></span>
+
+</pre>
+</body>
+</html>

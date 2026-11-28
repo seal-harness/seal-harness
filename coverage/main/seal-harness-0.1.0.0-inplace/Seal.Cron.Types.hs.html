@@ -1,0 +1,449 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Cron types: smart-constructed newtypes for job IDs, cron expressions,
+<span class="lineno">    3 </span>-- and timezones, plus the 'CronJob' and 'CronRun' data types.
+<span class="lineno">    4 </span>module Seal.Cron.Types
+<span class="lineno">    5 </span>  ( CronJobId (..)
+<span class="lineno">    6 </span>  , mkCronJobId
+<span class="lineno">    7 </span>  , cronJobIdText
+<span class="lineno">    8 </span>  , CronExpr (..)
+<span class="lineno">    9 </span>  , mkCronExpr
+<span class="lineno">   10 </span>  , cronExprText
+<span class="lineno">   11 </span>  , CronTimeZone (..)
+<span class="lineno">   12 </span>  , mkCronTimeZone
+<span class="lineno">   13 </span>  , cronTimeZoneText
+<span class="lineno">   14 </span>  , validateCronTimeZone
+<span class="lineno">   15 </span>  , CronJob (..)
+<span class="lineno">   16 </span>  , CronRun (..)
+<span class="lineno">   17 </span>  , CronRunStatus (..)
+<span class="lineno">   18 </span>  , slugify
+<span class="lineno">   19 </span>  , computeNextFire
+<span class="lineno">   20 </span>  ) where
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>import Data.Aeson
+<span class="lineno">   23 </span>  ( FromJSON (..), ToJSON (..), object, withObject, (.:), (.:?), (.=) )
+<span class="lineno">   24 </span>import qualified Data.ByteString.Char8 as BS
+<span class="lineno">   25 </span>import Data.Char (isAlphaNum, isAscii, isAsciiLower, isDigit, toLower)
+<span class="lineno">   26 </span>import Data.List.NonEmpty (NonEmpty, toList)
+<span class="lineno">   27 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   28 </span>import Control.Exception (try, SomeException)
+<span class="lineno">   29 </span>import Data.Text (Text)
+<span class="lineno">   30 </span>import Data.Text qualified as T
+<span class="lineno">   31 </span>import Data.Time
+<span class="lineno">   32 </span>  ( UTCTime (..), toGregorian, DayOfWeek (..), dayOfWeek
+<span class="lineno">   33 </span>  , addUTCTime, utc, utcToLocalTime, localTimeToUTC )
+<span class="lineno">   34 </span>import GHC.Generics (Generic)
+<span class="lineno">   35 </span>
+<span class="lineno">   36 </span>import System.Cron.Parser (parseCronSchedule)
+<span class="lineno">   37 </span>import System.Cron.Types (CronSchedule)
+<span class="lineno">   38 </span>import System.Cron.Internal.Check (Expanded (..), expand)
+<span class="lineno">   39 </span>import Data.Time.Zones (TZ, loadSystemTZ, utcToLocalTimeTZ, localTimeToUTCTZ)
+<span class="lineno">   40 </span>import qualified Data.Time.Zones.All as ZonesAll
+<span class="lineno">   41 </span>
+<span class="lineno">   42 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   43 </span>-- CronJobId
+<span class="lineno">   44 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   45 </span>
+<span class="lineno">   46 </span>newtype CronJobId = CronJobId { <span class="istickedoff"><span class="decl"><span class="istickedoff">unCronJobId</span></span></span> :: Text }
+<span class="lineno">   47 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   48 </span>  deriving newtype (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>)
+<span class="lineno">   49 </span>
+<span class="lineno">   50 </span>mkCronJobId :: Text -&gt; Either Text CronJobId
+<span class="lineno">   51 </span><span class="decl"><span class="istickedoff">mkCronJobId t</span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">| T.null t = Left <span class="nottickedoff">&quot;cron job id must not be empty&quot;</span></span>
+<span class="lineno">   53 </span><span class="spaces">  </span><span class="istickedoff">| T.length t &gt; 64 = Left <span class="nottickedoff">&quot;cron job id must be at most 64 characters&quot;</span></span>
+<span class="lineno">   54 </span><span class="spaces">  </span><span class="istickedoff">| T.head t == '-' = Left <span class="nottickedoff">&quot;cron job id must not start with a dash&quot;</span></span>
+<span class="lineno">   55 </span><span class="spaces">  </span><span class="istickedoff">| not (T.all isValidIdChar t) = Left <span class="nottickedoff">&quot;cron job id must contain only [a-z0-9-]&quot;</span></span>
+<span class="lineno">   56 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Right (CronJobId t)</span></span>
+<span class="lineno">   57 </span>
+<span class="lineno">   58 </span>isValidIdChar :: Char -&gt; Bool
+<span class="lineno">   59 </span><span class="decl"><span class="istickedoff">isValidIdChar c = isAsciiLower c || isDigit c || c == '-'</span></span>
+<span class="lineno">   60 </span>
+<span class="lineno">   61 </span>cronJobIdText :: CronJobId -&gt; Text
+<span class="lineno">   62 </span><span class="decl"><span class="istickedoff">cronJobIdText = unCronJobId</span></span>
+<span class="lineno">   63 </span>
+<span class="lineno">   64 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON CronJobId</span></span></span></span> where
+<span class="lineno">   65 </span>  <span class="decl"><span class="istickedoff">parseJSON = withObject <span class="nottickedoff">&quot;CronJobId&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">   66 </span><span class="spaces">    </span><span class="istickedoff">t &lt;- o .: &quot;id&quot;</span>
+<span class="lineno">   67 </span><span class="spaces">    </span><span class="istickedoff">case mkCronJobId t of</span>
+<span class="lineno">   68 </span><span class="spaces">      </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">fail (T.unpack e)</span></span>
+<span class="lineno">   69 </span><span class="spaces">      </span><span class="istickedoff">Right cid -&gt; pure cid</span></span>
+<span class="lineno">   70 </span>
+<span class="lineno">   71 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   72 </span>-- CronExpr
+<span class="lineno">   73 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   74 </span>
+<span class="lineno">   75 </span>-- | A validated 5-field cron expression (e.g. @&quot;0 9 * * 1-5&quot;@). The
+<span class="lineno">   76 </span>-- underlying 'CronSchedule' is parsed at construction time.
+<span class="lineno">   77 </span>data CronExpr = CronExpr
+<span class="lineno">   78 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">ceSchedule</span></span></span> :: !CronSchedule
+<span class="lineno">   79 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">ceText</span></span></span>     :: !Text
+<span class="lineno">   80 </span>  }
+<span class="lineno">   81 </span>
+<span class="lineno">   82 </span>mkCronExpr :: Text -&gt; Either Text CronExpr
+<span class="lineno">   83 </span><span class="decl"><span class="istickedoff">mkCronExpr t</span>
+<span class="lineno">   84 </span><span class="spaces">  </span><span class="istickedoff">| T.null t = Left <span class="nottickedoff">&quot;cron expression must not be empty&quot;</span></span>
+<span class="lineno">   85 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case parseCronSchedule t of</span>
+<span class="lineno">   86 </span><span class="spaces">      </span><span class="istickedoff">Left err -&gt; Left <span class="nottickedoff">(&quot;invalid cron expression: &quot; &lt;&gt; t &lt;&gt; &quot; (&quot; &lt;&gt; T.pack err &lt;&gt; &quot;)&quot;)</span></span>
+<span class="lineno">   87 </span><span class="spaces">      </span><span class="istickedoff">Right sched -&gt; Right (CronExpr { ceSchedule = sched, ceText = t })</span></span>
+<span class="lineno">   88 </span>
+<span class="lineno">   89 </span>cronExprText :: CronExpr -&gt; Text
+<span class="lineno">   90 </span><span class="decl"><span class="istickedoff">cronExprText = ceText</span></span>
+<span class="lineno">   91 </span>
+<span class="lineno">   92 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON CronExpr</span></span></span></span></span></span></span></span> where
+<span class="lineno">   93 </span>  <span class="decl"><span class="istickedoff">toJSON = toJSON . ceText</span></span>
+<span class="lineno">   94 </span>
+<span class="lineno">   95 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON CronExpr</span></span></span></span> where
+<span class="lineno">   96 </span>  <span class="decl"><span class="istickedoff">parseJSON v = do</span>
+<span class="lineno">   97 </span><span class="spaces">    </span><span class="istickedoff">t &lt;- parseJSON v</span>
+<span class="lineno">   98 </span><span class="spaces">    </span><span class="istickedoff">case mkCronExpr t of</span>
+<span class="lineno">   99 </span><span class="spaces">      </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">fail (T.unpack e)</span></span>
+<span class="lineno">  100 </span><span class="spaces">      </span><span class="istickedoff">Right e -&gt; pure e</span></span>
+<span class="lineno">  101 </span>
+<span class="lineno">  102 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show CronExpr</span></span></span></span> where
+<span class="lineno">  103 </span>  <span class="decl"><span class="nottickedoff">show = T.unpack . ceText</span></span>
+<span class="lineno">  104 </span>
+<span class="lineno">  105 </span>instance <span class="decl"><span class="nottickedoff">Eq CronExpr</span></span> where
+<span class="lineno">  106 </span>  <span class="decl"><span class="istickedoff">a == b = ceText a == ceText b</span></span>
+<span class="lineno">  107 </span>
+<span class="lineno">  108 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord CronExpr</span></span></span></span></span></span></span></span></span></span></span></span> where
+<span class="lineno">  109 </span>  <span class="decl"><span class="nottickedoff">compare a b = compare (ceText a) (ceText b)</span></span>
+<span class="lineno">  110 </span>
+<span class="lineno">  111 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  112 </span>-- CronTimeZone
+<span class="lineno">  113 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  114 </span>
+<span class="lineno">  115 </span>newtype CronTimeZone = CronTimeZone { <span class="istickedoff"><span class="decl"><span class="istickedoff">unCronTimeZone</span></span></span> :: Text }
+<span class="lineno">  116 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  117 </span>  deriving newtype (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>)
+<span class="lineno">  118 </span>
+<span class="lineno">  119 </span>mkCronTimeZone :: Text -&gt; Either Text CronTimeZone
+<span class="lineno">  120 </span><span class="decl"><span class="istickedoff">mkCronTimeZone t</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">| T.null t = Left <span class="nottickedoff">&quot;timezone must not be empty&quot;</span></span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">| not (isValidIanaTz t) = Left <span class="nottickedoff">&quot;timezone must be a valid IANA identifier (e.g. America/New_York)&quot;</span></span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Right (CronTimeZone t)</span></span>
+<span class="lineno">  124 </span>
+<span class="lineno">  125 </span>-- | Validate a 'CronTimeZone' against the tz database. The pure
+<span class="lineno">  126 </span>-- 'mkCronTimeZone' constructor checks format only; this IO function
+<span class="lineno">  127 </span>-- additionally verifies the zone exists in the database (e.g.
+<span class="lineno">  128 </span>-- @&quot;Not/AZone&quot;@ passes the format check but is not a real zone). Used
+<span class="lineno">  129 </span>-- at the write boundary on both the opcode and web paths so a bad zone
+<span class="lineno">  130 </span>-- can never enter the store and kill the scheduler thread.
+<span class="lineno">  131 </span>validateCronTimeZone :: CronTimeZone -&gt; IO (Either Text ())
+<span class="lineno">  132 </span><span class="decl"><span class="istickedoff">validateCronTimeZone tz = do</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="istickedoff">eEx &lt;- loadCronTZ tz</span>
+<span class="lineno">  134 </span><span class="spaces">  </span><span class="istickedoff">pure $ case eEx of</span>
+<span class="lineno">  135 </span><span class="spaces">    </span><span class="istickedoff">Left (_ :: SomeException) -&gt; Left <span class="nottickedoff">(&quot;timezone not found in tz database: &quot; &lt;&gt; cronTimeZoneText tz)</span></span>
+<span class="lineno">  136 </span><span class="spaces">    </span><span class="istickedoff">Right _ -&gt; Right ()</span></span>
+<span class="lineno">  137 </span>
+<span class="lineno">  138 </span>isValidIanaTz :: Text -&gt; Bool
+<span class="lineno">  139 </span><span class="decl"><span class="istickedoff">isValidIanaTz t =</span>
+<span class="lineno">  140 </span><span class="spaces">  </span><span class="istickedoff">let parts = T.splitOn &quot;/&quot; t</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">in length parts &gt;= 2 &amp;&amp; not (any T.null parts) &amp;&amp; all isValidTzComponent parts</span></span>
+<span class="lineno">  142 </span>
+<span class="lineno">  143 </span>isValidTzComponent :: Text -&gt; Bool
+<span class="lineno">  144 </span><span class="decl"><span class="istickedoff">isValidTzComponent = T.all (\c -&gt; isAscii c &amp;&amp; (isAlphaNum c || c == '_' || <span class="nottickedoff">c == '-'</span>))</span></span>
+<span class="lineno">  145 </span>
+<span class="lineno">  146 </span>cronTimeZoneText :: CronTimeZone -&gt; Text
+<span class="lineno">  147 </span><span class="decl"><span class="istickedoff">cronTimeZoneText = unCronTimeZone</span></span>
+<span class="lineno">  148 </span>
+<span class="lineno">  149 </span>-- | Load a zone from the host tz database, falling back to the database
+<span class="lineno">  150 </span>-- embedded in @tzdata@. The fallback keeps static release binaries portable:
+<span class="lineno">  151 </span>-- 'loadTZFromDB' resolves to a build-time Nix store data path that does not
+<span class="lineno">  152 </span>-- exist on a machine without Nix.
+<span class="lineno">  153 </span>loadCronTZ :: CronTimeZone -&gt; IO (Either SomeException TZ)
+<span class="lineno">  154 </span><span class="decl"><span class="istickedoff">loadCronTZ zone = do</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">let name = T.unpack (cronTimeZoneText zone)</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="istickedoff">eSystem &lt;- try (loadSystemTZ name)</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="istickedoff">pure $ case eSystem of</span>
+<span class="lineno">  158 </span><span class="spaces">    </span><span class="istickedoff">Right loaded -&gt; Right loaded</span>
+<span class="lineno">  159 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; case ZonesAll.tzByName (BS.pack name) of</span>
+<span class="lineno">  160 </span><span class="spaces">      </span><span class="istickedoff">Just loaded -&gt; Right <span class="nottickedoff">loaded</span></span>
+<span class="lineno">  161 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; Left <span class="nottickedoff">err</span></span></span>
+<span class="lineno">  162 </span>
+<span class="lineno">  163 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON CronTimeZone</span></span></span></span> where
+<span class="lineno">  164 </span>  <span class="decl"><span class="nottickedoff">parseJSON v = do</span>
+<span class="lineno">  165 </span><span class="spaces">    </span><span class="nottickedoff">t &lt;- parseJSON v</span>
+<span class="lineno">  166 </span><span class="spaces">    </span><span class="nottickedoff">case mkCronTimeZone t of</span>
+<span class="lineno">  167 </span><span class="spaces">      </span><span class="nottickedoff">Left e -&gt; fail (T.unpack e)</span>
+<span class="lineno">  168 </span><span class="spaces">      </span><span class="nottickedoff">Right tz -&gt; pure tz</span></span>
+<span class="lineno">  169 </span>
+<span class="lineno">  170 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  171 </span>-- CronJob
+<span class="lineno">  172 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  173 </span>
+<span class="lineno">  174 </span>data CronJob = CronJob
+<span class="lineno">  175 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">cjId</span></span></span>          :: !CronJobId
+<span class="lineno">  176 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cjName</span></span></span>        :: !Text
+<span class="lineno">  177 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cjSchedule</span></span></span>    :: !CronExpr
+<span class="lineno">  178 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cjTimezone</span></span></span>    :: !(Maybe CronTimeZone)
+<span class="lineno">  179 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cjPrompt</span></span></span>      :: !Text
+<span class="lineno">  180 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cjAgentDefId</span></span></span>  :: !(Maybe Text)
+<span class="lineno">  181 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cjProvider</span></span></span>    :: !(Maybe Text)
+<span class="lineno">  182 </span>    -- ^ Optional provider override. 'Nothing' means &quot;use Seal's configured
+<span class="lineno">  183 </span>    -- default provider&quot;. Validated at the write boundary by 'isProviderName'
+<span class="lineno">  184 </span>    -- (syntactic only — an unconfigured-but-valid name is caught at fire time).
+<span class="lineno">  185 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cjModel</span></span></span>       :: !(Maybe Text)
+<span class="lineno">  186 </span>    -- ^ Optional model override. 'Nothing' means &quot;use Seal's configured
+<span class="lineno">  187 </span>    -- default model&quot;. Independent of 'cjProvider': a model with no provider
+<span class="lineno">  188 </span>    -- applies to whichever provider resolves at fire time.
+<span class="lineno">  189 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cjEnabled</span></span></span>     :: !Bool
+<span class="lineno">  190 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cjOneShot</span></span></span>     :: !Bool
+<span class="lineno">  191 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cjCreatedAt</span></span></span>   :: !UTCTime
+<span class="lineno">  192 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cjUpdatedAt</span></span></span>   :: !UTCTime
+<span class="lineno">  193 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cjLastFire</span></span></span>    :: !(Maybe UTCTime)
+<span class="lineno">  194 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cjRunCount</span></span></span>    :: !Int
+<span class="lineno">  195 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">cjConsecutiveFailures</span></span></span> :: !Int
+<span class="lineno">  196 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">  197 </span>
+<span class="lineno">  198 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON CronJob</span></span></span></span></span></span></span></span> where
+<span class="lineno">  199 </span>  <span class="decl"><span class="istickedoff">toJSON j = object</span>
+<span class="lineno">  200 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;id&quot; .= cjId j</span>
+<span class="lineno">  201 </span><span class="spaces">    </span><span class="istickedoff">, &quot;name&quot; .= cjName j</span>
+<span class="lineno">  202 </span><span class="spaces">    </span><span class="istickedoff">, &quot;schedule&quot; .= cjSchedule j</span>
+<span class="lineno">  203 </span><span class="spaces">    </span><span class="istickedoff">, &quot;timezone&quot; .= cjTimezone j</span>
+<span class="lineno">  204 </span><span class="spaces">    </span><span class="istickedoff">, &quot;prompt&quot; .= cjPrompt j</span>
+<span class="lineno">  205 </span><span class="spaces">    </span><span class="istickedoff">, &quot;agent_def_id&quot; .= cjAgentDefId j</span>
+<span class="lineno">  206 </span><span class="spaces">    </span><span class="istickedoff">, &quot;provider&quot; .= cjProvider j</span>
+<span class="lineno">  207 </span><span class="spaces">    </span><span class="istickedoff">, &quot;model&quot; .= cjModel j</span>
+<span class="lineno">  208 </span><span class="spaces">    </span><span class="istickedoff">, &quot;enabled&quot; .= cjEnabled j</span>
+<span class="lineno">  209 </span><span class="spaces">    </span><span class="istickedoff">, &quot;one_shot&quot; .= cjOneShot j</span>
+<span class="lineno">  210 </span><span class="spaces">    </span><span class="istickedoff">, &quot;created_at&quot; .= cjCreatedAt j</span>
+<span class="lineno">  211 </span><span class="spaces">    </span><span class="istickedoff">, &quot;updated_at&quot; .= cjUpdatedAt j</span>
+<span class="lineno">  212 </span><span class="spaces">    </span><span class="istickedoff">, &quot;last_fire&quot; .= cjLastFire j</span>
+<span class="lineno">  213 </span><span class="spaces">    </span><span class="istickedoff">, &quot;run_count&quot; .= cjRunCount j</span>
+<span class="lineno">  214 </span><span class="spaces">    </span><span class="istickedoff">, &quot;consecutive_failures&quot; .= cjConsecutiveFailures j</span>
+<span class="lineno">  215 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">  216 </span>
+<span class="lineno">  217 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON CronJob</span></span></span></span> where
+<span class="lineno">  218 </span>  <span class="decl"><span class="istickedoff">parseJSON = withObject <span class="nottickedoff">&quot;CronJob&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">  219 </span><span class="spaces">    </span><span class="istickedoff">rawId &lt;- o .: &quot;id&quot;</span>
+<span class="lineno">  220 </span><span class="spaces">    </span><span class="istickedoff">cid &lt;- either <span class="nottickedoff">(fail . T.unpack)</span> pure (mkCronJobId rawId)</span>
+<span class="lineno">  221 </span><span class="spaces">    </span><span class="istickedoff">name &lt;- o .: &quot;name&quot;</span>
+<span class="lineno">  222 </span><span class="spaces">    </span><span class="istickedoff">sched &lt;- o .: &quot;schedule&quot;</span>
+<span class="lineno">  223 </span><span class="spaces">    </span><span class="istickedoff">mTz &lt;- o .:? &quot;timezone&quot;</span>
+<span class="lineno">  224 </span><span class="spaces">    </span><span class="istickedoff">prompt &lt;- o .: &quot;prompt&quot;</span>
+<span class="lineno">  225 </span><span class="spaces">    </span><span class="istickedoff">mAgentDefId &lt;- o .:? &quot;agent_def_id&quot;</span>
+<span class="lineno">  226 </span><span class="spaces">    </span><span class="istickedoff">mProvider &lt;- o .:? &quot;provider&quot;</span>
+<span class="lineno">  227 </span><span class="spaces">    </span><span class="istickedoff">mModel &lt;- o .:? &quot;model&quot;</span>
+<span class="lineno">  228 </span><span class="spaces">    </span><span class="istickedoff">enabled &lt;- o .: &quot;enabled&quot;</span>
+<span class="lineno">  229 </span><span class="spaces">    </span><span class="istickedoff">oneShot &lt;- o .: &quot;one_shot&quot;</span>
+<span class="lineno">  230 </span><span class="spaces">    </span><span class="istickedoff">createdAt &lt;- o .: &quot;created_at&quot;</span>
+<span class="lineno">  231 </span><span class="spaces">    </span><span class="istickedoff">updatedAt &lt;- o .: &quot;updated_at&quot;</span>
+<span class="lineno">  232 </span><span class="spaces">    </span><span class="istickedoff">mLastFire &lt;- o .:? &quot;last_fire&quot;</span>
+<span class="lineno">  233 </span><span class="spaces">    </span><span class="istickedoff">runCount &lt;- o .: &quot;run_count&quot;</span>
+<span class="lineno">  234 </span><span class="spaces">    </span><span class="istickedoff">failCount &lt;- fromMaybe 0 &lt;$&gt; o .:? &quot;consecutive_failures&quot;</span>
+<span class="lineno">  235 </span><span class="spaces">    </span><span class="istickedoff">pure CronJob</span>
+<span class="lineno">  236 </span><span class="spaces">      </span><span class="istickedoff">{ cjId = cid</span>
+<span class="lineno">  237 </span><span class="spaces">      </span><span class="istickedoff">, cjName = name</span>
+<span class="lineno">  238 </span><span class="spaces">      </span><span class="istickedoff">, cjSchedule = sched</span>
+<span class="lineno">  239 </span><span class="spaces">      </span><span class="istickedoff">, cjTimezone = mTz</span>
+<span class="lineno">  240 </span><span class="spaces">      </span><span class="istickedoff">, cjPrompt = prompt</span>
+<span class="lineno">  241 </span><span class="spaces">      </span><span class="istickedoff">, cjAgentDefId = mAgentDefId</span>
+<span class="lineno">  242 </span><span class="spaces">      </span><span class="istickedoff">, cjProvider = mProvider</span>
+<span class="lineno">  243 </span><span class="spaces">      </span><span class="istickedoff">, cjModel = mModel</span>
+<span class="lineno">  244 </span><span class="spaces">      </span><span class="istickedoff">, cjEnabled = enabled</span>
+<span class="lineno">  245 </span><span class="spaces">      </span><span class="istickedoff">, cjOneShot = oneShot</span>
+<span class="lineno">  246 </span><span class="spaces">      </span><span class="istickedoff">, cjCreatedAt = createdAt</span>
+<span class="lineno">  247 </span><span class="spaces">      </span><span class="istickedoff">, cjUpdatedAt = updatedAt</span>
+<span class="lineno">  248 </span><span class="spaces">      </span><span class="istickedoff">, cjLastFire = mLastFire</span>
+<span class="lineno">  249 </span><span class="spaces">      </span><span class="istickedoff">, cjRunCount = runCount</span>
+<span class="lineno">  250 </span><span class="spaces">      </span><span class="istickedoff">, cjConsecutiveFailures = failCount</span>
+<span class="lineno">  251 </span><span class="spaces">      </span><span class="istickedoff">}</span></span>
+<span class="lineno">  252 </span>
+<span class="lineno">  253 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  254 </span>-- CronRun + CronRunStatus
+<span class="lineno">  255 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  256 </span>
+<span class="lineno">  257 </span>data CronRunStatus = CrPending | CrRunning | CrCompleted | CrFailed
+<span class="lineno">  258 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">  259 </span>
+<span class="lineno">  260 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON CronRunStatus</span></span></span></span></span></span></span></span> where
+<span class="lineno">  261 </span>  <span class="decl"><span class="istickedoff">toJSON s = toJSON $ case s of</span>
+<span class="lineno">  262 </span><span class="spaces">    </span><span class="istickedoff">CrPending -&gt; (&quot;pending&quot; :: Text)</span>
+<span class="lineno">  263 </span><span class="spaces">    </span><span class="istickedoff">CrRunning -&gt; &quot;running&quot;</span>
+<span class="lineno">  264 </span><span class="spaces">    </span><span class="istickedoff">CrCompleted -&gt; &quot;completed&quot;</span>
+<span class="lineno">  265 </span><span class="spaces">    </span><span class="istickedoff">CrFailed -&gt; &quot;failed&quot;</span></span>
+<span class="lineno">  266 </span>
+<span class="lineno">  267 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON CronRunStatus</span></span></span></span> where
+<span class="lineno">  268 </span>  <span class="decl"><span class="istickedoff">parseJSON v = do</span>
+<span class="lineno">  269 </span><span class="spaces">    </span><span class="istickedoff">t &lt;- parseJSON v</span>
+<span class="lineno">  270 </span><span class="spaces">    </span><span class="istickedoff">case t :: Text of</span>
+<span class="lineno">  271 </span><span class="spaces">      </span><span class="istickedoff">&quot;pending&quot; -&gt; pure CrPending</span>
+<span class="lineno">  272 </span><span class="spaces">      </span><span class="istickedoff">&quot;running&quot; -&gt; pure CrRunning</span>
+<span class="lineno">  273 </span><span class="spaces">      </span><span class="istickedoff">&quot;completed&quot; -&gt; pure CrCompleted</span>
+<span class="lineno">  274 </span><span class="spaces">      </span><span class="istickedoff">&quot;failed&quot; -&gt; pure CrFailed</span>
+<span class="lineno">  275 </span><span class="spaces">      </span><span class="istickedoff">other -&gt; <span class="nottickedoff">fail (&quot;unknown cron run status: &quot; &lt;&gt; T.unpack other)</span></span></span>
+<span class="lineno">  276 </span>
+<span class="lineno">  277 </span>data CronRun = CronRun
+<span class="lineno">  278 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">crJobId</span></span></span>     :: !CronJobId
+<span class="lineno">  279 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">crSessionId</span></span></span> :: !Text
+<span class="lineno">  280 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">crStartedAt</span></span></span> :: !UTCTime
+<span class="lineno">  281 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">crEndedAt</span></span></span>   :: !(Maybe UTCTime)
+<span class="lineno">  282 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">crStatus</span></span></span>    :: !CronRunStatus
+<span class="lineno">  283 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">crError</span></span></span>     :: !(Maybe Text)
+<span class="lineno">  284 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">  285 </span>
+<span class="lineno">  286 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON CronRun</span></span></span></span></span></span></span></span> where
+<span class="lineno">  287 </span>  <span class="decl"><span class="istickedoff">toJSON r = object</span>
+<span class="lineno">  288 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;job_id&quot; .= crJobId r</span>
+<span class="lineno">  289 </span><span class="spaces">    </span><span class="istickedoff">, &quot;session_id&quot; .= crSessionId r</span>
+<span class="lineno">  290 </span><span class="spaces">    </span><span class="istickedoff">, &quot;started_at&quot; .= crStartedAt r</span>
+<span class="lineno">  291 </span><span class="spaces">    </span><span class="istickedoff">, &quot;ended_at&quot; .= crEndedAt r</span>
+<span class="lineno">  292 </span><span class="spaces">    </span><span class="istickedoff">, &quot;status&quot; .= crStatus r</span>
+<span class="lineno">  293 </span><span class="spaces">    </span><span class="istickedoff">, &quot;error&quot; .= crError r</span>
+<span class="lineno">  294 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">  295 </span>
+<span class="lineno">  296 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON CronRun</span></span></span></span> where
+<span class="lineno">  297 </span>  <span class="decl"><span class="istickedoff">parseJSON = withObject <span class="nottickedoff">&quot;CronRun&quot;</span> $ \o -&gt; do</span>
+<span class="lineno">  298 </span><span class="spaces">    </span><span class="istickedoff">rawJobId &lt;- o .: &quot;job_id&quot;</span>
+<span class="lineno">  299 </span><span class="spaces">    </span><span class="istickedoff">jid &lt;- either <span class="nottickedoff">(fail . T.unpack)</span> pure (mkCronJobId rawJobId)</span>
+<span class="lineno">  300 </span><span class="spaces">    </span><span class="istickedoff">sid &lt;- o .: &quot;session_id&quot;</span>
+<span class="lineno">  301 </span><span class="spaces">    </span><span class="istickedoff">started &lt;- o .: &quot;started_at&quot;</span>
+<span class="lineno">  302 </span><span class="spaces">    </span><span class="istickedoff">mEnded &lt;- o .:? &quot;ended_at&quot;</span>
+<span class="lineno">  303 </span><span class="spaces">    </span><span class="istickedoff">status &lt;- o .: &quot;status&quot;</span>
+<span class="lineno">  304 </span><span class="spaces">    </span><span class="istickedoff">mErr &lt;- o .:? &quot;error&quot;</span>
+<span class="lineno">  305 </span><span class="spaces">    </span><span class="istickedoff">pure CronRun</span>
+<span class="lineno">  306 </span><span class="spaces">      </span><span class="istickedoff">{ crJobId = jid</span>
+<span class="lineno">  307 </span><span class="spaces">      </span><span class="istickedoff">, crSessionId = sid</span>
+<span class="lineno">  308 </span><span class="spaces">      </span><span class="istickedoff">, crStartedAt = started</span>
+<span class="lineno">  309 </span><span class="spaces">      </span><span class="istickedoff">, crEndedAt = mEnded</span>
+<span class="lineno">  310 </span><span class="spaces">      </span><span class="istickedoff">, crStatus = status</span>
+<span class="lineno">  311 </span><span class="spaces">      </span><span class="istickedoff">, crError = mErr</span>
+<span class="lineno">  312 </span><span class="spaces">      </span><span class="istickedoff">}</span></span>
+<span class="lineno">  313 </span>
+<span class="lineno">  314 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  315 </span>-- Slug
+<span class="lineno">  316 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  317 </span>
+<span class="lineno">  318 </span>slugify :: Text -&gt; Text
+<span class="lineno">  319 </span><span class="decl"><span class="istickedoff">slugify name =</span>
+<span class="lineno">  320 </span><span class="spaces">  </span><span class="istickedoff">let lowered = T.map toLower name</span>
+<span class="lineno">  321 </span><span class="spaces">      </span><span class="istickedoff">slugged = T.map (\c -&gt; if isSlugChar c then c else '-') lowered</span>
+<span class="lineno">  322 </span><span class="spaces">      </span><span class="istickedoff">collapsed = collapseDashes slugged</span>
+<span class="lineno">  323 </span><span class="spaces">      </span><span class="istickedoff">trimmed = T.dropWhile (== '-') (T.dropWhileEnd (== '-') collapsed)</span>
+<span class="lineno">  324 </span><span class="spaces">      </span><span class="istickedoff">truncated = T.take 32 trimmed</span>
+<span class="lineno">  325 </span><span class="spaces">  </span><span class="istickedoff">in if T.null truncated then &quot;job&quot; else truncated</span>
+<span class="lineno">  326 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  327 </span><span class="spaces">    </span><span class="istickedoff">isSlugChar :: Char -&gt; Bool</span>
+<span class="lineno">  328 </span><span class="spaces">    </span><span class="istickedoff">isSlugChar c = isAsciiLower c || isDigit c || c == '-'</span></span>
+<span class="lineno">  329 </span>
+<span class="lineno">  330 </span>collapseDashes :: Text -&gt; Text
+<span class="lineno">  331 </span><span class="decl"><span class="istickedoff">collapseDashes = T.intercalate &quot;-&quot; . filter (not . T.null) . T.splitOn &quot;-&quot;</span></span>
+<span class="lineno">  332 </span>
+<span class="lineno">  333 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  334 </span>-- Next fire computation
+<span class="lineno">  335 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  336 </span>
+<span class="lineno">  337 </span>-- | Compute the next fire time for a cron job, given the reference time
+<span class="lineno">  338 </span>-- (usually @now@). Uses the @cron@ package's 'expand' for schedule matching
+<span class="lineno">  339 </span>-- and the @tz@ package for timezone-aware computation.
+<span class="lineno">  340 </span>--
+<span class="lineno">  341 </span>-- When the job has a timezone, the reference time is converted to local
+<span class="lineno">  342 </span>-- time, the next fire is computed in local time, and the result is
+<span class="lineno">  343 </span>-- converted back to UTC.
+<span class="lineno">  344 </span>computeNextFire :: CronExpr -&gt; Maybe CronTimeZone -&gt; UTCTime -&gt; IO (Maybe UTCTime)
+<span class="lineno">  345 </span><span class="decl"><span class="istickedoff">computeNextFire expr mTz refTime =</span>
+<span class="lineno">  346 </span><span class="spaces">  </span><span class="istickedoff">case mTz of</span>
+<span class="lineno">  347 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; pure (nextFireUTC (ceSchedule expr) refTime)</span>
+<span class="lineno">  348 </span><span class="spaces">    </span><span class="istickedoff">Just tz -&gt; nextFireTZ (ceSchedule expr) tz refTime</span></span>
+<span class="lineno">  349 </span>
+<span class="lineno">  350 </span>-- | Compute next fire in UTC (no timezone). Searches minute by minute
+<span class="lineno">  351 </span>-- from the reference time forward, up to a reasonable limit (366 days).
+<span class="lineno">  352 </span>nextFireUTC :: CronSchedule -&gt; UTCTime -&gt; Maybe UTCTime
+<span class="lineno">  353 </span><span class="decl"><span class="istickedoff">nextFireUTC sched refTime =</span>
+<span class="lineno">  354 </span><span class="spaces">  </span><span class="istickedoff">case expand sched of</span>
+<span class="lineno">  355 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  356 </span><span class="spaces">    </span><span class="istickedoff">Just ex -&gt; findNextMatch ex refTime</span></span>
+<span class="lineno">  357 </span>
+<span class="lineno">  358 </span>-- | Compute next fire with timezone awareness.
+<span class="lineno">  359 </span>nextFireTZ :: CronSchedule -&gt; CronTimeZone -&gt; UTCTime -&gt; IO (Maybe UTCTime)
+<span class="lineno">  360 </span><span class="decl"><span class="istickedoff">nextFireTZ sched tz refTime = do</span>
+<span class="lineno">  361 </span><span class="spaces">  </span><span class="istickedoff">eLoaded &lt;- loadCronTZ tz</span>
+<span class="lineno">  362 </span><span class="spaces">  </span><span class="istickedoff">case eLoaded of</span>
+<span class="lineno">  363 </span><span class="spaces">    </span><span class="istickedoff">Left (_ :: SomeException) -&gt; pure Nothing</span>
+<span class="lineno">  364 </span><span class="spaces">    </span><span class="istickedoff">Right loadedTz -&gt; do</span>
+<span class="lineno">  365 </span><span class="spaces">      </span><span class="istickedoff">let localRef = utcToLocalTimeTZ loadedTz refTime</span>
+<span class="lineno">  366 </span><span class="spaces">          </span><span class="istickedoff">pseudoUtc = localTimeToUTC utc localRef</span>
+<span class="lineno">  367 </span><span class="spaces">      </span><span class="istickedoff">case nextFireUTC sched pseudoUtc of</span>
+<span class="lineno">  368 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">pure Nothing</span></span>
+<span class="lineno">  369 </span><span class="spaces">        </span><span class="istickedoff">Just nextPseudoUtc -&gt; do</span>
+<span class="lineno">  370 </span><span class="spaces">          </span><span class="istickedoff">let <span class="nottickedoff">nextLocal = utcToLocalTime utc nextPseudoUtc</span></span>
+<span class="lineno">  371 </span><span class="spaces">          </span><span class="istickedoff">pure (Just <span class="nottickedoff">(localTimeToUTCTZ loadedTz nextLocal)</span>)</span></span>
+<span class="lineno">  372 </span>
+<span class="lineno">  373 </span>-- | Find the next time after @refTime@ that matches all cron fields.
+<span class="lineno">  374 </span>-- Searches up to 366 days forward (527040 minutes).
+<span class="lineno">  375 </span>findNextMatch :: Expanded -&gt; UTCTime -&gt; Maybe UTCTime
+<span class="lineno">  376 </span><span class="decl"><span class="istickedoff">findNextMatch ex refTime =</span>
+<span class="lineno">  377 </span><span class="spaces">  </span><span class="istickedoff">let truncated = truncateToMinute refTime</span>
+<span class="lineno">  378 </span><span class="spaces">      </span><span class="istickedoff">startMinute = addOneMinute truncated</span>
+<span class="lineno">  379 </span><span class="spaces">  </span><span class="istickedoff">in go 0 startMinute</span>
+<span class="lineno">  380 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  381 </span><span class="spaces">    </span><span class="istickedoff">go :: Int -&gt; UTCTime -&gt; Maybe UTCTime</span>
+<span class="lineno">  382 </span><span class="spaces">    </span><span class="istickedoff">go n t</span>
+<span class="lineno">  383 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">n &gt;= 366 * 24 * 60</span> = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  384 </span><span class="spaces">      </span><span class="istickedoff">| matchesExpanded ex t = Just t</span>
+<span class="lineno">  385 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = go (n + 1) (addOneMinute t)</span></span>
+<span class="lineno">  386 </span>
+<span class="lineno">  387 </span>-- | Check if a 'UTCTime' matches all fields of an 'Expanded' cron schedule.
+<span class="lineno">  388 </span>matchesExpanded :: Expanded -&gt; UTCTime -&gt; Bool
+<span class="lineno">  389 </span><span class="decl"><span class="istickedoff">matchesExpanded ex t =</span>
+<span class="lineno">  390 </span><span class="spaces">  </span><span class="istickedoff">let (_year, month, day) = toGregorian (utctDay t)</span>
+<span class="lineno">  391 </span><span class="spaces">      </span><span class="istickedoff">secs = utctDayTime t</span>
+<span class="lineno">  392 </span><span class="spaces">      </span><span class="istickedoff">totalSecs = floor secs :: Int</span>
+<span class="lineno">  393 </span><span class="spaces">      </span><span class="istickedoff">hour = totalSecs `div` 3600</span>
+<span class="lineno">  394 </span><span class="spaces">      </span><span class="istickedoff">minute = (totalSecs `div` 60) `mod` 60</span>
+<span class="lineno">  395 </span><span class="spaces">      </span><span class="istickedoff">dowNum = dowToInt (dayOfWeek (utctDay t))</span>
+<span class="lineno">  396 </span><span class="spaces">  </span><span class="istickedoff">in  inSet minute (minF ex)</span>
+<span class="lineno">  397 </span><span class="spaces">      </span><span class="istickedoff">&amp;&amp; inSet hour (hourF ex)</span>
+<span class="lineno">  398 </span><span class="spaces">      </span><span class="istickedoff">&amp;&amp; inSet day (domF ex)</span>
+<span class="lineno">  399 </span><span class="spaces">      </span><span class="istickedoff">&amp;&amp; inSet month (monthF ex)</span>
+<span class="lineno">  400 </span><span class="spaces">      </span><span class="istickedoff">&amp;&amp; inSet dowNum (dowF ex)</span></span>
+<span class="lineno">  401 </span>
+<span class="lineno">  402 </span>-- | Check if an 'Int' is in the expanded field's 'NonEmpty Int' list.
+<span class="lineno">  403 </span>inSet :: Int -&gt; NonEmpty Int -&gt; Bool
+<span class="lineno">  404 </span><span class="decl"><span class="istickedoff">inSet x = elem x . toList</span></span>
+<span class="lineno">  405 </span>
+<span class="lineno">  406 </span>-- | Convert 'DayOfWeek' to cron integer (0=Sunday, 7=Sunday, 1=Monday..6=Saturday).
+<span class="lineno">  407 </span>-- The cron package uses 0-7 where both 0 and 7 mean Sunday.
+<span class="lineno">  408 </span>dowToInt :: DayOfWeek -&gt; Int
+<span class="lineno">  409 </span><span class="decl"><span class="istickedoff">dowToInt Sunday = 0</span>
+<span class="lineno">  410 </span><span class="spaces"></span><span class="istickedoff">dowToInt Monday = 1</span>
+<span class="lineno">  411 </span><span class="spaces"></span><span class="istickedoff">dowToInt Tuesday = <span class="nottickedoff">2</span></span>
+<span class="lineno">  412 </span><span class="spaces"></span><span class="istickedoff">dowToInt Wednesday = 3</span>
+<span class="lineno">  413 </span><span class="spaces"></span><span class="istickedoff">dowToInt Thursday = <span class="nottickedoff">4</span></span>
+<span class="lineno">  414 </span><span class="spaces"></span><span class="istickedoff">dowToInt Friday = <span class="nottickedoff">5</span></span>
+<span class="lineno">  415 </span><span class="spaces"></span><span class="istickedoff">dowToInt Saturday = 6</span></span>
+<span class="lineno">  416 </span>
+<span class="lineno">  417 </span>-- | Add one minute to a 'UTCTime'.
+<span class="lineno">  418 </span>addOneMinute :: UTCTime -&gt; UTCTime
+<span class="lineno">  419 </span><span class="decl"><span class="istickedoff">addOneMinute = addUTCTime 60</span></span>
+<span class="lineno">  420 </span>
+<span class="lineno">  421 </span>-- | Truncate a 'UTCTime' to the minute boundary (zero out seconds).
+<span class="lineno">  422 </span>-- Ensures cron fire times are always at second 0.
+<span class="lineno">  423 </span>truncateToMinute :: UTCTime -&gt; UTCTime
+<span class="lineno">  424 </span><span class="decl"><span class="istickedoff">truncateToMinute t =</span>
+<span class="lineno">  425 </span><span class="spaces">  </span><span class="istickedoff">let secs = floor (utctDayTime t) :: Int</span>
+<span class="lineno">  426 </span><span class="spaces">  </span><span class="istickedoff">in t { utctDayTime = fromIntegral ((secs `div` 60) * 60) }</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,85 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>{-# LANGUAGE TemplateHaskell #-}
+<span class="lineno">    3 </span>-- | The web frontend's build output (frontend/dist), embedded into the
+<span class="lineno">    4 </span>-- binary at compile time so @seal serve@ needs no on-disk static dir and
+<span class="lineno">    5 </span>-- no config. Same philosophy as &quot;Seal.Skills.Builtins&quot;: the UI is always
+<span class="lineno">    6 </span>-- the version the binary shipped with — self-contained, no first-run
+<span class="lineno">    7 </span>-- materialization, no install-layout dependency, no staleness across
+<span class="lineno">    8 </span>-- upgrades.
+<span class="lineno">    9 </span>module Seal.Gateway.Embedded
+<span class="lineno">   10 </span>  ( embeddedAssets
+<span class="lineno">   11 </span>  , embeddedAssetCount
+<span class="lineno">   12 </span>  , distManifest
+<span class="lineno">   13 </span>  ) where
+<span class="lineno">   14 </span>
+<span class="lineno">   15 </span>import Data.ByteString (ByteString)
+<span class="lineno">   16 </span>import Data.FileEmbed (embedDir, embedOneStringFileOf)
+<span class="lineno">   17 </span>import Data.Map.Strict (Map)
+<span class="lineno">   18 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   19 </span>import Language.Haskell.TH.Syntax (runIO)
+<span class="lineno">   20 </span>import System.Directory (doesDirectoryExist)
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>-- | Frontend bytes keyed by forward-slash path relative to the dist root
+<span class="lineno">   23 </span>-- (e.g. @&quot;index.html&quot;@, @&quot;assets\/index-De3F1a.js&quot;@).
+<span class="lineno">   24 </span>--
+<span class="lineno">   25 </span>-- @embedDir@ properties (verified in file-embed source):
+<span class="lineno">   26 </span>--   * Recursive, sorted output.
+<span class="lineno">   27 </span>--   * Dot-prefixed entries skipped (so @.seal-manifest@ never appears).
+<span class="lineno">   28 </span>--   * Every embedded file registered with @qAddDependentFile@ (called
+<span class="lineno">   29 </span>--     inside @pairToExp@ in file-embed's @embedDir@ implementation).
+<span class="lineno">   30 </span>--   * Keys are relative paths joined with @System.FilePath.(&lt;\/&gt;)@ — which
+<span class="lineno">   31 </span>--     uses @\&quot;\/\&quot;@ on Unix (verified: @fileList'@ builds keys via
+<span class="lineno">   32 </span>--     @top &lt;\/&gt; filename@ where @top@ starts as @\&quot;\&quot;@). This matches the
+<span class="lineno">   33 </span>--     @T.intercalate \&quot;\/\&quot;@ lookup in 'Seal.Gateway.Server.serveEmbedded'.
+<span class="lineno">   34 </span>--     Target platforms are Unix-only (nix, macOS, Linux).
+<span class="lineno">   35 </span>embeddedAssets :: Map FilePath ByteString
+<span class="lineno">   36 </span><span class="decl"><span class="istickedoff">embeddedAssets = Map.fromList</span>
+<span class="lineno">   37 </span><span class="spaces">  </span><span class="istickedoff">$(do exists &lt;- runIO (doesDirectoryExist &quot;frontend/dist&quot;)</span>
+<span class="lineno">   38 </span><span class="spaces">       </span><span class="istickedoff">if exists</span>
+<span class="lineno">   39 </span><span class="spaces">         </span><span class="istickedoff">then embedDir &quot;frontend/dist&quot;</span>
+<span class="lineno">   40 </span><span class="spaces">         </span><span class="istickedoff">else [| [] |]</span>
+<span class="lineno">   41 </span><span class="spaces">  </span><span class="istickedoff">)</span></span>
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>-- | Sentinel written by @make frontend-build@ (a hash over the dist tree).
+<span class="lineno">   44 </span>-- Changes on every UI build, forcing this module to recompile so the
+<span class="lineno">   45 </span>-- @embedDir@ splice re-runs. This closes file-embed's documented caveat
+<span class="lineno">   46 </span>-- that /newly added/ files don't reliably retrigger recompilation — which
+<span class="lineno">   47 </span>-- is the default case for us, since Vite emits new hash-named files each
+<span class="lineno">   48 </span>-- build. Fallback file (committed) keeps @cabal build@ working from a
+<span class="lineno">   49 </span>-- clean checkout with no dist.
+<span class="lineno">   50 </span>--
+<span class="lineno">   51 </span>-- Exported (not just a side-effect splice) to avoid @-Wunused-top-binds@
+<span class="lineno">   52 </span>-- under @-Wall -Werror@. Also useful for debugging: the manifest hash
+<span class="lineno">   53 </span>-- identifies which UI build is embedded in a running binary.
+<span class="lineno">   54 </span>distManifest :: String
+<span class="lineno">   55 </span><span class="decl"><span class="istickedoff">distManifest = $(embedOneStringFileOf</span>
+<span class="lineno">   56 </span><span class="spaces">  </span><span class="istickedoff">[ &quot;frontend/dist/.seal-manifest&quot;</span>
+<span class="lineno">   57 </span><span class="spaces">  </span><span class="istickedoff">, &quot;config/frontend-dist-absent.txt&quot;</span>
+<span class="lineno">   58 </span><span class="spaces">  </span><span class="istickedoff">])</span></span>
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>-- | Number of embedded assets. Equal to 'Map.size' of 'embeddedAssets'.
+<span class="lineno">   61 </span>embeddedAssetCount :: Int
+<span class="lineno">   62 </span><span class="decl"><span class="istickedoff">embeddedAssetCount = Map.size embeddedAssets</span></span>
+
+</pre>
+</body>
+</html>

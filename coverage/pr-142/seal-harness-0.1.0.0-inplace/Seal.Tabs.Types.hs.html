@@ -1,0 +1,223 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE DeriveAnyClass #-}
+<span class="lineno">    2 </span>{-# LANGUAGE DeriveGeneric #-}
+<span class="lineno">    3 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    4 </span>-- | The pure 'TabList' — the crown jewel. I1 (contiguous slots, removal
+<span class="lineno">    5 </span>-- compacts tmux-window style), I2 (no two tabs share a 'TabRef'), and I3
+<span class="lineno">    6 </span>-- (a cursor keys by 'TabRef' not slot, so it survives compaction) are all
+<span class="lineno">    7 </span>-- enforced **by construction** (the smart constructors reject violations).
+<span class="lineno">    8 </span>-- Plus the per-conversation routing types and the parsed @/tab@ command
+<span class="lineno">    9 </span>-- ADTs.
+<span class="lineno">   10 </span>module Seal.Tabs.Types
+<span class="lineno">   11 </span>  ( TabRef (..)
+<span class="lineno">   12 </span>  , TabStatus (..)
+<span class="lineno">   13 </span>  , Tab (..)
+<span class="lineno">   14 </span>  , ConversationKey (..)
+<span class="lineno">   15 </span>  , RelayMode (..)
+<span class="lineno">   16 </span>  , CursorState (..)
+<span class="lineno">   17 </span>  , TabList (..)
+<span class="lineno">   18 </span>  , TabKindArg (..)
+<span class="lineno">   19 </span>  , ForceMode (..)
+<span class="lineno">   20 </span>  , TabSlashCommand (..)
+<span class="lineno">   21 </span>  , emptyTabList
+<span class="lineno">   22 </span>  , tabCount
+<span class="lineno">   23 </span>  , insertTab
+<span class="lineno">   24 </span>  , lookupTab
+<span class="lineno">   25 </span>  , lookupByRef
+<span class="lineno">   26 </span>  , removeTab
+<span class="lineno">   27 </span>  , renameTab
+<span class="lineno">   28 </span>  , rebindTab
+<span class="lineno">   29 </span>  , slotOf
+<span class="lineno">   30 </span>  ) where
+<span class="lineno">   31 </span>
+<span class="lineno">   32 </span>import Data.Aeson (FromJSON, ToJSON)
+<span class="lineno">   33 </span>import Data.Text (Text)
+<span class="lineno">   34 </span>import GHC.Generics (Generic)
+<span class="lineno">   35 </span>
+<span class="lineno">   36 </span>import Seal.Core.ChannelKind (ChannelKind)
+<span class="lineno">   37 </span>import Seal.Core.MessageSource (ConversationId)
+<span class="lineno">   38 </span>import Seal.Core.Types (SessionId)
+<span class="lineno">   39 </span>import Seal.Handles.Tab (TabIndex (..), TabKind, mkTabIndex)
+<span class="lineno">   40 </span>import Seal.Harness.Id (HarnessId)
+<span class="lineno">   41 </span>
+<span class="lineno">   42 </span>-- | A tab's reference to ground truth: a live session OR a harness.
+<span class="lineno">   43 </span>data TabRef = BoundSession SessionId | BoundHarness HarnessId
+<span class="lineno">   44 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">   45 </span>  deriving anyclass (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   46 </span>
+<span class="lineno">   47 </span>-- | The liveness of a tab's backing ref.
+<span class="lineno">   48 </span>data TabStatus = Live | Dead
+<span class="lineno">   49 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">   50 </span>  deriving anyclass (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   51 </span>
+<span class="lineno">   52 </span>-- | One tab.
+<span class="lineno">   53 </span>data Tab = Tab
+<span class="lineno">   54 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">tIndex</span></span></span>  :: TabIndex
+<span class="lineno">   55 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tRef</span></span></span>    :: TabRef
+<span class="lineno">   56 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tKind</span></span></span>   :: TabKind
+<span class="lineno">   57 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tLabel</span></span></span>  :: Maybe Text     -- ^ optional user-set label
+<span class="lineno">   58 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tStatus</span></span></span> :: TabStatus
+<span class="lineno">   59 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">   60 </span>  deriving anyclass (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   61 </span>
+<span class="lineno">   62 </span>-- | The per-conversation routing key: ChannelKind × ConversationId.
+<span class="lineno">   63 </span>data ConversationKey = ConversationKey ChannelKind ConversationId
+<span class="lineno">   64 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   65 </span>
+<span class="lineno">   66 </span>-- | How a conversation receives a tab's output.
+<span class="lineno">   67 </span>data RelayMode = FocusedOnly | ActivityDigest | Firehose
+<span class="lineno">   68 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   69 </span>
+<span class="lineno">   70 </span>-- | A conversation's cursor + relay mode. The cursor keys by 'TabRef' (I3):
+<span class="lineno">   71 </span>-- it names ground truth, resolved to a current slot at read time via
+<span class="lineno">   72 </span>-- 'slotOf'.
+<span class="lineno">   73 </span>data CursorState = CursorState
+<span class="lineno">   74 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">csFocused</span></span></span>   :: TabRef           -- ^ which tab this conversation is focused on
+<span class="lineno">   75 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">csRelayMode</span></span></span> :: RelayMode
+<span class="lineno">   76 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   77 </span>
+<span class="lineno">   78 </span>-- | The tab list. I1 (contiguous 0..n-1, removal compacts) + I2 (no two tabs
+<span class="lineno">   79 </span>-- share a 'TabRef') are enforced by the smart constructors. Hard 36-slot cap.
+<span class="lineno">   80 </span>newtype TabList = TabList { <span class="istickedoff"><span class="decl"><span class="istickedoff">tlTabs</span></span></span> :: [Tab] }
+<span class="lineno">   81 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Generic</span></span></span></span>)
+<span class="lineno">   82 </span>  deriving anyclass (<span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON</span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON</span></span></span></span></span></span>)
+<span class="lineno">   83 </span>
+<span class="lineno">   84 </span>-- | Construct an empty 'TabList'.
+<span class="lineno">   85 </span>emptyTabList :: TabList
+<span class="lineno">   86 </span><span class="decl"><span class="istickedoff">emptyTabList = TabList []</span></span>
+<span class="lineno">   87 </span>
+<span class="lineno">   88 </span>-- | The number of tabs (also the next free slot under I1).
+<span class="lineno">   89 </span>tabCount :: TabList -&gt; Int
+<span class="lineno">   90 </span><span class="decl"><span class="istickedoff">tabCount = length . tlTabs</span></span>
+<span class="lineno">   91 </span>
+<span class="lineno">   92 </span>-- | The maximum number of tabs (the hard 36-slot cap).
+<span class="lineno">   93 </span>maxTabs :: Int
+<span class="lineno">   94 </span><span class="decl"><span class="istickedoff">maxTabs = 36</span></span>
+<span class="lineno">   95 </span>
+<span class="lineno">   96 </span>-- | Insert a tab at the lowest free slot (I1). 'Left' if the 'TabRef' is
+<span class="lineno">   97 </span>-- already present (I2) or the list is full (36).
+<span class="lineno">   98 </span>insertTab :: TabRef -&gt; TabKind -&gt; Maybe Text -&gt; TabList -&gt; Either Text TabList
+<span class="lineno">   99 </span><span class="decl"><span class="istickedoff">insertTab ref kind label (TabList ts)</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">| ref `elem` map tRef ts = Left <span class="nottickedoff">&quot;tab ref already bound&quot;</span></span>
+<span class="lineno">  101 </span><span class="spaces">  </span><span class="istickedoff">| length ts &gt;= maxTabs   = Left <span class="nottickedoff">&quot;tab list full (36 slots)&quot;</span></span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> =</span>
+<span class="lineno">  103 </span><span class="spaces">      </span><span class="istickedoff">-- The index is the lowest free slot. Since the list is contiguous</span>
+<span class="lineno">  104 </span><span class="spaces">      </span><span class="istickedoff">-- (I1), that's just `length ts` (the next slot after the last).</span>
+<span class="lineno">  105 </span><span class="spaces">      </span><span class="istickedoff">let idx = mkTabIndex (length ts)</span>
+<span class="lineno">  106 </span><span class="spaces">      </span><span class="istickedoff">in case idx of</span>
+<span class="lineno">  107 </span><span class="spaces">           </span><span class="istickedoff">Right i -&gt; Right (TabList (ts &lt;&gt; [Tab i ref kind label Live]))</span>
+<span class="lineno">  108 </span><span class="spaces">           </span><span class="istickedoff">Left e  -&gt; <span class="nottickedoff">Left e</span></span></span>  -- unreachable: length &lt; 36 implies idx &lt; 36
+<span class="lineno">  109 </span>
+<span class="lineno">  110 </span>-- | Look up a tab by index. 'Nothing' if the index is out of range.
+<span class="lineno">  111 </span>lookupTab :: TabList -&gt; TabIndex -&gt; Maybe Tab
+<span class="lineno">  112 </span><span class="decl"><span class="istickedoff">lookupTab (TabList ts) i = go ts</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  114 </span><span class="spaces">    </span><span class="istickedoff">go [] = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  115 </span><span class="spaces">    </span><span class="istickedoff">go (t:rest)</span>
+<span class="lineno">  116 </span><span class="spaces">      </span><span class="istickedoff">| tIndex t == i = Just t</span>
+<span class="lineno">  117 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>     = go rest</span></span>
+<span class="lineno">  118 </span>
+<span class="lineno">  119 </span>-- | Look up a tab by its 'TabRef'. 'Nothing' if absent.
+<span class="lineno">  120 </span>lookupByRef :: TabList -&gt; TabRef -&gt; Maybe Tab
+<span class="lineno">  121 </span><span class="decl"><span class="istickedoff">lookupByRef (TabList ts) ref = go ts</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  123 </span><span class="spaces">    </span><span class="istickedoff">go [] = Nothing</span>
+<span class="lineno">  124 </span><span class="spaces">    </span><span class="istickedoff">go (t:rest)</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="istickedoff">| tRef t == ref = Just t</span>
+<span class="lineno">  126 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>    = go rest</span></span>
+<span class="lineno">  127 </span>
+<span class="lineno">  128 </span>-- | Remove a tab by index. Compacts the list (I1: slots renumber to 0..n-1).
+<span class="lineno">  129 </span>-- 'Left' if the index is out of range.
+<span class="lineno">  130 </span>removeTab :: TabList -&gt; TabIndex -&gt; Either Text TabList
+<span class="lineno">  131 </span><span class="decl"><span class="istickedoff">removeTab (TabList ts) i =</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">case break (\t -&gt; tIndex t == i) ts of</span>
+<span class="lineno">  133 </span><span class="spaces">    </span><span class="istickedoff">(_, []) -&gt; Left <span class="nottickedoff">&quot;tab index out of range&quot;</span></span>
+<span class="lineno">  134 </span><span class="spaces">    </span><span class="istickedoff">(before, _t : after) -&gt;</span>
+<span class="lineno">  135 </span><span class="spaces">      </span><span class="istickedoff">-- Renumber the surviving tabs 0..n-2 (I1: contiguous after compaction).</span>
+<span class="lineno">  136 </span><span class="spaces">      </span><span class="istickedoff">let survivors = before &lt;&gt; after</span>
+<span class="lineno">  137 </span><span class="spaces">          </span><span class="istickedoff">renumbered = zipWith (\n t -&gt; t { tIndex = mkIdx n }) [0..] survivors</span>
+<span class="lineno">  138 </span><span class="spaces">      </span><span class="istickedoff">in Right (TabList renumbered)</span>
+<span class="lineno">  139 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  140 </span><span class="spaces">    </span><span class="istickedoff">mkIdx n = case mkTabIndex n of</span>
+<span class="lineno">  141 </span><span class="spaces">      </span><span class="istickedoff">Right x -&gt; x</span>
+<span class="lineno">  142 </span><span class="spaces">      </span><span class="istickedoff">Left _  -&gt; <span class="nottickedoff">error (&quot;removeTab: renumber out of range (unreachable, n=&quot; &lt;&gt; show n &lt;&gt; &quot;)&quot;)</span></span></span>
+<span class="lineno">  143 </span>
+<span class="lineno">  144 </span>-- | Rename a tab (set its label). 'Left' if the index is out of range.
+<span class="lineno">  145 </span>renameTab :: TabList -&gt; TabIndex -&gt; Text -&gt; Either Text TabList
+<span class="lineno">  146 </span><span class="decl"><span class="istickedoff">renameTab (TabList ts) i name =</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="istickedoff">case go ts of</span>
+<span class="lineno">  148 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">Left &quot;tab index out of range&quot;</span></span>
+<span class="lineno">  149 </span><span class="spaces">    </span><span class="istickedoff">Just ts' -&gt; Right (TabList ts')</span>
+<span class="lineno">  150 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  151 </span><span class="spaces">    </span><span class="istickedoff">go [] = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  152 </span><span class="spaces">    </span><span class="istickedoff">go (t:rest)</span>
+<span class="lineno">  153 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">tIndex t == i</span> = Just (t { tLabel = Just name } : rest)</span>
+<span class="lineno">  154 </span><span class="spaces">      </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span>     = <span class="nottickedoff">case go rest of</span></span>
+<span class="lineno">  155 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">Just rest' -&gt; Just (t : rest')</span></span>
+<span class="lineno">  156 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">Nothing   -&gt; Nothing</span></span></span>
+<span class="lineno">  157 </span>
+<span class="lineno">  158 </span>-- | Rebind a tab's 'TabRef' in place — preserve its index, kind, label, and
+<span class="lineno">  159 </span>-- status, only swapping @tRef@. Used by @\/new@ to point an existing tab at a
+<span class="lineno">  160 </span>-- fresh session.
+<span class="lineno">  161 </span>--
+<span class="lineno">  162 </span>-- I2 (no two tabs share a 'TabRef') is preserved: 'Left' if the new ref is
+<span class="lineno">  163 </span>-- already bound to a /different/ tab. Rebinding a tab to its own current
+<span class="lineno">  164 </span>-- ref is a no-op 'Right' (idempotent — the I2 check excludes the target
+<span class="lineno">  165 </span>-- slot itself). 'Left' if the index is out of range.
+<span class="lineno">  166 </span>rebindTab :: TabIndex -&gt; TabRef -&gt; TabList -&gt; Either Text TabList
+<span class="lineno">  167 </span><span class="decl"><span class="istickedoff">rebindTab idx newRef (TabList ts) =</span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="istickedoff">case break (\t -&gt; tIndex t == idx) ts of</span>
+<span class="lineno">  169 </span><span class="spaces">    </span><span class="istickedoff">(_, []) -&gt; Left <span class="nottickedoff">&quot;tab index out of range&quot;</span></span>
+<span class="lineno">  170 </span><span class="spaces">    </span><span class="istickedoff">(before, target : after) -&gt;</span>
+<span class="lineno">  171 </span><span class="spaces">      </span><span class="istickedoff">if newRef `elem` map tRef (before &lt;&gt; after)</span>
+<span class="lineno">  172 </span><span class="spaces">        </span><span class="istickedoff">then Left <span class="nottickedoff">&quot;tab ref already bound to another tab&quot;</span></span>
+<span class="lineno">  173 </span><span class="spaces">        </span><span class="istickedoff">else Right (TabList (before &lt;&gt; [target { tRef = newRef }] &lt;&gt; after))</span></span>
+<span class="lineno">  174 </span>
+<span class="lineno">  175 </span>-- | The current slot of a 'TabRef' (I3: resolved at read time). 'Nothing' if
+<span class="lineno">  176 </span>-- the ref is no longer in the list (the cursor is stale).
+<span class="lineno">  177 </span>slotOf :: TabList -&gt; TabRef -&gt; Maybe TabIndex
+<span class="lineno">  178 </span><span class="decl"><span class="istickedoff">slotOf tl ref = tIndex &lt;$&gt; lookupByRef tl ref</span></span>
+<span class="lineno">  179 </span>
+<span class="lineno">  180 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  181 </span>-- The parsed /tab command ADTs
+<span class="lineno">  182 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  183 </span>
+<span class="lineno">  184 </span>-- | The tab-kind argument to @/tab new [&lt;kind&gt;]@.
+<span class="lineno">  185 </span>data TabKindArg = TkaAi | TkaProvider | TkaHarness | TkaShell | TkaSsh | TkaTmux
+<span class="lineno">  186 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  187 </span>
+<span class="lineno">  188 </span>-- | The --force flag for @/tab close &lt;N&gt; [--force]@.
+<span class="lineno">  189 </span>data ForceMode = Force | NoForce
+<span class="lineno">  190 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  191 </span>
+<span class="lineno">  192 </span>-- | The parsed @/tab@ command family.
+<span class="lineno">  193 </span>data TabSlashCommand
+<span class="lineno">  194 </span>  = TabNewCmd (Maybe TabKindArg)
+<span class="lineno">  195 </span>  | TabListCmd
+<span class="lineno">  196 </span>  | TabCloseCmd TabIndex ForceMode
+<span class="lineno">  197 </span>  | TabFocusCmd TabIndex
+<span class="lineno">  198 </span>  | TabResumeCmd SessionId
+<span class="lineno">  199 </span>  | TabRenameCmd TabIndex Text
+<span class="lineno">  200 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+
+</pre>
+</body>
+</html>

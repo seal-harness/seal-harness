@@ -1,0 +1,94 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Pure predicate: should this opcode invocation be written to the
+<span class="lineno">    3 </span>-- cross-session audit log?
+<span class="lineno">    4 </span>--
+<span class="lineno">    5 </span>-- The audit log captures only /mutating/ operations on the evolutionary
+<span class="lineno">    6 </span>-- stores (skills, agent definitions, vault secrets, memory). Read-only
+<span class="lineno">    7 </span>-- operations and non-evolutionary mutations (agent lifecycle, session
+<span class="lineno">    8 </span>-- creation, harness management) are excluded — their audit trail lives in
+<span class="lineno">    9 </span>-- the session transcript and the in-process runtime registries.
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- The predicate is an explicit allowlist of @(opcode, action)@ pairs. An
+<span class="lineno">   12 </span>-- opcode not listed here is never audited, regardless of its action. An
+<span class="lineno">   13 </span>-- action not listed for a listed opcode is not audited. A 'Nothing' action
+<span class="lineno">   14 </span>-- (opcode has no @action@ field) is never audited — all audited opcodes
+<span class="lineno">   15 </span>-- are action-based.
+<span class="lineno">   16 </span>module Seal.Audit.Predicate
+<span class="lineno">   17 </span>  ( shouldAudit
+<span class="lineno">   18 </span>  , extractAction
+<span class="lineno">   19 </span>  , extractTargetId
+<span class="lineno">   20 </span>  ) where
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>import Data.Aeson (Value, withObject, (.:))
+<span class="lineno">   23 </span>import Data.Aeson.Types (parseMaybe)
+<span class="lineno">   24 </span>import Control.Applicative ((&lt;|&gt;))
+<span class="lineno">   25 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   26 </span>import Data.Text (Text)
+<span class="lineno">   27 </span>import Data.Map.Strict (Map)
+<span class="lineno">   28 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   29 </span>import Data.Set (Set)
+<span class="lineno">   30 </span>import Data.Set qualified as Set
+<span class="lineno">   31 </span>
+<span class="lineno">   32 </span>import Seal.Core.Types (OpName (..))
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>-- | The audited actions for each opcode. Only the listed actions are
+<span class="lineno">   35 </span>-- audited; all other actions (read, list, search, load) are excluded.
+<span class="lineno">   36 </span>auditedActions :: Map OpName (Set Text)
+<span class="lineno">   37 </span><span class="decl"><span class="istickedoff">auditedActions = Map.fromList</span>
+<span class="lineno">   38 </span><span class="spaces">  </span><span class="istickedoff">[ (OpName &quot;SKILL_MANAGE&quot;, Set.fromList [&quot;write&quot;, &quot;delete&quot;])</span>
+<span class="lineno">   39 </span><span class="spaces">  </span><span class="istickedoff">, (OpName &quot;AGENT_DEF_MANAGE&quot;, Set.fromList [&quot;write&quot;, &quot;delete&quot;])</span>
+<span class="lineno">   40 </span><span class="spaces">  </span><span class="istickedoff">, (OpName &quot;SECRET_MANAGE&quot;, Set.fromList [&quot;put&quot;, &quot;delete&quot;])</span>
+<span class="lineno">   41 </span><span class="spaces">  </span><span class="istickedoff">, (OpName &quot;MEMORY_MANAGE&quot;, Set.fromList [&quot;write&quot;, &quot;archive&quot;])</span>
+<span class="lineno">   42 </span><span class="spaces">  </span><span class="istickedoff">]</span></span>
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>-- | Should this opcode invocation be written to the audit log?
+<span class="lineno">   45 </span>-- Returns 'True' only when both the opcode and its action are in the
+<span class="lineno">   46 </span>-- allowlist. A 'Nothing' action (no @action@ field in the input) is
+<span class="lineno">   47 </span>-- never audited.
+<span class="lineno">   48 </span>shouldAudit :: OpName -&gt; Maybe Text -&gt; Bool
+<span class="lineno">   49 </span><span class="decl"><span class="istickedoff">shouldAudit opName mAction =</span>
+<span class="lineno">   50 </span><span class="spaces">  </span><span class="istickedoff">case mAction of</span>
+<span class="lineno">   51 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; False</span>
+<span class="lineno">   52 </span><span class="spaces">    </span><span class="istickedoff">Just action -&gt; case Map.lookup opName auditedActions of</span>
+<span class="lineno">   53 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; False</span>
+<span class="lineno">   54 </span><span class="spaces">      </span><span class="istickedoff">Just allowed -&gt; Set.member action allowed</span></span>
+<span class="lineno">   55 </span>
+<span class="lineno">   56 </span>-- | Extract the @action@ field from an opcode's input JSON. Returns
+<span class="lineno">   57 </span>-- 'Nothing' when the input has no @action@ field (e.g. legacy single-action
+<span class="lineno">   58 </span>-- opcodes). All audited opcodes are action-based, so 'Nothing' means
+<span class="lineno">   59 </span>-- &quot;not audited&quot;.
+<span class="lineno">   60 </span>extractAction :: Value -&gt; Maybe Text
+<span class="lineno">   61 </span><span class="decl"><span class="istickedoff">extractAction = parseMaybe (withObject <span class="nottickedoff">&quot;input&quot;</span> (.: &quot;action&quot;))</span></span>
+<span class="lineno">   62 </span>
+<span class="lineno">   63 </span>-- | Extract the target identifier from an opcode's input JSON. The field
+<span class="lineno">   64 </span>-- name varies by opcode: @id@ for skills and agent defs, @name@ for vault
+<span class="lineno">   65 </span>-- secrets, @path@ for memory. Falls back through these in order.
+<span class="lineno">   66 </span>extractTargetId :: Value -&gt; Text
+<span class="lineno">   67 </span><span class="decl"><span class="nottickedoff">extractTargetId v =</span>
+<span class="lineno">   68 </span><span class="spaces">  </span><span class="nottickedoff">let mId = parseMaybe (withObject &quot;input&quot; (.: &quot;id&quot;)) v</span>
+<span class="lineno">   69 </span><span class="spaces">      </span><span class="nottickedoff">mName = parseMaybe (withObject &quot;input&quot; (.: &quot;name&quot;)) v</span>
+<span class="lineno">   70 </span><span class="spaces">      </span><span class="nottickedoff">mPath = parseMaybe (withObject &quot;input&quot; (.: &quot;path&quot;)) v</span>
+<span class="lineno">   71 </span><span class="spaces">  </span><span class="nottickedoff">in fromMaybe &quot;-&quot; (mId &lt;|&gt; mName &lt;|&gt; mPath)</span></span>
+
+</pre>
+</body>
+</html>

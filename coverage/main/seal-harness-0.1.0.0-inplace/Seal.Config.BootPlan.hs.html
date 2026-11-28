@@ -1,0 +1,283 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Deciding whether the gateway may start, and in what state — the design §10
+<span class="lineno">    3 </span>-- table as two functions.
+<span class="lineno">    4 </span>--
+<span class="lineno">    5 </span>-- The split matters for testability: 'preflight' does the I/O (read
+<span class="lineno">    6 </span>-- @security.toml@ as text, read @credentials.toml@) and 'bootPlan' is pure, so
+<span class="lineno">    7 </span>-- every refusal is reachable in a unit test without a filesystem, a socket, or
+<span class="lineno">    8 </span>-- a running server.
+<span class="lineno">    9 </span>--
+<span class="lineno">   10 </span>-- Two properties this module exists to guarantee:
+<span class="lineno">   11 </span>--
+<span class="lineno">   12 </span>-- * /Totality./ Every combination of (section present?, mode?, credentials
+<span class="lineno">   13 </span>--   present?, credential version, coordinates, bind address) lands on exactly
+<span class="lineno">   14 </span>--   one row. There is no &quot;fall through to something reasonable&quot; arm — a state
+<span class="lineno">   15 </span>--   the table does not describe is a refusal to boot, not a guess.
+<span class="lineno">   16 </span>-- * /One place./ The mode defaulting that used to live in
+<span class="lineno">   17 </span>--   'Seal.Security.AccessControl.resolveAccessControl' — &quot;no mode line means
+<span class="lineno">   18 </span>--   passkey if credentials exist&quot; — is here, so a caller cannot independently
+<span class="lineno">   19 </span>--   decide what an absent @mode@ means and drift from it. In particular the
+<span class="lineno">   20 </span>--   rule that guards the whole feature: absence never means @none@.
+<span class="lineno">   21 </span>module Seal.Config.BootPlan
+<span class="lineno">   22 </span>  ( BindCoordinates (..)
+<span class="lineno">   23 </span>  , BootInputs (..)
+<span class="lineno">   24 </span>  , CredentialsPresence (..)
+<span class="lineno">   25 </span>  , BootRefusal (..)
+<span class="lineno">   26 </span>  , bootRefusalMessage
+<span class="lineno">   27 </span>  , BootPlan (..)
+<span class="lineno">   28 </span>  , preflight
+<span class="lineno">   29 </span>  , bootPlan
+<span class="lineno">   30 </span>  ) where
+<span class="lineno">   31 </span>
+<span class="lineno">   32 </span>import Data.Map.Strict (Map)
+<span class="lineno">   33 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   34 </span>import Data.Text (Text)
+<span class="lineno">   35 </span>import Data.Text qualified as T
+<span class="lineno">   36 </span>import Data.Text.IO qualified as TIO
+<span class="lineno">   37 </span>import System.Directory (doesFileExist)
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>import Seal.Config.Credentials
+<span class="lineno">   40 </span>  ( CredentialsFile (..), credentialsVersion, loadCredentials )
+<span class="lineno">   41 </span>import Seal.Config.Paths
+<span class="lineno">   42 </span>  ( SealPaths, credentialsFilePath, securityFilePath )
+<span class="lineno">   43 </span>import Seal.Config.Security
+<span class="lineno">   44 </span>  ( AccessControlFileConfig (..), SecurityConfig (..), decodeSecurityConfig
+<span class="lineno">   45 </span>  , CredentialFileConfig, hasLegacyLayout )
+<span class="lineno">   46 </span>import Seal.Security.AccessControl
+<span class="lineno">   47 </span>  ( CredentialAvailability (..), credentialAvailability, credentialFromFile
+<span class="lineno">   48 </span>  , isLoopbackHost, resolveCoordinates )
+<span class="lineno">   49 </span>import Seal.Security.EnrollmentGrant (GrantSource (..))
+<span class="lineno">   50 </span>import Seal.Security.WebAuthn.Types (AccessMode (..), Credential, parseAccessMode)
+<span class="lineno">   51 </span>
+<span class="lineno">   52 </span>-- | The address the gateway would bind, which decides whether credentials can
+<span class="lineno">   53 </span>-- be resolved to a usable origin and whether a session cookie could travel in
+<span class="lineno">   54 </span>-- the clear.
+<span class="lineno">   55 </span>data BindCoordinates = BindCoordinates
+<span class="lineno">   56 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">bcHost</span></span></span> :: !Text
+<span class="lineno">   57 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">bcPort</span></span></span> :: !Int
+<span class="lineno">   58 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   59 </span>
+<span class="lineno">   60 </span>-- | Everything 'bootPlan' needs, gathered by 'preflight'.
+<span class="lineno">   61 </span>data BootInputs = BootInputs
+<span class="lineno">   62 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">biSecurityRaw</span></span></span> :: !Text
+<span class="lineno">   63 </span>    -- ^ The @security.toml@ bytes as they are on disk. Kept because the
+<span class="lineno">   64 </span>    -- legacy-layout check has to see the document, not a decoded summary of
+<span class="lineno">   65 </span>    -- it: decoding is what loses a table the codec does not know.
+<span class="lineno">   66 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">biSection</span></span></span>     :: !(Maybe AccessControlFileConfig)
+<span class="lineno">   67 </span>    -- ^ 'Nothing' when the file is absent or has no @[access_control]@.
+<span class="lineno">   68 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">biCredentials</span></span></span> :: !CredentialsPresence
+<span class="lineno">   69 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   70 </span>
+<span class="lineno">   71 </span>-- | What @credentials.toml@ turned out to be. Three states, because boot treats
+<span class="lineno">   72 </span>-- them differently: absent is normal (nothing enrolled yet), invalid is a
+<span class="lineno">   73 </span>-- refusal, and present-but-empty is a corruption signal — the store's writers
+<span class="lineno">   74 </span>-- cannot produce it (design §9.2), so seeing it means something else did.
+<span class="lineno">   75 </span>data CredentialsPresence
+<span class="lineno">   76 </span>  = CredentialsAbsent
+<span class="lineno">   77 </span>  | CredentialsPresent !Int !(Map Text CredentialFileConfig)
+<span class="lineno">   78 </span>  | CredentialsInvalid Text
+<span class="lineno">   79 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   80 </span>
+<span class="lineno">   81 </span>-- | Why the gateway will not start. Every constructor names the thing the
+<span class="lineno">   82 </span>-- operator has to change; none of them is a catch-all.
+<span class="lineno">   83 </span>data BootRefusal
+<span class="lineno">   84 </span>  = BrSecurityUnparseable Text
+<span class="lineno">   85 </span>  | BrLegacyLayout
+<span class="lineno">   86 </span>  | BrCredentialsInvalid Text
+<span class="lineno">   87 </span>  | BrCredentialsEmpty
+<span class="lineno">   88 </span>  | BrCredentialsVersion !Int
+<span class="lineno">   89 </span>  | BrModeInvalid Text
+<span class="lineno">   90 </span>  | BrCoordinatesInvalid Text
+<span class="lineno">   91 </span>  | BrUnsafeBind Text
+<span class="lineno">   92 </span>  | BrPublicBindWithLoopbackOrigin
+<span class="lineno">   93 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   94 </span>
+<span class="lineno">   95 </span>-- | The operator-facing text for a refusal. Each message names the command or
+<span class="lineno">   96 </span>-- the edit that fixes it — a refusal that only says &quot;no&quot; leaves the operator
+<span class="lineno">   97 </span>-- with a gateway that will not start and no way forward.
+<span class="lineno">   98 </span>bootRefusalMessage :: BootRefusal -&gt; Text
+<span class="lineno">   99 </span><span class="decl"><span class="istickedoff">bootRefusalMessage refusal = case refusal of</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">BrSecurityUnparseable err -&gt;</span>
+<span class="lineno">  101 </span><span class="spaces">    </span><span class="istickedoff">&quot;security.toml could not be read: &quot; &lt;&gt; err</span>
+<span class="lineno">  102 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;\n  Fix ~/.seal/security.toml by hand; `seal serve` will not start until it parses.&quot;</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">BrLegacyLayout -&gt;</span>
+<span class="lineno">  104 </span><span class="spaces">    </span><span class="istickedoff">&quot;security.toml still holds the pre-split [access_control.credentials] tables.\n&quot;</span>
+<span class="lineno">  105 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;  Run `seal access-control migrate-credentials` to move them to credentials.toml.&quot;</span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="istickedoff">BrCredentialsInvalid err -&gt;</span>
+<span class="lineno">  107 </span><span class="spaces">    </span><span class="istickedoff">&quot;credentials.toml could not be read: &quot; &lt;&gt; err</span>
+<span class="lineno">  108 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;\n  Run `seal access-control reset --yes` (with the daemon stopped) and enroll again.&quot;</span>
+<span class="lineno">  109 </span><span class="spaces">  </span><span class="istickedoff">BrCredentialsEmpty -&gt;</span>
+<span class="lineno">  110 </span><span class="spaces">    </span><span class="istickedoff">&quot;credentials.toml exists but holds no credentials.\n&quot;</span>
+<span class="lineno">  111 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;  The store is never written empty on purpose; treat this as corruption.\n&quot;</span>
+<span class="lineno">  112 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;  Run `seal access-control reset --yes` (with the daemon stopped) and enroll again.&quot;</span>
+<span class="lineno">  113 </span><span class="spaces">  </span><span class="istickedoff">BrCredentialsVersion version -&gt;</span>
+<span class="lineno">  114 </span><span class="spaces">    </span><span class="istickedoff">&quot;credentials.toml has format version &quot; &lt;&gt; tshow version</span>
+<span class="lineno">  115 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;, which this build does not understand.\n&quot;</span>
+<span class="lineno">  116 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;  Upgrade seal, or restore a backup of ~/.seal/credentials.toml.&quot;</span>
+<span class="lineno">  117 </span><span class="spaces">  </span><span class="istickedoff">BrModeInvalid raw -&gt;</span>
+<span class="lineno">  118 </span><span class="spaces">    </span><span class="istickedoff">&quot;access_control.mode is \&quot;&quot; &lt;&gt; raw &lt;&gt; &quot;\&quot;, which is not a valid mode.\n&quot;</span>
+<span class="lineno">  119 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;  Use \&quot;passkey\&quot; (the default) or \&quot;none\&quot;.&quot;</span>
+<span class="lineno">  120 </span><span class="spaces">  </span><span class="istickedoff">BrCoordinatesInvalid err -&gt;</span>
+<span class="lineno">  121 </span><span class="spaces">    </span><span class="istickedoff">&quot;[access_control] origin/rp_id are unusable: &quot; &lt;&gt; err</span>
+<span class="lineno">  122 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;\n  Set origin to an absolute URL (or unset it for a loopback bind).&quot;</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">BrUnsafeBind reason -&gt;</span>
+<span class="lineno">  124 </span><span class="spaces">    </span><span class="istickedoff">&quot;refusing to serve passkey-protected access with an unusable origin: &quot; &lt;&gt; reason</span>
+<span class="lineno">  125 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;\n  Bind a loopback address, or run behind a TLS reverse proxy and set &quot;</span>
+<span class="lineno">  126 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;[access_control] origin to its https:// URL.&quot;</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="istickedoff">BrPublicBindWithLoopbackOrigin -&gt;</span>
+<span class="lineno">  128 </span><span class="spaces">    </span><span class="istickedoff">&quot;the gateway binds a non-loopback address but [access_control] origin is a &quot;</span>
+<span class="lineno">  129 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;loopback URL.\n&quot;</span>
+<span class="lineno">  130 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;  Browsers reaching it from another machine cannot use a localhost &quot;</span>
+<span class="lineno">  131 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;origin, and the setup window would be reachable from the network.\n&quot;</span>
+<span class="lineno">  132 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;  Set origin to the address clients actually use.&quot;</span></span>
+<span class="lineno">  133 </span>
+<span class="lineno">  134 </span>-- | Everything the runtime needs, already decided. The handle built from this
+<span class="lineno">  135 </span>-- never reads @credentials.toml@ again, which is what makes a mid-flight edit
+<span class="lineno">  136 </span>-- of the store unable to change the running gateway's behaviour.
+<span class="lineno">  137 </span>data BootPlan = BootPlan
+<span class="lineno">  138 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">bpMode</span></span></span>      :: !AccessMode
+<span class="lineno">  139 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">bpOrigin</span></span></span>    :: !(Maybe Text)
+<span class="lineno">  140 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">bpRpId</span></span></span>      :: !(Maybe Text)
+<span class="lineno">  141 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">bpCreds</span></span></span>     :: !(Map Text Credential)
+<span class="lineno">  142 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">bpMintGrant</span></span></span> :: !(Maybe GrantSource)
+<span class="lineno">  143 </span>    -- ^ 'Just' when boot should mint an enrollment grant: nothing enrolled,
+<span class="lineno">  144 </span>    -- nothing usable, or access control is off. Never minted when a usable
+<span class="lineno">  145 </span>    -- credential exists — there is already an authority.
+<span class="lineno">  146 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  147 </span>
+<span class="lineno">  148 </span>-- | Read the two files and hand 'bootPlan' what it needs.
+<span class="lineno">  149 </span>--
+<span class="lineno">  150 </span>-- Reads @security.toml@ as text /and/ decodes it: the raw document is what the
+<span class="lineno">  151 </span>-- legacy check needs, and the decoded section is what the table needs.
+<span class="lineno">  152 </span>preflight :: SealPaths -&gt; IO (Either BootRefusal BootInputs)
+<span class="lineno">  153 </span><span class="decl"><span class="istickedoff">preflight paths = do</span>
+<span class="lineno">  154 </span><span class="spaces">  </span><span class="istickedoff">securityExists &lt;- doesFileExist (securityFilePath paths)</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">raw &lt;- if securityExists then TIO.readFile (securityFilePath paths) else pure &quot;&quot;</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="istickedoff">creds &lt;- credentialsPresence paths</span>
+<span class="lineno">  157 </span><span class="spaces">  </span><span class="istickedoff">-- A document that does not decode leaves the section absent here; 'bootPlan'</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="istickedoff">-- refuses it with the decoder's own message. Deciding it in one place keeps</span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="istickedoff">-- the refusals testable without files, and keeps the two copies from</span>
+<span class="lineno">  160 </span><span class="spaces">  </span><span class="istickedoff">-- disagreeing about which condition wins.</span>
+<span class="lineno">  161 </span><span class="spaces">  </span><span class="istickedoff">pure (Right BootInputs</span>
+<span class="lineno">  162 </span><span class="spaces">    </span><span class="istickedoff">{ biSecurityRaw = raw</span>
+<span class="lineno">  163 </span><span class="spaces">    </span><span class="istickedoff">, biSection     = either (const Nothing) scAccessControl (decodeSecurityConfig raw)</span>
+<span class="lineno">  164 </span><span class="spaces">    </span><span class="istickedoff">, biCredentials = creds })</span></span>
+<span class="lineno">  165 </span>
+<span class="lineno">  166 </span>credentialsPresence :: SealPaths -&gt; IO CredentialsPresence
+<span class="lineno">  167 </span><span class="decl"><span class="istickedoff">credentialsPresence paths = do</span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="istickedoff">loaded &lt;- loadCredentials (credentialsFilePath paths)</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="istickedoff">pure $ case loaded of</span>
+<span class="lineno">  170 </span><span class="spaces">    </span><span class="istickedoff">Left err               -&gt; <span class="nottickedoff">CredentialsInvalid err</span></span>
+<span class="lineno">  171 </span><span class="spaces">    </span><span class="istickedoff">Right Nothing          -&gt; CredentialsAbsent</span>
+<span class="lineno">  172 </span><span class="spaces">    </span><span class="istickedoff">Right (Just file)      -&gt; CredentialsPresent (crdVersion file) (crdCredentials file)</span></span>
+<span class="lineno">  173 </span>
+<span class="lineno">  174 </span>-- | The design §10 table.
+<span class="lineno">  175 </span>bootPlan :: BindCoordinates -&gt; BootInputs -&gt; Either BootRefusal BootPlan
+<span class="lineno">  176 </span><span class="decl"><span class="istickedoff">bootPlan coords inputs = do</span>
+<span class="lineno">  177 </span><span class="spaces">  </span><span class="istickedoff">-- The two document-level refusals. Both live here rather than in 'preflight'</span>
+<span class="lineno">  178 </span><span class="spaces">  </span><span class="istickedoff">-- because 'BootInputs' carries the raw text precisely so the decision stays</span>
+<span class="lineno">  179 </span><span class="spaces">  </span><span class="istickedoff">-- pure. Order matters: a document that does not even parse is refused first,</span>
+<span class="lineno">  180 </span><span class="spaces">  </span><span class="istickedoff">-- since 'hasLegacyLayout' answers False for it and would otherwise let a</span>
+<span class="lineno">  181 </span><span class="spaces">  </span><span class="istickedoff">-- corrupt file through as &quot;no legacy layout&quot;.</span>
+<span class="lineno">  182 </span><span class="spaces">  </span><span class="istickedoff">case decodeSecurityConfig (biSecurityRaw inputs) of</span>
+<span class="lineno">  183 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; Left (BrSecurityUnparseable err)</span>
+<span class="lineno">  184 </span><span class="spaces">    </span><span class="istickedoff">Right _  -&gt; Right <span class="nottickedoff">()</span></span>
+<span class="lineno">  185 </span><span class="spaces">  </span><span class="istickedoff">-- Legacy before anything about the store: a pre-split install has no</span>
+<span class="lineno">  186 </span><span class="spaces">  </span><span class="istickedoff">-- credentials.toml at all, so reporting the missing store would send the</span>
+<span class="lineno">  187 </span><span class="spaces">  </span><span class="istickedoff">-- operator to `reset --yes` when the answer is `migrate-credentials`.</span>
+<span class="lineno">  188 </span><span class="spaces">  </span><span class="istickedoff">if hasLegacyLayout (biSecurityRaw inputs) then Left BrLegacyLayout else Right <span class="nottickedoff">()</span></span>
+<span class="lineno">  189 </span><span class="spaces">  </span><span class="istickedoff">creds &lt;- plannedCredentials (biCredentials inputs)</span>
+<span class="lineno">  190 </span><span class="spaces">  </span><span class="istickedoff">mode &lt;- plannedMode inputs creds</span>
+<span class="lineno">  191 </span><span class="spaces">  </span><span class="istickedoff">(origin, rpId) &lt;- case resolveCoordinates (bcHost coords) (bcPort coords)</span>
+<span class="lineno">  192 </span><span class="spaces">                                            </span><span class="istickedoff">(biSection inputs) mode of</span>
+<span class="lineno">  193 </span><span class="spaces">    </span><span class="istickedoff">Left err -&gt; Left (BrCoordinatesInvalid err)</span>
+<span class="lineno">  194 </span><span class="spaces">    </span><span class="istickedoff">Right resolved -&gt; Right resolved</span>
+<span class="lineno">  195 </span><span class="spaces">  </span><span class="istickedoff">checkBind coords mode origin rpId</span>
+<span class="lineno">  196 </span><span class="spaces">  </span><span class="istickedoff">pure BootPlan</span>
+<span class="lineno">  197 </span><span class="spaces">    </span><span class="istickedoff">{ bpMode      = mode</span>
+<span class="lineno">  198 </span><span class="spaces">    </span><span class="istickedoff">, bpOrigin    = origin</span>
+<span class="lineno">  199 </span><span class="spaces">    </span><span class="istickedoff">, bpRpId      = rpId</span>
+<span class="lineno">  200 </span><span class="spaces">    </span><span class="istickedoff">, bpCreds     = creds</span>
+<span class="lineno">  201 </span><span class="spaces">    </span><span class="istickedoff">, bpMintGrant = mintFor mode rpId creds</span>
+<span class="lineno">  202 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">  203 </span>
+<span class="lineno">  204 </span>-- | The credential map, or a refusal. The version is checked before anything
+<span class="lineno">  205 </span>-- else: a future format must not be read with this build's assumptions.
+<span class="lineno">  206 </span>plannedCredentials :: CredentialsPresence -&gt; Either BootRefusal (Map Text Credential)
+<span class="lineno">  207 </span><span class="decl"><span class="istickedoff">plannedCredentials presence = case presence of</span>
+<span class="lineno">  208 </span><span class="spaces">  </span><span class="istickedoff">CredentialsAbsent        -&gt; Right Map.empty</span>
+<span class="lineno">  209 </span><span class="spaces">  </span><span class="istickedoff">CredentialsInvalid err   -&gt; Left (BrCredentialsInvalid err)</span>
+<span class="lineno">  210 </span><span class="spaces">  </span><span class="istickedoff">CredentialsPresent v raw</span>
+<span class="lineno">  211 </span><span class="spaces">    </span><span class="istickedoff">| v /= credentialsVersion -&gt; Left (BrCredentialsVersion v)</span>
+<span class="lineno">  212 </span><span class="spaces">    </span><span class="istickedoff">| Map.null raw            -&gt; Left BrCredentialsEmpty</span>
+<span class="lineno">  213 </span><span class="spaces">    </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>               -&gt; case traverse credentialFromFile (Map.toList raw) of</span>
+<span class="lineno">  214 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; Left (BrCredentialsInvalid err)</span>
+<span class="lineno">  215 </span><span class="spaces">        </span><span class="istickedoff">Right ok -&gt; Right (Map.fromList ok)</span></span>
+<span class="lineno">  216 </span>
+<span class="lineno">  217 </span>-- | Mode, including the one defaulting rule: no @mode@ line means passkey when
+<span class="lineno">  218 </span>-- credentials exist and unconfigured otherwise. @none@ is never inferred.
+<span class="lineno">  219 </span>plannedMode :: BootInputs -&gt; Map Text Credential -&gt; Either BootRefusal AccessMode
+<span class="lineno">  220 </span><span class="decl"><span class="istickedoff">plannedMode inputs creds = case biSection inputs &gt;&gt;= acfcMode of</span>
+<span class="lineno">  221 </span><span class="spaces">  </span><span class="istickedoff">Nothing</span>
+<span class="lineno">  222 </span><span class="spaces">    </span><span class="istickedoff">| <span class="tickonlytrue">Map.null creds</span> -&gt; Right AccessUnconfigured</span>
+<span class="lineno">  223 </span><span class="spaces">    </span><span class="istickedoff">| <span class="nottickedoff">otherwise</span>      -&gt; <span class="nottickedoff">Right AccessPasskey</span></span>
+<span class="lineno">  224 </span><span class="spaces">  </span><span class="istickedoff">Just raw -&gt; case parseAccessMode raw of</span>
+<span class="lineno">  225 </span><span class="spaces">    </span><span class="istickedoff">Left err  -&gt; Left (BrModeInvalid <span class="nottickedoff">err</span>)</span>
+<span class="lineno">  226 </span><span class="spaces">    </span><span class="istickedoff">Right mode -&gt; Right mode</span></span>
+<span class="lineno">  227 </span>
+<span class="lineno">  228 </span>-- | The two bind checks, kept as separate constructors so a failure tells the
+<span class="lineno">  229 </span>-- operator which of the two distinct problems they have.
+<span class="lineno">  230 </span>checkBind
+<span class="lineno">  231 </span>  :: BindCoordinates -&gt; AccessMode -&gt; Maybe Text -&gt; Maybe Text
+<span class="lineno">  232 </span>  -&gt; Either BootRefusal ()
+<span class="lineno">  233 </span><span class="decl"><span class="istickedoff">checkBind coords mode origin rpId</span>
+<span class="lineno">  234 </span><span class="spaces">  </span><span class="istickedoff">-- Most specific first: a public bind pointed at a loopback origin is that</span>
+<span class="lineno">  235 </span><span class="spaces">  </span><span class="istickedoff">-- mistake, not the broader &quot;not https&quot; one, and the two need different fixes.</span>
+<span class="lineno">  236 </span><span class="spaces">  </span><span class="istickedoff">| not loopbackBind &amp;&amp; maybe <span class="nottickedoff">False</span> isLoopbackHost rpId =</span>
+<span class="lineno">  237 </span><span class="spaces">      </span><span class="istickedoff">Left BrPublicBindWithLoopbackOrigin</span>
+<span class="lineno">  238 </span><span class="spaces">  </span><span class="istickedoff">| mode == AccessPasskey &amp;&amp; not loopbackBind &amp;&amp; not originIsHttps =</span>
+<span class="lineno">  239 </span><span class="spaces">      </span><span class="istickedoff">Left (BrUnsafeBind <span class="nottickedoff">&quot;the bind address is not loopback and the origin is not https&quot;</span>)</span>
+<span class="lineno">  240 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = Right <span class="nottickedoff">()</span></span>
+<span class="lineno">  241 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  242 </span><span class="spaces">    </span><span class="istickedoff">loopbackBind = isLoopbackHost (bcHost coords)</span>
+<span class="lineno">  243 </span><span class="spaces">    </span><span class="istickedoff">originIsHttps = maybe <span class="nottickedoff">False</span> (&quot;https://&quot; `T.isPrefixOf`) origin</span></span>
+<span class="lineno">  244 </span>
+<span class="lineno">  245 </span>-- | Which boot states mint an enrollment grant (design §11).
+<span class="lineno">  246 </span>--
+<span class="lineno">  247 </span>-- A usable credential means an assertion is available, so nothing is minted. In
+<span class="lineno">  248 </span>-- @open@ mode the grant is what stops a network client enrolling its own
+<span class="lineno">  249 </span>-- credential and flipping a public gateway into one locked with a key the
+<span class="lineno">  250 </span>-- operator does not hold.
+<span class="lineno">  251 </span>mintFor :: AccessMode -&gt; Maybe Text -&gt; Map Text Credential -&gt; Maybe GrantSource
+<span class="lineno">  252 </span><span class="decl"><span class="istickedoff">mintFor mode rpId creds = case mode of</span>
+<span class="lineno">  253 </span><span class="spaces">  </span><span class="istickedoff">AccessUnconfigured -&gt; Just CliToken</span>
+<span class="lineno">  254 </span><span class="spaces">  </span><span class="istickedoff">AccessOpen         -&gt; Just CliToken</span>
+<span class="lineno">  255 </span><span class="spaces">  </span><span class="istickedoff">AccessPasskey      -&gt; case credentialAvailability rpId creds of</span>
+<span class="lineno">  256 </span><span class="spaces">    </span><span class="istickedoff">Usable       -&gt; Nothing</span>
+<span class="lineno">  257 </span><span class="spaces">    </span><span class="istickedoff">NoCredentials -&gt; Just <span class="nottickedoff">CliToken</span></span>
+<span class="lineno">  258 </span><span class="spaces">    </span><span class="istickedoff">UnusableOnly -&gt; Just CliToken</span></span>
+<span class="lineno">  259 </span>tshow :: Show a =&gt; a -&gt; Text
+<span class="lineno">  260 </span><span class="decl"><span class="istickedoff">tshow = T.pack . show</span></span>
+
+</pre>
+</body>
+</html>

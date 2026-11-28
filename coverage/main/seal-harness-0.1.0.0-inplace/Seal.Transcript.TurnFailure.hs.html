@@ -1,0 +1,243 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>{-# LANGUAGE PatternSynonyms #-}
+<span class="lineno">    3 </span>-- | Classifying a failed turn into one user-facing descriptor.
+<span class="lineno">    4 </span>--
+<span class="lineno">    5 </span>-- The harness already catches turn exceptions and logs them
+<span class="lineno">    6 </span>-- ('Seal.Logging.Exceptions.withExceptionLogging'), but on the web surface the
+<span class="lineno">    7 </span>-- sanitized result was dropped on the floor, so a failed turn was
+<span class="lineno">    8 </span>-- indistinguishable from a completed one. This module owns the /vocabulary/ of
+<span class="lineno">    9 </span>-- that failure: what kind it is, how it is phrased for each surface, and what
+<span class="lineno">   10 </span>-- crosses the wire.
+<span class="lineno">   11 </span>--
+<span class="lineno">   12 </span>-- == Why the cause is a closed enum and not @show e@
+<span class="lineno">   13 </span>--
+<span class="lineno">   14 </span>-- The first design draft carried @T.pack (show e)@ as the cause. That was
+<span class="lineno">   15 </span>-- wrong, and the design review caught it: the harness's redaction machinery
+<span class="lineno">   16 </span>-- ('Seal.Handles.Transcript.redactMessages') is /provenance/-based — it blanks
+<span class="lineno">   17 </span>-- tool results whose opcode is in @secretOpcodes@ — and there is no
+<span class="lineno">   18 </span>-- secret-/value/ scrubber anywhere in the tree. An arbitrary exception message
+<span class="lineno">   19 </span>-- can embed a vault value, a credential in a URI, or a path under @~/.seal@.
+<span class="lineno">   20 </span>-- That text would have been written into @conversation.jsonl@ (which the model
+<span class="lineno">   21 </span>-- reads) and fanned out to Telegram/Signal (which cannot be un-sent).
+<span class="lineno">   22 </span>--
+<span class="lineno">   23 </span>-- So the cause is a closed 'FailureCause' vocabulary. Leaks are structurally
+<span class="lineno">   24 </span>-- impossible rather than scrubbed after the fact, matching the harness's actual
+<span class="lineno">   25 </span>-- invariant: 'Seal.ISA.Opcode.orRecorded' is documented as &quot;what the transcript
+<span class="lineno">   26 </span>-- records (secret-free)&quot; — exclusion by construction.
+<span class="lineno">   27 </span>--
+<span class="lineno">   28 </span>-- The full raw @show e@ still goes to @seal.log@, joined to the user-facing
+<span class="lineno">   29 </span>-- report by 'tfRef'.
+<span class="lineno">   30 </span>module Seal.Transcript.TurnFailure
+<span class="lineno">   31 </span>  ( TurnFailure (..)
+<span class="lineno">   32 </span>  , FailureCause (..)
+<span class="lineno">   33 </span>  , classify
+<span class="lineno">   34 </span>  , renderCause
+<span class="lineno">   35 </span>  , renderForUser
+<span class="lineno">   36 </span>  , renderForChat
+<span class="lineno">   37 </span>  , renderForLog
+<span class="lineno">   38 </span>  , renderForModel
+<span class="lineno">   39 </span>  , causeWire
+<span class="lineno">   40 </span>  , parseCause
+<span class="lineno">   41 </span>  ) where
+<span class="lineno">   42 </span>
+<span class="lineno">   43 </span>import Control.Exception (ErrorCall, SomeException, displayException, fromException)
+<span class="lineno">   44 </span>import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.:), (.=))
+<span class="lineno">   45 </span>import Data.List (isInfixOf)
+<span class="lineno">   46 </span>import Data.Text (Text)
+<span class="lineno">   47 </span>import Data.Text qualified as T
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>import Seal.Providers.Class
+<span class="lineno">   50 </span>  ( ContentBlock (..), Message, pattern Message, Role (..) )
+<span class="lineno">   51 </span>import Seal.Transcript.Error (TranscriptError (..))
+<span class="lineno">   52 </span>
+<span class="lineno">   53 </span>-- | What went wrong, as a closed vocabulary. Adding a constructor is a wire
+<span class="lineno">   54 </span>-- change: update 'causeWire' and 'parseCause' together.
+<span class="lineno">   55 </span>data FailureCause
+<span class="lineno">   56 </span>  = CauseUnicode            -- ^ invalid UTF-8 in tool/process output
+<span class="lineno">   57 </span>  | CauseNoSpace            -- ^ ENOSPC, rendered as &quot;No space left on device&quot;
+<span class="lineno">   58 </span>  | CauseTooManyFiles       -- ^ EMFILE, rendered as &quot;Too many open files&quot;
+<span class="lineno">   59 </span>  | CauseTranscriptDead     -- ^ the transcript writer died or was unreachable
+<span class="lineno">   60 </span>  | CauseProviderUnresolved -- ^ provider/model/vault-key resolution failed
+<span class="lineno">   61 </span>  | CauseOther Text         -- ^ exception TYPE name only — never a message
+<span class="lineno">   62 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   63 </span>
+<span class="lineno">   64 </span>-- | One failed turn, normalized for every surface.
+<span class="lineno">   65 </span>--
+<span class="lineno">   66 </span>-- The JSON instance emits exactly @{headline, cause, ref}@ and nothing else
+<span class="lineno">   67 </span>-- (design §3.2 — deliberately no @kind@ field: 'FailureCause' is the only
+<span class="lineno">   68 </span>-- taxonomy, so a second discriminator could only drift from it).
+<span class="lineno">   69 </span>data TurnFailure = TurnFailure
+<span class="lineno">   70 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">tfHeadline</span></span></span> :: !Text
+<span class="lineno">   71 </span>  -- ^ Plain language, user-facing, e.g. &quot;invalid UTF-8 in tool output&quot;.
+<span class="lineno">   72 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tfCause</span></span></span>    :: FailureCause
+<span class="lineno">   73 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tfRef</span></span></span>      :: !Text
+<span class="lineno">   74 </span>  -- ^ 8-hex correlation id. The SAME id 'Seal.Logging.Exceptions' logged, so
+<span class="lineno">   75 </span>  -- the operator can find the full detail in @seal.log@.
+<span class="lineno">   76 </span>  }
+<span class="lineno">   77 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   78 </span>
+<span class="lineno">   79 </span>-- | Classify an exception. /Pure/ on purpose: the caller supplies the
+<span class="lineno">   80 </span>-- transcript daemon's recorded inner cause (which is an @IO@ read), so this
+<span class="lineno">   81 </span>-- stays testable without IO. Precedence is most-specific first.
+<span class="lineno">   82 </span>--
+<span class="lineno">   83 </span>-- @mInner@ matters because the motivating incident threw a 'TranscriptError'
+<span class="lineno">   84 </span>-- whose own message (&quot;the writer died&quot;) said nothing about the real cause (a
+<span class="lineno">   85 </span>-- strict UTF-8 decode). Reporting the wrapper would have been useless; reporting
+<span class="lineno">   86 </span>-- the inner exception is the whole point.
+<span class="lineno">   87 </span>classify :: Maybe SomeException -&gt; SomeException -&gt; Text -&gt; TurnFailure
+<span class="lineno">   88 </span><span class="decl"><span class="istickedoff">classify mInner outer ref =</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="istickedoff">let cause = case fromException outer of</span>
+<span class="lineno">   90 </span><span class="spaces">        </span><span class="istickedoff">Just (TranscriptError _ inner) -&gt;</span>
+<span class="lineno">   91 </span><span class="spaces">          </span><span class="istickedoff">maybe CauseTranscriptDead classifyCause (inner `firstJust` mInner)</span>
+<span class="lineno">   92 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; classifyCause outer</span>
+<span class="lineno">   93 </span><span class="spaces">  </span><span class="istickedoff">in TurnFailure (headlineFor cause) cause ref</span></span>
+<span class="lineno">   94 </span>
+<span class="lineno">   95 </span>firstJust :: Maybe a -&gt; Maybe a -&gt; Maybe a
+<span class="lineno">   96 </span><span class="decl"><span class="istickedoff">firstJust (Just x) _ = Just x</span>
+<span class="lineno">   97 </span><span class="spaces"></span><span class="istickedoff">firstJust Nothing  y = y</span></span>
+<span class="lineno">   98 </span>
+<span class="lineno">   99 </span>-- | The exception -&gt; cause mapping, after 'TranscriptError' unwrapping.
+<span class="lineno">  100 </span>classifyCause :: SomeException -&gt; FailureCause
+<span class="lineno">  101 </span><span class="decl"><span class="istickedoff">classifyCause e</span>
+<span class="lineno">  102 </span><span class="spaces">  </span><span class="istickedoff">| isUnicode e      = CauseUnicode</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">| isNoSpace <span class="nottickedoff">e</span>      = CauseNoSpace</span>
+<span class="lineno">  104 </span><span class="spaces">  </span><span class="istickedoff">| isTooManyFiles <span class="nottickedoff">e</span> = CauseTooManyFiles</span>
+<span class="lineno">  105 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>        = CauseOther (typeName e)</span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  107 </span><span class="spaces">    </span><span class="istickedoff">shown = displayException e</span>
+<span class="lineno">  108 </span><span class="spaces">    </span><span class="istickedoff">-- 'UnicodeException' exposes no constructor we can match, so the only</span>
+<span class="lineno">  109 </span><span class="spaces">    </span><span class="istickedoff">-- faithful probe is the rendered message. Both phrasings are GHC's.</span>
+<span class="lineno">  110 </span><span class="spaces">    </span><span class="istickedoff">isUnicode ex =</span>
+<span class="lineno">  111 </span><span class="spaces">      </span><span class="istickedoff">let m = displayException ex</span>
+<span class="lineno">  112 </span><span class="spaces">      </span><span class="istickedoff">in &quot;Cannot decode byte&quot; `isInfixOf` m || &quot;Invalid UTF-8&quot; `isInfixOf` m</span>
+<span class="lineno">  113 </span><span class="spaces">    </span><span class="istickedoff">-- GHC renders ENOSPC/EMFILE as words: &quot;resource exhausted (No space left</span>
+<span class="lineno">  114 </span><span class="spaces">    </span><span class="istickedoff">-- on device)&quot; / &quot;(Too many open files)&quot;. The literal tokens never appear in</span>
+<span class="lineno">  115 </span><span class="spaces">    </span><span class="istickedoff">-- the rendering, so probing for them would be dead code.</span>
+<span class="lineno">  116 </span><span class="spaces">    </span><span class="istickedoff">isNoSpace _ = &quot;No space left on device&quot; `isInfixOf` shown</span>
+<span class="lineno">  117 </span><span class="spaces">    </span><span class="istickedoff">isTooManyFiles _ = &quot;Too many open files&quot; `isInfixOf` shown</span></span>
+<span class="lineno">  118 </span>
+<span class="lineno">  119 </span>-- | The exception's TYPE NAME only — never its message, which may carry
+<span class="lineno">  120 </span>-- secrets or paths. 'SomeException' erases the type, so this probes the handful
+<span class="lineno">  121 </span>-- of types the harness actually raises and otherwise reports a fixed literal.
+<span class="lineno">  122 </span>typeName :: SomeException -&gt; Text
+<span class="lineno">  123 </span><span class="decl"><span class="istickedoff">typeName e =</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">case fromException e :: Maybe IOError of</span>
+<span class="lineno">  125 </span><span class="spaces">    </span><span class="istickedoff">Just _  -&gt; &quot;IOError&quot;</span>
+<span class="lineno">  126 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">case fromException e :: Maybe ErrorCall of</span></span>
+<span class="lineno">  127 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">Just _  -&gt; &quot;ErrorCall&quot;</span></span>
+<span class="lineno">  128 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt; &quot;Exception&quot;</span></span></span>
+<span class="lineno">  129 </span>
+<span class="lineno">  130 </span>-- | The plain-language headline shown to the user.
+<span class="lineno">  131 </span>headlineFor :: FailureCause -&gt; Text
+<span class="lineno">  132 </span><span class="decl"><span class="istickedoff">headlineFor = \case</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="istickedoff">CauseUnicode            -&gt; &quot;invalid UTF-8 in tool output&quot;</span>
+<span class="lineno">  134 </span><span class="spaces">  </span><span class="istickedoff">CauseNoSpace            -&gt; &quot;out of disk space&quot;</span>
+<span class="lineno">  135 </span><span class="spaces">  </span><span class="istickedoff">CauseTooManyFiles       -&gt; &quot;out of open file handles&quot;</span>
+<span class="lineno">  136 </span><span class="spaces">  </span><span class="istickedoff">CauseTranscriptDead     -&gt; &quot;the session transcript became unavailable&quot;</span>
+<span class="lineno">  137 </span><span class="spaces">  </span><span class="istickedoff">CauseProviderUnresolved -&gt; <span class="nottickedoff">&quot;the model provider could not be resolved&quot;</span></span>
+<span class="lineno">  138 </span><span class="spaces">  </span><span class="istickedoff">CauseOther _            -&gt; &quot;an internal error stopped the turn&quot;</span></span>
+<span class="lineno">  139 </span>
+<span class="lineno">  140 </span>-- | The cause line. Fixed strings only: an exception /type name/ is not a
+<span class="lineno">  141 </span>-- secret under constraint 1, whereas its message body can be.
+<span class="lineno">  142 </span>renderCause :: FailureCause -&gt; Text
+<span class="lineno">  143 </span><span class="decl"><span class="istickedoff">renderCause = \case</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">CauseUnicode            -&gt; &quot;UnicodeException&quot;</span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="istickedoff">CauseNoSpace            -&gt; &quot;resource exhausted (No space left on device)&quot;</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">CauseTooManyFiles       -&gt; &quot;resource exhausted (Too many open files)&quot;</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="istickedoff">CauseTranscriptDead     -&gt; &quot;session transcript unavailable&quot;</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="istickedoff">CauseProviderUnresolved -&gt; &quot;model provider could not be resolved&quot;</span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="istickedoff">CauseOther tn           -&gt; tn</span></span>
+<span class="lineno">  150 </span>
+<span class="lineno">  151 </span>-- | The full user-facing report: the web transcript entry and the CLI line.
+<span class="lineno">  152 </span>renderForUser :: TurnFailure -&gt; Text
+<span class="lineno">  153 </span><span class="decl"><span class="istickedoff">renderForUser f =</span>
+<span class="lineno">  154 </span><span class="spaces">  </span><span class="istickedoff">&quot;Turn failed \8212 &quot; &lt;&gt; tfHeadline f &lt;&gt; &quot;\n\n&quot;</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;Cause: &quot; &lt;&gt; renderCause (tfCause f) &lt;&gt; &quot;\n&quot;</span>
+<span class="lineno">  156 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;Reference: &quot; &lt;&gt; tfRef f</span></span>
+<span class="lineno">  157 </span>
+<span class="lineno">  158 </span>-- | The chat-channel message (Telegram/Signal): headline + reference only.
+<span class="lineno">  159 </span>--
+<span class="lineno">  160 </span>-- This is the one surface that leaves the machine and cannot be un-sent, so it
+<span class="lineno">  161 </span>-- carries the least text. Requirement 6 asks only that a phone user learns the
+<span class="lineno">  162 </span>-- turn failed; it does not ask for the cause.
+<span class="lineno">  163 </span>renderForChat :: TurnFailure -&gt; Text
+<span class="lineno">  164 </span><span class="decl"><span class="istickedoff">renderForChat f =</span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="istickedoff">&quot;Turn failed \8212 &quot; &lt;&gt; tfHeadline f &lt;&gt; &quot; (ref &quot; &lt;&gt; tfRef f &lt;&gt; &quot;)&quot;</span></span>
+<span class="lineno">  166 </span>
+<span class="lineno">  167 </span>-- | The operator-log line, joined to the full detail in @seal.log@ by 'tfRef'.
+<span class="lineno">  168 </span>renderForLog :: TurnFailure -&gt; Text
+<span class="lineno">  169 </span><span class="decl"><span class="istickedoff">renderForLog f =</span>
+<span class="lineno">  170 </span><span class="spaces">  </span><span class="istickedoff">&quot;turn failure: &quot; &lt;&gt; tfHeadline f</span>
+<span class="lineno">  171 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;; cause=&quot; &lt;&gt; renderCause (tfCause f)</span>
+<span class="lineno">  172 </span><span class="spaces">  </span><span class="istickedoff">&lt;&gt; &quot;; ref=&quot; &lt;&gt; tfRef f</span></span>
+<span class="lineno">  173 </span>
+<span class="lineno">  174 </span>-- | What the /model/ sees on the next turn: decision 1 accepts that it should
+<span class="lineno">  175 </span>-- know its own prior turn failed, so it does not repeat the same mistake.
+<span class="lineno">  176 </span>-- Deliberately terse and closed-vocabulary, so a context full of prior failures
+<span class="lineno">  177 </span>-- does not derail the next attempt.
+<span class="lineno">  178 </span>renderForModel :: TurnFailure -&gt; Message
+<span class="lineno">  179 </span><span class="decl"><span class="istickedoff">renderForModel f = Message Assistant [CbText text]</span>
+<span class="lineno">  180 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  181 </span><span class="spaces">    </span><span class="istickedoff">text = &quot;A previous turn failed: &quot; &lt;&gt; tfHeadline f</span>
+<span class="lineno">  182 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot; (cause: &quot; &lt;&gt; renderCause (tfCause f)</span>
+<span class="lineno">  183 </span><span class="spaces">      </span><span class="istickedoff">&lt;&gt; &quot;, ref &quot; &lt;&gt; tfRef f &lt;&gt; &quot;)&quot;</span></span>
+<span class="lineno">  184 </span>
+<span class="lineno">  185 </span>-- | The wire tag for a cause. Lowercase kebab-case, matching the repo's
+<span class="lineno">  186 </span>-- existing event vocabulary (@harness-status@, @reply-delivered@).
+<span class="lineno">  187 </span>causeWire :: FailureCause -&gt; Text
+<span class="lineno">  188 </span><span class="decl"><span class="istickedoff">causeWire = \case</span>
+<span class="lineno">  189 </span><span class="spaces">  </span><span class="istickedoff">CauseUnicode            -&gt; &quot;unicode&quot;</span>
+<span class="lineno">  190 </span><span class="spaces">  </span><span class="istickedoff">CauseNoSpace            -&gt; &quot;no-space&quot;</span>
+<span class="lineno">  191 </span><span class="spaces">  </span><span class="istickedoff">CauseTooManyFiles       -&gt; &quot;too-many-files&quot;</span>
+<span class="lineno">  192 </span><span class="spaces">  </span><span class="istickedoff">CauseTranscriptDead     -&gt; &quot;transcript-dead&quot;</span>
+<span class="lineno">  193 </span><span class="spaces">  </span><span class="istickedoff">CauseProviderUnresolved -&gt; &quot;provider-unresolved&quot;</span>
+<span class="lineno">  194 </span><span class="spaces">  </span><span class="istickedoff">CauseOther tn           -&gt; &quot;other:&quot; &lt;&gt; tn</span></span>
+<span class="lineno">  195 </span>
+<span class="lineno">  196 </span>-- | Parse a wire tag. An /unknown/ tag degrades to 'CauseOther' carrying the
+<span class="lineno">  197 </span>-- raw string rather than failing: this entry type is tag-filtered and will
+<span class="lineno">  198 </span>-- outlive several deploys, so it must be forward-compatible for free.
+<span class="lineno">  199 </span>parseCause :: Text -&gt; FailureCause
+<span class="lineno">  200 </span><span class="decl"><span class="istickedoff">parseCause t = case t of</span>
+<span class="lineno">  201 </span><span class="spaces">  </span><span class="istickedoff">&quot;unicode&quot;             -&gt; <span class="nottickedoff">CauseUnicode</span></span>
+<span class="lineno">  202 </span><span class="spaces">  </span><span class="istickedoff">&quot;no-space&quot;            -&gt; <span class="nottickedoff">CauseNoSpace</span></span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="istickedoff">&quot;too-many-files&quot;      -&gt; <span class="nottickedoff">CauseTooManyFiles</span></span>
+<span class="lineno">  204 </span><span class="spaces">  </span><span class="istickedoff">&quot;transcript-dead&quot;     -&gt; <span class="nottickedoff">CauseTranscriptDead</span></span>
+<span class="lineno">  205 </span><span class="spaces">  </span><span class="istickedoff">&quot;provider-unresolved&quot; -&gt; <span class="nottickedoff">CauseProviderUnresolved</span></span>
+<span class="lineno">  206 </span><span class="spaces">  </span><span class="istickedoff">other                 -&gt; maybe (CauseOther other) CauseOther (T.stripPrefix &quot;other:&quot; other)</span></span>
+<span class="lineno">  207 </span>
+<span class="lineno">  208 </span>instance <span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">ToJSON TurnFailure</span></span></span></span></span></span></span></span> where
+<span class="lineno">  209 </span>  <span class="decl"><span class="istickedoff">toJSON f = object</span>
+<span class="lineno">  210 </span><span class="spaces">    </span><span class="istickedoff">[ &quot;headline&quot; .= tfHeadline f</span>
+<span class="lineno">  211 </span><span class="spaces">    </span><span class="istickedoff">, &quot;cause&quot;    .= causeWire (tfCause f)</span>
+<span class="lineno">  212 </span><span class="spaces">    </span><span class="istickedoff">, &quot;ref&quot;      .= tfRef f</span>
+<span class="lineno">  213 </span><span class="spaces">    </span><span class="istickedoff">]</span></span>
+<span class="lineno">  214 </span>
+<span class="lineno">  215 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">FromJSON TurnFailure</span></span></span></span> where
+<span class="lineno">  216 </span>  <span class="decl"><span class="istickedoff">parseJSON = withObject <span class="nottickedoff">&quot;TurnFailure&quot;</span> $ \o -&gt;</span>
+<span class="lineno">  217 </span><span class="spaces">    </span><span class="istickedoff">TurnFailure</span>
+<span class="lineno">  218 </span><span class="spaces">      </span><span class="istickedoff">&lt;$&gt; o .: &quot;headline&quot;</span>
+<span class="lineno">  219 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; (parseCause &lt;$&gt; o .: &quot;cause&quot;)</span>
+<span class="lineno">  220 </span><span class="spaces">      </span><span class="istickedoff">&lt;*&gt; o .: &quot;ref&quot;</span></span>
+
+</pre>
+</body>
+</html>

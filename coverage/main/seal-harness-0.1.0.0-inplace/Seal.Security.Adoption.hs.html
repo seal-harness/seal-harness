@@ -1,0 +1,65 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE DeriveGeneric #-}
+<span class="lineno">    2 </span>-- | Consent-gated adoption of an external tmux window. A discovered window
+<span class="lineno">    3 </span>-- requires @consent_confirmed@ from an interactive channel; a headless run
+<span class="lineno">    4 </span>-- cannot confirm, so adoption fail-closes (the user must confirm via an
+<span class="lineno">    5 </span>-- interactive channel).
+<span class="lineno">    6 </span>module Seal.Security.Adoption
+<span class="lineno">    7 </span>  ( ConsentChannel (..)
+<span class="lineno">    8 </span>  , AdoptError (..)
+<span class="lineno">    9 </span>  , AdoptedHarness (..)
+<span class="lineno">   10 </span>  , authorizeAdoption
+<span class="lineno">   11 </span>  ) where
+<span class="lineno">   12 </span>
+<span class="lineno">   13 </span>import Data.Text (Text)
+<span class="lineno">   14 </span>import GHC.Generics (Generic)
+<span class="lineno">   15 </span>
+<span class="lineno">   16 </span>import Seal.Harness.Id (HarnessId)
+<span class="lineno">   17 </span>
+<span class="lineno">   18 </span>-- | The interactive channels that can confirm an adoption.
+<span class="lineno">   19 </span>data ConsentChannel = CcCli | CcSignal | CcWeb
+<span class="lineno">   20 </span>  deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>-- | The adoption error type. Matched on to drive control flow.
+<span class="lineno">   23 </span>data AdoptError
+<span class="lineno">   24 </span>  = AeHeadlessNoConsent       -- ^ cannot confirm consent in a headless run
+<span class="lineno">   25 </span>  | AeConsentMissing          -- ^ the channel is interactive but consent was not given
+<span class="lineno">   26 </span>  | AeAlreadyManaged HarnessId  -- ^ the window already has a seal_id
+<span class="lineno">   27 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   28 </span>
+<span class="lineno">   29 </span>-- | An adopted harness: the discovered window's coord + the minted id.
+<span class="lineno">   30 </span>data AdoptedHarness = AdoptedHarness
+<span class="lineno">   31 </span>  { <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ahCoord</span></span></span> :: Text
+<span class="lineno">   32 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">ahId</span></span></span>    :: HarnessId
+<span class="lineno">   33 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Generic</span></span></span></span>)
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>-- | Authorize an adoption: requires @consent_confirmed@ from an
+<span class="lineno">   36 </span>-- interactive 'ConsentChannel'. A headless run (@Nothing@ channel)
+<span class="lineno">   37 </span>-- fail-closes with 'AeHeadlessNoConsent'; an interactive channel with
+<span class="lineno">   38 </span>-- @consent_confirmed = False@ fail-closes with 'AeConsentMissing'.
+<span class="lineno">   39 </span>authorizeAdoption :: Maybe ConsentChannel -&gt; Bool -&gt; Either AdoptError ()
+<span class="lineno">   40 </span><span class="decl"><span class="istickedoff">authorizeAdoption Nothing _ = Left AeHeadlessNoConsent</span>
+<span class="lineno">   41 </span><span class="spaces"></span><span class="istickedoff">authorizeAdoption (Just _) False = Left AeConsentMissing</span>
+<span class="lineno">   42 </span><span class="spaces"></span><span class="istickedoff">authorizeAdoption (Just _) True = Right ()</span></span>
+
+</pre>
+</body>
+</html>

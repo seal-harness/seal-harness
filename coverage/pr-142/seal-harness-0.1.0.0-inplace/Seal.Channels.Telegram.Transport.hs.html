@@ -1,0 +1,604 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The testability seam over the Telegram Bot API. The real implementation
+<span class="lineno">    3 </span>-- uses HTTP long-polling on @getUpdates@ and sends via @sendMessage@; the
+<span class="lineno">    4 </span>-- mock implementation backs the test suite, so no network is needed for
+<span class="lineno">    5 </span>-- @cabal test@. Mirrors &quot;Seal.Channels.Signal.Transport&quot; in shape:
+<span class="lineno">    6 </span>-- 'tgReceive' pulls the next inbound update, 'tgSend' sends a message,
+<span class="lineno">    7 </span>-- 'tgClose' cleans up.
+<span class="lineno">    8 </span>module Seal.Channels.Telegram.Transport
+<span class="lineno">    9 </span>  ( TelegramTransport (..)
+<span class="lineno">   10 </span>  , TelegramUpdate (..)
+<span class="lineno">   11 </span>  , TelegramButton (..)
+<span class="lineno">   12 </span>  , BotCommand (..)
+<span class="lineno">   13 </span>  , mkMockTelegramTransport
+<span class="lineno">   14 </span>  , mkRealTelegramTransport
+<span class="lineno">   15 </span>  , parseTelegramUpdate
+<span class="lineno">   16 </span>  , chunkMessage
+<span class="lineno">   17 </span>  , tgSendWithKeyboardViaApi
+<span class="lineno">   18 </span>  , answerCallbackQueryViaApi
+<span class="lineno">   19 </span>  , editReplyMarkupViaApi
+<span class="lineno">   20 </span>  ) where
+<span class="lineno">   21 </span>
+<span class="lineno">   22 </span>import Control.Concurrent.STM
+<span class="lineno">   23 </span>  ( atomically, newTQueueIO, tryReadTQueue, writeTQueue )
+<span class="lineno">   24 </span>import Control.Exception (SomeException, try)
+<span class="lineno">   25 </span>import Data.Aeson (Value)
+<span class="lineno">   26 </span>import Data.Aeson qualified as A
+<span class="lineno">   27 </span>import Data.Aeson.Key qualified as Key
+<span class="lineno">   28 </span>import Data.Aeson.KeyMap qualified as KeyMap
+<span class="lineno">   29 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   30 </span>import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
+<span class="lineno">   31 </span>import Data.Text (Text)
+<span class="lineno">   32 </span>import Data.Text qualified as T
+<span class="lineno">   33 </span>import Data.Vector qualified as V
+<span class="lineno">   34 </span>import Network.HTTP.Client
+<span class="lineno">   35 </span>  ( Manager, Request (..), httpLbs, parseRequest, requestBody, responseBody
+<span class="lineno">   36 </span>  , responseStatus, responseTimeoutMicro, RequestBody (RequestBodyLBS) )
+<span class="lineno">   37 </span>import Network.HTTP.Types (statusCode, methodPost)
+<span class="lineno">   38 </span>
+<span class="lineno">   39 </span>import Katip (Severity (..), ls)
+<span class="lineno">   40 </span>import Seal.Core.MessageSource
+<span class="lineno">   41 </span>  ( ConversationId, UserId, mkConversationId, mkUserId )
+<span class="lineno">   42 </span>import Seal.Logging.Global (globalLogIO)
+<span class="lineno">   43 </span>
+<span class="lineno">   44 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   45 </span>-- TelegramTransport — the testability seam
+<span class="lineno">   46 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">   47 </span>
+<span class="lineno">   48 </span>-- | The testability seam over the Telegram Bot API. The channel layer calls
+<span class="lineno">   49 </span>-- 'tgReceive' to pull the next parsed update (blocks until one arrives or
+<span class="lineno">   50 </span>-- the transport closes), 'tgSend' to send a message (chat id + body),
+<span class="lineno">   51 </span>-- 'tgSetCommands' to register the bot's slash-command menu with BotFather
+<span class="lineno">   52 </span>-- (for auto-completion), and 'tgClose' to clean up.
+<span class="lineno">   53 </span>data TelegramTransport = TelegramTransport
+<span class="lineno">   54 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">tgReceive</span></span></span>     :: IO (Either Text TelegramUpdate)
+<span class="lineno">   55 </span>    -- ^ Next inbound update. 'Right' on success; 'Left' diagnostic on
+<span class="lineno">   56 </span>    -- close/failure (the reader thread stops).
+<span class="lineno">   57 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tgSend</span></span></span>        :: Text -&gt; Text -&gt; IO ()
+<span class="lineno">   58 </span>    -- ^ Send a message: chat id, body. Calls the Bot API @sendMessage@.
+<span class="lineno">   59 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tgSendWithKeyboard</span></span></span> :: Text -&gt; Text -&gt; [[TelegramButton]] -&gt; IO ()
+<span class="lineno">   60 </span>    -- ^ Send a message with an inline keyboard: chat id, body, keyboard
+<span class="lineno">   61 </span>    -- rows. Calls @sendMessage@ with @reply_markup@. Does NOT set
+<span class="lineno">   62 </span>    -- @parse_mode@ (gate: Security #3 — plain text).
+<span class="lineno">   63 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">tgSetCommands</span></span></span> :: [BotCommand] -&gt; IO ()
+<span class="lineno">   64 </span>    -- ^ Register the bot's command menu via @setMyCommands@ (auto-completion).
+<span class="lineno">   65 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tgAnswerCallback</span></span></span> :: Text -&gt; IO ()
+<span class="lineno">   66 </span>    -- ^ Acknowledge a @callback_query@ via the Bot API
+<span class="lineno">   67 </span>    -- @answerCallbackQuery@ (stops the button's loading spinner).
+<span class="lineno">   68 </span>    -- Best-effort: never throws. The argument is the
+<span class="lineno">   69 </span>    -- @callback_query_id@.
+<span class="lineno">   70 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tgEditReplyMarkup</span></span></span> :: Text -&gt; Text -&gt; IO ()
+<span class="lineno">   71 </span>    -- ^ Remove the inline keyboard from a message via the Bot API
+<span class="lineno">   72 </span>    -- @editMessageReplyMarkup@ (disables the buttons after a tap).
+<span class="lineno">   73 </span>    -- Args: chat id, message id. Best-effort: never throws.
+<span class="lineno">   74 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tgClose</span></span></span>       :: IO ()
+<span class="lineno">   75 </span>  }
+<span class="lineno">   76 </span>
+<span class="lineno">   77 </span>-- | A BotFather command menu entry: the command name (without the leading
+<span class="lineno">   78 </span>-- @/@) and a short description (≤ 256 chars per Telegram's limit). Derived
+<span class="lineno">   79 </span>-- from the Seal command 'Registry' by 'telegramBotCommands'.
+<span class="lineno">   80 </span>data BotCommand = BotCommand
+<span class="lineno">   81 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">bcName</span></span></span>        :: Text   -- ^ command name, lowercase, ≤ 32 chars
+<span class="lineno">   82 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">bcDescription</span></span></span> :: Text   -- ^ short description, ≤ 256 chars
+<span class="lineno">   83 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   84 </span>
+<span class="lineno">   85 </span>-- | One inline-keyboard button: the visible text + the callback_data (sent
+<span class="lineno">   86 </span>-- back to the bot when the human taps the button). The callback_data is
+<span class="lineno">   87 </span>-- @\&quot;&lt;8hexAskIdPrefix&gt;:&lt;label&gt;\&quot;@ (≤ 64 bytes; the label byte-bound is 55).
+<span class="lineno">   88 </span>data TelegramButton = TelegramButton
+<span class="lineno">   89 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">tbText</span></span></span>         :: !Text
+<span class="lineno">   90 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tbCallbackData</span></span></span> :: !Text
+<span class="lineno">   91 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   92 </span>
+<span class="lineno">   93 </span>-- | ToJSON for 'TelegramButton' — encodes as @{\&quot;text\&quot;:..., \&quot;callback_data\&quot;:...}@.
+<span class="lineno">   94 </span>instance <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">A.ToJSON TelegramButton</span></span></span></span></span></span></span></span> where
+<span class="lineno">   95 </span>  <span class="decl"><span class="nottickedoff">toJSON (TelegramButton txt cbd) = A.object</span>
+<span class="lineno">   96 </span><span class="spaces">    </span><span class="nottickedoff">[ &quot;text&quot; A..= txt</span>
+<span class="lineno">   97 </span><span class="spaces">    </span><span class="nottickedoff">, &quot;callback_data&quot; A..= cbd</span>
+<span class="lineno">   98 </span><span class="spaces">    </span><span class="nottickedoff">]</span></span>
+<span class="lineno">   99 </span>
+<span class="lineno">  100 </span>-- | A parsed inbound Telegram update: the conversation id (from chat.id),
+<span class="lineno">  101 </span>-- the sender's user id (from from.id), and the message body. The
+<span class="lineno">  102 </span>-- conversation id is server-derived from authenticated transport metadata
+<span class="lineno">  103 </span>-- (the Telegram @chat.id@ field), never read from the message body. The
+<span class="lineno">  104 </span>-- raw @chatId@ is also carried so the channel can address replies without
+<span class="lineno">  105 </span>-- stripping the @tg:@ conversation-id prefix.
+<span class="lineno">  106 </span>--
+<span class="lineno">  107 </span>-- When the update is a @callback_query@ (a button tap), 'tuCallbackData'
+<span class="lineno">  108 </span>-- is @Just data@ + 'tuCallbackId' is @Just id@; 'tuBody' is the
+<span class="lineno">  109 </span>-- callback_data (the loop uses it to route). When the update is a regular
+<span class="lineno">  110 </span>-- @message@, both are @Nothing@ + 'tuBody' is the message text.
+<span class="lineno">  111 </span>data TelegramUpdate = TelegramUpdate
+<span class="lineno">  112 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">tuConversationId</span></span></span> :: ConversationId
+<span class="lineno">  113 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tuChatId</span></span></span>          :: Text
+<span class="lineno">  114 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tuSender</span></span></span>          :: UserId
+<span class="lineno">  115 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tuBody</span></span></span>            :: Text
+<span class="lineno">  116 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tuCallbackData</span></span></span>    :: Maybe Text  -- ^ @Just data@ for callback_query; @Nothing@ for message
+<span class="lineno">  117 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tuCallbackId</span></span></span>      :: Maybe Text  -- ^ @Just id@ for callback_query (for answerCallbackQuery); @Nothing@ for message
+<span class="lineno">  118 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">tuCallbackMessageId</span></span></span> :: Maybe Text
+<span class="lineno">  119 </span>  -- ^ @Just msgId@ for callback_query (the message holding the keyboard,
+<span class="lineno">  120 </span>  -- so we can remove it after a tap); @Nothing@ for message.
+<span class="lineno">  121 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  122 </span>
+<span class="lineno">  123 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  124 </span>-- Mock transport
+<span class="lineno">  125 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  126 </span>
+<span class="lineno">  127 </span>-- | A mock transport backed by a 'TQueue' of inbound 'TelegramUpdate's and an
+<span class="lineno">  128 </span>-- 'IORef' of captured sends. 'tgReceive' pops the next inbound (or returns
+<span class="lineno">  129 </span>-- @Left &quot;inbox empty&quot;@); 'tgSend' appends @(chatId, body)@ to the capture;
+<span class="lineno">  130 </span>-- 'tgSetCommands' captures the last registered commands; 'tgClose' is a
+<span class="lineno">  131 </span>-- no-op (idempotent). 'tgSendWithKeyboard' + 'tgAnswerCallback' capture to
+<span class="lineno">  132 </span>-- separate IORefs (for test assertions). Returns the transport + an action
+<span class="lineno">  133 </span>-- to read captured sends + an action to read captured commands + an action
+<span class="lineno">  134 </span>-- to read captured callback acknowledgements + an action to read captured
+<span class="lineno">  135 </span>-- keyboard sends (each @(chatId, body, keyboard)@).
+<span class="lineno">  136 </span>mkMockTelegramTransport
+<span class="lineno">  137 </span>  :: [TelegramUpdate]
+<span class="lineno">  138 </span>  -&gt; IO ( TelegramTransport, IO [(Text, Text)], IO [BotCommand]
+<span class="lineno">  139 </span>        , IO [Text], IO [(Text, Text, [[TelegramButton]])] )
+<span class="lineno">  140 </span><span class="decl"><span class="istickedoff">mkMockTelegramTransport scripted = do</span>
+<span class="lineno">  141 </span><span class="spaces">  </span><span class="istickedoff">q &lt;- newTQueueIO</span>
+<span class="lineno">  142 </span><span class="spaces">  </span><span class="istickedoff">mapM_ (atomically . writeTQueue q) scripted</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">capRef &lt;- newIORef []</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">cmdRef &lt;- newIORef <span class="nottickedoff">[]</span></span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="istickedoff">kbRef &lt;- newIORef []</span>
+<span class="lineno">  146 </span><span class="spaces">  </span><span class="istickedoff">cbRef &lt;- newIORef []</span>
+<span class="lineno">  147 </span><span class="spaces">  </span><span class="istickedoff">let transport = TelegramTransport</span>
+<span class="lineno">  148 </span><span class="spaces">        </span><span class="istickedoff">{ tgReceive = do</span>
+<span class="lineno">  149 </span><span class="spaces">            </span><span class="istickedoff">m &lt;- atomically (tryReadTQueue q)</span>
+<span class="lineno">  150 </span><span class="spaces">            </span><span class="istickedoff">case m of</span>
+<span class="lineno">  151 </span><span class="spaces">              </span><span class="istickedoff">Just u  -&gt; pure (Right u)</span>
+<span class="lineno">  152 </span><span class="spaces">              </span><span class="istickedoff">Nothing -&gt; pure (Left <span class="nottickedoff">&quot;telegram inbox empty&quot;</span>)</span>
+<span class="lineno">  153 </span><span class="spaces">        </span><span class="istickedoff">, tgSend = \c b -&gt; modifyIORef' capRef ((<span class="nottickedoff">c</span>, b) :)</span>
+<span class="lineno">  154 </span><span class="spaces">        </span><span class="istickedoff">, tgSendWithKeyboard = \c b kb -&gt; modifyIORef' kbRef ((<span class="nottickedoff">c</span>, b, kb) :)</span>
+<span class="lineno">  155 </span><span class="spaces">        </span><span class="istickedoff">, tgSetCommands = <span class="nottickedoff">writeIORef cmdRef</span></span>
+<span class="lineno">  156 </span><span class="spaces">        </span><span class="istickedoff">, tgAnswerCallback = \cbId -&gt; modifyIORef' cbRef (cbId :)</span>
+<span class="lineno">  157 </span><span class="spaces">        </span><span class="istickedoff">, tgEditReplyMarkup = \_c _m -&gt; pure <span class="nottickedoff">()</span>  -- mock: no-op</span>
+<span class="lineno">  158 </span><span class="spaces">        </span><span class="istickedoff">, tgClose = pure <span class="nottickedoff">()</span></span>
+<span class="lineno">  159 </span><span class="spaces">        </span><span class="istickedoff">}</span>
+<span class="lineno">  160 </span><span class="spaces">      </span><span class="istickedoff">getCaptured = reverse &lt;$&gt; readIORef capRef</span>
+<span class="lineno">  161 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">getCommands = readIORef cmdRef</span></span>
+<span class="lineno">  162 </span><span class="spaces">      </span><span class="istickedoff">getCallbacks = reverse &lt;$&gt; readIORef cbRef</span>
+<span class="lineno">  163 </span><span class="spaces">      </span><span class="istickedoff">getKeyboards = reverse &lt;$&gt; readIORef kbRef</span>
+<span class="lineno">  164 </span><span class="spaces">  </span><span class="istickedoff">pure (transport, getCaptured, <span class="nottickedoff">getCommands</span>, getCallbacks, getKeyboards)</span></span>
+<span class="lineno">  165 </span>
+<span class="lineno">  166 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  167 </span>-- Real transport — Telegram Bot API over HTTPS
+<span class="lineno">  168 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  169 </span>
+<span class="lineno">  170 </span>-- | The Telegram Bot API base URL.
+<span class="lineno">  171 </span>telegramApiBase :: Text
+<span class="lineno">  172 </span><span class="decl"><span class="nottickedoff">telegramApiBase = &quot;https://api.telegram.org/bot&quot;</span></span>
+<span class="lineno">  173 </span>
+<span class="lineno">  174 </span>-- | Spawn the real Telegram transport: long-polls @getUpdates@ and sends via
+<span class="lineno">  175 </span>-- @sendMessage@. 'tgReceive' blocks on @getUpdates@ (30s long-poll), parses
+<span class="lineno">  176 </span>-- each update into a 'TelegramUpdate', and advances the @offset@ so
+<span class="lineno">  177 </span>-- acknowledged updates are not re-delivered. 'tgSend' calls @sendMessage@.
+<span class="lineno">  178 </span>-- 'tgSetCommands' calls @setMyCommands@ to register the bot's slash-command
+<span class="lineno">  179 </span>-- menu for auto-completion. 'tgClose' is a no-op (long-polling is stateless;
+<span class="lineno">  180 </span>-- no child process to kill). The transport maintains an internal buffer
+<span class="lineno">  181 </span>-- ('TQueue') of parsed updates from the last @getUpdates@ call, refilling
+<span class="lineno">  182 </span>-- when it drains.
+<span class="lineno">  183 </span>mkRealTelegramTransport :: Text -&gt; Manager -&gt; IO TelegramTransport
+<span class="lineno">  184 </span><span class="decl"><span class="nottickedoff">mkRealTelegramTransport token mgr = do</span>
+<span class="lineno">  185 </span><span class="spaces">  </span><span class="nottickedoff">buffer &lt;- newTQueueIO</span>
+<span class="lineno">  186 </span><span class="spaces">  </span><span class="nottickedoff">offsetRef &lt;- newIORef (0 :: Int)</span>
+<span class="lineno">  187 </span><span class="spaces">  </span><span class="nottickedoff">pure TelegramTransport</span>
+<span class="lineno">  188 </span><span class="spaces">    </span><span class="nottickedoff">{ tgReceive = fillAndReceive buffer offsetRef</span>
+<span class="lineno">  189 </span><span class="spaces">    </span><span class="nottickedoff">, tgSend = sendViaApi mgr token</span>
+<span class="lineno">  190 </span><span class="spaces">    </span><span class="nottickedoff">, tgSendWithKeyboard = tgSendWithKeyboardViaApi mgr token</span>
+<span class="lineno">  191 </span><span class="spaces">    </span><span class="nottickedoff">, tgSetCommands = \cmds -&gt; do</span>
+<span class="lineno">  192 </span><span class="spaces">        </span><span class="nottickedoff">eRes &lt;- setMyCommandsViaApi mgr token cmds</span>
+<span class="lineno">  193 </span><span class="spaces">        </span><span class="nottickedoff">case eRes of</span>
+<span class="lineno">  194 </span><span class="spaces">          </span><span class="nottickedoff">Left err -&gt; globalLogIO ErrorS (&quot;telegram setMyCommands failed: &quot; &lt;&gt; ls err)</span>
+<span class="lineno">  195 </span><span class="spaces">          </span><span class="nottickedoff">Right _  -&gt; pure ()</span>
+<span class="lineno">  196 </span><span class="spaces">    </span><span class="nottickedoff">, tgAnswerCallback = answerCallbackQueryViaApi mgr token</span>
+<span class="lineno">  197 </span><span class="spaces">    </span><span class="nottickedoff">, tgEditReplyMarkup = editReplyMarkupViaApi mgr token</span>
+<span class="lineno">  198 </span><span class="spaces">    </span><span class="nottickedoff">, tgClose = pure ()</span>
+<span class="lineno">  199 </span><span class="spaces">    </span><span class="nottickedoff">}</span>
+<span class="lineno">  200 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  201 </span><span class="spaces">    </span><span class="nottickedoff">-- If the buffer is empty, call getUpdates to refill it, then pop one.</span>
+<span class="lineno">  202 </span><span class="spaces">    </span><span class="nottickedoff">fillAndReceive buffer offsetRef = do</span>
+<span class="lineno">  203 </span><span class="spaces">      </span><span class="nottickedoff">m &lt;- atomically (tryReadTQueue buffer)</span>
+<span class="lineno">  204 </span><span class="spaces">      </span><span class="nottickedoff">case m of</span>
+<span class="lineno">  205 </span><span class="spaces">        </span><span class="nottickedoff">Just u  -&gt; pure (Right u)</span>
+<span class="lineno">  206 </span><span class="spaces">        </span><span class="nottickedoff">Nothing -&gt; do</span>
+<span class="lineno">  207 </span><span class="spaces">          </span><span class="nottickedoff">offset &lt;- readIORef offsetRef</span>
+<span class="lineno">  208 </span><span class="spaces">          </span><span class="nottickedoff">eResult &lt;- getUpdates mgr token offset</span>
+<span class="lineno">  209 </span><span class="spaces">          </span><span class="nottickedoff">case eResult of</span>
+<span class="lineno">  210 </span><span class="spaces">            </span><span class="nottickedoff">Left err -&gt; pure (Left err)</span>
+<span class="lineno">  211 </span><span class="spaces">            </span><span class="nottickedoff">Right (updates, rawIds) -&gt;</span>
+<span class="lineno">  212 </span><span class="spaces">              </span><span class="nottickedoff">if null updates</span>
+<span class="lineno">  213 </span><span class="spaces">                </span><span class="nottickedoff">then</span>
+<span class="lineno">  214 </span><span class="spaces">                  </span><span class="nottickedoff">-- No parseable updates. Still advance the offset past</span>
+<span class="lineno">  215 </span><span class="spaces">                  </span><span class="nottickedoff">-- any raw update_ids so we don't loop forever on</span>
+<span class="lineno">  216 </span><span class="spaces">                  </span><span class="nottickedoff">-- unparseable updates.</span>
+<span class="lineno">  217 </span><span class="spaces">                  </span><span class="nottickedoff">if null rawIds</span>
+<span class="lineno">  218 </span><span class="spaces">                    </span><span class="nottickedoff">then fillAndReceive buffer offsetRef</span>
+<span class="lineno">  219 </span><span class="spaces">                    </span><span class="nottickedoff">else do</span>
+<span class="lineno">  220 </span><span class="spaces">                      </span><span class="nottickedoff">let lastId = maximum rawIds</span>
+<span class="lineno">  221 </span><span class="spaces">                      </span><span class="nottickedoff">modifyIORef' offsetRef (const (lastId + 1))</span>
+<span class="lineno">  222 </span><span class="spaces">                      </span><span class="nottickedoff">fillAndReceive buffer offsetRef</span>
+<span class="lineno">  223 </span><span class="spaces">                </span><span class="nottickedoff">else do</span>
+<span class="lineno">  224 </span><span class="spaces">                  </span><span class="nottickedoff">let lastId = maximum (map fst updates)</span>
+<span class="lineno">  225 </span><span class="spaces">                  </span><span class="nottickedoff">modifyIORef' offsetRef (const (lastId + 1))</span>
+<span class="lineno">  226 </span><span class="spaces">                  </span><span class="nottickedoff">mapM_ ((atomically . writeTQueue buffer) . snd) updates</span>
+<span class="lineno">  227 </span><span class="spaces">                  </span><span class="nottickedoff">fillAndReceive buffer offsetRef</span></span>
+<span class="lineno">  228 </span>
+<span class="lineno">  229 </span>-- | Call @getUpdates@ with long-polling (30s timeout). Returns the parsed
+<span class="lineno">  230 </span>-- updates as @(update_id, TelegramUpdate)@ pairs — @message@ and
+<span class="lineno">  231 </span>-- @callback_query@ updates are parsed; other update types are skipped.
+<span class="lineno">  232 </span>-- Explicitly requests @message@ + @callback_query@ via @allowed_updates@
+<span class="lineno">  233 </span>-- so button taps are delivered (without this, Telegram uses the previous
+<span class="lineno">  234 </span>-- setting, which may exclude @callback_query@).
+<span class="lineno">  235 </span>getUpdates :: Manager -&gt; Text -&gt; Int -&gt; IO (Either Text ([(Int, TelegramUpdate)], [Int]))
+<span class="lineno">  236 </span>-- ^ Returns @(parsedUpdates, allRawUpdateIds)@. The raw ids let the caller
+<span class="lineno">  237 </span>-- advance the offset even when some updates fail to parse (e.g. an
+<span class="lineno">  238 </span>-- unparseable callback_query), avoiding an infinite loop re-receiving
+<span class="lineno">  239 </span>-- them.
+<span class="lineno">  240 </span><span class="decl"><span class="nottickedoff">getUpdates mgr token offset = do</span>
+<span class="lineno">  241 </span><span class="spaces">  </span><span class="nottickedoff">let url = T.unpack (telegramApiBase &lt;&gt; token &lt;&gt; &quot;/getUpdates&quot;)</span>
+<span class="lineno">  242 </span><span class="spaces">             </span><span class="nottickedoff">&lt;&gt; &quot;?offset=&quot; &lt;&gt; show offset &lt;&gt; &quot;&amp;timeout=30&quot;</span>
+<span class="lineno">  243 </span><span class="spaces">  </span><span class="nottickedoff">eReq &lt;- try @SomeException (parseRequest url)</span>
+<span class="lineno">  244 </span><span class="spaces">  </span><span class="nottickedoff">case eReq of</span>
+<span class="lineno">  245 </span><span class="spaces">    </span><span class="nottickedoff">Left ex -&gt; pure (Left (&quot;getUpdates request error: &quot; &lt;&gt; T.pack (show ex)))</span>
+<span class="lineno">  246 </span><span class="spaces">    </span><span class="nottickedoff">Right req0 -&gt; do</span>
+<span class="lineno">  247 </span><span class="spaces">      </span><span class="nottickedoff">let req = req0 { responseTimeout = responseTimeoutMicro 60000000 }</span>
+<span class="lineno">  248 </span><span class="spaces">      </span><span class="nottickedoff">eResp &lt;- try @SomeException (httpLbs req mgr)</span>
+<span class="lineno">  249 </span><span class="spaces">      </span><span class="nottickedoff">case eResp of</span>
+<span class="lineno">  250 </span><span class="spaces">        </span><span class="nottickedoff">Left ex -&gt; pure (Left (&quot;getUpdates network error: &quot; &lt;&gt; T.pack (show ex)))</span>
+<span class="lineno">  251 </span><span class="spaces">        </span><span class="nottickedoff">Right resp -&gt;</span>
+<span class="lineno">  252 </span><span class="spaces">          </span><span class="nottickedoff">let code = statusCode (responseStatus resp)</span>
+<span class="lineno">  253 </span><span class="spaces">              </span><span class="nottickedoff">body = responseBody resp</span>
+<span class="lineno">  254 </span><span class="spaces">          </span><span class="nottickedoff">in if code == 200</span>
+<span class="lineno">  255 </span><span class="spaces">               </span><span class="nottickedoff">then pure (parseGetUpdatesResponse body)</span>
+<span class="lineno">  256 </span><span class="spaces">               </span><span class="nottickedoff">else pure (Left (&quot;getUpdates returned HTTP &quot; &lt;&gt; T.pack (show code)</span>
+<span class="lineno">  257 </span><span class="spaces">                              </span><span class="nottickedoff">&lt;&gt; &quot; — &quot; &lt;&gt; T.pack (show body)))</span></span>
+<span class="lineno">  258 </span>
+<span class="lineno">  259 </span>-- | Parse the JSON response from getUpdates. Returns @(parsedUpdates,
+<span class="lineno">  260 </span>-- allRawUpdateIds)@. The raw ids let the caller advance the offset even
+<span class="lineno">  261 </span>-- when some updates fail to parse (e.g. an unparseable callback_query).
+<span class="lineno">  262 </span>parseGetUpdatesResponse :: BL.ByteString -&gt; Either Text ([(Int, TelegramUpdate)], [Int])
+<span class="lineno">  263 </span><span class="decl"><span class="nottickedoff">parseGetUpdatesResponse body =</span>
+<span class="lineno">  264 </span><span class="spaces">  </span><span class="nottickedoff">case A.decode body of</span>
+<span class="lineno">  265 </span><span class="spaces">    </span><span class="nottickedoff">Nothing -&gt; Left &quot;getUpdates: malformed JSON response&quot;</span>
+<span class="lineno">  266 </span><span class="spaces">    </span><span class="nottickedoff">Just (A.Object o) -&gt; case KeyMap.lookup (Key.fromString &quot;result&quot;) o of</span>
+<span class="lineno">  267 </span><span class="spaces">      </span><span class="nottickedoff">Just (A.Array arr) -&gt;</span>
+<span class="lineno">  268 </span><span class="spaces">        </span><span class="nottickedoff">let raws = V.toList arr</span>
+<span class="lineno">  269 </span><span class="spaces">            </span><span class="nottickedoff">allIds = [ uid | v &lt;- raws, Just uid &lt;- [rawUpdateId v] ]</span>
+<span class="lineno">  270 </span><span class="spaces">            </span><span class="nottickedoff">parsed = [ parseOneUpdate v | v &lt;- raws ]</span>
+<span class="lineno">  271 </span><span class="spaces">            </span><span class="nottickedoff">okUpdates = [ (uid, u) | Right (uid, u) &lt;- parsed ]</span>
+<span class="lineno">  272 </span><span class="spaces">        </span><span class="nottickedoff">in Right (okUpdates, allIds)</span>
+<span class="lineno">  273 </span><span class="spaces">      </span><span class="nottickedoff">_ -&gt; Right ([], [])</span>
+<span class="lineno">  274 </span><span class="spaces">    </span><span class="nottickedoff">Just _ -&gt; Left &quot;getUpdates: response not an object&quot;</span>
+<span class="lineno">  275 </span><span class="spaces">  </span><span class="nottickedoff">where</span>
+<span class="lineno">  276 </span><span class="spaces">    </span><span class="nottickedoff">parseOneUpdate v = do</span>
+<span class="lineno">  277 </span><span class="spaces">      </span><span class="nottickedoff">uid &lt;- updateId v</span>
+<span class="lineno">  278 </span><span class="spaces">      </span><span class="nottickedoff">case parseTelegramUpdate v of</span>
+<span class="lineno">  279 </span><span class="spaces">        </span><span class="nottickedoff">Left err -&gt; Left err</span>
+<span class="lineno">  280 </span><span class="spaces">        </span><span class="nottickedoff">Right u  -&gt; Right (uid, u)</span></span>
+<span class="lineno">  281 </span>
+<span class="lineno">  282 </span>-- | Extract the raw @update_id@ from an update object (for offset
+<span class="lineno">  283 </span>-- advancement even when the update body fails to parse).
+<span class="lineno">  284 </span>rawUpdateId :: Value -&gt; Maybe Int
+<span class="lineno">  285 </span><span class="decl"><span class="nottickedoff">rawUpdateId v =</span>
+<span class="lineno">  286 </span><span class="spaces">  </span><span class="nottickedoff">case v of</span>
+<span class="lineno">  287 </span><span class="spaces">    </span><span class="nottickedoff">A.Object o -&gt; case KeyMap.lookup (Key.fromString &quot;update_id&quot;) o of</span>
+<span class="lineno">  288 </span><span class="spaces">      </span><span class="nottickedoff">Just (A.Number n) -&gt; Just (round n)</span>
+<span class="lineno">  289 </span><span class="spaces">      </span><span class="nottickedoff">_ -&gt; Nothing</span>
+<span class="lineno">  290 </span><span class="spaces">    </span><span class="nottickedoff">_ -&gt; Nothing</span></span>
+<span class="lineno">  291 </span>
+<span class="lineno">  292 </span>-- | Extract the numeric @update_id@ from a Telegram update object.
+<span class="lineno">  293 </span>updateId :: Value -&gt; Either Text Int
+<span class="lineno">  294 </span><span class="decl"><span class="nottickedoff">updateId v =</span>
+<span class="lineno">  295 </span><span class="spaces">  </span><span class="nottickedoff">case v of</span>
+<span class="lineno">  296 </span><span class="spaces">    </span><span class="nottickedoff">A.Object o -&gt; case KeyMap.lookup (Key.fromString &quot;update_id&quot;) o of</span>
+<span class="lineno">  297 </span><span class="spaces">      </span><span class="nottickedoff">Just (A.Number n) -&gt; Right (round n)</span>
+<span class="lineno">  298 </span><span class="spaces">      </span><span class="nottickedoff">_ -&gt; Left &quot;update missing update_id&quot;</span>
+<span class="lineno">  299 </span><span class="spaces">    </span><span class="nottickedoff">_ -&gt; Left &quot;update not an object&quot;</span></span>
+<span class="lineno">  300 </span>
+<span class="lineno">  301 </span>-- | Parse a raw Telegram update into a 'TelegramUpdate'. Handles two shapes:
+<span class="lineno">  302 </span>--
+<span class="lineno">  303 </span>-- 1. @message@ — a regular text message. 'tuCallbackData'/'tuCallbackId' are
+<span class="lineno">  304 </span>--    @Nothing@; 'tuBody' is the message text.
+<span class="lineno">  305 </span>-- 2. @callback_query@ — a button tap on an inline keyboard.
+<span class="lineno">  306 </span>--    'tuCallbackData' is @Just data@ (the callback_data); 'tuCallbackId' is
+<span class="lineno">  307 </span>--    @Just id@ (the callback_query id, for answerCallbackQuery);
+<span class="lineno">  308 </span>--    'tuBody' is the callback_data (the loop routes by it); the chat id +
+<span class="lineno">  309 </span>--    sender come from @callback_query.message.chat@ / @callback_query.from@.
+<span class="lineno">  310 </span>--
+<span class="lineno">  311 </span>-- Skips non-message/non-callback updates with a 'Left'.
+<span class="lineno">  312 </span>parseTelegramUpdate :: Value -&gt; Either Text TelegramUpdate
+<span class="lineno">  313 </span><span class="decl"><span class="istickedoff">parseTelegramUpdate v =</span>
+<span class="lineno">  314 </span><span class="spaces">  </span><span class="istickedoff">case v of</span>
+<span class="lineno">  315 </span><span class="spaces">    </span><span class="istickedoff">A.Object o -&gt;</span>
+<span class="lineno">  316 </span><span class="spaces">      </span><span class="istickedoff">case KeyMap.lookup (Key.fromString &quot;callback_query&quot;) o of</span>
+<span class="lineno">  317 </span><span class="spaces">        </span><span class="istickedoff">Just cq -&gt; parseCallbackQuery cq</span>
+<span class="lineno">  318 </span><span class="spaces">        </span><span class="istickedoff">Nothing -&gt; case KeyMap.lookup (Key.fromString &quot;message&quot;) o of</span>
+<span class="lineno">  319 </span><span class="spaces">          </span><span class="istickedoff">Just m  -&gt; parseMessage m</span>
+<span class="lineno">  320 </span><span class="spaces">          </span><span class="istickedoff">Nothing -&gt; Left <span class="nottickedoff">&quot;update has no message or callback_query field&quot;</span></span>
+<span class="lineno">  321 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Left &quot;update not an object&quot;</span></span>
+<span class="lineno">  322 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  323 </span><span class="spaces">    </span><span class="istickedoff">parseMessage msg =</span>
+<span class="lineno">  324 </span><span class="spaces">      </span><span class="istickedoff">case msg of</span>
+<span class="lineno">  325 </span><span class="spaces">        </span><span class="istickedoff">A.Object mo -&gt; do</span>
+<span class="lineno">  326 </span><span class="spaces">          </span><span class="istickedoff">chatId &lt;- requireChatId mo</span>
+<span class="lineno">  327 </span><span class="spaces">          </span><span class="istickedoff">cid &lt;- case mkConversationId (&quot;tg:&quot; &lt;&gt; chatId) of</span>
+<span class="lineno">  328 </span><span class="spaces">            </span><span class="istickedoff">Right c -&gt; Right c</span>
+<span class="lineno">  329 </span><span class="spaces">            </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">Left (&quot;conversation id construction failed: &quot; &lt;&gt; err)</span></span>
+<span class="lineno">  330 </span><span class="spaces">          </span><span class="istickedoff">sender &lt;- requireSender mo</span>
+<span class="lineno">  331 </span><span class="spaces">          </span><span class="istickedoff">let body = extractText mo</span>
+<span class="lineno">  332 </span><span class="spaces">          </span><span class="istickedoff">Right TelegramUpdate</span>
+<span class="lineno">  333 </span><span class="spaces">            </span><span class="istickedoff">{ tuConversationId = cid</span>
+<span class="lineno">  334 </span><span class="spaces">            </span><span class="istickedoff">, tuChatId          = chatId</span>
+<span class="lineno">  335 </span><span class="spaces">            </span><span class="istickedoff">, tuSender          = sender</span>
+<span class="lineno">  336 </span><span class="spaces">            </span><span class="istickedoff">, tuBody            = body</span>
+<span class="lineno">  337 </span><span class="spaces">            </span><span class="istickedoff">, tuCallbackData    = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  338 </span><span class="spaces">            </span><span class="istickedoff">, tuCallbackId      = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  339 </span><span class="spaces">            </span><span class="istickedoff">, tuCallbackMessageId = <span class="nottickedoff">Nothing</span></span>
+<span class="lineno">  340 </span><span class="spaces">            </span><span class="istickedoff">}</span>
+<span class="lineno">  341 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Left &quot;message not an object&quot;</span></span>
+<span class="lineno">  342 </span><span class="spaces">    </span><span class="istickedoff">parseCallbackQuery cq =</span>
+<span class="lineno">  343 </span><span class="spaces">      </span><span class="istickedoff">case cq of</span>
+<span class="lineno">  344 </span><span class="spaces">        </span><span class="istickedoff">A.Object cqo -&gt; do</span>
+<span class="lineno">  345 </span><span class="spaces">          </span><span class="istickedoff">-- callback_query has: id (a String per the Bot API), from,</span>
+<span class="lineno">  346 </span><span class="spaces">          </span><span class="istickedoff">-- message (with chat), data.</span>
+<span class="lineno">  347 </span><span class="spaces">          </span><span class="istickedoff">callbackId &lt;- case KeyMap.lookup (Key.fromString &quot;id&quot;) cqo of</span>
+<span class="lineno">  348 </span><span class="spaces">            </span><span class="istickedoff">Just (A.String t) -&gt; Right t</span>
+<span class="lineno">  349 </span><span class="spaces">            </span><span class="istickedoff">Just (A.Number n) -&gt; Right (T.pack (show (round n :: Int)))</span>
+<span class="lineno">  350 </span><span class="spaces">            </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Left &quot;callback_query.id missing&quot;</span></span>
+<span class="lineno">  351 </span><span class="spaces">          </span><span class="istickedoff">callbackData &lt;- case KeyMap.lookup (Key.fromString &quot;data&quot;) cqo of</span>
+<span class="lineno">  352 </span><span class="spaces">            </span><span class="istickedoff">Just (A.String t) -&gt; Right t</span>
+<span class="lineno">  353 </span><span class="spaces">            </span><span class="istickedoff">_ -&gt; Left <span class="nottickedoff">&quot;callback_query.data missing&quot;</span></span>
+<span class="lineno">  354 </span><span class="spaces">          </span><span class="istickedoff">-- chat.id comes from callback_query.message.chat.id</span>
+<span class="lineno">  355 </span><span class="spaces">          </span><span class="istickedoff">msg &lt;- case KeyMap.lookup (Key.fromString &quot;message&quot;) cqo of</span>
+<span class="lineno">  356 </span><span class="spaces">            </span><span class="istickedoff">Just m -&gt; Right m</span>
+<span class="lineno">  357 </span><span class="spaces">            </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">Left &quot;callback_query has no message field&quot;</span></span>
+<span class="lineno">  358 </span><span class="spaces">          </span><span class="istickedoff">case msg of</span>
+<span class="lineno">  359 </span><span class="spaces">            </span><span class="istickedoff">A.Object mo -&gt; do</span>
+<span class="lineno">  360 </span><span class="spaces">              </span><span class="istickedoff">chatId &lt;- requireChatId mo</span>
+<span class="lineno">  361 </span><span class="spaces">              </span><span class="istickedoff">cid &lt;- case mkConversationId (&quot;tg:&quot; &lt;&gt; chatId) of</span>
+<span class="lineno">  362 </span><span class="spaces">                </span><span class="istickedoff">Right c -&gt; Right c</span>
+<span class="lineno">  363 </span><span class="spaces">                </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">Left (&quot;conversation id construction failed: &quot; &lt;&gt; err)</span></span>
+<span class="lineno">  364 </span><span class="spaces">              </span><span class="istickedoff">sender &lt;- case KeyMap.lookup (Key.fromString &quot;from&quot;) cqo of</span>
+<span class="lineno">  365 </span><span class="spaces">                </span><span class="istickedoff">Just (A.Object fo) -&gt; case KeyMap.lookup (Key.fromString &quot;id&quot;) fo of</span>
+<span class="lineno">  366 </span><span class="spaces">                  </span><span class="istickedoff">Just (A.Number n) -&gt; case mkUserId (T.pack (show (round n :: Int))) of</span>
+<span class="lineno">  367 </span><span class="spaces">                    </span><span class="istickedoff">Right u  -&gt; Right u</span>
+<span class="lineno">  368 </span><span class="spaces">                    </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">Left (&quot;telegram callback sender not a valid UserId: &quot; &lt;&gt; err)</span></span>
+<span class="lineno">  369 </span><span class="spaces">                  </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Left &quot;callback_query.from.id missing&quot;</span></span>
+<span class="lineno">  370 </span><span class="spaces">                </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Left &quot;callback_query.from field missing&quot;</span></span>
+<span class="lineno">  371 </span><span class="spaces">              </span><span class="istickedoff">-- The message_id of the message holding the keyboard (so the</span>
+<span class="lineno">  372 </span><span class="spaces">              </span><span class="istickedoff">-- reader can remove the keyboard after a tap).</span>
+<span class="lineno">  373 </span><span class="spaces">              </span><span class="istickedoff">mMsgId &lt;- case KeyMap.lookup (Key.fromString &quot;message_id&quot;) mo of</span>
+<span class="lineno">  374 </span><span class="spaces">                </span><span class="istickedoff">Just (A.Number n) -&gt; Right (T.pack (show (round n :: Int)))</span>
+<span class="lineno">  375 </span><span class="spaces">                </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Left &quot;callback_query.message.message_id missing&quot;</span></span>
+<span class="lineno">  376 </span><span class="spaces">              </span><span class="istickedoff">Right TelegramUpdate</span>
+<span class="lineno">  377 </span><span class="spaces">                </span><span class="istickedoff">{ tuConversationId = cid</span>
+<span class="lineno">  378 </span><span class="spaces">                </span><span class="istickedoff">, tuChatId          = chatId</span>
+<span class="lineno">  379 </span><span class="spaces">                </span><span class="istickedoff">, tuSender          = sender</span>
+<span class="lineno">  380 </span><span class="spaces">                </span><span class="istickedoff">, tuBody            = callbackData</span>
+<span class="lineno">  381 </span><span class="spaces">                </span><span class="istickedoff">, tuCallbackData    = Just callbackData</span>
+<span class="lineno">  382 </span><span class="spaces">                </span><span class="istickedoff">, tuCallbackId      = Just callbackId</span>
+<span class="lineno">  383 </span><span class="spaces">                </span><span class="istickedoff">, tuCallbackMessageId = Just mMsgId</span>
+<span class="lineno">  384 </span><span class="spaces">                </span><span class="istickedoff">}</span>
+<span class="lineno">  385 </span><span class="spaces">            </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Left &quot;callback_query.message not an object&quot;</span></span>
+<span class="lineno">  386 </span><span class="spaces">        </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Left &quot;callback_query not an object&quot;</span></span></span>
+<span class="lineno">  387 </span>
+<span class="lineno">  388 </span>-- | Extract @chat.id@ from a message object. Telegram chat ids are integers;
+<span class="lineno">  389 </span>-- we stringify them for the conversation id prefix.
+<span class="lineno">  390 </span>requireChatId :: A.Object -&gt; Either Text Text
+<span class="lineno">  391 </span><span class="decl"><span class="istickedoff">requireChatId mo =</span>
+<span class="lineno">  392 </span><span class="spaces">  </span><span class="istickedoff">case KeyMap.lookup (Key.fromString &quot;chat&quot;) mo of</span>
+<span class="lineno">  393 </span><span class="spaces">    </span><span class="istickedoff">Just (A.Object co) -&gt; case KeyMap.lookup (Key.fromString &quot;id&quot;) co of</span>
+<span class="lineno">  394 </span><span class="spaces">      </span><span class="istickedoff">Just (A.Number n) -&gt; Right (T.pack (show (round n :: Int)))</span>
+<span class="lineno">  395 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Left &quot;chat.id missing&quot;</span></span>
+<span class="lineno">  396 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; Left <span class="nottickedoff">&quot;chat field missing&quot;</span></span></span>
+<span class="lineno">  397 </span>
+<span class="lineno">  398 </span>-- | Extract @from.id@ from a message object.
+<span class="lineno">  399 </span>requireSender :: A.Object -&gt; Either Text UserId
+<span class="lineno">  400 </span><span class="decl"><span class="istickedoff">requireSender mo =</span>
+<span class="lineno">  401 </span><span class="spaces">  </span><span class="istickedoff">case KeyMap.lookup (Key.fromString &quot;from&quot;) mo of</span>
+<span class="lineno">  402 </span><span class="spaces">    </span><span class="istickedoff">Just (A.Object fo) -&gt; case KeyMap.lookup (Key.fromString &quot;id&quot;) fo of</span>
+<span class="lineno">  403 </span><span class="spaces">      </span><span class="istickedoff">Just (A.Number n) -&gt; case mkUserId (T.pack (show (round n :: Int))) of</span>
+<span class="lineno">  404 </span><span class="spaces">        </span><span class="istickedoff">Right u  -&gt; Right u</span>
+<span class="lineno">  405 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">Left (&quot;telegram sender not a valid UserId: &quot; &lt;&gt; err)</span></span>
+<span class="lineno">  406 </span><span class="spaces">      </span><span class="istickedoff">_ -&gt; <span class="nottickedoff">Left &quot;from.id missing&quot;</span></span>
+<span class="lineno">  407 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; Left <span class="nottickedoff">&quot;from field missing&quot;</span></span></span>
+<span class="lineno">  408 </span>
+<span class="lineno">  409 </span>-- | Extract @text@ from a message object (empty when absent — non-text
+<span class="lineno">  410 </span>-- messages like stickers produce an empty body, which the caller drops).
+<span class="lineno">  411 </span>extractText :: A.Object -&gt; Text
+<span class="lineno">  412 </span><span class="decl"><span class="istickedoff">extractText mo =</span>
+<span class="lineno">  413 </span><span class="spaces">  </span><span class="istickedoff">case KeyMap.lookup (Key.fromString &quot;text&quot;) mo of</span>
+<span class="lineno">  414 </span><span class="spaces">    </span><span class="istickedoff">Just (A.String t) -&gt; t</span>
+<span class="lineno">  415 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; &quot;&quot;</span></span>
+<span class="lineno">  416 </span>
+<span class="lineno">  417 </span>-- | Send a message via the Bot API @sendMessage@.
+<span class="lineno">  418 </span>sendViaApi :: Manager -&gt; Text -&gt; Text -&gt; Text -&gt; IO ()
+<span class="lineno">  419 </span><span class="decl"><span class="nottickedoff">sendViaApi mgr token chatId body = do</span>
+<span class="lineno">  420 </span><span class="spaces">  </span><span class="nottickedoff">eReq &lt;- try @SomeException</span>
+<span class="lineno">  421 </span><span class="spaces">    </span><span class="nottickedoff">(parseRequest (T.unpack (telegramApiBase &lt;&gt; token &lt;&gt; &quot;/sendMessage&quot;)))</span>
+<span class="lineno">  422 </span><span class="spaces">  </span><span class="nottickedoff">case eReq of</span>
+<span class="lineno">  423 </span><span class="spaces">    </span><span class="nottickedoff">Left ex -&gt; globalLogIO WarningS (&quot;telegram send: request error: &quot; &lt;&gt; ls (T.pack (show ex)))</span>
+<span class="lineno">  424 </span><span class="spaces">    </span><span class="nottickedoff">Right req0 -&gt; do</span>
+<span class="lineno">  425 </span><span class="spaces">      </span><span class="nottickedoff">let payload = A.object</span>
+<span class="lineno">  426 </span><span class="spaces">            </span><span class="nottickedoff">[ &quot;chat_id&quot; A..= chatId</span>
+<span class="lineno">  427 </span><span class="spaces">            </span><span class="nottickedoff">, &quot;text&quot;   A..= body</span>
+<span class="lineno">  428 </span><span class="spaces">            </span><span class="nottickedoff">]</span>
+<span class="lineno">  429 </span><span class="spaces">          </span><span class="nottickedoff">req = req0 { method = methodPost</span>
+<span class="lineno">  430 </span><span class="spaces">                     </span><span class="nottickedoff">, requestBody = RequestBodyLBS (A.encode payload)</span>
+<span class="lineno">  431 </span><span class="spaces">                     </span><span class="nottickedoff">, requestHeaders = [(&quot;Content-Type&quot;, &quot;application/json&quot;)]</span>
+<span class="lineno">  432 </span><span class="spaces">                     </span><span class="nottickedoff">}</span>
+<span class="lineno">  433 </span><span class="spaces">      </span><span class="nottickedoff">_ &lt;- try @SomeException (httpLbs req mgr)</span>
+<span class="lineno">  434 </span><span class="spaces">      </span><span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  435 </span>
+<span class="lineno">  436 </span>-- | Send a message with an inline keyboard via the Bot API @sendMessage@.
+<span class="lineno">  437 </span>-- The payload includes @reply_markup: {inline_keyboard: ...}@. **MUST NOT
+<span class="lineno">  438 </span>-- set @parse_mode@** (gate: Security #3 — the question text and button
+<span class="lineno">  439 </span>-- labels are plain text; no markdown/HTML interpretation). The keyboard is
+<span class="lineno">  440 </span>-- an array of rows, each row an array of 'TelegramButton'.
+<span class="lineno">  441 </span>tgSendWithKeyboardViaApi :: Manager -&gt; Text -&gt; Text -&gt; Text -&gt; [[TelegramButton]] -&gt; IO ()
+<span class="lineno">  442 </span><span class="decl"><span class="nottickedoff">tgSendWithKeyboardViaApi mgr token chatId body keyboard = do</span>
+<span class="lineno">  443 </span><span class="spaces">  </span><span class="nottickedoff">eReq &lt;- try @SomeException</span>
+<span class="lineno">  444 </span><span class="spaces">    </span><span class="nottickedoff">(parseRequest (T.unpack (telegramApiBase &lt;&gt; token &lt;&gt; &quot;/sendMessage&quot;)))</span>
+<span class="lineno">  445 </span><span class="spaces">  </span><span class="nottickedoff">case eReq of</span>
+<span class="lineno">  446 </span><span class="spaces">    </span><span class="nottickedoff">Left ex -&gt; globalLogIO WarningS (&quot;telegram send+keyboard: request error: &quot; &lt;&gt; ls (T.pack (show ex)))</span>
+<span class="lineno">  447 </span><span class="spaces">    </span><span class="nottickedoff">Right req0 -&gt; do</span>
+<span class="lineno">  448 </span><span class="spaces">      </span><span class="nottickedoff">let payload = A.object</span>
+<span class="lineno">  449 </span><span class="spaces">            </span><span class="nottickedoff">[ &quot;chat_id&quot; A..= chatId</span>
+<span class="lineno">  450 </span><span class="spaces">            </span><span class="nottickedoff">, &quot;text&quot;   A..= body</span>
+<span class="lineno">  451 </span><span class="spaces">            </span><span class="nottickedoff">, &quot;reply_markup&quot; A..= A.object</span>
+<span class="lineno">  452 </span><span class="spaces">                </span><span class="nottickedoff">[ &quot;inline_keyboard&quot; A..= map (map A.toJSON) keyboard</span>
+<span class="lineno">  453 </span><span class="spaces">                </span><span class="nottickedoff">]</span>
+<span class="lineno">  454 </span><span class="spaces">            </span><span class="nottickedoff">]</span>
+<span class="lineno">  455 </span><span class="spaces">          </span><span class="nottickedoff">req = req0 { method = methodPost</span>
+<span class="lineno">  456 </span><span class="spaces">                     </span><span class="nottickedoff">, requestBody = RequestBodyLBS (A.encode payload)</span>
+<span class="lineno">  457 </span><span class="spaces">                     </span><span class="nottickedoff">, requestHeaders = [(&quot;Content-Type&quot;, &quot;application/json&quot;)]</span>
+<span class="lineno">  458 </span><span class="spaces">                     </span><span class="nottickedoff">}</span>
+<span class="lineno">  459 </span><span class="spaces">      </span><span class="nottickedoff">_ &lt;- try @SomeException (httpLbs req mgr)</span>
+<span class="lineno">  460 </span><span class="spaces">      </span><span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  461 </span>
+<span class="lineno">  462 </span>-- | Acknowledge a callback_query via the Bot API @answerCallbackQuery@.
+<span class="lineno">  463 </span>-- Stops the button's loading spinner. Best-effort (logs on failure, never
+<span class="lineno">  464 </span>-- throws). The @callback_query_id@ is from the inbound update's
+<span class="lineno">  465 </span>-- 'tuCallbackId'. (Deferred from the v1 inbound path — the
+<span class="lineno">  466 </span>-- callback_query_id is not currently threaded through the channel loop;
+<span class="lineno">  467 </span>-- this function is ready for the follow-up.)
+<span class="lineno">  468 </span>answerCallbackQueryViaApi :: Manager -&gt; Text -&gt; Text -&gt; IO ()
+<span class="lineno">  469 </span><span class="decl"><span class="nottickedoff">answerCallbackQueryViaApi mgr token callbackQueryId = do</span>
+<span class="lineno">  470 </span><span class="spaces">  </span><span class="nottickedoff">eReq &lt;- try @SomeException</span>
+<span class="lineno">  471 </span><span class="spaces">    </span><span class="nottickedoff">(parseRequest (T.unpack (telegramApiBase &lt;&gt; token &lt;&gt; &quot;/answerCallbackQuery&quot;)))</span>
+<span class="lineno">  472 </span><span class="spaces">  </span><span class="nottickedoff">case eReq of</span>
+<span class="lineno">  473 </span><span class="spaces">    </span><span class="nottickedoff">Left _ -&gt; pure ()  -- best-effort: log nothing (no logger in scope)</span>
+<span class="lineno">  474 </span><span class="spaces">    </span><span class="nottickedoff">Right req0 -&gt; do</span>
+<span class="lineno">  475 </span><span class="spaces">      </span><span class="nottickedoff">let payload = A.object</span>
+<span class="lineno">  476 </span><span class="spaces">            </span><span class="nottickedoff">[ &quot;callback_query_id&quot; A..= callbackQueryId</span>
+<span class="lineno">  477 </span><span class="spaces">            </span><span class="nottickedoff">]</span>
+<span class="lineno">  478 </span><span class="spaces">          </span><span class="nottickedoff">req = req0 { method = methodPost</span>
+<span class="lineno">  479 </span><span class="spaces">                     </span><span class="nottickedoff">, requestBody = RequestBodyLBS (A.encode payload)</span>
+<span class="lineno">  480 </span><span class="spaces">                     </span><span class="nottickedoff">, requestHeaders = [(&quot;Content-Type&quot;, &quot;application/json&quot;)]</span>
+<span class="lineno">  481 </span><span class="spaces">                     </span><span class="nottickedoff">}</span>
+<span class="lineno">  482 </span><span class="spaces">      </span><span class="nottickedoff">_ &lt;- try @SomeException (httpLbs req mgr)</span>
+<span class="lineno">  483 </span><span class="spaces">      </span><span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  484 </span>
+<span class="lineno">  485 </span>-- | Remove the inline keyboard from a message via the Bot API
+<span class="lineno">  486 </span>-- @editMessageReplyMarkup@ with an empty @reply_markup@. Disables the
+<span class="lineno">  487 </span>-- buttons after a tap so they can't be re-clicked. Best-effort (logs on
+<span class="lineno">  488 </span>-- failure, never throws). Args: chat id, message id.
+<span class="lineno">  489 </span>editReplyMarkupViaApi :: Manager -&gt; Text -&gt; Text -&gt; Text -&gt; IO ()
+<span class="lineno">  490 </span><span class="decl"><span class="nottickedoff">editReplyMarkupViaApi mgr token chatId messageId = do</span>
+<span class="lineno">  491 </span><span class="spaces">  </span><span class="nottickedoff">eReq &lt;- try @SomeException</span>
+<span class="lineno">  492 </span><span class="spaces">    </span><span class="nottickedoff">(parseRequest (T.unpack (telegramApiBase &lt;&gt; token &lt;&gt; &quot;/editMessageReplyMarkup&quot;)))</span>
+<span class="lineno">  493 </span><span class="spaces">  </span><span class="nottickedoff">case eReq of</span>
+<span class="lineno">  494 </span><span class="spaces">    </span><span class="nottickedoff">Left _ -&gt; pure ()</span>
+<span class="lineno">  495 </span><span class="spaces">    </span><span class="nottickedoff">Right req0 -&gt; do</span>
+<span class="lineno">  496 </span><span class="spaces">      </span><span class="nottickedoff">let payload = A.object</span>
+<span class="lineno">  497 </span><span class="spaces">            </span><span class="nottickedoff">[ &quot;chat_id&quot; A..= chatId</span>
+<span class="lineno">  498 </span><span class="spaces">            </span><span class="nottickedoff">, &quot;message_id&quot; A..= messageId</span>
+<span class="lineno">  499 </span><span class="spaces">            </span><span class="nottickedoff">, &quot;reply_markup&quot; A..= A.object [ &quot;inline_keyboard&quot; A..= ([] :: [[A.Value]]) ]</span>
+<span class="lineno">  500 </span><span class="spaces">            </span><span class="nottickedoff">]</span>
+<span class="lineno">  501 </span><span class="spaces">          </span><span class="nottickedoff">req = req0 { method = methodPost</span>
+<span class="lineno">  502 </span><span class="spaces">                     </span><span class="nottickedoff">, requestBody = RequestBodyLBS (A.encode payload)</span>
+<span class="lineno">  503 </span><span class="spaces">                     </span><span class="nottickedoff">, requestHeaders = [(&quot;Content-Type&quot;, &quot;application/json&quot;)]</span>
+<span class="lineno">  504 </span><span class="spaces">                     </span><span class="nottickedoff">}</span>
+<span class="lineno">  505 </span><span class="spaces">      </span><span class="nottickedoff">_ &lt;- try @SomeException (httpLbs req mgr)</span>
+<span class="lineno">  506 </span><span class="spaces">      </span><span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  507 </span>
+<span class="lineno">  508 </span>-- | Register the bot's command menu via @setMyCommands@ so Telegram shows
+<span class="lineno">  509 </span>-- auto-completion for the bot's slash commands. Calls the Bot API with a
+<span class="lineno">  510 </span>-- JSON array of @{command, description}@ objects. Returns 'Left' with a
+<span class="lineno">  511 </span>-- diagnostic on failure (the bot still works without auto-completion); the
+<span class="lineno">  512 </span>-- caller logs the error.
+<span class="lineno">  513 </span>setMyCommandsViaApi :: Manager -&gt; Text -&gt; [BotCommand] -&gt; IO (Either Text ())
+<span class="lineno">  514 </span><span class="decl"><span class="nottickedoff">setMyCommandsViaApi mgr token commands = do</span>
+<span class="lineno">  515 </span><span class="spaces">  </span><span class="nottickedoff">eReq &lt;- try @SomeException</span>
+<span class="lineno">  516 </span><span class="spaces">    </span><span class="nottickedoff">(parseRequest (T.unpack (telegramApiBase &lt;&gt; token &lt;&gt; &quot;/setMyCommands&quot;)))</span>
+<span class="lineno">  517 </span><span class="spaces">  </span><span class="nottickedoff">case eReq of</span>
+<span class="lineno">  518 </span><span class="spaces">    </span><span class="nottickedoff">Left ex -&gt; pure (Left (&quot;request error: &quot; &lt;&gt; T.pack (show ex)))</span>
+<span class="lineno">  519 </span><span class="spaces">    </span><span class="nottickedoff">Right req0 -&gt; do</span>
+<span class="lineno">  520 </span><span class="spaces">      </span><span class="nottickedoff">let cmds = [ A.object [ &quot;command&quot; A..= bcName bc</span>
+<span class="lineno">  521 </span><span class="spaces">                            </span><span class="nottickedoff">, &quot;description&quot; A..= bcDescription bc</span>
+<span class="lineno">  522 </span><span class="spaces">                            </span><span class="nottickedoff">]</span>
+<span class="lineno">  523 </span><span class="spaces">                 </span><span class="nottickedoff">| bc &lt;- commands</span>
+<span class="lineno">  524 </span><span class="spaces">                 </span><span class="nottickedoff">]</span>
+<span class="lineno">  525 </span><span class="spaces">          </span><span class="nottickedoff">payload = A.object [ &quot;commands&quot; A..= cmds ]</span>
+<span class="lineno">  526 </span><span class="spaces">          </span><span class="nottickedoff">req = req0 { method = methodPost</span>
+<span class="lineno">  527 </span><span class="spaces">                     </span><span class="nottickedoff">, requestBody = RequestBodyLBS (A.encode payload)</span>
+<span class="lineno">  528 </span><span class="spaces">                     </span><span class="nottickedoff">, requestHeaders = [(&quot;Content-Type&quot;, &quot;application/json&quot;)]</span>
+<span class="lineno">  529 </span><span class="spaces">                     </span><span class="nottickedoff">}</span>
+<span class="lineno">  530 </span><span class="spaces">      </span><span class="nottickedoff">eResp &lt;- try @SomeException (httpLbs req mgr)</span>
+<span class="lineno">  531 </span><span class="spaces">      </span><span class="nottickedoff">case eResp of</span>
+<span class="lineno">  532 </span><span class="spaces">        </span><span class="nottickedoff">Left ex -&gt; pure (Left (&quot;network error: &quot; &lt;&gt; T.pack (show ex)))</span>
+<span class="lineno">  533 </span><span class="spaces">        </span><span class="nottickedoff">Right resp -&gt; do</span>
+<span class="lineno">  534 </span><span class="spaces">          </span><span class="nottickedoff">let code = statusCode (responseStatus resp)</span>
+<span class="lineno">  535 </span><span class="spaces">          </span><span class="nottickedoff">if code == 200</span>
+<span class="lineno">  536 </span><span class="spaces">            </span><span class="nottickedoff">then pure (Right ())</span>
+<span class="lineno">  537 </span><span class="spaces">            </span><span class="nottickedoff">else pure (Left (&quot;HTTP &quot; &lt;&gt; T.pack (show code) &lt;&gt; &quot; — &quot; &lt;&gt; T.pack (show (responseBody resp))))</span></span>
+<span class="lineno">  538 </span>
+<span class="lineno">  539 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  540 </span>-- chunkMessage — split long messages for Telegram's 4096-char limit
+<span class="lineno">  541 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  542 </span>
+<span class="lineno">  543 </span>-- | Split a message into chunks of at most 'limit' characters, preferring
+<span class="lineno">  544 </span>-- paragraph boundaries (@\\n\\n@), then line boundaries (@\\n@), hard-cut
+<span class="lineno">  545 </span>-- as a last resort. Chunks carry their trailing separator (except the last),
+<span class="lineno">  546 </span>-- so 'T.concat' of the chunks is identity. Mirrors
+<span class="lineno">  547 </span>-- 'Seal.Channels.Signal.Transport.chunkMessage'.
+<span class="lineno">  548 </span>chunkMessage :: Int -&gt; Text -&gt; [Text]
+<span class="lineno">  549 </span><span class="decl"><span class="istickedoff">chunkMessage limit t</span>
+<span class="lineno">  550 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlyfalse">limit &lt; 1</span> = <span class="nottickedoff">error &quot;chunkMessage: limit must be &gt;= 1&quot;</span></span>
+<span class="lineno">  551 </span><span class="spaces">  </span><span class="istickedoff">| T.null t  = []</span>
+<span class="lineno">  552 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = go t</span>
+<span class="lineno">  553 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  554 </span><span class="spaces">    </span><span class="istickedoff">go s</span>
+<span class="lineno">  555 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlyfalse">T.null s</span>       = <span class="nottickedoff">[]</span></span>
+<span class="lineno">  556 </span><span class="spaces">      </span><span class="istickedoff">| T.length s &lt;= limit = [s]</span>
+<span class="lineno">  557 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> =</span>
+<span class="lineno">  558 </span><span class="spaces">          </span><span class="istickedoff">let (chunk, rest) = nextChunk limit s</span>
+<span class="lineno">  559 </span><span class="spaces">          </span><span class="istickedoff">in chunk : if <span class="tickonlyfalse">T.null rest</span> then <span class="nottickedoff">[]</span> else go rest</span></span>
+<span class="lineno">  560 </span>
+<span class="lineno">  561 </span>nextChunk :: Int -&gt; Text -&gt; (Text, Text)
+<span class="lineno">  562 </span><span class="decl"><span class="istickedoff">nextChunk limit s =</span>
+<span class="lineno">  563 </span><span class="spaces">  </span><span class="istickedoff">case findParagraphBreak limit s of</span>
+<span class="lineno">  564 </span><span class="spaces">    </span><span class="istickedoff">Just n -&gt; T.splitAt n s</span>
+<span class="lineno">  565 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; case findLineBreak limit s of</span>
+<span class="lineno">  566 </span><span class="spaces">      </span><span class="istickedoff">Just n -&gt; T.splitAt n s</span>
+<span class="lineno">  567 </span><span class="spaces">      </span><span class="istickedoff">Nothing -&gt; T.splitAt limit s</span></span>
+<span class="lineno">  568 </span>
+<span class="lineno">  569 </span>findParagraphBreak :: Int -&gt; Text -&gt; Maybe Int
+<span class="lineno">  570 </span><span class="decl"><span class="istickedoff">findParagraphBreak limit s =</span>
+<span class="lineno">  571 </span><span class="spaces">  </span><span class="istickedoff">let window = T.take limit s</span>
+<span class="lineno">  572 </span><span class="spaces">  </span><span class="istickedoff">in case T.breakOnEnd &quot;\n\n&quot; window of</span>
+<span class="lineno">  573 </span><span class="spaces">       </span><span class="istickedoff">(pre, _post) | not (T.null pre) -&gt; Just (T.length pre)</span>
+<span class="lineno">  574 </span><span class="spaces">       </span><span class="istickedoff">_ -&gt; Nothing</span></span>
+<span class="lineno">  575 </span>
+<span class="lineno">  576 </span>findLineBreak :: Int -&gt; Text -&gt; Maybe Int
+<span class="lineno">  577 </span><span class="decl"><span class="istickedoff">findLineBreak limit s =</span>
+<span class="lineno">  578 </span><span class="spaces">  </span><span class="istickedoff">let window = T.take limit s</span>
+<span class="lineno">  579 </span><span class="spaces">  </span><span class="istickedoff">in case T.breakOnEnd &quot;\n&quot; window of</span>
+<span class="lineno">  580 </span><span class="spaces">       </span><span class="istickedoff">(pre, _post) | not (T.null pre) -&gt; Just (T.length pre)</span>
+<span class="lineno">  581 </span><span class="spaces">       </span><span class="istickedoff">_ -&gt; Nothing</span></span>
+
+</pre>
+</body>
+</html>

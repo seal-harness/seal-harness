@@ -1,0 +1,204 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>{-# LANGUAGE TypeApplications #-}
+<span class="lineno">    3 </span>-- | The Signal channel: a 'SignalChannel' record (resolved allow-list +
+<span class="lineno">    4 </span>-- chunk limit + account + inbox 'TQueue' + transport + last-sender 'IORef'
+<span class="lineno">    5 </span>-- + logger) and its 'Channel' instance. The reader thread parses signal-cli
+<span class="lineno">    6 </span>-- output, allow-lists the sender, and pushes envelopes to the inbox; sends
+<span class="lineno">    7 </span>-- are chunked via 'Seal.Channels.Signal.Transport.chunkMessage' to the
+<span class="lineno">    8 </span>-- configured limit and addressed to the last sender.
+<span class="lineno">    9 </span>module Seal.Channels.Signal
+<span class="lineno">   10 </span>  ( SignalChannel (..)
+<span class="lineno">   11 </span>  , withSignalChannel
+<span class="lineno">   12 </span>  ) where
+<span class="lineno">   13 </span>
+<span class="lineno">   14 </span>import Control.Concurrent (forkIO, killThread, threadDelay)
+<span class="lineno">   15 </span>import Control.Concurrent.STM (TQueue, atomically, newTQueueIO, tryReadTQueue, writeTQueue)
+<span class="lineno">   16 </span>import Control.Exception (bracket, SomeException, try, AsyncException (..), fromException)
+<span class="lineno">   17 </span>import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+<span class="lineno">   18 </span>import Data.Text (Text)
+<span class="lineno">   19 </span>import Data.Text qualified as T
+<span class="lineno">   20 </span>
+<span class="lineno">   21 </span>import Seal.Channels.Class (Channel (..))
+<span class="lineno">   22 </span>import Seal.Channels.Signal.Transport
+<span class="lineno">   23 </span>  ( SignalEnvelope (..), SignalTransport (..), chunkMessage, parseSignalEnvelope )
+<span class="lineno">   24 </span>import Seal.Core.AllowList (AllowList (..), isAllowed)
+<span class="lineno">   25 </span>import Seal.Core.ChannelKind (ChannelKind (..))
+<span class="lineno">   26 </span>import Seal.Core.MessageSource
+<span class="lineno">   27 </span>  ( MessageSource, UserId, mkMessageSource, userIdText )
+<span class="lineno">   28 </span>import Seal.Handles.Channel (ChannelHandle (..), Deferral (..))
+<span class="lineno">   29 </span>import Seal.Logging.Logger (SealLogger, logIO)
+<span class="lineno">   30 </span>import Seal.Signal.Config (SignalAccount (..))
+<span class="lineno">   31 </span>
+<span class="lineno">   32 </span>import Katip (Severity (..), ls)
+<span class="lineno">   33 </span>
+<span class="lineno">   34 </span>-- | The live Signal channel state.
+<span class="lineno">   35 </span>data SignalChannel = SignalChannel
+<span class="lineno">   36 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">scAllowList</span></span></span>    :: AllowList UserId  -- ^ resolved sender allow-list
+<span class="lineno">   37 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scChunkLimit</span></span></span>   :: Int               -- ^ chunk limit for sends
+<span class="lineno">   38 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">scAccount</span></span></span>      :: SignalAccount
+<span class="lineno">   39 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scInbox</span></span></span>        :: TQueue (MessageSource, Text)
+<span class="lineno">   40 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scTransport</span></span></span>    :: SignalTransport
+<span class="lineno">   41 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scLastSender</span></span></span>   :: IORef (Maybe UserId)
+<span class="lineno">   42 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scReaderAlive</span></span></span>  :: IORef Bool
+<span class="lineno">   43 </span>    -- ^ 'True' while the reader thread is running. 'chReceive' stops
+<span class="lineno">   44 </span>    -- returning once the inbox drains and this is 'False'.
+<span class="lineno">   45 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">scLogger</span></span></span>       :: SealLogger
+<span class="lineno">   46 </span>    -- ^ The shared logger for structured katip logging.
+<span class="lineno">   47 </span>  }
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>instance Channel SignalChannel where
+<span class="lineno">   50 </span>  <span class="decl"><span class="istickedoff">toHandle ch = ChannelHandle</span>
+<span class="lineno">   51 </span><span class="spaces">    </span><span class="istickedoff">{ chLabel       = <span class="nottickedoff">&quot;signal&quot;</span></span>
+<span class="lineno">   52 </span><span class="spaces">    </span><span class="istickedoff">, chSend         = sendChunked ch</span>
+<span class="lineno">   53 </span><span class="spaces">    </span><span class="istickedoff">, chSendError    = <span class="nottickedoff">\t -&gt; sendChunked ch (&quot;error: &quot; &lt;&gt; t)</span></span>
+<span class="lineno">   54 </span><span class="spaces">    </span><span class="istickedoff">, chSendChunk    = <span class="nottickedoff">sendRaw ch</span></span>
+<span class="lineno">   55 </span><span class="spaces">    </span><span class="istickedoff">, chPrompt       = \_ -&gt; pure (Left Deferred)   -- Signal can't answer inline</span>
+<span class="lineno">   56 </span><span class="spaces">    </span><span class="istickedoff">, chPromptSecret = <span class="nottickedoff">\_ -&gt; pure (Left Deferred)</span></span>
+<span class="lineno">   57 </span><span class="spaces">    </span><span class="istickedoff">, chStreaming    = False  -- per-token messages flood the chat; send accumulated text once</span>
+<span class="lineno">   58 </span><span class="spaces">    </span><span class="istickedoff">, chReadSecret   = <span class="nottickedoff">pure Nothing</span>                  -- vault is reached via the vault handle</span>
+<span class="lineno">   59 </span><span class="spaces">    </span><span class="istickedoff">, chReceive      = receiveFromInbox ch</span>
+<span class="lineno">   60 </span><span class="spaces">    </span><span class="istickedoff">, chLastChatId   = <span class="nottickedoff">pure Nothing</span>                  -- Signal addresses by user id, not chat id</span>
+<span class="lineno">   61 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">   62 </span>
+<span class="lineno">   63 </span>-- | Run the reader thread with cleanup. Spawns a background thread that
+<span class="lineno">   64 </span>-- loops 'stReceive' + 'parseSignalEnvelope', allow-lists the sender, and
+<span class="lineno">   65 </span>-- pushes @(MessageSource, body)@ to 'scInbox'. On transport close or
+<span class="lineno">   66 </span>-- exception, the thread exits. The action runs with the channel; on exit
+<span class="lineno">   67 </span>-- the transport is closed and the reader is killed.
+<span class="lineno">   68 </span>withSignalChannel
+<span class="lineno">   69 </span>  :: (AllowList UserId, Int)
+<span class="lineno">   70 </span>  -&gt; SignalAccount
+<span class="lineno">   71 </span>  -&gt; SignalTransport
+<span class="lineno">   72 </span>  -&gt; SealLogger
+<span class="lineno">   73 </span>  -&gt; (SignalChannel -&gt; IO a)
+<span class="lineno">   74 </span>  -&gt; IO a
+<span class="lineno">   75 </span><span class="decl"><span class="istickedoff">withSignalChannel (allow, chunkLimit) account transport logger action =</span>
+<span class="lineno">   76 </span><span class="spaces">  </span><span class="istickedoff">bracket before after (action . snd)</span>
+<span class="lineno">   77 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   78 </span><span class="spaces">    </span><span class="istickedoff">before = do</span>
+<span class="lineno">   79 </span><span class="spaces">      </span><span class="istickedoff">inbox      &lt;- newTQueueIO</span>
+<span class="lineno">   80 </span><span class="spaces">      </span><span class="istickedoff">lastSender &lt;- newIORef Nothing</span>
+<span class="lineno">   81 </span><span class="spaces">      </span><span class="istickedoff">alive      &lt;- newIORef True</span>
+<span class="lineno">   82 </span><span class="spaces">      </span><span class="istickedoff">let ch = SignalChannel</span>
+<span class="lineno">   83 </span><span class="spaces">            </span><span class="istickedoff">{ scAllowList  = allow</span>
+<span class="lineno">   84 </span><span class="spaces">            </span><span class="istickedoff">, scChunkLimit = chunkLimit</span>
+<span class="lineno">   85 </span><span class="spaces">            </span><span class="istickedoff">, scAccount    = <span class="nottickedoff">account</span></span>
+<span class="lineno">   86 </span><span class="spaces">            </span><span class="istickedoff">, scInbox      = inbox</span>
+<span class="lineno">   87 </span><span class="spaces">            </span><span class="istickedoff">, scTransport  = transport</span>
+<span class="lineno">   88 </span><span class="spaces">            </span><span class="istickedoff">, scLastSender = lastSender</span>
+<span class="lineno">   89 </span><span class="spaces">            </span><span class="istickedoff">, scReaderAlive = alive</span>
+<span class="lineno">   90 </span><span class="spaces">            </span><span class="istickedoff">, scLogger     = logger</span>
+<span class="lineno">   91 </span><span class="spaces">            </span><span class="istickedoff">}</span>
+<span class="lineno">   92 </span><span class="spaces">      </span><span class="istickedoff">tid &lt;- forkIO (readerLoop ch)</span>
+<span class="lineno">   93 </span><span class="spaces">      </span><span class="istickedoff">pure (tid, ch)</span>
+<span class="lineno">   94 </span><span class="spaces">    </span><span class="istickedoff">after (tid, _ch) = do</span>
+<span class="lineno">   95 </span><span class="spaces">      </span><span class="istickedoff">killThread tid</span>
+<span class="lineno">   96 </span><span class="spaces">      </span><span class="istickedoff">stClose transport</span></span>
+<span class="lineno">   97 </span>
+<span class="lineno">   98 </span>-- | The background reader: loop 'stReceive', parse each inbound value,
+<span class="lineno">   99 </span>-- allow-list the sender, and push to the inbox. A malformed line or a
+<span class="lineno">  100 </span>-- non-allow-listed sender is logged via 'logIO' and dropped (not fatal).
+<span class="lineno">  101 </span>-- Exits when 'stReceive' returns 'Left' (the channel is closing).
+<span class="lineno">  102 </span>-- 'ThreadKilled' is logged at 'InfoS' (normal shutdown); other
+<span class="lineno">  103 </span>-- 'AsyncException's at 'WarningS'; synchronous exceptions at 'ErrorS'.
+<span class="lineno">  104 </span>readerLoop :: SignalChannel -&gt; IO ()
+<span class="lineno">  105 </span><span class="decl"><span class="istickedoff">readerLoop ch = go</span>
+<span class="lineno">  106 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  107 </span><span class="spaces">    </span><span class="istickedoff">logger = scLogger ch</span>
+<span class="lineno">  108 </span><span class="spaces">    </span><span class="istickedoff">go = do</span>
+<span class="lineno">  109 </span><span class="spaces">      </span><span class="istickedoff">eVal &lt;- try @SomeException (stReceive (scTransport ch))</span>
+<span class="lineno">  110 </span><span class="spaces">      </span><span class="istickedoff">case eVal of</span>
+<span class="lineno">  111 </span><span class="spaces">        </span><span class="istickedoff">Left e -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  112 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">case (fromException e :: Maybe AsyncException) of</span></span>
+<span class="lineno">  113 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Just ThreadKilled -&gt;</span></span>
+<span class="lineno">  114 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">logIO logger InfoS &quot;reader thread stopped (channel shutting down)&quot;</span></span>
+<span class="lineno">  115 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Just _ -&gt;</span></span>
+<span class="lineno">  116 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">logIO logger WarningS (&quot;reader thread terminated by async exception: &quot; &lt;&gt; ls (T.pack (show e)))</span></span>
+<span class="lineno">  117 </span><span class="spaces">            </span><span class="istickedoff"><span class="nottickedoff">Nothing -&gt;</span></span>
+<span class="lineno">  118 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">logIO logger ErrorS (&quot;reader thread exception: &quot; &lt;&gt; ls (T.pack (show e)))</span></span>
+<span class="lineno">  119 </span><span class="spaces">          </span><span class="istickedoff"><span class="nottickedoff">writeIORef (scReaderAlive ch) False</span></span>
+<span class="lineno">  120 </span><span class="spaces">        </span><span class="istickedoff">Right (Left err) -&gt; do</span>
+<span class="lineno">  121 </span><span class="spaces">          </span><span class="istickedoff">logIO logger ErrorS <span class="nottickedoff">(&quot;reader exiting: &quot; &lt;&gt; ls err)</span></span>
+<span class="lineno">  122 </span><span class="spaces">          </span><span class="istickedoff">writeIORef (scReaderAlive ch) False</span>
+<span class="lineno">  123 </span><span class="spaces">        </span><span class="istickedoff">Right (Right val) -&gt; do</span>
+<span class="lineno">  124 </span><span class="spaces">          </span><span class="istickedoff">case parseSignalEnvelope val of</span>
+<span class="lineno">  125 </span><span class="spaces">            </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">logIO logger WarningS (&quot;envelope parse error: &quot; &lt;&gt; ls err)</span></span>
+<span class="lineno">  126 </span><span class="spaces">            </span><span class="istickedoff">Right env</span>
+<span class="lineno">  127 </span><span class="spaces">              </span><span class="istickedoff">| <span class="tickonlyfalse">T.null (seBody env)</span> -&gt; <span class="nottickedoff">go</span></span>
+<span class="lineno">  128 </span><span class="spaces">                </span><span class="istickedoff">-- Skip non-data envelopes (receipts, typing, sync messages).</span>
+<span class="lineno">  129 </span><span class="spaces">                </span><span class="istickedoff">-- signal-cli emits these constantly; only dataMessage carries</span>
+<span class="lineno">  130 </span><span class="spaces">                </span><span class="istickedoff">-- real text. Avoids tight-cycling the loop with empty envelopes.</span>
+<span class="lineno">  131 </span><span class="spaces">              </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; do</span>
+<span class="lineno">  132 </span><span class="spaces">                </span><span class="istickedoff">let sender = seSender env</span>
+<span class="lineno">  133 </span><span class="spaces">                </span><span class="istickedoff">logIO logger DebugS <span class="nottickedoff">(&quot;signal: inbound message from &quot; &lt;&gt; ls (userIdText sender))</span></span>
+<span class="lineno">  134 </span><span class="spaces">                </span><span class="istickedoff">if isAllowed sender (scAllowList ch)</span>
+<span class="lineno">  135 </span><span class="spaces">                  </span><span class="istickedoff">then do</span>
+<span class="lineno">  136 </span><span class="spaces">                    </span><span class="istickedoff">case mkMessageSource (seConversationId env) Signal <span class="nottickedoff">(Just sender)</span> mempty of</span>
+<span class="lineno">  137 </span><span class="spaces">                      </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">logIO logger WarningS (&quot;MessageSource construction failed: &quot; &lt;&gt; ls err)</span></span>
+<span class="lineno">  138 </span><span class="spaces">                      </span><span class="istickedoff">Right ms -&gt; do</span>
+<span class="lineno">  139 </span><span class="spaces">                        </span><span class="istickedoff">writeIORef (scLastSender ch) (Just sender)</span>
+<span class="lineno">  140 </span><span class="spaces">                        </span><span class="istickedoff">atomically (writeTQueue (scInbox ch) (ms, seBody env))</span>
+<span class="lineno">  141 </span><span class="spaces">                  </span><span class="istickedoff">else logIO logger InfoS <span class="nottickedoff">(&quot;dropped non-allow-listed sender: &quot; &lt;&gt; ls (userIdText sender))</span></span>
+<span class="lineno">  142 </span><span class="spaces">                </span><span class="istickedoff">go</span></span>
+<span class="lineno">  143 </span>
+<span class="lineno">  144 </span>-- | Send a message, chunked to 'scChunkLimit', addressed to the last sender.
+<span class="lineno">  145 </span>-- If no peer has been seen yet, the send is dropped with a warning log.
+<span class="lineno">  146 </span>sendChunked :: SignalChannel -&gt; Text -&gt; IO ()
+<span class="lineno">  147 </span><span class="decl"><span class="istickedoff">sendChunked ch t = do</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="istickedoff">mSender &lt;- readIORef (scLastSender ch)</span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="istickedoff">case mSender of</span>
+<span class="lineno">  150 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; logIO (scLogger ch) WarningS <span class="nottickedoff">&quot;signal: dropping send — no last sender yet&quot;</span></span>
+<span class="lineno">  151 </span><span class="spaces">    </span><span class="istickedoff">Just _  -&gt; mapM_ (sendRaw ch) (chunkMessage (scChunkLimit ch) t)</span></span>
+<span class="lineno">  152 </span>
+<span class="lineno">  153 </span>-- | Send one chunk verbatim to the last sender (no further splitting).
+<span class="lineno">  154 </span>-- Used by 'chSendChunk' (the caller pre-split) and by 'sendChunked' for
+<span class="lineno">  155 </span>-- each split chunk. Addressed to the last sender.
+<span class="lineno">  156 </span>sendRaw :: SignalChannel -&gt; Text -&gt; IO ()
+<span class="lineno">  157 </span><span class="decl"><span class="istickedoff">sendRaw ch t = do</span>
+<span class="lineno">  158 </span><span class="spaces">  </span><span class="istickedoff">mSender &lt;- readIORef (scLastSender ch)</span>
+<span class="lineno">  159 </span><span class="spaces">  </span><span class="istickedoff">case mSender of</span>
+<span class="lineno">  160 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">logIO (scLogger ch) WarningS &quot;signal: dropping chunk — no last sender yet&quot;</span></span>
+<span class="lineno">  161 </span><span class="spaces">    </span><span class="istickedoff">Just uid -&gt; stSend (scTransport ch) (userIdText uid) t</span></span>
+<span class="lineno">  162 </span>
+<span class="lineno">  163 </span>-- | Pull the next @(MessageSource, body)@ from the inbox. Non-blocking:
+<span class="lineno">  164 </span>-- returns @(Nothing, &quot;&quot;)@ when the inbox is empty AND the reader thread has
+<span class="lineno">  165 </span>-- exited (transport closed / EOF). Returns @(Nothing, &quot;&quot;)@ immediately in
+<span class="lineno">  166 </span>-- that state so 'runSignalLoop' can terminate rather than block forever.
+<span class="lineno">  167 </span>receiveFromInbox :: SignalChannel -&gt; IO (Maybe MessageSource, Text)
+<span class="lineno">  168 </span><span class="decl"><span class="istickedoff">receiveFromInbox ch = do</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="istickedoff">mNext &lt;- atomically (tryReadTQueue (scInbox ch))</span>
+<span class="lineno">  170 </span><span class="spaces">  </span><span class="istickedoff">case mNext of</span>
+<span class="lineno">  171 </span><span class="spaces">    </span><span class="istickedoff">Just (ms, body) -&gt; pure (Just ms, body)</span>
+<span class="lineno">  172 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; do</span>
+<span class="lineno">  173 </span><span class="spaces">      </span><span class="istickedoff">alive &lt;- readIORef (scReaderAlive ch)</span>
+<span class="lineno">  174 </span><span class="spaces">      </span><span class="istickedoff">if alive</span>
+<span class="lineno">  175 </span><span class="spaces">        </span><span class="istickedoff">then do</span>
+<span class="lineno">  176 </span><span class="spaces">          </span><span class="istickedoff">-- Inbox momentarily empty but reader still running: retry once</span>
+<span class="lineno">  177 </span><span class="spaces">          </span><span class="istickedoff">-- after a brief yield to let the reader push the next envelope.</span>
+<span class="lineno">  178 </span><span class="spaces">          </span><span class="istickedoff">-- (A real transport blocks in stReceive; a mock drains fast.)</span>
+<span class="lineno">  179 </span><span class="spaces">          </span><span class="istickedoff">threadDelay 1000  -- 1ms</span>
+<span class="lineno">  180 </span><span class="spaces">          </span><span class="istickedoff">receiveFromInbox ch</span>
+<span class="lineno">  181 </span><span class="spaces">        </span><span class="istickedoff">else pure (Nothing, <span class="nottickedoff">&quot;&quot;</span>)</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,112 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The daemon liveness lock: @\&lt;state\&gt;\/serve.lock@.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- @seal serve@ takes an exclusive advisory lock on this file for its whole
+<span class="lineno">    5 </span>-- lifetime; the commands that must not race a live daemon (@enroll --cancel@,
+<span class="lineno">    6 </span>-- @disable@, @reset@, @migrate-credentials@) probe it with 'daemonHoldsLock'.
+<span class="lineno">    7 </span>--
+<span class="lineno">    8 </span>-- The lock is a POSIX @fcntl@ record lock, which the kernel holds on behalf of
+<span class="lineno">    9 </span>-- the process and releases when the process exits, however it exits. That is
+<span class="lineno">   10 </span>-- the property this module exists for: a daemon that crashed on Tuesday must
+<span class="lineno">   11 </span>-- not make @reset@ refuse on Wednesday. The file's /existence/ therefore means
+<span class="lineno">   12 </span>-- nothing; only the lock's state does.
+<span class="lineno">   13 </span>--
+<span class="lineno">   14 </span>-- Why not the @flock@-style @fileLock@: the @unix@ package shipped with GHC
+<span class="lineno">   15 </span>-- 9.12 (2.8.8.0) exposes only the record-lock API ('getLock', 'setLock',
+<span class="lineno">   16 </span>-- 'waitToSetLock'), and a record lock has the same released-on-death
+<span class="lineno">   17 </span>-- behaviour. The one difference worth knowing: closing /any/ descriptor for
+<span class="lineno">   18 </span>-- this file drops this process's lock on it, so nothing else in the daemon may
+<span class="lineno">   19 </span>-- open @serve.lock@.
+<span class="lineno">   20 </span>module Seal.Security.DaemonLock
+<span class="lineno">   21 </span>  ( ServeLock
+<span class="lineno">   22 </span>  , acquireServeLock
+<span class="lineno">   23 </span>  , releaseServeLock
+<span class="lineno">   24 </span>  , daemonHoldsLock
+<span class="lineno">   25 </span>  ) where
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>import Control.Exception (IOException, try)
+<span class="lineno">   28 </span>import Data.Maybe (isJust)
+<span class="lineno">   29 </span>import Data.Text (Text)
+<span class="lineno">   30 </span>import Data.Text qualified as T
+<span class="lineno">   31 </span>import GHC.IO.Device (SeekMode (AbsoluteSeek))
+<span class="lineno">   32 </span>import System.Posix.IO
+<span class="lineno">   33 </span>  ( FileLock, LockRequest (..), OpenFileFlags (creat), OpenMode (ReadWrite)
+<span class="lineno">   34 </span>  , closeFd, defaultFileFlags, getLock, openFd, setLock )
+<span class="lineno">   35 </span>import System.Posix.Types (Fd, ProcessID)
+<span class="lineno">   36 </span>
+<span class="lineno">   37 </span>-- | A held lock. Keep it alive for as long as the daemon should look alive;
+<span class="lineno">   38 </span>-- 'releaseServeLock' (or process exit) drops it.
+<span class="lineno">   39 </span>newtype ServeLock = ServeLock Fd
+<span class="lineno">   40 </span>
+<span class="lineno">   41 </span>-- | The whole-file, exclusive lock the daemon holds: lock byte 0 to EOF.
+<span class="lineno">   42 </span>wholeFile :: FileLock
+<span class="lineno">   43 </span><span class="decl"><span class="istickedoff">wholeFile = (WriteLock, AbsoluteSeek, 0, 0)</span></span>
+<span class="lineno">   44 </span>
+<span class="lineno">   45 </span>-- | Take the lock, or report that someone else holds it.
+<span class="lineno">   46 </span>--
+<span class="lineno">   47 </span>-- Non-blocking by design: a second @seal serve@ against the same
+<span class="lineno">   48 </span>-- @SEAL_HOME@ is a mistake to report, not a process to queue behind.
+<span class="lineno">   49 </span>acquireServeLock :: FilePath -&gt; IO (Either Text ServeLock)
+<span class="lineno">   50 </span><span class="decl"><span class="istickedoff">acquireServeLock path = do</span>
+<span class="lineno">   51 </span><span class="spaces">  </span><span class="istickedoff">opened &lt;- try (openFd path ReadWrite defaultFileFlags { creat = Just 0o600 })</span>
+<span class="lineno">   52 </span><span class="spaces">  </span><span class="istickedoff">case opened of</span>
+<span class="lineno">   53 </span><span class="spaces">    </span><span class="istickedoff">Left (err :: IOException) -&gt; <span class="nottickedoff">pure (Left (couldNotOpen path err))</span></span>
+<span class="lineno">   54 </span><span class="spaces">    </span><span class="istickedoff">Right fd -&gt; do</span>
+<span class="lineno">   55 </span><span class="spaces">      </span><span class="istickedoff">locked &lt;- try (setLock fd wholeFile)</span>
+<span class="lineno">   56 </span><span class="spaces">      </span><span class="istickedoff">case locked of</span>
+<span class="lineno">   57 </span><span class="spaces">        </span><span class="istickedoff">Right () -&gt; pure (Right (ServeLock fd))</span>
+<span class="lineno">   58 </span><span class="spaces">        </span><span class="istickedoff">Left (_ :: IOException) -&gt; do</span>
+<span class="lineno">   59 </span><span class="spaces">          </span><span class="istickedoff">closeFd fd</span>
+<span class="lineno">   60 </span><span class="spaces">          </span><span class="istickedoff">pure (Left <span class="nottickedoff">(&quot;another `seal serve` is already running for this SEAL_HOME (&quot;</span></span>
+<span class="lineno">   61 </span><span class="spaces">                       </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; T.pack path &lt;&gt; &quot; is locked).\n&quot;</span></span>
+<span class="lineno">   62 </span><span class="spaces">                       </span><span class="istickedoff"><span class="nottickedoff">&lt;&gt; &quot;  Stop it first: a second daemon would fight it for the port.&quot;)</span>)</span></span>
+<span class="lineno">   63 </span>
+<span class="lineno">   64 </span>-- | Drop the lock early. Process exit does this too.
+<span class="lineno">   65 </span>releaseServeLock :: ServeLock -&gt; IO ()
+<span class="lineno">   66 </span><span class="decl"><span class="istickedoff">releaseServeLock (ServeLock fd) = closeFd fd</span></span>
+<span class="lineno">   67 </span>
+<span class="lineno">   68 </span>-- | Is a live process holding the lock?
+<span class="lineno">   69 </span>--
+<span class="lineno">   70 </span>-- 'getLock' asks the kernel who holds the lock without taking it, which is
+<span class="lineno">   71 </span>-- exactly the question here. A missing lock file, an unreadable one, or a file
+<span class="lineno">   72 </span>-- left behind by a crashed daemon all answer @False@.
+<span class="lineno">   73 </span>daemonHoldsLock :: FilePath -&gt; IO Bool
+<span class="lineno">   74 </span><span class="decl"><span class="istickedoff">daemonHoldsLock path = do</span>
+<span class="lineno">   75 </span><span class="spaces">  </span><span class="istickedoff">opened &lt;- try (openFd path ReadWrite defaultFileFlags { creat = Just 0o600 })</span>
+<span class="lineno">   76 </span><span class="spaces">  </span><span class="istickedoff">case opened of</span>
+<span class="lineno">   77 </span><span class="spaces">    </span><span class="istickedoff">-- If the file cannot be opened at all, no daemon can be holding a lock on</span>
+<span class="lineno">   78 </span><span class="spaces">    </span><span class="istickedoff">-- it, and the command that probes is about to fail on its own write with a</span>
+<span class="lineno">   79 </span><span class="spaces">    </span><span class="istickedoff">-- better message than &quot;a daemon is running&quot;.</span>
+<span class="lineno">   80 </span><span class="spaces">    </span><span class="istickedoff">Left (_ :: IOException) -&gt; <span class="nottickedoff">pure False</span></span>
+<span class="lineno">   81 </span><span class="spaces">    </span><span class="istickedoff">Right fd -&gt; do</span>
+<span class="lineno">   82 </span><span class="spaces">      </span><span class="istickedoff">current &lt;- try (getLock fd wholeFile)</span>
+<span class="lineno">   83 </span><span class="spaces">              </span><span class="istickedoff">:: IO (Either IOException (Maybe (ProcessID, FileLock)))</span>
+<span class="lineno">   84 </span><span class="spaces">      </span><span class="istickedoff">closeFd fd</span>
+<span class="lineno">   85 </span><span class="spaces">      </span><span class="istickedoff">pure (either <span class="nottickedoff">(const True)</span> isJust current)</span></span>
+<span class="lineno">   86 </span>
+<span class="lineno">   87 </span>couldNotOpen :: FilePath -&gt; IOException -&gt; Text
+<span class="lineno">   88 </span><span class="decl"><span class="nottickedoff">couldNotOpen path err = T.pack path &lt;&gt; &quot;: could not open the daemon lock: &quot;</span>
+<span class="lineno">   89 </span><span class="spaces">  </span><span class="nottickedoff">&lt;&gt; T.pack (show err)</span></span>
+
+</pre>
+</body>
+</html>

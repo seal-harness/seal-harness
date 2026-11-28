@@ -1,0 +1,423 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Pure classification of Ollama's observed readiness.
+<span class="lineno">    3 </span>--
+<span class="lineno">    4 </span>-- The module exists because @configured@ answers &quot;did the operator express
+<span class="lineno">    5 </span>-- intent?&quot; and nothing else. On a machine with no daemon, no binary and no
+<span class="lineno">    6 </span>-- models, @configured@ is still @True@ for a keyless local Ollama — so the
+<span class="lineno">    7 </span>-- provider dropdowns, the CRUD list, the setup wizard and @\/provider list@
+<span class="lineno">    8 </span>-- all asserted usability they had never observed. This module is the second,
+<span class="lineno">    9 </span>-- observed axis.
+<span class="lineno">   10 </span>--
+<span class="lineno">   11 </span>-- Everything here is pure and total. The I/O — the HTTP probe, the cache, the
+<span class="lineno">   12 </span>-- single-flight gate, @findExecutable@, the RAM reader — lives in
+<span class="lineno">   13 </span>-- &quot;Seal.Providers.OllamaReadinessProbe&quot;.
+<span class="lineno">   14 </span>--
+<span class="lineno">   15 </span>-- == Why &quot;refused&quot; is decided on errno, never on the message
+<span class="lineno">   16 </span>--
+<span class="lineno">   17 </span>-- Measured on GHC 9.12 \/ http-client against a real closed port:
+<span class="lineno">   18 </span>--
+<span class="lineno">   19 </span>-- &gt; refusal:      type=NoSuchThing  msg=&quot;does not exist&quot;  errno=Just 61
+<span class="lineno">   20 </span>-- &gt; DNS failure:  type=NoSuchThing  msg=&quot;does not exist&quot;  errno=Nothing
+<span class="lineno">   21 </span>--
+<span class="lineno">   22 </span>-- The two are byte-identical in exception type and message. A substring match
+<span class="lineno">   23 </span>-- on @\&quot;refused\&quot;@ never fires, which would make 'RdNotRunning' unreachable
+<span class="lineno">   24 </span>-- and re-create the very bug this module exists to fix. 'classifyProbeFailure'
+<span class="lineno">   25 </span>-- therefore discriminates on 'ioe_errno' alone, and everything it cannot
+<span class="lineno">   26 </span>-- positively identify is 'OpeOther' — &quot;do not claim to know&quot;.
+<span class="lineno">   27 </span>module Seal.Providers.OllamaReadiness
+<span class="lineno">   28 </span>  ( OllamaReadiness (..)
+<span class="lineno">   29 </span>  , OllamaProbeError (..)
+<span class="lineno">   30 </span>  , OllamaHostKind (..)
+<span class="lineno">   31 </span>  , OllamaTag (..)
+<span class="lineno">   32 </span>  , OllamaProbe (..)
+<span class="lineno">   33 </span>  , classifyOllamaReadiness
+<span class="lineno">   34 </span>  , isCloudModel
+<span class="lineno">   35 </span>  , parseMemTotal
+<span class="lineno">   36 </span>  , readinessText
+<span class="lineno">   37 </span>  , readinessWire
+<span class="lineno">   38 </span>  , readinessUsableCount
+<span class="lineno">   39 </span>  , classifyProbeFailure
+<span class="lineno">   40 </span>  , probeTargetFor
+<span class="lineno">   41 </span>  , hostKindFor
+<span class="lineno">   42 </span>  , singleFlightKey
+<span class="lineno">   43 </span>  , probeTimeoutMicro
+<span class="lineno">   44 </span>  ) where
+<span class="lineno">   45 </span>
+<span class="lineno">   46 </span>import Control.Exception (IOException, fromException)
+<span class="lineno">   47 </span>import Data.Char (isDigit)
+<span class="lineno">   48 </span>import Data.Maybe (fromMaybe)
+<span class="lineno">   49 </span>import Data.Text (Text)
+<span class="lineno">   50 </span>import Data.Text qualified as T
+<span class="lineno">   51 </span>import Data.Word (Word64)
+<span class="lineno">   52 </span>import Foreign.C.Error (Errno (..), eCONNREFUSED)
+<span class="lineno">   53 </span>import GHC.IO.Exception (ioe_errno)
+<span class="lineno">   54 </span>import Network.HTTP.Client
+<span class="lineno">   55 </span>  ( HttpException (..), HttpExceptionContent (..), Request (..), parseRequest
+<span class="lineno">   56 </span>  , responseTimeoutMicro )
+<span class="lineno">   57 </span>import Network.HTTP.Types.Header (hContentType)
+<span class="lineno">   58 </span>
+<span class="lineno">   59 </span>import Seal.Providers.Ollama (defaultOllamaBaseUrl)
+<span class="lineno">   60 </span>import Seal.Web.UrlSafety (isAlwaysBlockedUrl)
+<span class="lineno">   61 </span>
+<span class="lineno">   62 </span>-- | The second, observed axis. 'RdPending' means /this process has not
+<span class="lineno">   63 </span>-- finished a probe yet/ — it is the only state that renders as nothing,
+<span class="lineno">   64 </span>-- because &quot;we have not looked&quot; must never be shown as a verdict.
+<span class="lineno">   65 </span>data OllamaReadiness
+<span class="lineno">   66 </span>  = RdPending          -- ^ no probe has completed yet in this process
+<span class="lineno">   67 </span>  | RdUnknown          -- ^ a probe ran and failed unexplainably
+<span class="lineno">   68 </span>  | RdNotInstalled     -- ^ loopback URL, nothing listening, no binary on PATH
+<span class="lineno">   69 </span>  | RdNotRunning       -- ^ loopback URL, connection REFUSED
+<span class="lineno">   70 </span>  | RdNoModels         -- ^ daemon answered, zero models
+<span class="lineno">   71 </span>  | RdNoFittingModel   -- ^ daemon answered, models exist, none usable (advisory)
+<span class="lineno">   72 </span>  | RdReady !Int       -- ^ N usable models; @n &gt;= 1@ by construction
+<span class="lineno">   73 </span>  | RdCloud            -- ^ ollama.com: no probe performed
+<span class="lineno">   74 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   75 </span>
+<span class="lineno">   76 </span>-- | Why a probe did not produce a tag list. 'OpeRefused' is the only
+<span class="lineno">   77 </span>-- constructor that permits the 'RdNotRunning' claim.
+<span class="lineno">   78 </span>data OllamaProbeError
+<span class="lineno">   79 </span>  = OpeRefused       -- ^ only: ConnectionFailure with @ioe_errno == eCONNREFUSED@
+<span class="lineno">   80 </span>  | OpeBlocked       -- ^ refused by the SSRF floor / URL-shape check, pre-request
+<span class="lineno">   81 </span>  | OpeTimeout
+<span class="lineno">   82 </span>  | OpeBadResponse   -- ^ something answered, but not with Ollama's JSON (or over the cap)
+<span class="lineno">   83 </span>  | OpeHttp !Int     -- ^ non-2xx status; a 3xx lands here (redirects are never followed)
+<span class="lineno">   84 </span>  | OpeOther         -- ^ any other transport failure (reset, TLS, DNS, non-IOError)
+<span class="lineno">   85 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="istickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   86 </span>
+<span class="lineno">   87 </span>-- | Where the base URL points. Split from the binary check because only the
+<span class="lineno">   88 </span>-- default-loopback spelling may refine its wording from @findExecutable@
+<span class="lineno">   89 </span>-- (D3.3): a Docker-hosted daemon is &quot;not running&quot;, not &quot;not installed&quot;.
+<span class="lineno">   90 </span>data OllamaHostKind
+<span class="lineno">   91 </span>  = OhCloud           -- ^ host is ollama.com: no probe at all
+<span class="lineno">   92 </span>  | OhDefaultLoopback -- ^ literally 'defaultOllamaBaseUrl': binary wording allowed
+<span class="lineno">   93 </span>  | OhLoopback        -- ^ 127\/8 \/ [::1] \/ localhost, any port
+<span class="lineno">   94 </span>  | OhOtherHost       -- ^ LAN \/ remote
+<span class="lineno">   95 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   96 </span>
+<span class="lineno">   97 </span>-- | One installed model, as @\/api\/tags@ reports it.
+<span class="lineno">   98 </span>--
+<span class="lineno">   99 </span>-- The two optional fields are what make the fit judgement hedgeable rather
+<span class="lineno">  100 </span>-- than assertive: an absent size or an absent RAM figure is /no evidence/, and
+<span class="lineno">  101 </span>-- no evidence must never become a claim (design D5.3).
+<span class="lineno">  102 </span>data OllamaTag = OllamaTag
+<span class="lineno">  103 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">otName</span></span></span>       :: !Text
+<span class="lineno">  104 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">otSizeBytes</span></span></span>  :: !(Maybe Word64)
+<span class="lineno">  105 </span>    -- ^ 'Nothing' = the daemon reported no size.
+<span class="lineno">  106 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">otRemoteHost</span></span></span> :: !(Maybe Text)
+<span class="lineno">  107 </span>    -- ^ 'Just' = the model runs server-side (cloud), so it is never sized
+<span class="lineno">  108 </span>    --   against local RAM.
+<span class="lineno">  109 </span>  } deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  110 </span>
+<span class="lineno">  111 </span>-- | The pure inputs to classification. Assembled by the I/O module.
+<span class="lineno">  112 </span>data OllamaProbe = OllamaProbe
+<span class="lineno">  113 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">opHostKind</span></span></span>      :: !OllamaHostKind
+<span class="lineno">  114 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">opTags</span></span></span>          :: !(Either OllamaProbeError [OllamaTag])
+<span class="lineno">  115 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">opBinaryPresent</span></span></span> :: !Bool
+<span class="lineno">  116 </span>    -- ^ Only consulted for 'OhDefaultLoopback' \/ 'OhLoopback' refusals.
+<span class="lineno">  117 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">opTotalRam</span></span></span>      :: !(Maybe Word64)
+<span class="lineno">  118 </span>    -- ^ Unused in WU-A; WU-B's fit predicate consumes it.
+<span class="lineno">  119 </span>  } deriving stock (<span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">  120 </span>
+<span class="lineno">  121 </span>-- | The state machine. Total, and deliberately narrow: every branch that is
+<span class="lineno">  122 </span>-- not positively identified degrades to 'RdUnknown'.
+<span class="lineno">  123 </span>classifyOllamaReadiness :: OllamaProbe -&gt; OllamaReadiness
+<span class="lineno">  124 </span><span class="decl"><span class="istickedoff">classifyOllamaReadiness p = case opHostKind p of</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="istickedoff">-- An ollama.com endpoint is not probed at all, so there is nothing to</span>
+<span class="lineno">  126 </span><span class="spaces">  </span><span class="istickedoff">-- classify — and &quot;not ready&quot; would simply be false.</span>
+<span class="lineno">  127 </span><span class="spaces">  </span><span class="istickedoff">OhCloud -&gt; RdCloud</span>
+<span class="lineno">  128 </span><span class="spaces">  </span><span class="istickedoff">_ -&gt; case opTags p of</span>
+<span class="lineno">  129 </span><span class="spaces">    </span><span class="istickedoff">Right [] -&gt; RdNoModels</span>
+<span class="lineno">  130 </span><span class="spaces">    </span><span class="istickedoff">Right tags -&gt; classifyTags (opTotalRam p) tags</span>
+<span class="lineno">  131 </span><span class="spaces">    </span><span class="istickedoff">Left OpeRefused</span>
+<span class="lineno">  132 </span><span class="spaces">      </span><span class="istickedoff">-- A refusal is evidence about *this* machine only when the URL points</span>
+<span class="lineno">  133 </span><span class="spaces">      </span><span class="istickedoff">-- at this machine. For a LAN or remote host, our own PATH says nothing.</span>
+<span class="lineno">  134 </span><span class="spaces">      </span><span class="istickedoff">| opHostKind p == OhDefaultLoopback || opHostKind p == OhLoopback -&gt;</span>
+<span class="lineno">  135 </span><span class="spaces">          </span><span class="istickedoff">if opBinaryPresent p then RdNotRunning else RdNotInstalled</span>
+<span class="lineno">  136 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> -&gt; RdUnknown</span>
+<span class="lineno">  137 </span><span class="spaces">    </span><span class="istickedoff">-- Everything else — blocked, timed out, malformed, an HTTP status, a</span>
+<span class="lineno">  138 </span><span class="spaces">    </span><span class="istickedoff">-- reset, TLS, DNS — is &quot;we do not know&quot;, never &quot;not running&quot;.</span>
+<span class="lineno">  139 </span><span class="spaces">    </span><span class="istickedoff">Left _ -&gt; RdUnknown</span></span>
+<span class="lineno">  140 </span>
+<span class="lineno">  141 </span>-- | Count the usable models, or report that none of the /sized/ ones fit.
+<span class="lineno">  142 </span>--
+<span class="lineno">  143 </span>-- The rules, all from design D5.3, are deliberately symmetric — RAM and size
+<span class="lineno">  144 </span>-- are treated the same way, because an asymmetry would emit
+<span class="lineno">  145 </span>-- @May Not Fit in RAM@ with zero evidence on one side:
+<span class="lineno">  146 </span>--
+<span class="lineno">  147 </span>-- * A /cloud/ model is always usable and is never sized locally
+<span class="lineno">  148 </span>--   ('isCloudModel').
+<span class="lineno">  149 </span>-- * An unknown size counts as usable: we cannot substantiate a problem.
+<span class="lineno">  150 </span>-- * Unknown RAM means /every/ local model is usable, and never
+<span class="lineno">  151 </span>--   'RdNoFittingModel'.
+<span class="lineno">  152 </span>-- * 'RdNoFittingModel' requires at least one /known/ size, and none of the
+<span class="lineno">  153 </span>--   known-size local models fitting.
+<span class="lineno">  154 </span>--
+<span class="lineno">  155 </span>-- The &quot;at least one known size&quot; requirement is satisfied /by construction/
+<span class="lineno">  156 </span>-- rather than by a separate guard, which is worth stating because it is the
+<span class="lineno">  157 </span>-- kind of thing that looks like a missing case: 'isUsable' returns 'True' for
+<span class="lineno">  158 </span>-- an unknown size, so @usable == 0@ can only happen when /every/ tag had a
+<span class="lineno">  159 </span>-- known size and none of them fit. If a size is ever unknown, the model counts
+<span class="lineno">  160 </span>-- as usable and we take the @RdReady@ branch — exactly the D5.3 rule
+<span class="lineno">  161 </span>-- (&quot;every size unknown ⇒ RdReady with the full count&quot;), reached without an
+<span class="lineno">  162 </span>-- extra test. An explicit @any hasKnownSize@ guard here would be dead code.
+<span class="lineno">  163 </span>classifyTags :: Maybe Word64 -&gt; [OllamaTag] -&gt; OllamaReadiness
+<span class="lineno">  164 </span><span class="decl"><span class="istickedoff">classifyTags mRam tags =</span>
+<span class="lineno">  165 </span><span class="spaces">  </span><span class="istickedoff">case mRam of</span>
+<span class="lineno">  166 </span><span class="spaces">    </span><span class="istickedoff">-- No RAM figure: nothing to judge against, so everything is usable.</span>
+<span class="lineno">  167 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; RdReady (length tags)</span>
+<span class="lineno">  168 </span><span class="spaces">    </span><span class="istickedoff">Just ram -&gt;</span>
+<span class="lineno">  169 </span><span class="spaces">      </span><span class="istickedoff">let usable = length (filter (isUsable ram) tags)</span>
+<span class="lineno">  170 </span><span class="spaces">      </span><span class="istickedoff">in if usable &gt; 0</span>
+<span class="lineno">  171 </span><span class="spaces">           </span><span class="istickedoff">then RdReady usable</span>
+<span class="lineno">  172 </span><span class="spaces">           </span><span class="istickedoff">else RdNoFittingModel</span></span>
+<span class="lineno">  173 </span>
+<span class="lineno">  174 </span>-- | Is a model usable at the given total RAM?
+<span class="lineno">  175 </span>--
+<span class="lineno">  176 </span>-- Cloud models always are. A local model is usable when its size is unknown
+<span class="lineno">  177 </span>-- (no evidence) or when 1.25x its size still fits in RAM. The comparison is
+<span class="lineno">  178 </span>-- exact integer arithmetic — @size * 5 &lt; ram * 4@ — so the predicate stays
+<span class="lineno">  179 </span>-- pure and exact, and never rounds in the operator's favour or against it.
+<span class="lineno">  180 </span>--
+<span class="lineno">  181 </span>-- The arithmetic is done in 'Integer', not 'Word64'. @size@ comes from the
+<span class="lineno">  182 </span>-- daemon, so it is untrusted input: a size near @2^64@ would wrap a 'Word64'
+<span class="lineno">  183 </span>-- multiplication and make an absurd model compare as fitting. @Integer@ is
+<span class="lineno">  184 </span>-- arbitrary-precision, so that cannot happen. RAM is bounded in practice, but
+<span class="lineno">  185 </span>-- widening both sides keeps the comparison obviously exact rather than
+<span class="lineno">  186 </span>-- exact-by-luck.
+<span class="lineno">  187 </span>isUsable :: Word64 -&gt; OllamaTag -&gt; Bool
+<span class="lineno">  188 </span><span class="decl"><span class="istickedoff">isUsable ram t</span>
+<span class="lineno">  189 </span><span class="spaces">  </span><span class="istickedoff">| isCloudModel t = True</span>
+<span class="lineno">  190 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case otSizeBytes t of</span>
+<span class="lineno">  191 </span><span class="spaces">      </span><span class="istickedoff">Nothing   -&gt; True</span>
+<span class="lineno">  192 </span><span class="spaces">      </span><span class="istickedoff">Just size -&gt; (toInteger size * 5) &lt; (toInteger ram * 4)</span></span>
+<span class="lineno">  193 </span>
+<span class="lineno">  194 </span>-- | Is this model served remotely?
+<span class="lineno">  195 </span>--
+<span class="lineno">  196 </span>-- True when @remote_host@ is present /or/ the name carries the @:cloud@
+<span class="lineno">  197 </span>-- suffix. @remote_host@ is authoritative when the two disagree: the suffix
+<span class="lineno">  198 </span>-- alone is a naming convention, while the field is what the daemon actually
+<span class="lineno">  199 </span>-- does.
+<span class="lineno">  200 </span>isCloudModel :: OllamaTag -&gt; Bool
+<span class="lineno">  201 </span><span class="decl"><span class="istickedoff">isCloudModel t = case otRemoteHost t of</span>
+<span class="lineno">  202 </span><span class="spaces">  </span><span class="istickedoff">Just _  -&gt; True</span>
+<span class="lineno">  203 </span><span class="spaces">  </span><span class="istickedoff">Nothing -&gt; &quot;:cloud&quot; `T.isSuffixOf` otName t</span></span>
+<span class="lineno">  204 </span>
+<span class="lineno">  205 </span>-- | Parse @MemTotal:@ from one @\/proc\/meminfo@ line, as bytes.
+<span class="lineno">  206 </span>--
+<span class="lineno">  207 </span>-- @kB@ is the only accepted unit. A non-kB suffix yields 'Nothing' rather than
+<span class="lineno">  208 </span>-- a silent rescale: a wrong 1000x guess would be worse than &quot;RAM unknown&quot;,
+<span class="lineno">  209 </span>-- which degrades safely to &quot;assume usable&quot;. @MemTotal: 0 kB@ is 'Just 0' — a
+<span class="lineno">  210 </span>-- real (if pathological) kernel value, not an absence.
+<span class="lineno">  211 </span>parseMemTotal :: Text -&gt; Maybe Word64
+<span class="lineno">  212 </span><span class="decl"><span class="istickedoff">parseMemTotal line = do</span>
+<span class="lineno">  213 </span><span class="spaces">  </span><span class="istickedoff">rest &lt;- T.stripPrefix &quot;MemTotal:&quot; line</span>
+<span class="lineno">  214 </span><span class="spaces">  </span><span class="istickedoff">case T.words rest of</span>
+<span class="lineno">  215 </span><span class="spaces">    </span><span class="istickedoff">[valueT, unitT]</span>
+<span class="lineno">  216 </span><span class="spaces">      </span><span class="istickedoff">| unitT == &quot;kB&quot; -&gt; (* 1024) &lt;$&gt; readDecimal valueT</span>
+<span class="lineno">  217 </span><span class="spaces">    </span><span class="istickedoff">_ -&gt; Nothing</span>
+<span class="lineno">  218 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  219 </span><span class="spaces">    </span><span class="istickedoff">readDecimal t = case reads (T.unpack t) of</span>
+<span class="lineno">  220 </span><span class="spaces">      </span><span class="istickedoff">[(n, &quot;&quot;)] -&gt; Just n</span>
+<span class="lineno">  221 </span><span class="spaces">      </span><span class="istickedoff">_         -&gt; Nothing</span></span>
+<span class="lineno">  222 </span>
+<span class="lineno">  223 </span>-- | How many models 'RdReady' counts. Exposed so the wire and the label
+<span class="lineno">  224 </span>-- cannot disagree.
+<span class="lineno">  225 </span>readinessUsableCount :: OllamaReadiness -&gt; Maybe Int
+<span class="lineno">  226 </span><span class="decl"><span class="nottickedoff">readinessUsableCount (RdReady n) = Just n</span>
+<span class="lineno">  227 </span><span class="spaces"></span><span class="nottickedoff">readinessUsableCount _           = Nothing</span></span>
+<span class="lineno">  228 </span>
+<span class="lineno">  229 </span>-- | The CLI's rendering (@\/provider list@). Total over all eight
+<span class="lineno">  230 </span>-- constructors; 'RdPending' is the empty string, and the caller omits the
+<span class="lineno">  231 </span>-- segment when the text is empty rather than printing a stray separator.
+<span class="lineno">  232 </span>readinessText :: OllamaReadiness -&gt; Text
+<span class="lineno">  233 </span><span class="decl"><span class="istickedoff">readinessText = \case</span>
+<span class="lineno">  234 </span><span class="spaces">  </span><span class="istickedoff">RdPending        -&gt; &quot;&quot;</span>
+<span class="lineno">  235 </span><span class="spaces">  </span><span class="istickedoff">RdUnknown        -&gt; &quot;Status Unknown&quot;</span>
+<span class="lineno">  236 </span><span class="spaces">  </span><span class="istickedoff">RdNotInstalled   -&gt; &quot;Ollama Not Found&quot;</span>
+<span class="lineno">  237 </span><span class="spaces">  </span><span class="istickedoff">RdNotRunning     -&gt; &quot;Not Running&quot;</span>
+<span class="lineno">  238 </span><span class="spaces">  </span><span class="istickedoff">RdNoModels       -&gt; &quot;No Models Pulled&quot;</span>
+<span class="lineno">  239 </span><span class="spaces">  </span><span class="istickedoff">RdNoFittingModel -&gt; &quot;May Not Fit in RAM&quot;</span>
+<span class="lineno">  240 </span><span class="spaces">  </span><span class="istickedoff">RdReady 1        -&gt; &quot;Ready · 1 Model&quot;</span>
+<span class="lineno">  241 </span><span class="spaces">  </span><span class="istickedoff">RdReady n        -&gt; &quot;Ready · &quot; &lt;&gt; T.pack (show n) &lt;&gt; &quot; Models&quot;</span>
+<span class="lineno">  242 </span><span class="spaces">  </span><span class="istickedoff">RdCloud          -&gt; &quot;Cloud&quot;</span></span>
+<span class="lineno">  243 </span>
+<span class="lineno">  244 </span>-- | The wire value (kebab-case, matching @api-key@ \/ @vault-locked@). The
+<span class="lineno">  245 </span>-- frontend's label table keys off exactly these strings.
+<span class="lineno">  246 </span>readinessWire :: OllamaReadiness -&gt; Text
+<span class="lineno">  247 </span><span class="decl"><span class="istickedoff">readinessWire = \case</span>
+<span class="lineno">  248 </span><span class="spaces">  </span><span class="istickedoff">RdPending        -&gt; &quot;pending&quot;</span>
+<span class="lineno">  249 </span><span class="spaces">  </span><span class="istickedoff">RdUnknown        -&gt; &quot;unknown&quot;</span>
+<span class="lineno">  250 </span><span class="spaces">  </span><span class="istickedoff">RdNotInstalled   -&gt; &quot;not-installed&quot;</span>
+<span class="lineno">  251 </span><span class="spaces">  </span><span class="istickedoff">RdNotRunning     -&gt; &quot;not-running&quot;</span>
+<span class="lineno">  252 </span><span class="spaces">  </span><span class="istickedoff">RdNoModels       -&gt; &quot;no-models&quot;</span>
+<span class="lineno">  253 </span><span class="spaces">  </span><span class="istickedoff">RdNoFittingModel -&gt; &quot;no-fitting-model&quot;</span>
+<span class="lineno">  254 </span><span class="spaces">  </span><span class="istickedoff">RdReady _        -&gt; &quot;ready&quot;</span>
+<span class="lineno">  255 </span><span class="spaces">  </span><span class="istickedoff">RdCloud          -&gt; &quot;cloud&quot;</span></span>
+<span class="lineno">  256 </span>
+<span class="lineno">  257 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  258 </span>-- Failure classification
+<span class="lineno">  259 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  260 </span>
+<span class="lineno">  261 </span>-- | Turn an 'HttpException' into the probe's own error type. The /only/ way
+<span class="lineno">  262 </span>-- to get 'OpeRefused' is a @ConnectionFailure@ whose payload unwraps to an
+<span class="lineno">  263 </span>-- 'IOException' with @ioe_errno == Just n@ and @Errno n == eCONNREFUSED@.
+<span class="lineno">  264 </span>--
+<span class="lineno">  265 </span>-- Note the unwrap: @ConnectionFailure@ carries a 'SomeException', not an
+<span class="lineno">  266 </span>-- 'IOException', so matching on an 'IOException' pattern directly does not
+<span class="lineno">  267 </span>-- typecheck. The trailing catch-all is an intentional fail-safe, not an
+<span class="lineno">  268 </span>-- oversight — it absorbs any future 'HttpException' shape as &quot;do not claim to
+<span class="lineno">  269 </span>-- know&quot; rather than inventing a state.
+<span class="lineno">  270 </span>classifyProbeFailure :: HttpException -&gt; OllamaProbeError
+<span class="lineno">  271 </span><span class="decl"><span class="istickedoff">classifyProbeFailure (HttpExceptionRequest _ (ConnectionFailure se)) =</span>
+<span class="lineno">  272 </span><span class="spaces">  </span><span class="istickedoff">case fromException se :: Maybe IOException of</span>
+<span class="lineno">  273 </span><span class="spaces">    </span><span class="istickedoff">Just ioe -&gt; case ioe_errno ioe of</span>
+<span class="lineno">  274 </span><span class="spaces">      </span><span class="istickedoff">Just n | Errno n == eCONNREFUSED -&gt; OpeRefused</span>
+<span class="lineno">  275 </span><span class="spaces">      </span><span class="istickedoff">_                                -&gt; OpeOther</span>
+<span class="lineno">  276 </span><span class="spaces">    </span><span class="istickedoff">Nothing -&gt; <span class="nottickedoff">OpeOther</span></span>
+<span class="lineno">  277 </span><span class="spaces"></span><span class="istickedoff">classifyProbeFailure (HttpExceptionRequest _ ResponseTimeout) = OpeTimeout</span>
+<span class="lineno">  278 </span><span class="spaces"></span><span class="istickedoff">classifyProbeFailure _ = OpeOther</span></span>
+<span class="lineno">  279 </span>
+<span class="lineno">  280 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  281 </span>-- The request
+<span class="lineno">  282 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  283 </span>
+<span class="lineno">  284 </span>-- | The probe's per-request timeout. Two seconds, deliberately /not/ the
+<span class="lineno">  285 </span>-- provider's five-minute 'Seal.Providers.Ollama.ollamaResponseTimeoutMicro':
+<span class="lineno">  286 </span>-- the cache caps in-flight probes at one globally, so a probe that never
+<span class="lineno">  287 </span>-- returns would hold that slot forever and starve every later refresh.
+<span class="lineno">  288 </span>probeTimeoutMicro :: Int
+<span class="lineno">  289 </span><span class="decl"><span class="istickedoff">probeTimeoutMicro = 2_000_000</span></span>
+<span class="lineno">  290 </span>
+<span class="lineno">  291 </span>-- | Validate a base URL and build the probe request. Pure, so the URL-shape
+<span class="lineno">  292 </span>-- and SSRF rules are testable without a socket.
+<span class="lineno">  293 </span>--
+<span class="lineno">  294 </span>-- Rejected, in order of cheapness:
+<span class="lineno">  295 </span>--
+<span class="lineno">  296 </span>-- * a scheme other than http\/https ('OpeBlocked');
+<span class="lineno">  297 </span>-- * any authority carrying userinfo ('OpeBlocked') — @http:\/\/x\@169.254.169.254\/@
+<span class="lineno">  298 </span>--   is the bypass this rule closes;
+<span class="lineno">  299 </span>-- * a URL the SSRF floor blocks ('OpeBlocked') — the cloud-metadata literals;
+<span class="lineno">  300 </span>-- * a URL http-client cannot parse ('OpeBadResponse').
+<span class="lineno">  301 </span>--
+<span class="lineno">  302 </span>-- The resulting request is built from 'parseRequest' plus explicit fields. It
+<span class="lineno">  303 </span>-- never goes through @withHeaders@, so it cannot acquire the vault key: the
+<span class="lineno">  304 </span>-- probe is keyless by construction (D2.1).
+<span class="lineno">  305 </span>probeTargetFor :: Text -&gt; Either OllamaProbeError Request
+<span class="lineno">  306 </span><span class="decl"><span class="istickedoff">probeTargetFor baseUrl</span>
+<span class="lineno">  307 </span><span class="spaces">  </span><span class="istickedoff">| not (isHttpScheme baseUrl) = Left <span class="nottickedoff">OpeBlocked</span></span>
+<span class="lineno">  308 </span><span class="spaces">  </span><span class="istickedoff">| carriesUserinfo baseUrl = Left <span class="nottickedoff">OpeBlocked</span></span>
+<span class="lineno">  309 </span><span class="spaces">  </span><span class="istickedoff">| isAlwaysBlockedUrl baseUrl = Left <span class="nottickedoff">OpeBlocked</span></span>
+<span class="lineno">  310 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = case parseRequest (T.unpack (&quot;GET &quot; &lt;&gt; baseUrl &lt;&gt; &quot;/api/tags&quot;)) of</span>
+<span class="lineno">  311 </span><span class="spaces">      </span><span class="istickedoff">Left _ -&gt; <span class="nottickedoff">Left OpeBadResponse</span></span>
+<span class="lineno">  312 </span><span class="spaces">      </span><span class="istickedoff">Right req -&gt; Right req</span>
+<span class="lineno">  313 </span><span class="spaces">          </span><span class="istickedoff">{ requestHeaders  = [ (hContentType, &quot;application/json&quot;) ]</span>
+<span class="lineno">  314 </span><span class="spaces">          </span><span class="istickedoff">-- Never follow a redirect: a 3xx is reported, not chased. This is</span>
+<span class="lineno">  315 </span><span class="spaces">          </span><span class="istickedoff">-- what keeps a metadata redirect from being reached at all.</span>
+<span class="lineno">  316 </span><span class="spaces">          </span><span class="istickedoff">, redirectCount   = 0</span>
+<span class="lineno">  317 </span><span class="spaces">          </span><span class="istickedoff">, responseTimeout = responseTimeoutMicro probeTimeoutMicro</span>
+<span class="lineno">  318 </span><span class="spaces">          </span><span class="istickedoff">}</span></span>
+<span class="lineno">  319 </span>
+<span class="lineno">  320 </span>-- | Everything after @scheme://@. 'T.breakOn' leaves the delimiter in the
+<span class="lineno">  321 </span>-- suffix, so it must be dropped — keeping it would make the authority
+<span class="lineno">  322 </span>-- @&quot;://localhost:11434&quot;@ and every host comparison fail.
+<span class="lineno">  323 </span>afterSchemeOf :: Text -&gt; Text
+<span class="lineno">  324 </span><span class="decl"><span class="istickedoff">afterSchemeOf url = T.drop 3 (snd (T.breakOn &quot;://&quot; url))</span></span>
+<span class="lineno">  325 </span>
+<span class="lineno">  326 </span>-- | The scheme check. Deliberately not a URL parser: it only needs to know
+<span class="lineno">  327 </span>-- whether the prefix is one of the two allowed schemes.
+<span class="lineno">  328 </span>isHttpScheme :: Text -&gt; Bool
+<span class="lineno">  329 </span><span class="decl"><span class="istickedoff">isHttpScheme url =</span>
+<span class="lineno">  330 </span><span class="spaces">  </span><span class="istickedoff">&quot;http://&quot; `T.isPrefixOf` lowered || &quot;https://&quot; `T.isPrefixOf` lowered</span>
+<span class="lineno">  331 </span><span class="spaces">  </span><span class="istickedoff">where lowered = T.toLower url</span></span>
+<span class="lineno">  332 </span>
+<span class="lineno">  333 </span>-- | Does the authority carry userinfo (an @\@@ before the path)? This is the
+<span class="lineno">  334 </span>-- D2.8 bypass guard. The last @\@@ in the authority is the separator, because
+<span class="lineno">  335 </span>-- a password may itself contain one.
+<span class="lineno">  336 </span>carriesUserinfo :: Text -&gt; Bool
+<span class="lineno">  337 </span><span class="decl"><span class="istickedoff">carriesUserinfo url =</span>
+<span class="lineno">  338 </span><span class="spaces">  </span><span class="istickedoff">let afterScheme = afterSchemeOf url</span>
+<span class="lineno">  339 </span><span class="spaces">      </span><span class="istickedoff">authority = T.takeWhile (\c -&gt; c /= '/' &amp;&amp; c /= '?' &amp;&amp; c /= '#') afterScheme</span>
+<span class="lineno">  340 </span><span class="spaces">  </span><span class="istickedoff">in T.any (== '@') authority</span></span>
+<span class="lineno">  341 </span>
+<span class="lineno">  342 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  343 </span>-- Host kind
+<span class="lineno">  344 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  345 </span>
+<span class="lineno">  346 </span>-- | Which host kind a base URL is. The comparison is on the authority (after
+<span class="lineno">  347 </span>-- userinfo and port stripping), and @localhost@ must match /exactly/ — a
+<span class="lineno">  348 </span>-- @localhost.attacker.tld@ is 'OhOtherHost', not the default loopback.
+<span class="lineno">  349 </span>hostKindFor :: Text -&gt; OllamaHostKind
+<span class="lineno">  350 </span><span class="decl"><span class="istickedoff">hostKindFor baseUrl</span>
+<span class="lineno">  351 </span><span class="spaces">  </span><span class="istickedoff">| host == &quot;ollama.com&quot; = OhCloud</span>
+<span class="lineno">  352 </span><span class="spaces">  </span><span class="istickedoff">| stripTrailingSlash baseUrl == defaultOllamaBaseUrl = OhDefaultLoopback</span>
+<span class="lineno">  353 </span><span class="spaces">  </span><span class="istickedoff">| isLoopbackHost host = OhLoopback</span>
+<span class="lineno">  354 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = OhOtherHost</span>
+<span class="lineno">  355 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  356 </span><span class="spaces">    </span><span class="istickedoff">host = hostOf baseUrl</span></span>
+<span class="lineno">  357 </span>
+<span class="lineno">  358 </span>-- | The authority's host: userinfo stripped, port stripped, IPv6 brackets
+<span class="lineno">  359 </span>-- stripped and lowercased. A small local twin of
+<span class="lineno">  360 </span>-- @Seal.Web.UrlSafety@'s internal helper (which is deliberately not exported);
+<span class="lineno">  361 </span>-- keeping it here means the readiness rules are testable without widening that
+<span class="lineno">  362 </span>-- module's public surface.
+<span class="lineno">  363 </span>hostOf :: Text -&gt; Text
+<span class="lineno">  364 </span><span class="decl"><span class="istickedoff">hostOf url =</span>
+<span class="lineno">  365 </span><span class="spaces">  </span><span class="istickedoff">let afterScheme = afterSchemeOf url</span>
+<span class="lineno">  366 </span><span class="spaces">      </span><span class="istickedoff">authority = T.takeWhile (\c -&gt; c /= '/' &amp;&amp; c /= '?' &amp;&amp; c /= '#') afterScheme</span>
+<span class="lineno">  367 </span><span class="spaces">      </span><span class="istickedoff">afterUserinfo = snd (T.breakOnEnd &quot;@&quot; authority)</span>
+<span class="lineno">  368 </span><span class="spaces">  </span><span class="istickedoff">in T.toLower $ case T.uncons afterUserinfo of</span>
+<span class="lineno">  369 </span><span class="spaces">       </span><span class="istickedoff">Just ('[', rest) -&gt; T.takeWhile (/= ']') rest</span>
+<span class="lineno">  370 </span><span class="spaces">       </span><span class="istickedoff">_                -&gt; T.takeWhile (/= ':') afterUserinfo</span></span>
+<span class="lineno">  371 </span>
+<span class="lineno">  372 </span>-- | The loopback aliases that count as &quot;this machine&quot; for state purposes
+<span class="lineno">  373 </span>-- (D3.4): @localhost@, all of @127\/8@, and the IPv6 loopback @::1@. Only the
+<span class="lineno">  374 </span>-- exact spellings count — a hostname that merely starts with one does not.
+<span class="lineno">  375 </span>isLoopbackHost :: Text -&gt; Bool
+<span class="lineno">  376 </span><span class="decl"><span class="istickedoff">isLoopbackHost host =</span>
+<span class="lineno">  377 </span><span class="spaces">  </span><span class="istickedoff">host == &quot;localhost&quot;</span>
+<span class="lineno">  378 </span><span class="spaces">  </span><span class="istickedoff">|| host == &quot;::1&quot;</span>
+<span class="lineno">  379 </span><span class="spaces">  </span><span class="istickedoff">|| case T.stripPrefix &quot;127.&quot; host of</span>
+<span class="lineno">  380 </span><span class="spaces">       </span><span class="istickedoff">Just rest -&gt; not (T.null rest) &amp;&amp; T.all isDigitable rest</span>
+<span class="lineno">  381 </span><span class="spaces">       </span><span class="istickedoff">Nothing   -&gt; False</span>
+<span class="lineno">  382 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">  383 </span><span class="spaces">    </span><span class="istickedoff">isDigitable c = isDigit c || c == '.'</span></span>
+<span class="lineno">  384 </span>
+<span class="lineno">  385 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  386 </span>-- Cache key
+<span class="lineno">  387 </span>-- ---------------------------------------------------------------------------
+<span class="lineno">  388 </span>
+<span class="lineno">  389 </span>-- | The single-flight key: the base URL with one trailing slash removed. Two
+<span class="lineno">  390 </span>-- spellings that differ only by that slash must share one in-flight probe
+<span class="lineno">  391 </span>-- (D2.10).
+<span class="lineno">  392 </span>singleFlightKey :: Text -&gt; Text
+<span class="lineno">  393 </span><span class="decl"><span class="istickedoff">singleFlightKey = stripTrailingSlash</span></span>
+<span class="lineno">  394 </span>
+<span class="lineno">  395 </span>-- | Drop exactly one trailing slash. A local twin of the same rule in
+<span class="lineno">  396 </span>-- @Seal.Providers.Ollama@, which keeps it private; duplicating three lines is
+<span class="lineno">  397 </span>-- cheaper than widening that module's surface, and both spellings must agree
+<span class="lineno">  398 </span>-- so the cache key is stable.
+<span class="lineno">  399 </span>stripTrailingSlash :: Text -&gt; Text
+<span class="lineno">  400 </span><span class="decl"><span class="istickedoff">stripTrailingSlash t = fromMaybe t (T.stripSuffix &quot;/&quot; t)</span></span>
+
+</pre>
+</body>
+</html>

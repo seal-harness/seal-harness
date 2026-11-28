@@ -1,0 +1,213 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | Seeding a branched session: copy the first @N@ conversation lines of a
+<span class="lineno">    3 </span>-- parent session into a new child session directory.
+<span class="lineno">    4 </span>--
+<span class="lineno">    5 </span>-- The transcript is the only thing a branch inherits. The workdir is
+<span class="lineno">    6 </span>-- deliberately /not/ copied: the transcript records tool inputs and
+<span class="lineno">    7 </span>-- outputs, never filesystem snapshots, so a historical workdir cannot be
+<span class="lineno">    8 </span>-- reconstructed — and copying the /current/ one would be misleading the
+<span class="lineno">    9 </span>-- moment the branch point is earlier than the present. A new session id
+<span class="lineno">   10 </span>-- already gets a fresh empty workdir via 'ensureSessionWorkdir', so the
+<span class="lineno">   11 </span>-- correct behaviour is the default.
+<span class="lineno">   12 </span>module Seal.Session.Branch
+<span class="lineno">   13 </span>  ( branchSession
+<span class="lineno">   14 </span>  , clampBranchLen
+<span class="lineno">   15 </span>  , foldEntryPrefix
+<span class="lineno">   16 </span>  ) where
+<span class="lineno">   17 </span>
+<span class="lineno">   18 </span>import Control.Exception (IOException, try)
+<span class="lineno">   19 </span>import Control.Monad (when)
+<span class="lineno">   20 </span>import Data.Aeson qualified as A
+<span class="lineno">   21 </span>import Data.ByteString qualified as BS
+<span class="lineno">   22 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   23 </span>import Data.Maybe (mapMaybe)
+<span class="lineno">   24 </span>import Data.Text (Text)
+<span class="lineno">   25 </span>import Data.Text qualified as T
+<span class="lineno">   26 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   27 </span>import System.Directory
+<span class="lineno">   28 </span>  ( createDirectoryIfMissing, doesDirectoryExist, doesFileExist
+<span class="lineno">   29 </span>  , removeDirectoryRecursive )
+<span class="lineno">   30 </span>
+<span class="lineno">   31 </span>import Seal.Config.Paths
+<span class="lineno">   32 </span>  ( SealPaths, sessionConversationIndexPath, sessionConversationPath
+<span class="lineno">   33 </span>  , sessionDir, sessionEntriesPath, sessionMetaPath )
+<span class="lineno">   34 </span>import Seal.Core.Types (SessionId, sessionIdText)
+<span class="lineno">   35 </span>import Seal.Session.Meta (readSessionMeta)
+<span class="lineno">   36 </span>import Seal.Transcript.ConvIndex (ensureIndex)
+<span class="lineno">   37 </span>import Seal.Transcript.Entries (EntryKind (..), EntryRecord (..), encodeEntryRecordRaw)
+<span class="lineno">   38 </span>import Seal.Util.StrictIO (readFileTextStrict)
+<span class="lineno">   39 </span>
+<span class="lineno">   40 </span>-- | Clamp a client-supplied branch length into @[0, parentLen]@.
+<span class="lineno">   41 </span>--
+<span class="lineno">   42 </span>-- The value reaches us from the browser, so it is untrusted. Clamping
+<span class="lineno">   43 </span>-- (rather than rejecting) means a stale frontend whose transcript view is
+<span class="lineno">   44 </span>-- ahead of the parent's file is harmless: the branch simply copies what
+<span class="lineno">   45 </span>-- exists.
+<span class="lineno">   46 </span>clampBranchLen :: Int -&gt; Int -&gt; Int
+<span class="lineno">   47 </span><span class="decl"><span class="istickedoff">clampBranchLen parentLen n = max 0 (min parentLen n)</span></span>
+<span class="lineno">   48 </span>
+<span class="lineno">   49 </span>-- | Select the prefix of @entries.jsonl@ that belongs to the first @n@
+<span class="lineno">   50 </span>-- conversation lines.
+<span class="lineno">   51 </span>--
+<span class="lineno">   52 </span>-- This replicates the /writer's/ @erConvLen@ convention, which is not
+<span class="lineno">   53 </span>-- uniform per kind ('Seal.Handles.Transcript.writeOne'):
+<span class="lineno">   54 </span>--
+<span class="lineno">   55 </span>--   * 'EKRequest', 'EKResponse', 'EKCompaction' — @erConvLen@ is the
+<span class="lineno">   56 </span>--     conversation length after the entry (absolute).
+<span class="lineno">   57 </span>--   * 'EKHarness' — @erConvLen@ is a delta: how many lines that entry
+<span class="lineno">   58 </span>--     contributed (0 for a plain opcode invocation, 1 for a skill load or
+<span class="lineno">   59 </span>--     setup-repo result).
+<span class="lineno">   60 </span>--
+<span class="lineno">   61 </span>-- An entry is included iff its cursor-after is @&lt;= n@. Entries are
+<span class="lineno">   62 </span>-- append-ordered, so the first entry that overflows ends the prefix.
+<span class="lineno">   63 </span>foldEntryPrefix :: Int -&gt; [EntryRecord] -&gt; [EntryRecord]
+<span class="lineno">   64 </span><span class="decl"><span class="istickedoff">foldEntryPrefix n = go <span class="nottickedoff">0</span></span>
+<span class="lineno">   65 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   66 </span><span class="spaces">    </span><span class="istickedoff">go _ [] = []</span>
+<span class="lineno">   67 </span><span class="spaces">    </span><span class="istickedoff">go cursor (e : es)</span>
+<span class="lineno">   68 </span><span class="spaces">      </span><span class="istickedoff">| after &gt; n = []</span>
+<span class="lineno">   69 </span><span class="spaces">      </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span> = e : go after es</span>
+<span class="lineno">   70 </span><span class="spaces">      </span><span class="istickedoff">where</span>
+<span class="lineno">   71 </span><span class="spaces">        </span><span class="istickedoff">after = case erKind e of</span>
+<span class="lineno">   72 </span><span class="spaces">          </span><span class="istickedoff">EKHarness -&gt; cursor + erConvLen e</span>
+<span class="lineno">   73 </span><span class="spaces">          </span><span class="istickedoff">_         -&gt; erConvLen e</span></span>
+<span class="lineno">   74 </span>
+<span class="lineno">   75 </span>-- | Copy the parent's transcript prefix into a new child session directory.
+<span class="lineno">   76 </span>--
+<span class="lineno">   77 </span>-- Copies @conversation.jsonl@ byte-exactly (so the inherited lines are
+<span class="lineno">   78 </span>-- identical to the parent's) and the matching @entries.jsonl@ prefix, then
+<span class="lineno">   79 </span>-- builds @conversation.idx@. Writes no @session.json@ — the caller does
+<span class="lineno">   80 </span>-- that last, so a failed seed leaves nothing that 'listSessions' would
+<span class="lineno">   81 </span>-- surface.
+<span class="lineno">   82 </span>--
+<span class="lineno">   83 </span>-- The anchor count is derived from the /newline-terminated/ lines actually
+<span class="lineno">   84 </span>-- present rather than from the index, which also makes a torn trailing
+<span class="lineno">   85 </span>-- line (an in-flight turn mid-write) harmless: a partial final line has no
+<span class="lineno">   86 </span>-- newline, so it never counts toward @n@ and is never copied.
+<span class="lineno">   87 </span>branchSession
+<span class="lineno">   88 </span>  :: SealPaths
+<span class="lineno">   89 </span>  -&gt; SessionId   -- ^ parent
+<span class="lineno">   90 </span>  -&gt; SessionId   -- ^ child
+<span class="lineno">   91 </span>  -&gt; Int         -- ^ requested conversation length
+<span class="lineno">   92 </span>  -&gt; IO (Either Text ())
+<span class="lineno">   93 </span><span class="decl"><span class="istickedoff">branchSession paths parentSid childSid requestedLen = do</span>
+<span class="lineno">   94 </span><span class="spaces">  </span><span class="istickedoff">mParentMeta &lt;- readSessionMeta paths parentSid</span>
+<span class="lineno">   95 </span><span class="spaces">  </span><span class="istickedoff">-- Refuse if the child id already names a real session. Session ids are</span>
+<span class="lineno">   96 </span><span class="spaces">  </span><span class="istickedoff">-- timestamp-derived to the millisecond, so a same-millisecond mint could</span>
+<span class="lineno">   97 </span><span class="spaces">  </span><span class="istickedoff">-- collide; clobbering an existing session's transcript would be</span>
+<span class="lineno">   98 </span><span class="spaces">  </span><span class="istickedoff">-- unacceptable, so this is a hard guard rather than an overwrite.</span>
+<span class="lineno">   99 </span><span class="spaces">  </span><span class="istickedoff">childExists &lt;- doesFileExist (sessionMetaPath paths childSid)</span>
+<span class="lineno">  100 </span><span class="spaces">  </span><span class="istickedoff">case (mParentMeta, childExists) of</span>
+<span class="lineno">  101 </span><span class="spaces">    </span><span class="istickedoff">(Nothing, _) -&gt; pure (Left <span class="nottickedoff">(&quot;parent session not found: &quot; &lt;&gt; sessionIdText parentSid)</span>)</span>
+<span class="lineno">  102 </span><span class="spaces">    </span><span class="istickedoff">(Just _, True) -&gt;</span>
+<span class="lineno">  103 </span><span class="spaces">      </span><span class="istickedoff"><span class="nottickedoff">pure (Left (&quot;refusing to branch into an existing session: &quot; &lt;&gt; sessionIdText childSid))</span></span>
+<span class="lineno">  104 </span><span class="spaces">    </span><span class="istickedoff">(Just _, False) -&gt; do</span>
+<span class="lineno">  105 </span><span class="spaces">      </span><span class="istickedoff">let parentConv  = sessionConversationPath paths parentSid</span>
+<span class="lineno">  106 </span><span class="spaces">          </span><span class="istickedoff">parentEntry = sessionEntriesPath paths parentSid</span>
+<span class="lineno">  107 </span><span class="spaces">          </span><span class="istickedoff">childDir    = sessionDir paths childSid</span>
+<span class="lineno">  108 </span><span class="spaces">          </span><span class="istickedoff">childConv   = sessionConversationPath paths childSid</span>
+<span class="lineno">  109 </span><span class="spaces">          </span><span class="istickedoff">childEntry  = sessionEntriesPath paths childSid</span>
+<span class="lineno">  110 </span><span class="spaces">          </span><span class="istickedoff">childIdx    = sessionConversationIndexPath paths childSid</span>
+<span class="lineno">  111 </span><span class="spaces"></span><span class="istickedoff"></span>
+<span class="lineno">  112 </span><span class="spaces">      </span><span class="istickedoff">eConv &lt;- readConversationByLines parentConv</span>
+<span class="lineno">  113 </span><span class="spaces">      </span><span class="istickedoff">case eConv of</span>
+<span class="lineno">  114 </span><span class="spaces">        </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">pure (Left err)</span></span>
+<span class="lineno">  115 </span><span class="spaces">        </span><span class="istickedoff">Right convBytes -&gt; do</span>
+<span class="lineno">  116 </span><span class="spaces">          </span><span class="istickedoff">let n = clampBranchLen (length convBytes) requestedLen</span>
+<span class="lineno">  117 </span><span class="spaces">              </span><span class="istickedoff">copiedBytes = take n convBytes</span>
+<span class="lineno">  118 </span><span class="spaces">          </span><span class="istickedoff">eResult &lt;- try @IOException $ do</span>
+<span class="lineno">  119 </span><span class="spaces">            </span><span class="istickedoff">createDirectoryIfMissing True childDir</span>
+<span class="lineno">  120 </span><span class="spaces">            </span><span class="istickedoff">when (n &gt; 0) $ do</span>
+<span class="lineno">  121 </span><span class="spaces">              </span><span class="istickedoff">BS.writeFile childConv (BS.concat copiedBytes)</span>
+<span class="lineno">  122 </span><span class="spaces">              </span><span class="istickedoff">eEntries &lt;- readEntryPrefix parentEntry n</span>
+<span class="lineno">  123 </span><span class="spaces">              </span><span class="istickedoff">case eEntries of</span>
+<span class="lineno">  124 </span><span class="spaces">                </span><span class="istickedoff">Right er -&gt; BS.writeFile childEntry er</span>
+<span class="lineno">  125 </span><span class="spaces">                </span><span class="istickedoff">Left err -&gt; <span class="nottickedoff">ioError (userError (T.unpack err))</span></span>
+<span class="lineno">  126 </span><span class="spaces">              </span><span class="istickedoff">-- Build-if-missing, matching 'withIndexedTranscript'. Only</span>
+<span class="lineno">  127 </span><span class="spaces">              </span><span class="istickedoff">-- when the conversation file exists: a zero-length branch</span>
+<span class="lineno">  128 </span><span class="spaces">              </span><span class="istickedoff">-- must look exactly like a fresh session (no conversation</span>
+<span class="lineno">  129 </span><span class="spaces">              </span><span class="istickedoff">-- file, no index), because a lone [0] offset is rejected by</span>
+<span class="lineno">  130 </span><span class="spaces">              </span><span class="istickedoff">-- 'validateIndex' as corrupt.</span>
+<span class="lineno">  131 </span><span class="spaces">              </span><span class="istickedoff">_ &lt;- ensureIndex childConv childIdx</span>
+<span class="lineno">  132 </span><span class="spaces">              </span><span class="istickedoff">pure ()</span>
+<span class="lineno">  133 </span><span class="spaces">          </span><span class="istickedoff">case eResult :: Either IOException () of</span>
+<span class="lineno">  134 </span><span class="spaces">            </span><span class="istickedoff">Right () -&gt; pure (Right ())</span>
+<span class="lineno">  135 </span><span class="spaces">            </span><span class="istickedoff">Left ioe -&gt; <span class="nottickedoff">do</span></span>
+<span class="lineno">  136 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">-- Leave no partial child directory behind.</span></span>
+<span class="lineno">  137 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">exists &lt;- doesDirectoryExist childDir</span></span>
+<span class="lineno">  138 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">when exists (ignoreIO (removeDirectoryRecursive childDir))</span></span>
+<span class="lineno">  139 </span><span class="spaces">              </span><span class="istickedoff"><span class="nottickedoff">pure (Left (&quot;could not seed branch: &quot; &lt;&gt; T.pack (show ioe)))</span></span></span>
+<span class="lineno">  140 </span>
+<span class="lineno">  141 </span>-- | Read a conversation file as (per-line bytes, per-line bytes). The
+<span class="lineno">  142 </span>-- line list is used for counting; the byte list is what we copy verbatim.
+<span class="lineno">  143 </span>--
+<span class="lineno">  144 </span>-- An absent file is @Right ([], [])@ — a brand-new parent has nothing to
+<span class="lineno">  145 </span>-- inherit, which is not an error.
+<span class="lineno">  146 </span>readConversationByLines :: FilePath -&gt; IO (Either Text [BS.ByteString])
+<span class="lineno">  147 </span><span class="decl"><span class="istickedoff">readConversationByLines path = do</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  149 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  150 </span><span class="spaces">    </span><span class="istickedoff">then pure (Right [])</span>
+<span class="lineno">  151 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  152 </span><span class="spaces">      </span><span class="istickedoff">eBs &lt;- try @IOException (BS.readFile path)</span>
+<span class="lineno">  153 </span><span class="spaces">      </span><span class="istickedoff">pure $ case eBs of</span>
+<span class="lineno">  154 </span><span class="spaces">        </span><span class="istickedoff">Left ioe -&gt; <span class="nottickedoff">Left (&quot;could not read parent conversation: &quot; &lt;&gt; T.pack (show ioe))</span></span>
+<span class="lineno">  155 </span><span class="spaces">        </span><span class="istickedoff">Right bs -&gt;</span>
+<span class="lineno">  156 </span><span class="spaces">          </span><span class="istickedoff">-- Split on newlines (0x0a). A trailing partial line (no final</span>
+<span class="lineno">  157 </span><span class="spaces">          </span><span class="istickedoff">-- newline) is DROPPED: it belongs to an in-flight write.</span>
+<span class="lineno">  158 </span><span class="spaces">          </span><span class="istickedoff">let complete = dropTrailingPartial (BS.split 0x0a bs)</span>
+<span class="lineno">  159 </span><span class="spaces">          </span><span class="istickedoff">in Right [ p &lt;&gt; &quot;\n&quot; | p &lt;- complete ]</span></span>
+<span class="lineno">  160 </span>
+<span class="lineno">  161 </span>-- | 'BS.split' on a file ending with a newline yields a final empty
+<span class="lineno">  162 </span>-- element. That empty element is the artifact of the trailing newline, not
+<span class="lineno">  163 </span>-- a line; drop it. Any /other/ final element is a genuinely partial line
+<span class="lineno">  164 </span>-- and is dropped too.
+<span class="lineno">  165 </span>dropTrailingPartial :: [BS.ByteString] -&gt; [BS.ByteString]
+<span class="lineno">  166 </span><span class="decl"><span class="istickedoff">dropTrailingPartial pieces = case reverse pieces of</span>
+<span class="lineno">  167 </span><span class="spaces">  </span><span class="istickedoff">(&quot;&quot; : rest) -&gt; reverse rest   -- file ended with '\n': no partial line</span>
+<span class="lineno">  168 </span><span class="spaces">  </span><span class="istickedoff">(_  : rest) -&gt; reverse rest   -- partial line mid-write: drop it</span>
+<span class="lineno">  169 </span><span class="spaces">  </span><span class="istickedoff">[]          -&gt; <span class="nottickedoff">[]</span></span></span>
+<span class="lineno">  170 </span>
+<span class="lineno">  171 </span>-- | Read the parent's @entries.jsonl@ and encode the prefix for the child.
+<span class="lineno">  172 </span>readEntryPrefix :: FilePath -&gt; Int -&gt; IO (Either Text BS.ByteString)
+<span class="lineno">  173 </span><span class="decl"><span class="istickedoff">readEntryPrefix path n = do</span>
+<span class="lineno">  174 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  175 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  176 </span><span class="spaces">    </span><span class="istickedoff">then pure (Right BS.empty)</span>
+<span class="lineno">  177 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  178 </span><span class="spaces">      </span><span class="istickedoff">eRaw &lt;- try @IOException (readFileTextStrict path)</span>
+<span class="lineno">  179 </span><span class="spaces">      </span><span class="istickedoff">pure $ case eRaw of</span>
+<span class="lineno">  180 </span><span class="spaces">        </span><span class="istickedoff">Left ioe -&gt; <span class="nottickedoff">Left (&quot;could not read parent entries: &quot; &lt;&gt; T.pack (show ioe))</span></span>
+<span class="lineno">  181 </span><span class="spaces">        </span><span class="istickedoff">Right raw -&gt;</span>
+<span class="lineno">  182 </span><span class="spaces">          </span><span class="istickedoff">let decoded = mapMaybe (A.decode . BL.fromStrict . TE.encodeUtf8)</span>
+<span class="lineno">  183 </span><span class="spaces">                                </span><span class="istickedoff">(filter (not . T.null) (T.lines raw))</span>
+<span class="lineno">  184 </span><span class="spaces">          </span><span class="istickedoff">in Right (BS.concat (map (\e -&gt; encodeEntryRecordRaw e &lt;&gt; &quot;\n&quot;)</span>
+<span class="lineno">  185 </span><span class="spaces">                                   </span><span class="istickedoff">(foldEntryPrefix n decoded)))</span></span>
+<span class="lineno">  186 </span>
+<span class="lineno">  187 </span>ignoreIO :: IO () -&gt; IO ()
+<span class="lineno">  188 </span><span class="decl"><span class="nottickedoff">ignoreIO action = do</span>
+<span class="lineno">  189 </span><span class="spaces">  </span><span class="nottickedoff">_ &lt;- try @IOException action</span>
+<span class="lineno">  190 </span><span class="spaces">  </span><span class="nottickedoff">pure ()</span></span>
+
+</pre>
+</body>
+</html>

@@ -1,0 +1,202 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The memory store backend. Disk is canonical: memory entries live as
+<span class="lineno">    3 </span>-- Markdown files under @config\/memory\/\&lt;id\&gt;.md@ (frontmatter + body, where
+<span class="lineno">    4 </span>-- the body is the memory content and tags/created/updated/session live in
+<span class="lineno">    5 </span>-- frontmatter). 'markdownMemoryBackend' reads by enumerating the directory
+<span class="lineno">    6 </span>-- and writes by atomic file replace + auto-commit; delete removes the file and
+<span class="lineno">    7 </span>-- commits. 'noneBackend' (in-memory) is kept for tests.
+<span class="lineno">    8 </span>--
+<span class="lineno">    9 </span>-- The git repo is the versioning + audit layer; model-authored writes
+<span class="lineno">   10 </span>-- (@MEMORY_STORE@ \/ @MEMORY_UPDATE@ \/ @MEMORY_DELETE@, which are Trusted
+<span class="lineno">   11 </span>-- file writes) auto-commit.
+<span class="lineno">   12 </span>module Seal.Memory.Backend
+<span class="lineno">   13 </span>  ( MemoryBackend (..)
+<span class="lineno">   14 </span>  , noneBackend
+<span class="lineno">   15 </span>  , markdownMemoryBackend
+<span class="lineno">   16 </span>  , encodeMemory
+<span class="lineno">   17 </span>  , decodeMemory
+<span class="lineno">   18 </span>  ) where
+<span class="lineno">   19 </span>
+<span class="lineno">   20 </span>import Control.Monad (forM)
+<span class="lineno">   21 </span>import Data.Aeson (Value (..), encode)
+<span class="lineno">   22 </span>import Data.ByteString.Lazy qualified as BL
+<span class="lineno">   23 </span>import Data.Either (fromRight)
+<span class="lineno">   24 </span>import Data.IORef
+<span class="lineno">   25 </span>import Data.List (sortOn)
+<span class="lineno">   26 </span>import Data.Map.Strict (Map)
+<span class="lineno">   27 </span>import Data.Map.Strict qualified as Map
+<span class="lineno">   28 </span>import Data.Maybe (catMaybes, fromMaybe)
+<span class="lineno">   29 </span>import Data.Text (Text)
+<span class="lineno">   30 </span>import Data.Text qualified as T
+<span class="lineno">   31 </span>import Data.Text.Encoding qualified as TE
+<span class="lineno">   32 </span>import Data.Text.IO qualified as TIO
+<span class="lineno">   33 </span>import Data.Time (UTCTime (..))
+<span class="lineno">   34 </span>import Data.Time.Calendar (fromGregorian)
+<span class="lineno">   35 </span>import Data.Time.Clock (secondsToDiffTime)
+<span class="lineno">   36 </span>import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
+<span class="lineno">   37 </span>import Data.Vector qualified as V
+<span class="lineno">   38 </span>import System.Directory (doesFileExist, listDirectory, removeFile, renameFile)
+<span class="lineno">   39 </span>import System.FilePath ((&lt;/&gt;), (&lt;.&gt;))
+<span class="lineno">   40 </span>import System.Posix.Files (setFileMode)
+<span class="lineno">   41 </span>
+<span class="lineno">   42 </span>import Seal.Core.Types (mkSessionId, mkSystemSessionId, sessionIdText)
+<span class="lineno">   43 </span>import Seal.Git.Repo (ConfigRepo, gitCommitAll)
+<span class="lineno">   44 </span>import Seal.Memory.Types (MemoryEntry (..), MemoryId (..), mkMemoryId, memoryIdText)
+<span class="lineno">   45 </span>import Seal.Store.Markdown (decodeDoc, encodeDoc, fmLookup, fmLookupList)
+<span class="lineno">   46 </span>
+<span class="lineno">   47 </span>-- | The memory store capability. Each operation is IO (the Markdown backend
+<span class="lineno">   48 </span>-- writes to disk + git); 'mbList' returns all memories sorted by id.
+<span class="lineno">   49 </span>data MemoryBackend = MemoryBackend
+<span class="lineno">   50 </span>  { <span class="istickedoff"><span class="decl"><span class="istickedoff">mbStore</span></span></span>  :: MemoryEntry -&gt; IO ()
+<span class="lineno">   51 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">mbRecall</span></span></span> :: MemoryId -&gt; IO (Maybe MemoryEntry)
+<span class="lineno">   52 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">mbList</span></span></span>   :: IO [MemoryEntry]
+<span class="lineno">   53 </span>  , <span class="nottickedoff"><span class="decl"><span class="nottickedoff">mbUpdate</span></span></span> :: MemoryEntry -&gt; IO ()
+<span class="lineno">   54 </span>  , <span class="istickedoff"><span class="decl"><span class="istickedoff">mbDelete</span></span></span> :: MemoryId -&gt; IO ()
+<span class="lineno">   55 </span>  }
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>-- | The in-memory backend: a single 'IORef' over a 'Map'. Used by tests.
+<span class="lineno">   58 </span>noneBackend :: IO MemoryBackend
+<span class="lineno">   59 </span><span class="decl"><span class="istickedoff">noneBackend = do</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="istickedoff">ref &lt;- newIORef (Map.empty :: Map MemoryId MemoryEntry)</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">pure MemoryBackend</span>
+<span class="lineno">   62 </span><span class="spaces">    </span><span class="istickedoff">{ mbStore  = \e -&gt; modifyIORef' ref (Map.insert (meId e) e)</span>
+<span class="lineno">   63 </span><span class="spaces">    </span><span class="istickedoff">, mbRecall = \mid -&gt; Map.lookup mid &lt;$&gt; readIORef ref</span>
+<span class="lineno">   64 </span><span class="spaces">    </span><span class="istickedoff">, mbList   = Map.elems &lt;$&gt; readIORef ref</span>
+<span class="lineno">   65 </span><span class="spaces">    </span><span class="istickedoff">, mbUpdate = <span class="nottickedoff">\e -&gt; modifyIORef' ref (Map.insert (meId e) e)</span></span>
+<span class="lineno">   66 </span><span class="spaces">    </span><span class="istickedoff">, mbDelete = modifyIORef' ref . Map.delete</span>
+<span class="lineno">   67 </span><span class="spaces">    </span><span class="istickedoff">}</span></span>
+<span class="lineno">   68 </span>
+<span class="lineno">   69 </span>-- | The Markdown backend. One file per memory under @dir@ (the
+<span class="lineno">   70 </span>-- @config/memory@ directory); writes are atomic (tmp → chmod 0600 → rename)
+<span class="lineno">   71 </span>-- and auto-committed to the config git repo; delete removes the file and
+<span class="lineno">   72 </span>-- commits. Reads enumerate the directory. Malformed files are skipped.
+<span class="lineno">   73 </span>markdownMemoryBackend :: FilePath -&gt; ConfigRepo -&gt; IO MemoryBackend
+<span class="lineno">   74 </span><span class="decl"><span class="istickedoff">markdownMemoryBackend dir repo = pure MemoryBackend</span>
+<span class="lineno">   75 </span><span class="spaces">  </span><span class="istickedoff">{ mbStore  = writeMemory dir repo</span>
+<span class="lineno">   76 </span><span class="spaces">  </span><span class="istickedoff">, mbRecall = readMemory dir</span>
+<span class="lineno">   77 </span><span class="spaces">  </span><span class="istickedoff">, mbList   = listMemories dir</span>
+<span class="lineno">   78 </span><span class="spaces">  </span><span class="istickedoff">, mbUpdate = <span class="nottickedoff">writeMemory dir repo</span></span>
+<span class="lineno">   79 </span><span class="spaces">  </span><span class="istickedoff">, mbDelete = deleteMemory dir repo</span>
+<span class="lineno">   80 </span><span class="spaces">  </span><span class="istickedoff">}</span></span>
+<span class="lineno">   81 </span>
+<span class="lineno">   82 </span>-- | The filename for a memory: @\&lt;id\&gt;.md@.
+<span class="lineno">   83 </span>memoryFile :: FilePath -&gt; MemoryId -&gt; FilePath
+<span class="lineno">   84 </span><span class="decl"><span class="istickedoff">memoryFile dir mid = dir &lt;/&gt; T.unpack (memoryIdText mid) &lt;.&gt; &quot;md&quot;</span></span>
+<span class="lineno">   85 </span>
+<span class="lineno">   86 </span>-- | Encode a 'MemoryEntry' as a Markdown document (frontmatter + body, where
+<span class="lineno">   87 </span>-- the body is the memory content).
+<span class="lineno">   88 </span>encodeMemory :: MemoryEntry -&gt; Text
+<span class="lineno">   89 </span><span class="decl"><span class="istickedoff">encodeMemory e = encodeDoc fm (meContent e)</span>
+<span class="lineno">   90 </span><span class="spaces">  </span><span class="istickedoff">where</span>
+<span class="lineno">   91 </span><span class="spaces">    </span><span class="istickedoff">fm = Map.fromList</span>
+<span class="lineno">   92 </span><span class="spaces">      </span><span class="istickedoff">[ (&quot;id&quot;, memoryIdText (meId e))</span>
+<span class="lineno">   93 </span><span class="spaces">      </span><span class="istickedoff">, (&quot;tags&quot;, renderTags (meTags e))</span>
+<span class="lineno">   94 </span><span class="spaces">      </span><span class="istickedoff">, (&quot;created_at&quot;, isoTime (meCreatedAt e))</span>
+<span class="lineno">   95 </span><span class="spaces">      </span><span class="istickedoff">, (&quot;updated_at&quot;, isoTime (meUpdatedAt e))</span>
+<span class="lineno">   96 </span><span class="spaces">      </span><span class="istickedoff">, (&quot;session&quot;, sessionIdText (meSession e))</span>
+<span class="lineno">   97 </span><span class="spaces">      </span><span class="istickedoff">]</span></span>
+<span class="lineno">   98 </span>
+<span class="lineno">   99 </span>-- | Decode a Markdown document into a 'MemoryEntry'. Returns 'Nothing' if the
+<span class="lineno">  100 </span>-- id field is missing or fails 'mkMemoryId'.
+<span class="lineno">  101 </span>decodeMemory :: Text -&gt; Maybe MemoryEntry
+<span class="lineno">  102 </span><span class="decl"><span class="istickedoff">decodeMemory content =</span>
+<span class="lineno">  103 </span><span class="spaces">  </span><span class="istickedoff">case decodeDoc content of</span>
+<span class="lineno">  104 </span><span class="spaces">    </span><span class="istickedoff">(fm, body) -&gt; do</span>
+<span class="lineno">  105 </span><span class="spaces">      </span><span class="istickedoff">midT &lt;- fmLookup &quot;id&quot; fm</span>
+<span class="lineno">  106 </span><span class="spaces">      </span><span class="istickedoff">mid  &lt;- either <span class="nottickedoff">(const Nothing)</span> Just (mkMemoryId midT)</span>
+<span class="lineno">  107 </span><span class="spaces">      </span><span class="istickedoff">Just MemoryEntry</span>
+<span class="lineno">  108 </span><span class="spaces">        </span><span class="istickedoff">{ meId = mid</span>
+<span class="lineno">  109 </span><span class="spaces">        </span><span class="istickedoff">, meContent = body</span>
+<span class="lineno">  110 </span><span class="spaces">        </span><span class="istickedoff">, meTags = fromMaybe <span class="nottickedoff">[]</span> (fmLookupList &quot;tags&quot; fm)</span>
+<span class="lineno">  111 </span><span class="spaces">        </span><span class="istickedoff">, meCreatedAt = parseTime (fmLookup &quot;created_at&quot; fm)</span>
+<span class="lineno">  112 </span><span class="spaces">        </span><span class="istickedoff">, meUpdatedAt = parseTime (fmLookup &quot;updated_at&quot; fm)</span>
+<span class="lineno">  113 </span><span class="spaces">        </span><span class="istickedoff">, meSession = fromRight <span class="nottickedoff">(mkSystemSessionId &quot;unknown&quot;)</span> (mkSessionId (fromMaybe <span class="nottickedoff">&quot;unknown&quot;</span> (fmLookup &quot;session&quot; fm)))</span>
+<span class="lineno">  114 </span><span class="spaces">        </span><span class="istickedoff">}</span></span>
+<span class="lineno">  115 </span>
+<span class="lineno">  116 </span>-- | Write one memory to disk (atomic) and auto-commit.
+<span class="lineno">  117 </span>writeMemory :: FilePath -&gt; ConfigRepo -&gt; MemoryEntry -&gt; IO ()
+<span class="lineno">  118 </span><span class="decl"><span class="istickedoff">writeMemory dir repo e = do</span>
+<span class="lineno">  119 </span><span class="spaces">  </span><span class="istickedoff">let path = memoryFile dir (meId e)</span>
+<span class="lineno">  120 </span><span class="spaces">      </span><span class="istickedoff">tmp  = path &lt;.&gt; &quot;tmp&quot;</span>
+<span class="lineno">  121 </span><span class="spaces">  </span><span class="istickedoff">TIO.writeFile tmp (encodeMemory e)</span>
+<span class="lineno">  122 </span><span class="spaces">  </span><span class="istickedoff">setFileMode tmp 0o600</span>
+<span class="lineno">  123 </span><span class="spaces">  </span><span class="istickedoff">renameFile tmp path</span>
+<span class="lineno">  124 </span><span class="spaces">  </span><span class="istickedoff">let rel = &quot;memory&quot; &lt;/&gt; (T.unpack (memoryIdText (meId e)) &lt;.&gt; &quot;md&quot;)</span>
+<span class="lineno">  125 </span><span class="spaces">  </span><span class="istickedoff">_ &lt;- gitCommitAll repo rel (&quot;seal: MEMORY write &quot; &lt;&gt; memoryIdText (meId e))</span>
+<span class="lineno">  126 </span><span class="spaces">  </span><span class="istickedoff">pure <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  127 </span>
+<span class="lineno">  128 </span>-- | Read one memory by id. Returns 'Nothing' if the file is absent or malformed.
+<span class="lineno">  129 </span>readMemory :: FilePath -&gt; MemoryId -&gt; IO (Maybe MemoryEntry)
+<span class="lineno">  130 </span><span class="decl"><span class="istickedoff">readMemory dir mid = do</span>
+<span class="lineno">  131 </span><span class="spaces">  </span><span class="istickedoff">let path = memoryFile dir mid</span>
+<span class="lineno">  132 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  133 </span><span class="spaces">  </span><span class="istickedoff">if not exists</span>
+<span class="lineno">  134 </span><span class="spaces">    </span><span class="istickedoff">then pure Nothing</span>
+<span class="lineno">  135 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  136 </span><span class="spaces">      </span><span class="istickedoff">content &lt;- TIO.readFile path</span>
+<span class="lineno">  137 </span><span class="spaces">      </span><span class="istickedoff">pure (decodeMemory content)</span></span>
+<span class="lineno">  138 </span>
+<span class="lineno">  139 </span>-- | Enumerate all memories in the directory, sorted by id. Malformed files
+<span class="lineno">  140 </span>-- are skipped.
+<span class="lineno">  141 </span>listMemories :: FilePath -&gt; IO [MemoryEntry]
+<span class="lineno">  142 </span><span class="decl"><span class="istickedoff">listMemories dir = do</span>
+<span class="lineno">  143 </span><span class="spaces">  </span><span class="istickedoff">entries &lt;- listDirectory dir</span>
+<span class="lineno">  144 </span><span class="spaces">  </span><span class="istickedoff">let mdFiles = [e | e &lt;- entries, <span class="tickonlytrue">&quot;.md&quot; `T.isSuffixOf` T.pack e</span>]</span>
+<span class="lineno">  145 </span><span class="spaces">  </span><span class="istickedoff">mems &lt;- forM mdFiles $ \e -&gt; do</span>
+<span class="lineno">  146 </span><span class="spaces">    </span><span class="istickedoff">content &lt;- TIO.readFile (dir &lt;/&gt; e)</span>
+<span class="lineno">  147 </span><span class="spaces">    </span><span class="istickedoff">pure (decodeMemory content)</span>
+<span class="lineno">  148 </span><span class="spaces">  </span><span class="istickedoff">pure (sortOn (memoryIdText . meId) (catMaybes mems))</span></span>
+<span class="lineno">  149 </span>
+<span class="lineno">  150 </span>-- | Delete one memory file and auto-commit. Idempotent.
+<span class="lineno">  151 </span>deleteMemory :: FilePath -&gt; ConfigRepo -&gt; MemoryId -&gt; IO ()
+<span class="lineno">  152 </span><span class="decl"><span class="istickedoff">deleteMemory dir repo mid = do</span>
+<span class="lineno">  153 </span><span class="spaces">  </span><span class="istickedoff">let path = memoryFile dir mid</span>
+<span class="lineno">  154 </span><span class="spaces">  </span><span class="istickedoff">exists &lt;- doesFileExist path</span>
+<span class="lineno">  155 </span><span class="spaces">  </span><span class="istickedoff">if <span class="tickonlyfalse">not exists</span></span>
+<span class="lineno">  156 </span><span class="spaces">    </span><span class="istickedoff">then <span class="nottickedoff">pure ()</span></span>
+<span class="lineno">  157 </span><span class="spaces">    </span><span class="istickedoff">else do</span>
+<span class="lineno">  158 </span><span class="spaces">      </span><span class="istickedoff">removeFile path</span>
+<span class="lineno">  159 </span><span class="spaces">      </span><span class="istickedoff">let rel = &quot;memory&quot; &lt;/&gt; (T.unpack (memoryIdText mid) &lt;.&gt; &quot;md&quot;)</span>
+<span class="lineno">  160 </span><span class="spaces">      </span><span class="istickedoff">_ &lt;- gitCommitAll repo rel (&quot;seal: MEMORY delete &quot; &lt;&gt; memoryIdText mid)</span>
+<span class="lineno">  161 </span><span class="spaces">      </span><span class="istickedoff">pure <span class="nottickedoff">()</span></span></span>
+<span class="lineno">  162 </span>
+<span class="lineno">  163 </span>-- | Render the tags list as a JSON array string for the frontmatter line.
+<span class="lineno">  164 </span>renderTags :: [Text] -&gt; Text
+<span class="lineno">  165 </span><span class="decl"><span class="istickedoff">renderTags ts = TE.decodeUtf8 (BL.toStrict (encode (V.fromList (map String ts))))</span></span>
+<span class="lineno">  166 </span>
+<span class="lineno">  167 </span>-- | Render a 'UTCTime' as an ISO-8601 string (UTC, with @Z@ suffix).
+<span class="lineno">  168 </span>isoTime :: UTCTime -&gt; Text
+<span class="lineno">  169 </span><span class="decl"><span class="istickedoff">isoTime = T.pack . formatTime <span class="nottickedoff">defaultTimeLocale</span> &quot;%Y-%m-%dT%H:%M:%SZ&quot;</span></span>
+<span class="lineno">  170 </span>
+<span class="lineno">  171 </span>-- | Parse an ISO-8601 'UTCTime' from a frontmatter value. Defaults to epoch 0
+<span class="lineno">  172 </span>-- when absent or unparseable.
+<span class="lineno">  173 </span>parseTime :: Maybe Text -&gt; UTCTime
+<span class="lineno">  174 </span><span class="decl"><span class="istickedoff">parseTime Nothing    = <span class="nottickedoff">epochZero</span></span>
+<span class="lineno">  175 </span><span class="spaces"></span><span class="istickedoff">parseTime (Just raw) = fromMaybe <span class="nottickedoff">epochZero</span> (parseTimeM True <span class="nottickedoff">defaultTimeLocale</span> &quot;%Y-%m-%dT%H:%M:%SZ&quot; (T.unpack raw))</span></span>
+<span class="lineno">  176 </span>
+<span class="lineno">  177 </span>-- | The epoch fallback for missing/unparseable timestamps.
+<span class="lineno">  178 </span>epochZero :: UTCTime
+<span class="lineno">  179 </span><span class="decl"><span class="nottickedoff">epochZero = UTCTime (fromGregorian 1970 1 1) (secondsToDiffTime 0)</span></span>
+
+</pre>
+</body>
+</html>

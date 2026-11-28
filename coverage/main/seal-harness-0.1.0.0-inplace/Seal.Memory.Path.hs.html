@@ -1,0 +1,92 @@
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<style type="text/css">
+span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }
+span.nottickedoff { background: yellow}
+span.istickedoff { background: white }
+span.tickonlyfalse { margin: -1px; border: 1px solid #f20913; background: #f20913 }
+span.tickonlytrue  { margin: -1px; border: 1px solid #60de51; background: #60de51 }
+span.funcount { font-size: small; color: orange; z-index: 2; position: absolute; right: 20 }
+span.decl { font-weight: bold }
+span.spaces    { background: white }
+</style>
+</head>
+<body>
+<pre>
+<span class="decl"><span class="nottickedoff">never executed</span> <span class="tickonlytrue">always true</span> <span class="tickonlyfalse">always false</span></span>
+</pre>
+<pre>
+<span class="lineno">    1 </span>{-# LANGUAGE OverloadedStrings #-}
+<span class="lineno">    2 </span>-- | The memory path model. 'MemoryPath' is a smart-constructed newtype that
+<span class="lineno">    3 </span>-- validates directory-hierarchy paths for memory files under
+<span class="lineno">    4 </span>-- @~\/.seal\/memory\/active\/@. Paths are relative, @\/@-separated, and use
+<span class="lineno">    5 </span>-- the charset @[A-Za-z0-9_-]+@ per segment (the same charset as the former
+<span class="lineno">    6 </span>-- 'MemoryId', extended to allow @\/@ as a directory separator).
+<span class="lineno">    7 </span>--
+<span class="lineno">    8 </span>-- The path the agent provides does NOT include the @.md@ extension — the
+<span class="lineno">    9 </span>-- store appends it. So @&quot;projects\/pureclaw\/architecture&quot;@ maps to
+<span class="lineno">   10 </span>-- @active\/projects\/pureclaw\/architecture.md@ on disk.
+<span class="lineno">   11 </span>--
+<span class="lineno">   12 </span>-- Validation rejects:
+<span class="lineno">   13 </span>--   * empty paths
+<span class="lineno">   14 </span>--   * leading or trailing slashes
+<span class="lineno">   15 </span>--   * @..@ or @.@ segments (path traversal)
+<span class="lineno">   16 </span>--   * segments with leading dots (e.g. @.hidden@)
+<span class="lineno">   17 </span>--   * segments with characters outside @[A-Za-z0-9_-]+@
+<span class="lineno">   18 </span>--   * double slashes (empty segments)
+<span class="lineno">   19 </span>module Seal.Memory.Path
+<span class="lineno">   20 </span>  ( MemoryPath (..)
+<span class="lineno">   21 </span>  , mkMemoryPath
+<span class="lineno">   22 </span>  , isValidMemoryPath
+<span class="lineno">   23 </span>  , memoryPathText
+<span class="lineno">   24 </span>  , memoryPathSegments
+<span class="lineno">   25 </span>  ) where
+<span class="lineno">   26 </span>
+<span class="lineno">   27 </span>import Data.Text (Text)
+<span class="lineno">   28 </span>import Data.Text qualified as T
+<span class="lineno">   29 </span>
+<span class="lineno">   30 </span>-- | Opaque memory path. Smart-constructed via 'mkMemoryPath'; the charset
+<span class="lineno">   31 </span>-- predicate guards every segment.
+<span class="lineno">   32 </span>newtype MemoryPath = MemoryPath Text
+<span class="lineno">   33 </span>  deriving stock (<span class="decl"><span class="istickedoff"><span class="decl"><span class="nottickedoff">Eq</span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Ord</span></span></span></span></span></span></span></span></span></span></span></span></span></span>, <span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff"><span class="decl"><span class="nottickedoff">Show</span></span></span></span></span></span>)
+<span class="lineno">   34 </span>
+<span class="lineno">   35 </span>-- | The valid character set for each path segment (same as the former
+<span class="lineno">   36 </span>-- 'MemoryId' charset).
+<span class="lineno">   37 </span>segmentChars :: [Char]
+<span class="lineno">   38 </span><span class="decl"><span class="istickedoff">segmentChars = ['A' .. 'Z'] &lt;&gt; ['a' .. 'z'] &lt;&gt; ['0' .. '9'] &lt;&gt; &quot;_-&quot;</span></span>
+<span class="lineno">   39 </span>
+<span class="lineno">   40 </span>-- | Validate a segment: non-empty, no leading dot, only allowed chars.
+<span class="lineno">   41 </span>isValidSegment :: Text -&gt; Bool
+<span class="lineno">   42 </span><span class="decl"><span class="istickedoff">isValidSegment seg =</span>
+<span class="lineno">   43 </span><span class="spaces">  </span><span class="istickedoff">not (T.null seg)</span>
+<span class="lineno">   44 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; T.head seg /= '.'</span>
+<span class="lineno">   45 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; T.all (`elem` segmentChars) seg</span></span>
+<span class="lineno">   46 </span>
+<span class="lineno">   47 </span>-- | Validate a full memory path. See module docs for the rules.
+<span class="lineno">   48 </span>isValidMemoryPath :: Text -&gt; Bool
+<span class="lineno">   49 </span><span class="decl"><span class="istickedoff">isValidMemoryPath t =</span>
+<span class="lineno">   50 </span><span class="spaces">  </span><span class="istickedoff">not (T.null t)</span>
+<span class="lineno">   51 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; not (T.isPrefixOf &quot;/&quot; t)</span>
+<span class="lineno">   52 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; not (T.isSuffixOf &quot;/&quot; t)</span>
+<span class="lineno">   53 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; not (&quot;//&quot; `T.isInfixOf` t)</span>
+<span class="lineno">   54 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; all isValidSegment (T.splitOn &quot;/&quot; t)</span>
+<span class="lineno">   55 </span><span class="spaces">    </span><span class="istickedoff">&amp;&amp; not (any (\seg -&gt; seg == &quot;..&quot; || seg == &quot;.&quot;) (T.splitOn &quot;/&quot; t))</span></span>
+<span class="lineno">   56 </span>
+<span class="lineno">   57 </span>-- | Smart constructor for 'MemoryPath'.
+<span class="lineno">   58 </span>mkMemoryPath :: Text -&gt; Either Text MemoryPath
+<span class="lineno">   59 </span><span class="decl"><span class="istickedoff">mkMemoryPath t</span>
+<span class="lineno">   60 </span><span class="spaces">  </span><span class="istickedoff">| isValidMemoryPath t = Right (MemoryPath t)</span>
+<span class="lineno">   61 </span><span class="spaces">  </span><span class="istickedoff">| <span class="tickonlytrue">otherwise</span>           = Left <span class="nottickedoff">(&quot;invalid memory path: &quot; &lt;&gt; t)</span></span></span>
+<span class="lineno">   62 </span>
+<span class="lineno">   63 </span>-- | Extract the raw 'Text' from a 'MemoryPath'.
+<span class="lineno">   64 </span>memoryPathText :: MemoryPath -&gt; Text
+<span class="lineno">   65 </span><span class="decl"><span class="istickedoff">memoryPathText (MemoryPath t) = t</span></span>
+<span class="lineno">   66 </span>
+<span class="lineno">   67 </span>-- | Split a 'MemoryPath' into its directory segments.
+<span class="lineno">   68 </span>memoryPathSegments :: MemoryPath -&gt; [Text]
+<span class="lineno">   69 </span><span class="decl"><span class="istickedoff">memoryPathSegments (MemoryPath t) = T.splitOn &quot;/&quot; t</span></span>
+
+</pre>
+</body>
+</html>
