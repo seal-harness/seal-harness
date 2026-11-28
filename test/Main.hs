@@ -40,6 +40,7 @@ import qualified Seal.Util.StrictIOSpec
 import qualified Seal.AppMainSpec
 import qualified Seal.Session.BranchSpec
 import qualified Seal.Session.MachineSpec
+import qualified Seal.Session.MachineRoutingSpec
 import qualified Seal.Session.MetaSpec
 import qualified Seal.Session.AgentMetaCacheSpec
 import qualified Seal.Session.ExecCacheSpec
@@ -279,6 +280,7 @@ specs = do
   Seal.AppMainSpec.spec
   Seal.Session.BranchSpec.spec
   Seal.Session.MachineSpec.spec
+  Seal.Session.MachineRoutingSpec.spec
   Seal.Session.MetaSpec.spec
   Seal.Session.AgentMetaCacheSpec.spec
   Seal.Session.ExecCacheSpec.spec

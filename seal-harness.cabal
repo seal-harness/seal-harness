@@ -660,6 +660,7 @@ test-suite tests
          Seal.Config.WorkdirSpec
          Seal.Tools.Exec.LocalSpec
          Seal.Tools.Exec.HardenedBuildSpec
+         Seal.Session.MachineRoutingSpec
          Seal.Tools.Exec.RemoteSpec
           Seal.Tools.ArgsSpec
           Seal.Tools.Exec.CapabilityScopingFailSpec

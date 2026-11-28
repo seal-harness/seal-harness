@@ -22,6 +22,7 @@ module Seal.Session.Workdir
 import Control.Exception (IOException, try)
 import Data.List (isPrefixOf)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import System.Directory
@@ -36,22 +37,24 @@ import Seal.Config.Machines
 #else
 import Seal.Config.Machines
   ( MachineName, MachineRegistry (..), MachineTarget (..), Selectable (..)
-  , machineNameText, resolveRegistryForSecurity )
+  , localMachineName, machineNameText, resolveRegistryForSecurity )
 #endif
 import Seal.Config.Paths (SealPaths (..), sessionWorkdir, workdirsRoot)
 import Seal.Config.Security (SecurityConfig)
 import Seal.Core.Types (SessionId, sessionIdText, isValidSessionId)
 import Seal.Security.Path (WorkspaceRoot (..))
-import Seal.SourceControl.Clone (CloneDeps, stubCloneDeps)
+import Seal.SourceControl.Clone (CloneDeps (..), stubCloneDeps)
 import Seal.Text.LineFile (maxScanBytes)
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption (..))
 #if !defined(REMOTE_ONLY_UNTRUSTED)
 import Seal.Tools.Exec.Machine
-  ( MachineError (..), MachineRouting, mkMachineRouting, mkStaticRouting
+  ( MachineError (..), MachineRouting, UnreachableReason (..)
+  , mkMachineRouting, mkStaticRouting
   , resolveRegistryTarget, seedRouting )
 #else
 import Seal.Tools.Exec.Machine
-  ( MachineError (..), MachineRouting, mkMachineRouting
+  ( MachineError (..), MachineRouting, UnreachableReason (..)
+  , mkMachineRouting
   , resolveRegistryTarget, seedRouting )
 #endif
 import Seal.Tools.Exec.Remote
@@ -296,8 +299,16 @@ mkLocalExec wsRoot cloneDeps =
 -- | 'mkSessionExec' with an explicit machine, for a caller that has already
 -- resolved one (WU-9's session machine, or a test).
 --
--- Builds the routing table as well, so the session's exec and its per-call
--- routing agree about which machine the session is on.
+-- __Builds the multi-machine routing table__, so the session's exec and its
+-- per-call routing agree about which machine the session is on AND about which
+-- other machines a tool call may name. Before WU-5 this built a singleton
+-- routing table, which made every cross-machine call fail with
+-- 'MachineUnknown' no matter what @machines.toml@ said.
+--
+-- The session machine is seeded eagerly (its workdir bootstrap already
+-- happened); every other selectable machine bootstraps lazily on first use, and
+-- a failure is memoized so a dead machine costs one attempt per session rather
+-- than one per tool call.
 mkSessionExecFor
   :: SealPaths -> SecurityConfig -> SessionId
   -> CloneDeps -> RemoteRunner -> Maybe HostKeyAdoption
@@ -308,20 +319,123 @@ mkSessionExecFor paths secCfg sid cloneDeps runner mAdoption mMachine = do
   case eReg of
     Left err -> pure (failClosedSessionExecWithReason cloneDeps
                        ("machines.toml could not be read: " <> err))
-    Right reg -> case mMachine of
-      Nothing -> mkSessionExec paths secCfg sid cloneDeps runner mAdoption
-      Just name -> case Map.lookup name (regMachines reg) of
-        Nothing -> pure (failClosedSessionExecWithReason cloneDeps
-                          ("execution machine " <> machineNameText name
-                            <> " is not configured"))
-        Just MtLocal ->
-          mkSessionExec paths secCfg sid cloneDeps runner mAdoption
+    Right reg -> do
+      -- Which machine does this session run on? The recorded one, else the
+      -- configured default (regDefault), so an exec built for a session that
+      -- recorded nothing still agrees with what the dispatcher will resolve.
+      let resolvedName = case mMachine of
+            Just n  -> Just n
+            Nothing -> regDefault reg
+      case resolvedName of
+        -- No machine at all: leave the single-machine behaviour to
+        -- 'mkSessionExec', which resolves the same way and reports the failure
+        -- with the requirements' wording.
+        Nothing -> mkSessionExecWithRouting reg Nothing Nothing
+        Just name -> case Map.lookup name (regMachines reg) of
+          Nothing -> pure (failClosedSessionExecWithReason cloneDeps
+                            ("execution machine " <> machineNameText name
+                              <> " is not configured"))
+          Just target -> mkSessionExecWithRouting reg (Just name) (Just target)
+  where
+    -- Build the exec for the resolved machine, then replace its routing table
+    -- with the session's full one.
+    mkSessionExecWithRouting reg mName mTarget = do
+      exec <- case mTarget of
+        -- The local machine, or nothing to resolve: the existing constructor
+        -- already knows how, and it resolves the registry itself.
+        Nothing    -> mkSessionExec paths secCfg sid cloneDeps runner mAdoption
+        Just MtLocal -> mkSessionExec paths secCfg sid cloneDeps runner mAdoption
         Just (MtSsh sshCfg) -> do
           eRemoteWd <- ensureRemoteSessionWorkdir sshCfg runner sid
           case eRemoteWd of
             Left err -> pure (failClosedSessionExecWithReason cloneDeps
                                ("remote workdir creation failed: " <> T.pack (show err)))
             Right remoteWdText -> buildRemoteExec sshCfg remoteWdText cloneDeps runner
+      withFullRouting paths reg sid runner mName exec
+
+-- | Replace a freshly built 'SessionExec''s routing table with the session's
+-- full one: the session machine seeded, every other selectable machine
+-- bootstrapping lazily.
+--
+-- A fail-closed exec keeps its (empty) routing: offering machines on an exec
+-- with no workspace would let a call run somewhere the session has never been.
+withFullRouting
+  :: SealPaths
+  -> MachineRegistry
+  -> SessionId
+  -> RemoteRunner
+  -> Maybe MachineName
+  -> SessionExec
+  -> IO SessionExec
+withFullRouting paths reg sid runner mName exec
+  | isFailClosedSessionExec exec = pure exec
+  | otherwise = do
+      let uio  = uieUntrustedIO (seUIOEnv exec)
+          deps = uieCloneDeps (seUIOEnv exec)
+          sessionMachine = fromMaybe localMachineName mName
+          -- The selectable set is what the MODEL may name, so it is the whole
+          -- registry — the session machine included. Excluding it would make
+          -- `machine = "<the session's own machine>"` a MachineUnknown error,
+          -- because 'resolveMachineForCall' validates a supplied name against
+          -- exactly this list.
+          selectable = Map.keys (regMachines reg)
+      routing <- mkSessionRoutingFor uio deps sessionMachine selectable
+                   (bootstrapMachine paths reg sid runner)
+      pure exec { seUIOEnv = (seUIOEnv exec) { uieMachines = routing } }
+
+-- | Bootstrap one machine's capabilities on demand: create its per-session
+-- workdir on THAT machine, then build its handle and transport.
+--
+-- The session id and runner are captured from the caller, so a lazily built
+-- exec matches the eagerly built one: the same @<workspace>/workdirs/<sid>@
+-- path on a different machine, reached over the same runner.
+--
+-- Note what this deliberately does NOT do: reuse the session machine's
+-- transport. 'CloneDeps' is transport-bound (@cdIsRemote@,
+-- @cdPinnedKnownHosts@), so a call routed to machine B gets B's clone deps.
+bootstrapMachine
+  :: SealPaths
+  -> MachineRegistry
+  -> SessionId
+  -> RemoteRunner
+  -> MachineName
+  -> CloneDeps
+  -> IO (Either MachineError (UntrustedIO, CloneDeps))
+#if defined(REMOTE_ONLY_UNTRUSTED)
+bootstrapMachine _paths reg sid runner name baseDeps = case Map.lookup name (regMachines reg) of
+#else
+bootstrapMachine paths reg sid runner name baseDeps = case Map.lookup name (regMachines reg) of
+#endif
+  Nothing -> pure (Left (MachineGone name))
+#if defined(REMOTE_ONLY_UNTRUSTED)
+  -- The hardened build has no local executor, so @local@ cannot be reached
+  -- even if a registry somehow offered it. 'enforceRemoteOnly' rejects
+  -- allow_localhost = true at boot, so this arm is belt-and-braces.
+  Just MtLocal ->
+    pure (Left (MachineUnreachable name UrBootstrapFailed))
+#else
+  Just MtLocal ->
+    -- @local@ reached from a session that runs elsewhere: its per-session
+    -- workdir is the harness-local one.
+    do
+      eWd <- ensureSessionWorkdir paths sid
+      case eWd of
+        Left _ ->
+          pure (Left (MachineUnreachable name UrBootstrapFailed))
+        Right wsPath ->
+          pure (Right ( mkLocalUntrustedIO (WorkspaceRoot wsPath)
+                      , baseDeps { cdIsRemote = False } ))
+#endif
+  Just (MtSsh sshCfg) -> do
+    eWd <- ensureRemoteSessionWorkdir sshCfg runner sid
+    case eWd of
+      Left _ -> pure (Left (MachineUnreachable name UrBootstrapFailed))
+      Right wdText -> case mkRemotePath wdText of
+        Left _ -> pure (Left (MachineUnreachable name UrBootstrapFailed))
+        Right remotePath ->
+          let sshCfg' = sshCfg { scWorkspace = remotePath }
+          in pure (Right ( mkRemoteUntrustedIO sshCfg' runner
+                         , baseDeps { cdIsRemote = True } ))
 
 -- | Build the routing table a session's turns carry. The session machine is
 -- resolved eagerly (its workdir bootstrap already happened in
