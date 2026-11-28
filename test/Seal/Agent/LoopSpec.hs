@@ -670,7 +670,7 @@ spec = describe "Seal.Agent.Loop" $ do
                    , ccPromptSecret = \_ -> pure "" }
           wsRoot = WorkspaceRoot "/ws"
           policy = SecurityPolicy AllowAll Supervised
-          reg = mkRegistry [shellExecOp wsRoot policy]
+          reg = mkRegistry [shellExecOp wsRoot policy []]
       ref <- newIORef shellScript
       (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
@@ -719,7 +719,7 @@ spec = describe "Seal.Agent.Loop" $ do
                    , ccPromptSecret = \_ -> pure "" }
           wsRoot = WorkspaceRoot "/ws"
           policy = SecurityPolicy AllowAll Supervised
-          reg = mkRegistry [shellExecOp wsRoot policy]
+          reg = mkRegistry [shellExecOp wsRoot policy []]
       ref <- newIORef shellScript
       (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False
@@ -768,7 +768,7 @@ spec = describe "Seal.Agent.Loop" $ do
                    , ccPromptSecret = \_ -> pure "" }
           wsRoot = WorkspaceRoot "/ws"
           policy = SecurityPolicy AllowAll Full
-          reg = mkRegistry [shellExecOp wsRoot policy]
+          reg = mkRegistry [shellExecOp wsRoot policy []]
       ref <- newIORef shellScript
       (h, _) <- fakeIndexedTranscript
       stopFanoutDoneRef <- newIORef False

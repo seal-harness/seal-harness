@@ -15,6 +15,8 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 
+import Seal.Config.Machines (Selectable)
+import Seal.ISA.Ops.Machine (machinePropertySchema)
 import Seal.Core.Types (OpName (..))
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
@@ -29,11 +31,11 @@ import Seal.Tools.Exec.Types (mkRemotePath)
 -- @path@ defaults to @.@ (the workspace root). The result count is bounded
 -- by the operator-configured @maxResults@ ceiling; the model's
 -- @max_results@ request can only narrow it.
-searchFilesOp :: WorkspaceRoot -> SecurityPolicy -> Int -> Opcode
-searchFilesOp _wsRoot policy maxResults = UntrustedOpcode
+searchFilesOp :: WorkspaceRoot -> SecurityPolicy -> Int -> [Selectable] -> Opcode
+searchFilesOp _wsRoot policy maxResults selectable = UntrustedOpcode
   { uoName = OpName "SEARCH_FILES"
   , uoDesc = "Search workspace files for a pattern (rg, SafePath-confined, bounded)."
-  , uoInSchema = searchFilesSchema
+  , uoInSchema = searchFilesSchema selectable
   , uoOutSchema = object []
   , uoAuthorize = \v ->
       case patternField v of
@@ -66,8 +68,8 @@ searchFilesOp _wsRoot policy maxResults = UntrustedOpcode
                      (object ["pattern" .= pat, "path" .= pth, "result_count" .= count]))
   }
 
-searchFilesSchema :: Value
-searchFilesSchema =
+searchFilesSchema :: [Selectable] -> Value
+searchFilesSchema selectable =
   object
     [ "type" .= ("object" :: Text)
     , "properties" .= object
@@ -83,6 +85,7 @@ searchFilesSchema =
             [ "type" .= ("integer" :: Text)
             , "description" .= ("Max results to return (clamped to the operator ceiling)." :: Text)
             ]
+        , "machine" .= machinePropertySchema selectable
         ]
     , "required" .= (["pattern"] :: [Text])
     ]

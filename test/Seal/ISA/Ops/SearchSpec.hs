@@ -51,7 +51,7 @@ spec = describe "Seal.ISA.Ops.Search" $ do
     it "runs a search via rg and returns matching lines" $ do
       seen <- newIORef []
       let uio = fakeUio seen "src/Foo.hs:1:hello\nsrc/Bar.hs:3:world\n"
-          op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100
+          op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100 []
       r <- runTestApp (runOp uio Nothing op (object
         [ "pattern" .= ("hello" :: String)
         , "path" .= ("src" :: String)
@@ -60,19 +60,19 @@ spec = describe "Seal.ISA.Ops.Search" $ do
       orParts r `shouldSatisfy` \case [TrpText t] -> "hello" `T.isInfixOf` t; _ -> False
 
     it "rejects a pattern starting with dash (option injection)" $ do
-      let op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100
+      let op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100 []
       uoAuthorize op (object ["pattern" .= ("--flag" :: String), "path" .= ("." :: String)])
         `shouldBe` Left "SEARCH_FILES: pattern must not start with '-' (option injection)"
 
     it "missing pattern field -> error" $ do
-      let op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100
+      let op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100 []
       uoAuthorize op (object ["path" .= ("." :: String)])
         `shouldBe` Left "SEARCH_FILES requires {pattern:string}"
 
     it "orRecorded captures pattern + path + result count (secret-free)" $ do
       seen <- newIORef []
       let uio = fakeUio seen "a.hs:1:foo\nb.hs:2:bar\n"
-          op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100
+          op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100 []
       r <- runTestApp (runOp uio Nothing op (object
         [ "pattern" .= ("foo" :: String)
         , "path" .= ("." :: String)
@@ -84,14 +84,14 @@ spec = describe "Seal.ISA.Ops.Search" $ do
         ]
 
     it "Deny policy -> Denied" $ do
-      let op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly Set.empty) Deny) 100
+      let op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly Set.empty) Deny) 100 []
       uoAuthorize op (object ["pattern" .= ("x" :: String), "path" .= ("." :: String)])
         `shouldBe` Left "SEARCH_FILES denied by autonomy policy"
 
     it "result count is bounded by the operator ceiling" $ do
       seen <- newIORef []
       let uio = fakeUio seen "a:1:x\nb:2:x\nc:3:x\n"  -- 3 results
-          op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 2
+          op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 2 []
       r <- runTestApp (runOp uio Nothing op (object
         [ "pattern" .= ("x" :: String)
         , "path" .= ("." :: String)

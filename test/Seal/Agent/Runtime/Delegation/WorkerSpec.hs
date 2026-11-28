@@ -458,7 +458,7 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
 
   describe "handoffRepoRegistry" $ do
     it "always contains SETUP_REPO (a def allow-list cannot drop it)" $
-      case lookupOp (handoffRepoRegistry stubCloneDeps Full) (OpName "SETUP_REPO") of
+      case lookupOp (handoffRepoRegistry stubCloneDeps Full []) (OpName "SETUP_REPO") of
         Just _  -> pure ()
         Nothing -> expectationFailure "SETUP_REPO missing from the handoff repo registry"
 

@@ -212,7 +212,7 @@ spec = describe "Seal.ISA.Dispatch" $ do
 
   describe "schema advertisement (Task 8)" $ do
     it "SHELL_EXEC schema declares the optional 'timeout' field" $ do
-      let schema = shellExecSchema
+      let schema = shellExecSchema []
           props = case schema of
             A.Object o -> KeyMap.lookup (Key.fromText "properties") o
             _ -> Nothing
@@ -223,7 +223,7 @@ spec = describe "Seal.ISA.Dispatch" $ do
         _ -> expectationFailure "expected properties object"
 
     it "BIN_EXEC schema declares the optional 'timeout' field" $ do
-      let schema = binExecSchema
+      let schema = binExecSchema []
           props = case schema of
             A.Object o -> KeyMap.lookup (Key.fromText "properties") o
             _ -> Nothing

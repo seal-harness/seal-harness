@@ -56,6 +56,8 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import System.FilePath (isAbsolute)
 
+import Seal.Config.Machines (Selectable)
+import Seal.ISA.Ops.Machine (machinePropertySchema)
 import Seal.Core.Types (OpName (..))
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
@@ -82,11 +84,12 @@ binExecOp
   :: WorkspaceRoot
   -> SecurityPolicy
   -> Maybe (Set Text)
+  -> [Selectable]
   -> Opcode
-binExecOp wsRoot policy mAllowList = UntrustedOpcode
+binExecOp wsRoot policy mAllowList selectable = UntrustedOpcode
   { uoName = OpName "BIN_EXEC"
   , uoDesc = "Run a named binary with argv args (no shell, optional allow-list). Git and gh binaries get credential injection from registered repos."
-  , uoInSchema = binExecSchema
+  , uoInSchema = binExecSchema selectable
   , uoOutSchema = object []
   , uoAuthorize = \v ->
       case (binaryField v, argsField v) of
@@ -152,8 +155,8 @@ binExecOp wsRoot policy mAllowList = UntrustedOpcode
                                    Right out -> OpResult [TrpText out] False recorded
   }
 
-binExecSchema :: Value
-binExecSchema =
+binExecSchema :: [Selectable] -> Value
+binExecSchema selectable =
   object
     [ "type" .= ("object" :: Text)
     , "properties" .= object
@@ -174,6 +177,7 @@ binExecSchema =
             [ "type" .= ("integer" :: Text)
             , "description" .= ("Per-call timeout in seconds; if the tool doesn't finish in this time, it's killed. Default 120, max 600." :: Text)
             ]
+        , "machine" .= machinePropertySchema selectable
         ]
     , "required" .= (["binary"] :: [Text])
     ]

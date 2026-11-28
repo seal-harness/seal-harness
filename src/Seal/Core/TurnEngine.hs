@@ -71,7 +71,8 @@ import Seal.Config.Paths
    sessionLogPath, sessionRequestsPath, sessionResponsesPath, sessionWorkdir)
 import qualified Katip as K2 (Severity (..), ls)
 import Seal.Config.Machines
-  ( MachineTarget (..), machineNameText, resolveRegistryForSecurity )
+  ( MachineTarget (..), Selectable (..), machineNameText
+  , resolveRegistryForSecurity )
 import Seal.Config.Security
   ( SecurityConfig, loadSecurityConfig )
 import Seal.Logging.Global (globalLogIO)
@@ -156,7 +157,8 @@ import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption)
 import Seal.Tools.Exec.Remote (RemoteRunner, mkRealRemoteRunner)
-import Seal.Tools.Exec.Machine (resolveRegistryTarget)
+import Seal.Tools.Exec.Machine (resolveRegistryTarget, rtSelectable)
+import Seal.Tools.Exec.UIO.Internal (UIOEnv (..))
 import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs (..), snapIsDirectoryAt, snapTopDirs )
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
@@ -266,6 +268,7 @@ buildSessionRegistry
   -> Clone.CloneDeps
   -> Backends
   -> WorkspaceRoot
+  -> [Selectable]
   -> SessionId
   -> Int
   -> Policy.AutonomyLevel
@@ -278,7 +281,7 @@ buildSessionRegistry
   -> ChannelCaps
   -> Bool
   -> ISA.Registry
-buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
+buildSessionRegistry rt paths cloneDeps backends wsRoot selectable sid operatorCeiling autonomy webCfg
                      startWiring handoffDeps harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
@@ -309,14 +312,14 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , agentStopOp (bRuntime backends)
       , agentInterruptOp (bRuntime backends)
      , agentManageOp startWiring handoffDeps
-      , searchFilesOp wsRoot securityPolicy operatorCeiling
-      , fileReadOp wsRoot operatorCeiling
-      , fileWriteOp wsRoot operatorCeiling
-      , filePatchOp wsRoot
-      , shellExecOp wsRoot securityPolicy
-      , setupRepoOp cloneDeps autonomy
-      , binExecOp wsRoot securityPolicy binAllowList
-      , processManageOp wsRoot securityPolicy
+      , searchFilesOp wsRoot securityPolicy operatorCeiling selectable
+      , fileReadOp wsRoot operatorCeiling selectable
+      , fileWriteOp wsRoot operatorCeiling selectable
+      , filePatchOp wsRoot selectable
+      , shellExecOp wsRoot securityPolicy selectable
+      , setupRepoOp cloneDeps autonomy selectable
+      , binExecOp wsRoot securityPolicy binAllowList selectable
+      , processManageOp wsRoot securityPolicy selectable
      , browserManageOp securityPolicy
       , webFetchOp webFetchCfg
       , webSearchOp webSearchCfg
@@ -757,7 +760,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
       -- keeps the web frontend's status indicator correct while the turn
       -- is waiting for human input (not stuck on "thinking").
       askAwareCaps = wrapCapsForAskStatus (tdBroker td) sid (taCaps adapter)
-      isaReg = buildSessionRegistry (tdVault td) paths cloneDeps sessionBackends wsRoot sid operatorCeiling
+      isaReg = buildSessionRegistry (tdVault td) paths cloneDeps sessionBackends wsRoot (rtSelectable (uieMachines uioEnv)) sid operatorCeiling
                  (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring handoffDeps
                  (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) askAwareCaps onDemand
   itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
@@ -1149,7 +1152,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
           { ahdWorker = buildWorker td sessionBackends sid [sid] appEnv eCfg operatorCeiling channelLabel 0 True
           , ahdEnsureTab = Just (ensureTabForSession (tdTabsHandle td) KindAi)
           }
-        isaReg = buildSessionRegistry (tdVault td) (tdPaths td) cloneDeps sessionBackends wsRoot sid operatorCeiling
+        isaReg = buildSessionRegistry (tdVault td) (tdPaths td) cloneDeps sessionBackends wsRoot (rtSelectable (uieMachines uioEnv)) sid operatorCeiling
                    (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring handoffDeps
                    (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) caps onDemand
     itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
@@ -1412,6 +1415,9 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
                       (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner mAdopt Nothing)
                       eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
   let childWsRoot = seWorkspaceRoot childExec
+      -- The child's own selectable set: its schema must name the machines
+      -- THAT session can reach, not the parent's.
+      selectable = rtSelectable (uieMachines (seUIOEnv childExec))
       childWebCfg = either (const Nothing) rcWeb eCfg
       (_, _, _, orchEnabled) =
         resolveDelegationConfig (fromFileConfig (either (const Nothing) rcDelegation eCfg))
@@ -1433,14 +1439,14 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
         , skillDeleteOp (bSkills sessionBackends)
         , agentDefReadOp (bAgentDefs sessionBackends)
         , agentDefListOp (bAgentDefs sessionBackends)
-        , searchFilesOp childWsRoot securityPolicy operatorCeiling
-        , fileReadOp childWsRoot operatorCeiling
-        , fileWriteOp childWsRoot operatorCeiling
-        , filePatchOp childWsRoot
-        , shellExecOp childWsRoot securityPolicy
-        , setupRepoOp childCloneDeps (tdAutonomy td)
-        , binExecOp childWsRoot securityPolicy Nothing
-        , processManageOp childWsRoot securityPolicy
+        , searchFilesOp childWsRoot securityPolicy operatorCeiling selectable
+        , fileReadOp childWsRoot operatorCeiling selectable
+        , fileWriteOp childWsRoot operatorCeiling selectable
+        , filePatchOp childWsRoot selectable
+        , shellExecOp childWsRoot securityPolicy selectable
+        , setupRepoOp childCloneDeps (tdAutonomy td) selectable
+        , binExecOp childWsRoot securityPolicy Nothing selectable
+        , processManageOp childWsRoot securityPolicy selectable
         , webFetchOp childWebFetchCfg
         , webSearchOp childWebSearchCfg
        , sessionListOp (tdPaths td)

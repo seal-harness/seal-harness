@@ -64,8 +64,8 @@ spec = describe "Seal.Phase4Spec (capstone)" $ do
     seen <- newIORef []
     let uio  = fakeUio seen "ok\n"
         wsRoot = WorkspaceRoot "/ws"
-        shellOp = shellExecOp wsRoot (SecurityPolicy AllowAll Full)
-        fileWriteOp' = fileWriteOp wsRoot 65536
+        shellOp = shellExecOp wsRoot (SecurityPolicy AllowAll Full) []
+        fileWriteOp' = fileWriteOp wsRoot 65536 []
         reg = mkRegistry [shellOp, fileWriteOp']
     (h, _readState) <- fakeIndexedTranscript
     -- Dispatch SHELL_EXEC (Untrusted: ACK-before-execute)

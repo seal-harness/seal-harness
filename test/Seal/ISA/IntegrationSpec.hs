@@ -224,7 +224,7 @@ spec = describe "Seal.ISA.Integration" $ do
     it "\"Read the file notes.txt and show me what's in it.\" -> FILE_READ -> file contents returned" $
       withSystemTempDirectory "seal-int" $ \root -> do
         BS.writeFile (root </> "notes.txt") "hello world"
-        let op = fileReadOp (WorkspaceRoot root) maxScanBytes
+        let op = fileReadOp (WorkspaceRoot root) maxScanBytes []
             reg = Registry.mkRegistry [op]
         r <- runTestApp (dispatchOneWith reg (mkLocalUntrustedIO (WorkspaceRoot root)) (OpName "FILE_READ")
                           (object ["path" .= ("notes.txt" :: Text)]))
@@ -242,7 +242,7 @@ spec = describe "Seal.ISA.Integration" $ do
         BS.writeFile (root </> "notes.txt") "hello world"
         sent <- newIORef []
         let caps = recordCaps sent
-            op = fileReadOp (WorkspaceRoot root) maxScanBytes
+            op = fileReadOp (WorkspaceRoot root) maxScanBytes []
             reg = Registry.mkRegistry [op]
             script =
               [ CompletionResponse
@@ -270,7 +270,7 @@ spec = describe "Seal.ISA.Integration" $ do
   describe "FILE_WRITE" $ do
     it "\"Create a todo file with the line 'buy milk'.\" -> FILE_WRITE -> file on disk has the content" $
       withSystemTempDirectory "seal-int" $ \root -> do
-        let op = fileWriteOp (WorkspaceRoot root) 65536
+        let op = fileWriteOp (WorkspaceRoot root) 65536 []
             reg = Registry.mkRegistry [op]
         r <- runTestApp (dispatchOneWith reg (mkLocalUntrustedIO (WorkspaceRoot root)) (OpName "FILE_WRITE")
                           (object [ "path" .= ("todo.txt" :: Text)
@@ -289,7 +289,7 @@ spec = describe "Seal.ISA.Integration" $ do
     it "\"Replace 'foo' with 'bar' in code.txt.\" -> FILE_PATCH -> file patched in place" $
       withSystemTempDirectory "seal-int" $ \root -> do
         BS.writeFile (root </> "code.txt") "foo\nbaz\n"
-        let op = filePatchOp (WorkspaceRoot root)
+        let op = filePatchOp (WorkspaceRoot root) []
             reg = Registry.mkRegistry [op]
             patch = "--- a/code.txt\n+++ b/code.txt\n@@ -1,1 +1,1 @@\n-foo\n+bar\n"
         r <- runTestApp (dispatchOneWith reg (mkLocalUntrustedIO (WorkspaceRoot root)) (OpName "FILE_PATCH")
@@ -305,7 +305,7 @@ spec = describe "Seal.ISA.Integration" $ do
     it "\"Model sent 'diff' key instead of 'patch'.\" -> FILE_PATCH -> accepted via 'diff' alias, file patched" $
       withSystemTempDirectory "seal-int" $ \root -> do
         BS.writeFile (root </> "code.txt") "foo\nbaz\n"
-        let op = filePatchOp (WorkspaceRoot root)
+        let op = filePatchOp (WorkspaceRoot root) []
             reg = Registry.mkRegistry [op]
             wrongDiff = "--- a/code.txt\n+++ b/code.txt\n@@ -1,1 +1,1 @@\n-foo\n+bar\n"
         r <- runTestApp (dispatchOneWith reg (mkLocalUntrustedIO (WorkspaceRoot root)) (OpName "FILE_PATCH")
@@ -325,7 +325,7 @@ spec = describe "Seal.ISA.Integration" $ do
     it "\"Run 'echo hello' in the shell.\" -> SHELL_EXEC -> stdout returned" $ do
       seen <- newIORef []
       let uio = fakeUio seen "hello\n"
-          op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+          op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) []
           reg = Registry.mkRegistry [op]
       r <- runTestApp (dispatchOneWith reg uio (OpName "SHELL_EXEC")
                         (object ["command" .= ("echo hello" :: Text)]))
@@ -338,7 +338,7 @@ spec = describe "Seal.ISA.Integration" $ do
 
     it "\"Run a command.\" -> SHELL_EXEC under a Deny policy -> Denied at the gate" $ do
       let op = shellExecOp (WorkspaceRoot "/ws")
-                          (SecurityPolicy (AllowOnly mempty) Deny)
+                          (SecurityPolicy (AllowOnly mempty) Deny) []
           reg = Registry.mkRegistry [op]
       r <- runTestApp (dispatchOneWith reg failUio (OpName "SHELL_EXEC")
                         (object ["command" .= ("rm -rf /" :: Text)]))
@@ -352,7 +352,7 @@ spec = describe "Seal.ISA.Integration" $ do
       seen <- newIORef ([] :: [Text])
       let uio = fakeUio seen "hi\n"
           allowList = Just (Set.fromList ["python3" :: Text])
-          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) allowList
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) allowList []
           reg = Registry.mkRegistry [op]
       r <- runTestApp (dispatchOneWith reg uio (OpName "BIN_EXEC")
                         (object [ "binary" .= ("python3" :: Text)
@@ -364,7 +364,7 @@ spec = describe "Seal.ISA.Integration" $ do
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
     it "\"Run rm.\" -> BIN_EXEC with non-allow-listed binary -> Denied" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) (Just mempty)
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) (Just mempty) []
           reg = Registry.mkRegistry [op]
       r <- runTestApp (dispatchOneWith reg failUio (OpName "BIN_EXEC")
                         (object [ "binary" .= ("rm" :: Text)
@@ -378,7 +378,7 @@ spec = describe "Seal.ISA.Integration" $ do
     it "\"List the running processes.\" -> PROCESS_MANAGE action=list -> ps output returned" $ do
       seen <- newIORef ([] :: [Text])
       let uio = fakeUio seen "  1 /sbin/init\n 42 /bin/bash\n"
-          op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+          op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) []
           reg = Registry.mkRegistry [op]
       r <- runTestApp (dispatchOneWith reg uio (OpName "PROCESS_MANAGE")
                         (object ["action" .= ("list" :: Text)]))
@@ -391,7 +391,7 @@ spec = describe "Seal.ISA.Integration" $ do
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
     it "\"Kill process -1.\" -> PROCESS_MANAGE pid=-1 -> Denied (validated PID)" $ do
-      let op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+      let op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) []
           reg = Registry.mkRegistry [op]
       r <- runTestApp (dispatchOneWith reg failUio (OpName "PROCESS_MANAGE")
                         (object [ "action" .= ("kill" :: Text)
@@ -405,7 +405,7 @@ spec = describe "Seal.ISA.Integration" $ do
     it "\"Find every occurrence of 'TODO' under src/.\" -> SEARCH_FILES -> matches returned" $ do
       seen <- newIORef ([] :: [Text])
       let uio = fakeUio seen "src/Foo.hs:1:TODO fix\nsrc/Bar.hs:3:TODO later\n"
-          op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100
+          op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100 []
           reg = Registry.mkRegistry [op]
       r <- runTestApp (dispatchOneWith reg uio (OpName "SEARCH_FILES")
                         (object [ "pattern" .= ("TODO" :: Text)
@@ -419,7 +419,7 @@ spec = describe "Seal.ISA.Integration" $ do
         Left e -> expectationFailure ("dispatch failed: " <> show e)
 
     it "\"Search for '-x'.\" -> SEARCH_FILES pattern starting with - -> Denied (option injection)" $ do
-      let op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100
+      let op = searchFilesOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) 100 []
           reg = Registry.mkRegistry [op]
       r <- runTestApp (dispatchOneWith reg failUio (OpName "SEARCH_FILES")
                         (object ["pattern" .= ("-x" :: Text)]))

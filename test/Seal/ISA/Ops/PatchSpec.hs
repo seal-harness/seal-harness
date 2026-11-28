@@ -38,7 +38,7 @@ spec = describe "FILE_PATCH" $ do
   it "applies a simple unified diff to an existing file" $
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "hello\nworld\n"
-      let op = filePatchOp (WorkspaceRoot root)
+      let op = filePatchOp (WorkspaceRoot root) []
           diff = "--- a.txt\n+++ a.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+world!\n"
       r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("a.txt" :: String)
@@ -56,7 +56,7 @@ spec = describe "FILE_PATCH" $ do
   it "accepts the short hunk header form @@ -1 +1 @@ (length 1 implied)" $
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "hello\nworld\n"
-      let op = filePatchOp (WorkspaceRoot root)
+      let op = filePatchOp (WorkspaceRoot root) []
           diff = "--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-hello\n+hi\n"
       r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("a.txt" :: String)
@@ -69,7 +69,7 @@ spec = describe "FILE_PATCH" $ do
   it "accepts the short hunk header form for the new-side only (@@ -1,2 +1 @@)" $
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "hello\nworld\n"
-      let op = filePatchOp (WorkspaceRoot root)
+      let op = filePatchOp (WorkspaceRoot root) []
           diff = "--- a.txt\n+++ a.txt\n@@ -1,2 +1 @@\n-hello\n-world\n+hi\n"
       r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("a.txt" :: String)
@@ -82,7 +82,7 @@ spec = describe "FILE_PATCH" $ do
   it "accepts the short hunk header form for the old-side only (@@ -1 +1,2 @@)" $
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "hello\n"
-      let op = filePatchOp (WorkspaceRoot root)
+      let op = filePatchOp (WorkspaceRoot root) []
           diff = "--- a.txt\n+++ a.txt\n@@ -1 +1,2 @@\n-hello\n+hi\n+world\n"
       r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("a.txt" :: String)
@@ -95,7 +95,7 @@ spec = describe "FILE_PATCH" $ do
   it "orRecorded captures path + patch hash + line counts (not the patch body)" $
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "line1\nline2\n"
-      let op = filePatchOp (WorkspaceRoot root)
+      let op = filePatchOp (WorkspaceRoot root) []
           diff = "--- a.txt\n+++ a.txt\n@@ -1,2 +1,2 @@\n line1\n-line2\n+line2!\n"
       r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("a.txt" :: String)
@@ -107,7 +107,7 @@ spec = describe "FILE_PATCH" $ do
 
   it "rejects a path traversal escape (no write)" $
     withSystemTempDirectory "seal-ws" $ \root -> do
-      let op = filePatchOp (WorkspaceRoot root)
+      let op = filePatchOp (WorkspaceRoot root) []
           diff = "--- ../escape.txt\n+++ ../escape.txt\n@@ -1 +1 @@\n-a\n+b\n"
       r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("../escape.txt" :: String)
@@ -117,7 +117,7 @@ spec = describe "FILE_PATCH" $ do
 
   it "rejects a nonexistent file" $
     withSystemTempDirectory "seal-ws" $ \root -> do
-      let op = filePatchOp (WorkspaceRoot root)
+      let op = filePatchOp (WorkspaceRoot root) []
           diff = "--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-a\n+b\n"
       r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("nonexistent.txt" :: String)
@@ -127,7 +127,7 @@ spec = describe "FILE_PATCH" $ do
 
   it "missing path field -> error" $
     withSystemTempDirectory "seal-ws" $ \root -> do
-      let op = filePatchOp (WorkspaceRoot root)
+      let op = filePatchOp (WorkspaceRoot root) []
           diff = "--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-a\n+b\n"
       r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "patch" .= (diff :: String)
@@ -137,7 +137,7 @@ spec = describe "FILE_PATCH" $ do
   it "'diff' field is accepted as an alias for 'patch' (permissive parsing)" $
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "hello\nworld\n"
-      let op = filePatchOp (WorkspaceRoot root)
+      let op = filePatchOp (WorkspaceRoot root) []
           -- Model used the common-but-wrong key 'diff' instead of 'patch';
           -- patchField accepts 'diff' as a fallback alias so the model's first
           -- attempt succeeds without a round-trip through OPCODE_DESCRIBE.
@@ -153,7 +153,7 @@ spec = describe "FILE_PATCH" $ do
   it "missing both 'patch' and 'diff' fields -> error, not silent no-op success" $
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "hello\nworld\n"
-      let op = filePatchOp (WorkspaceRoot root)
+      let op = filePatchOp (WorkspaceRoot root) []
       r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("a.txt" :: String)
         ]))
@@ -164,7 +164,7 @@ spec = describe "FILE_PATCH" $ do
   it "empty patch string -> error, not silent no-op success" $
     withSystemTempDirectory "seal-ws" $ \root -> do
       BS.writeFile (root </> "a.txt") "hello\nworld\n"
-      let op = filePatchOp (WorkspaceRoot root)
+      let op = filePatchOp (WorkspaceRoot root) []
       r <- runTestApp (runOp (mkTestUio (WorkspaceRoot root)) Nothing op (object
         [ "path" .= ("a.txt" :: String)
         , "patch" .= ("" :: String)
@@ -190,7 +190,7 @@ spec = describe "FILE_PATCH" $ do
         -- applier, hunk 2's @@ -8 +8 @@ would land at index 7 of the
         -- already-extended file (which is now "l5"), corrupting the file.
         BS.writeFile (root </> "a.txt") "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n"
-        let op = filePatchOp (WorkspaceRoot root)
+        let op = filePatchOp (WorkspaceRoot root) []
             diff = unlines
               [ "--- a.txt"
               , "+++ a.txt"
@@ -216,7 +216,7 @@ spec = describe "FILE_PATCH" $ do
         -- hunk 2 edits l8 -> l8!. Position-based applier would land hunk 2
         -- 2 lines too early.
         BS.writeFile (root </> "a.txt") "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n"
-        let op = filePatchOp (WorkspaceRoot root)
+        let op = filePatchOp (WorkspaceRoot root) []
             diff = unlines
               [ "--- a.txt"
               , "+++ a.txt"
@@ -249,7 +249,7 @@ spec = describe "FILE_PATCH" $ do
         -- line was inserted above). A content-based applier finds "world"
         -- regardless; a position-based one corrupts line 3.
         BS.writeFile (root </> "a.txt") "hello\nworld\nfoo\n"
-        let op = filePatchOp (WorkspaceRoot root)
+        let op = filePatchOp (WorkspaceRoot root) []
             diff = unlines
               [ "--- a.txt"
               , "+++ a.txt"
@@ -268,7 +268,7 @@ spec = describe "FILE_PATCH" $ do
     it "fails loudly (not silently corrupts) when context lines don't match anywhere" $
       withSystemTempDirectory "seal-ws" $ \root -> do
         BS.writeFile (root </> "a.txt") "hello\nworld\n"
-        let op = filePatchOp (WorkspaceRoot root)
+        let op = filePatchOp (WorkspaceRoot root) []
             diff = unlines
               [ "--- a.txt"
               , "+++ a.txt"
@@ -297,7 +297,7 @@ spec = describe "FILE_PATCH" $ do
     it "applies when the patch context has trailing whitespace the file lacks" $
       withSystemTempDirectory "seal-ws" $ \root -> do
         BS.writeFile (root </> "a.txt") "hello\nworld\n"
-        let op = filePatchOp (WorkspaceRoot root)
+        let op = filePatchOp (WorkspaceRoot root) []
             -- context line " hello " (trailing space) vs file "hello"
             diff = unlines
               [ "--- a.txt"
@@ -324,7 +324,7 @@ spec = describe "FILE_PATCH" $ do
     it "appends new lines after the last existing line" $
       withSystemTempDirectory "seal-ws" $ \root -> do
         BS.writeFile (root </> "a.txt") "l1\nl2\nl3\n"
-        let op = filePatchOp (WorkspaceRoot root)
+        let op = filePatchOp (WorkspaceRoot root) []
             -- old length 0 means "insert after line 3"; only + lines.
             diff = unlines
               [ "--- a.txt"
@@ -344,7 +344,7 @@ spec = describe "FILE_PATCH" $ do
     it "appends to an empty file" $
       withSystemTempDirectory "seal-ws" $ \root -> do
         BS.writeFile (root </> "a.txt") ""
-        let op = filePatchOp (WorkspaceRoot root)
+        let op = filePatchOp (WorkspaceRoot root) []
             diff = unlines
               [ "--- a.txt"
               , "+++ a.txt"
@@ -377,7 +377,7 @@ spec = describe "FILE_PATCH" $ do
         -- (corrupting the file); a content-based applier searches for
         -- "marker2\ntarget" and lands at line 5.
         BS.writeFile (root </> "a.txt") "target\nmarker1\ntarget\nmarker2\ntarget\n"
-        let op = filePatchOp (WorkspaceRoot root)
+        let op = filePatchOp (WorkspaceRoot root) []
             diff = unlines
               [ "--- a.txt"
               , "+++ a.txt"

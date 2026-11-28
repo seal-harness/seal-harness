@@ -74,6 +74,8 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 
+import Seal.Config.Machines (Selectable)
+import Seal.ISA.Ops.Machine (machinePropertySchema)
 import Seal.Core.Types (OpName (..))
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
@@ -104,11 +106,11 @@ import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
 -- one — and the delegation worker (which has no workspace root in scope but
 -- does have the child's 'UIOEnv') can build this op for a handoff session's
 -- pre-turn checkout.
-setupRepoOp :: CloneDeps -> AutonomyLevel -> Opcode
-setupRepoOp deps autonomy = UntrustedOpcode
+setupRepoOp :: CloneDeps -> AutonomyLevel -> [Selectable] -> Opcode
+setupRepoOp deps autonomy selectable = UntrustedOpcode
   { uoName = OpName "SETUP_REPO"
   , uoDesc = "Clone a remote repository into the session workspace (shallow, idempotent; an optional branch or tag is checked out). Discover any skills it ships via the available-skills catalog on the next turn."
-  , uoInSchema = setupRepoSchema
+  , uoInSchema = setupRepoSchema selectable
   , uoOutSchema = object []
   , uoAuthorize = \v ->
       case parseSetupRepoInput v of
@@ -123,8 +125,8 @@ setupRepoOp deps autonomy = UntrustedOpcode
            Right (url, mBranch) -> runSetupRepo deps url mBranch recorded
   }
 
-setupRepoSchema :: Value
-setupRepoSchema =
+setupRepoSchema :: [Selectable] -> Value
+setupRepoSchema selectable =
   object
     [ "type" .= ("object" :: Text)
     , "properties" .= object
@@ -136,6 +138,7 @@ setupRepoSchema =
             [ "type" .= ("string" :: Text)
             , "description" .= ("The branch or tag to check out. Omit to use the remote's default branch." :: Text)
             ]
+        , "machine" .= machinePropertySchema selectable
         ]
     , "required" .= (["url"] :: [Text])
     ]

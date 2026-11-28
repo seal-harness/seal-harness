@@ -59,7 +59,7 @@ spec = describe "Seal.ISA.Ops.Shell" $ do
     it "runs a validated shell command via the executor and returns stdout" $ do
       seen <- newIORef []
       let uio = fakeUio seen "hello\n"
-          op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+          op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) []
       r <- runTestApp (runOp uio Nothing op (object ["command" .= ("echo hello" :: String)]))
       orIsError r `shouldBe` False
       orParts r `shouldBe` [TrpText "hello\n"]
@@ -68,50 +68,50 @@ spec = describe "Seal.ISA.Ops.Shell" $ do
     it "orRecorded captures the command (secret-free metadata)" $ do
       seen <- newIORef []
       let uio = fakeUio seen "out"
-          op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+          op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) []
       r <- runTestApp (runOp uio Nothing op (object ["command" .= ("ls /ws" :: String)]))
       orRecorded r `shouldBe` object ["command" .= ("ls /ws" :: String), "cwd" .= (Nothing :: Maybe String)]
 
     it "Deny policy -> Denied at the authorize gate (never runs the executor)" $ do
-      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly Set.empty) Deny)
+      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly Set.empty) Deny) []
       -- The authorize gate rejects; the dispatcher would never call uoRun.
       uoAuthorize op (object ["command" .= ("rm -rf /" :: String)]) `shouldBe` Left "SHELL_EXEC denied by autonomy policy"
 
     it "missing command field -> error result, never runs" $ do
       seen <- newIORef []
       let uio = fakeUio seen "x"
-          op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+          op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) []
       r <- runTestApp (runOp uio Nothing op (object []))
       orIsError r `shouldBe` True
       readIORef seen `shouldReturn` []
 
     it "executor failure surfaces as an error result" $ do
       let uio = failUio ExecNotImplemented
-          op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+          op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) []
       r <- runTestApp (runOp uio Nothing op (object ["command" .= ("false" :: String)]))
       orIsError r `shouldBe` True
 
     it "gh auth login is blocked at the authorize gate (writes secrets to disk)" $ do
-      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) []
       uoAuthorize op (object ["command" .= ("gh auth login" :: String)])
         `shouldSatisfy` isLeft
 
     it "gh auth token is blocked (prints secret to stdout → transcript)" $ do
-      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) []
       uoAuthorize op (object ["command" .= ("gh auth token" :: String)])
         `shouldSatisfy` isLeft
 
     it "gh auth setup-git in a compound command is blocked" $ do
-      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) []
       uoAuthorize op (object ["command" .= ("cd repo && gh auth setup-git && git push" :: String)])
         `shouldSatisfy` isLeft
 
     it "gh auth status is NOT blocked (read-only, no disk writes)" $ do
-      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) []
       uoAuthorize op (object ["command" .= ("gh auth status" :: String)])
         `shouldBe` Right ()
 
     it "non-gh-auth commands are NOT blocked" $ do
-      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full)
+      let op = shellExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) []
       uoAuthorize op (object ["command" .= ("gh pr create --title test" :: String)])
         `shouldBe` Right ()

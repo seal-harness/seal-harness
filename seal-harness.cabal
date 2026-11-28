@@ -661,6 +661,7 @@ test-suite tests
          Seal.Tools.Exec.LocalSpec
          Seal.Tools.Exec.HardenedBuildSpec
          Seal.Session.MachineRoutingSpec
+         Seal.ISA.Ops.MachineSchemaSpec
          Seal.Tools.Exec.RemoteSpec
           Seal.Tools.ArgsSpec
           Seal.Tools.Exec.CapabilityScopingFailSpec

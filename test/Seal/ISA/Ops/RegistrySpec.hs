@@ -84,7 +84,7 @@ spec = describe "Seal.ISA.Ops.Registry" $ do
     -- prominently (and mention the 'diff' alias) so a model that reads the
     -- describe text gets the field right without a wasted Denied round-trip.
     it "FILE_PATCH describe output names the 'patch' field and the 'diff' alias" $ do
-      let fp     = Seal.ISA.Ops.File.filePatchOp (WorkspaceRoot "/ws")
+      let fp     = Seal.ISA.Ops.File.filePatchOp (WorkspaceRoot "/ws") []
           reg'   = mkRegistry [ fp, opcodeDescribeOp reg' ]
           op     = opcodeDescribeOp reg'
       r <- runTestApp (opRun op localBackend (object ["name" .= ("FILE_PATCH" :: T.Text)]))

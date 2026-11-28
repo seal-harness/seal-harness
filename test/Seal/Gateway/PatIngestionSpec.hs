@@ -299,7 +299,7 @@ mkVaultDeps vr tmp = do
 -- the @gh@ branch, which is credential injection — not the authorize
 -- gate).
 testOp :: Opcode
-testOp = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+testOp = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
 
 ghPrCreateInput :: A.Value
 ghPrCreateInput = object

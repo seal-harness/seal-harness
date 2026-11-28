@@ -194,7 +194,7 @@ ghPatRepo =
 
 -- | The standard op used in gh tests (no allow-list, full autonomy).
 ghTestOp :: Opcode
-ghTestOp = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+ghTestOp = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
 
 -- | @gh pr create --title x@ input.
 ghPrCreateInput :: Value
@@ -234,7 +234,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
       seen <- newIORef []
       let uio = fakeUioFlat seen "42\n"
           allowList = Just (Set.fromList ["python3", "node"])
-          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) allowList
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) allowList []
       r <- runTestApp (runOp uio Nothing op (object
         [ "binary" .= ("python3" :: String)
         , "args" .= (["-c", "print(42)"] :: [String])
@@ -245,21 +245,21 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
 
     it "binary not in allow-list -> Denied" $ do
       let allowList = Just (Set.fromList ["python3"])
-          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) allowList
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) allowList []
       uoAuthorize op (object
         [ "binary" .= ("rm" :: String)
         , "args" .= (["-rf", "/"] :: [String])
         ]) `shouldBe` Left "BIN_EXEC: binary \"rm\" not in the allow-list"
 
     it "missing binary field -> error" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) (Just Set.empty)
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) (Just Set.empty) []
       uoAuthorize op (object ["args" .= (["x"] :: [String])])
         `shouldBe` Left "BIN_EXEC requires {binary:string, args:[string]}"
 
     it "args field is optional (defaults to [])" $ do
       seen <- newIORef []
       let uio = fakeUioFlat seen "ok\n"
-          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
       r <- runTestApp (runOp uio Nothing op (object
         [ "binary" .= ("ls" :: String)
         ]))
@@ -273,7 +273,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
       -- string as a JSON array.
       seen <- newIORef []
       let uio = fakeUioFlat seen "ok\n"
-          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
       r <- runTestApp (runOp uio Nothing op (object
         [ "binary" .= ("ls" :: String)
         , "args" .= ("[\"-la\", \"/tmp\"]" :: String)
@@ -282,27 +282,27 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
       readIORef seen `shouldReturn` ["ls -la /tmp"]
 
     it "binary with NUL -> Denied (validated BinName rejects NUL)" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
       uoAuthorize op (object
         [ "binary" .= ("ev\0il" :: String)
         ]) `shouldBe` Left "BIN_EXEC: invalid binary name"
 
     it "arg with NUL -> Denied (validated BinArg rejects NUL)" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
       uoAuthorize op (object
         [ "binary" .= ("ls" :: String)
         , "args" .= ["ok\0bad" :: String]
         ]) `shouldBe` Left "BIN_EXEC: invalid arg"
 
     it "leading-dash arg is permitted (flag, not option injection)" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) (Just (Set.fromList ["ls"]))
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) (Just (Set.fromList ["ls"])) []
       uoAuthorize op (object
         [ "binary" .= ("ls" :: String)
         , "args" .= (["-l", "-a"] :: [String])
         ]) `shouldBe` Right ()
 
     it "Nothing allow-list permits any binary (autonomy permitting)" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
       uoAuthorize op (object
         [ "binary" .= ("rm" :: String)
         , "args" .= (["-rf", "/"] :: [String])
@@ -311,7 +311,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
     it "orRecorded captures the binary + arg count (secret-free, not the args)" $ do
       seen <- newIORef []
       let uio = fakeUioFlat seen ""
-          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
       r <- runTestApp (runOp uio Nothing op (object
         [ "binary" .= ("node" :: String)
         , "args" .= (["-e", "console.log('hi')"] :: [String])
@@ -323,7 +323,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
         ]
 
     it "gh auth login is blocked (writes secrets to disk)" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
       r <- runTestApp (runOp mkRemoteUntrustedIOStub Nothing op (object
         [ "binary" .= ("gh" :: String)
         , "args" .= (["auth", "login"] :: [String])
@@ -333,7 +333,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
       partsText `shouldSatisfy` any (\t -> "gh auth" `T.isInfixOf` t && "blocked" `T.isInfixOf` t)
 
     it "gh auth token is blocked (prints secret to stdout)" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
       r <- runTestApp (runOp mkRemoteUntrustedIOStub Nothing op (object
         [ "binary" .= ("gh" :: String)
         , "args" .= (["auth", "token"] :: [String])
@@ -343,7 +343,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
       partsText `shouldSatisfy` any (\t -> "gh auth" `T.isInfixOf` t && "blocked" `T.isInfixOf` t)
 
     it "gh pr create is NOT blocked (authenticates via GH_TOKEN)" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
       -- The authorize gate should pass (gh pr create is not blocked).
       uoAuthorize op (object
         [ "binary" .= ("gh" :: String)
@@ -355,7 +355,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
     it "defaults cwd to Nothing when omitted (the executor anchors it to the workdir)" $ do
       seen <- newIORef []
       let uio = fakeUio seen "ok\n"
-          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
       _ <- runTestApp (runOp uio Nothing op (object
         [ "binary" .= ("pwd" :: String)
         ]))
@@ -364,7 +364,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
     it "passes a relative cwd as a RemotePath (workspace-relative)" $ do
       seen <- newIORef []
       let uio = fakeUio seen "ok\n"
-          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
       _ <- runTestApp (runOp uio Nothing op (object
         [ "binary" .= ("pwd" :: String)
         , "cwd" .= ("subdir" :: String)
@@ -374,7 +374,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
     it "passes an absolute cwd as a RemotePath (not workspace-confined)" $ do
       seen <- newIORef []
       let uio = fakeUio seen "ok\n"
-          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
       _ <- runTestApp (runOp uio Nothing op (object
         [ "binary" .= ("pwd" :: String)
         , "cwd" .= ("/tmp/seal-test" :: String)
@@ -382,21 +382,21 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
       readIORef seen `shouldReturn` [("pwd", [], Just "/tmp/seal-test")]
 
     it "rejects a @..@ cwd at the authorize gate (escape before execution)" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
       uoAuthorize op (object
         [ "binary" .= ("ls" :: String)
         , "cwd" .= ("../escape" :: String)
         ]) `shouldBe` Left "BIN_EXEC: cwd escapes the workspace"
 
     it "rejects a blocked-name cwd at the authorize gate" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
       uoAuthorize op (object
         [ "binary" .= ("ls" :: String)
         , "cwd" .= (".ssh" :: String)
         ]) `shouldBe` Left "BIN_EXEC: cwd touches a blocked location"
 
     it "rejects a leading-dash cwd at the authorize gate (option injection)" $ do
-      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+      let op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
       uoAuthorize op (object
         [ "binary" .= ("ls" :: String)
         , "cwd" .= ("-evil" :: String)
@@ -405,7 +405,7 @@ spec = describe "Seal.ISA.Ops.Bin" $ do
     it "orRecorded captures the cwd (secret-free metadata)" $ do
       seen <- newIORef []
       let uio = fakeUio seen ""
-          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+          op = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
       r <- runTestApp (runOp uio Nothing op (object
         [ "binary" .= ("pwd" :: String)
         , "cwd" .= ("subdir" :: String)

@@ -159,7 +159,7 @@ patRepo =
 
 -- | The standard op used in all tests.
 testOp :: Opcode
-testOp = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+testOp = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
 
 -- | The standard git fetch input.
 gitFetchInput :: Value
