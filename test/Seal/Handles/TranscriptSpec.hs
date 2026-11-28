@@ -225,11 +225,11 @@ spec = describe "Seal.Handles.Transcript" $ do
       alive `shouldBe` True
 
     it "TranscriptError is an Exception" $ do
-      let e = TranscriptError "test error"
+      let e = TranscriptError "test error" Nothing
       result <- try (evaluate (e :: TranscriptError) >> throwIO e) :: IO (Either SomeException ())
       case result of
         Left ex -> case fromException ex :: Maybe TranscriptError of
-          Just (TranscriptError msg) -> msg `shouldBe` "test error"
+          Just (TranscriptError msg _) -> msg `shouldBe` "test error"
           Nothing -> expectationFailure "exception was not a TranscriptError"
         Right _ -> expectationFailure "expected an exception but got none"
 
@@ -255,7 +255,7 @@ spec = describe "Seal.Handles.Transcript" $ do
           alive' `shouldBe` False
           r <- try (itwRecordAndAck h (IndexedTranscriptWrite [Message User [CbText "x"]] e))
           case r of
-            Left (TranscriptError msg) -> msg `shouldSatisfy` T.isInfixOf "dead"
+            Left (TranscriptError msg _) -> msg `shouldSatisfy` T.isInfixOf "dead"
             Right _ -> expectationFailure "expected a TranscriptError but got none"
 
     it "leaving the bracket terminates promptly when the writer died mid-turn" $

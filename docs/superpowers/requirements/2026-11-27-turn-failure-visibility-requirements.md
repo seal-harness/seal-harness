@@ -207,8 +207,9 @@ Facts the design should not have to rediscover. These are **not** requirements.
 
 ### A1 — 2026-11-27: decision 2 narrowed to a closed cause vocabulary
 
-**Status: awaiting operator sign-off.** Raised by the security review during
-the design gate.
+**Status: APPROVED 2026-11-27** — operator chose "continue as designed",
+which is the type-name-only variant specified here (not the middle
+option described below, which was offered and declined).
 
 Decision 2 originally promised a **raw** cause line
 (`UnicodeException in readBounded`). The design gate established that this is
@@ -233,10 +234,9 @@ cost is a small closed table of `(exception type, site) -> string` in
 `classify`, plus one more wire value per cause. The fallback for an unknown site
 is the type name alone.
 
-The design currently specifies type-name-only because that is the smallest
-change certainly safe. The middle option is strictly better copy for the same
-security posture, so I would take it if you agree — it makes decision 2
-literally true rather than "intent preserved".
+**DECLINED 2026-11-27** — the operator chose "continue as designed", i.e.
+type-name-only. The middle option above is recorded for a possible later
+follow-up but is NOT in scope for this change.
 
 **What the operator loses:** a raw Haskell exception dump in the UI.
 **What the operator keeps:** the ability to distinguish a disk-full from a
