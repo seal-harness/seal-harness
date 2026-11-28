@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 -- | The @seal serve@ startup wiring: build the gateway + broker + API from
 -- the existing startup (paths → config → vault → session → backends →
@@ -82,12 +83,16 @@ import Seal.Config.BootPlan
 import Seal.Security.EnrollmentGrant (GrantSource (..))
 import Seal.Config.Security
   ( AccessControlFileConfig (..), SecurityConfig (..), loadSecurityConfig
-  , allowLocalhostFromSecurity, gatewayConfigFromSecurity
-  , untrustedExecConfigFromSecurity )
+  , allowLocalhostFromSecurity, gatewayConfigFromSecurity )
+#if defined(REMOTE_ONLY_UNTRUSTED)
+-- Only the hardened boot path runs the check (see its call site), so these are
+-- unused — and unused imports are errors under -Werror — in a default build.
+import Seal.Config.Security (untrustedExecConfigFromSecurity)
+import Seal.Tools.Exec.Untrusted (enforceRemoteOnly)
+#endif
 import Seal.Config.Machines
   ( MachineTarget (..), resolveRegistryForSecurity )
 import Seal.Tools.Exec.Machine (resolveRegistryTarget)
-import Seal.Tools.Exec.Untrusted (enforceRemoteOnly)
 import Seal.Config.Paths (SealPaths (..), auditDir, configFilePath, cursorMapPath, ensureSealDirs, getSealPaths, repoKeysDir, reposFilePath, securityFilePath, serveLockPath, sessionMetaPath, sshAgentsDir, tabListPath, tlsCertPath, tlsKeyPath, vaultFilePath, watchMapPath)
 import Seal.Security.DaemonLock (ServeLock, acquireServeLock)
 import Seal.Gateway.AccessControl
@@ -209,16 +214,21 @@ runServeMainInner autonomy mCliStaticDir noEnrollToken logger runtimeRef = do
       ioError (userError ("security.toml could not be parsed; refusing to start. "
                           <> T.unpack err))
     Right c  -> pure c
-  -- The @-f remote-only-untrusted@ startup check (design 8 step 3, WU-16).
-  -- A hardened binary has no local executor, so @allow_localhost = true@ is a
-  -- configuration it cannot honour: refuse to start rather than start and then
-  -- fail every local call. Placed with the other boot refusals, before anything
-  -- binds or forks.
+  -- The @-f remote-only-untrusted@ startup check (design §8 step 3, WU-16).
+  --
+  -- __CPP-gated on the flag, and it MUST be.__ A DEFAULT build has the local
+  -- executor and therefore honours @allow_localhost = true@ — applying this
+  -- check there refuses to start on every fresh install, because the shipped
+  -- @security.toml@ leaves @[untrusted_execution]@ absent and the absent
+  -- section defaults to @true@. The check exists because a HARDENED binary
+  -- cannot honour @true@, so only that build runs it.
+#if defined(REMOTE_ONLY_UNTRUSTED)
   case enforceRemoteOnly (untrustedExecConfigFromSecurity secCfg) of
     Left err -> do
       logIO logger ErrorS ("untrusted execution: " <> ls err)
       ioError (userError (T.unpack err))
     Right () -> pure ()
+#endif
 
   -- Access control is resolved ONCE here, before any channel is forked or any
   -- port is bound, so the refuse-to-start matrix (design §10) runs first.

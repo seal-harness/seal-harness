@@ -51,9 +51,14 @@ import Seal.Command.Spec
   ( CommandAction (..), Registry, mkRegistry, registrySpecs )
 import Seal.Config.File (defaultRuntimeConfig, loadRuntimeConfig)
 import Seal.Config.Security
-  ( SecurityConfig, allowLocalhostFromSecurity, defaultSecurityConfig
-  , loadSecurityConfig, untrustedExecConfigFromSecurity )
+  ( SecurityConfig, allowLocalhostFromSecurity, loadSecurityConfig )
+#if defined(REMOTE_ONLY_UNTRUSTED)
+-- Only the hardened boot path runs the check (see its call site), so these are
+-- unused — and unused imports are errors under -Werror — in a default build.
+import Seal.Config.Security
+  ( defaultSecurityConfig, untrustedExecConfigFromSecurity )
 import Seal.Tools.Exec.Untrusted (enforceRemoteOnly)
+#endif
 import Seal.Config.Machines (MachineName, machineNameText)
 import Seal.Config.Paths (SealPaths (..), securityFilePath)
 import Seal.Core.Backends (Backends (..), newBackends)
@@ -158,11 +163,15 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
   execCache <- newSessionExecCache
   active0 <- readIORef (srActive sr)
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
-  -- The @-f remote-only-untrusted@ startup check, in the CLI boot path. The
-  -- hardened binary has no local executor, so @allow_localhost = true@ is a
-  -- configuration it cannot honour: refuse rather than start and fail every
-  -- local call. Both boot paths run this (here and 'Seal.Command.Serve'); before
-  -- this feature the check had no call site at all.
+  -- The @-f remote-only-untrusted@ startup check, in the CLI boot path.
+  --
+  -- __CPP-gated on the flag, and it MUST be.__ A default build HAS the local
+  -- executor, so @allow_localhost = true@ is a configuration it honours — and
+  -- the shipped @security.toml@ leaves @[untrusted_execution]@ absent, which
+  -- defaults to @true@. Running this check unconditionally refuses to start on
+  -- every fresh install. Both boot paths gate it (here and
+  -- 'Seal.Command.Serve'); before this feature the check had no call site.
+#if defined(REMOTE_ONLY_UNTRUSTED)
   case eSecCfg of
     Right secCfg -> case enforceRemoteOnly (untrustedExecConfigFromSecurity secCfg) of
       Left err -> ioError (userError (T.unpack err))
@@ -173,6 +182,7 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
     Left _ -> case enforceRemoteOnly (untrustedExecConfigFromSecurity defaultSecurityConfig) of
       Left err -> ioError (userError (T.unpack err))
       Right () -> pure ()
+#endif
   let allowLocal = either (const True) allowLocalhostFromSecurity eSecCfg
       -- The channel's CloneDeps need to know whether the untrusted plane is a
       -- different machine, because the deploy-key clone path only needs agent

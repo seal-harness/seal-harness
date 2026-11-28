@@ -52,6 +52,22 @@ spec :: Spec
 spec = describe "the hardened build (-f remote-only-untrusted)" $ do
 
   describe "the boot gate on the local wiring path" $ do
+    it "the gate is CPP-gated to the hardened build, not run unconditionally" $ do
+      -- A REGRESSION I introduced and CI caught. `enforceRemoteOnly` refuses
+      -- `allow_localhost = true`, and the shipped `security.toml` leaves
+      -- `[untrusted_execution]` absent — which defaults to `true`. Calling the
+      -- check unconditionally therefore refused to start on EVERY FRESH
+      -- INSTALL of a DEFAULT build, which has the local executor and honours
+      -- the flag perfectly well.
+      --
+      -- Asserted at the CALL SITES, because that is where the gating lives. A
+      -- pure-function test of `enforceRemoteOnly` cannot see this: the function
+      -- was always correct, and calling it in the wrong build was the bug.
+      serve <- readSrc "src/Seal/Command/Serve.hs"
+      cli <- readSrc "src/Seal/Channel/Cli.hs"
+      gatedIn "src/Seal/Command/Serve.hs" serve `shouldBe` True
+      gatedIn "src/Seal/Channel/Cli.hs" cli `shouldBe` True
+
     it "refuses the absent-section default, which is allow_localhost = true" $ do
       -- Done-when 3 says an install with no [untrusted_execution] gets
       -- allow_localhost = true; a hardened binary must therefore refuse to
@@ -212,6 +228,22 @@ omittedExecutorModules cabal =
          && not ("if " `T.isPrefixOf` s)
 
 -- | A small filterM helper (avoids importing Control.Monad for one combinator).
+-- | Does @path@ contain an @enforceRemoteOnly@ call inside a
+-- @#if defined(REMOTE_ONLY_UNTRUSTED)@ block?
+--
+-- Textual, because the property IS the CPP structure: the gate has no runtime
+-- representation to assert against. A call outside such a block is the bug.
+gatedIn :: FilePath -> T.Text -> Bool
+gatedIn _path src = go (T.lines src) False False
+  where
+    go [] _ _ = True   -- never saw an ungated call
+    go (ln : rest) inFlag seen
+      | "#if defined(REMOTE_ONLY_UNTRUSTED)" `T.isInfixOf` ln = go rest True seen
+      | "#endif" `T.isPrefixOf` T.strip ln                     = go rest False seen
+      | "enforceRemoteOnly" `T.isInfixOf` ln && not inFlag     = False
+      | "enforceRemoteOnly" `T.isInfixOf` ln                   = go rest inFlag True
+      | otherwise                                              = go rest inFlag seen
+
 filterM :: (a -> IO Bool) -> [a] -> IO [a]
 filterM _ [] = pure []
 filterM p (x:xs) = do
