@@ -15,6 +15,7 @@ module Seal.Channel.Cli
   , newBackends
   ) where
 
+import Control.Exception (IOException, try)
 import Control.Concurrent (forkIO)
 import Control.Monad (void)
 import Data.Foldable (for_)
@@ -54,6 +55,7 @@ import Seal.Config.Security
   ( SecurityConfig, allowLocalhostFromSecurity, defaultSecurityConfig
   , loadSecurityConfig, untrustedExecConfigFromSecurity )
 import Seal.Tools.Exec.Untrusted (enforceRemoteOnly)
+import Seal.Config.Machines (MachineName, machineNameText)
 import Seal.Config.Paths (SealPaths (..), securityFilePath)
 import Seal.Core.Backends (Backends (..), newBackends)
 import Seal.Core.TurnEngine (TurnDeps (..), TurnAdapter (..), TurnOutcome (..), runSessionTurn)
@@ -82,7 +84,7 @@ import Seal.Handles.AskReply
   ( AskReplyStore, deliverNextAnswerResolvedAny
   , askHumanWithOptions, formatQuestionWithOptions, newApprovalCache )
 import Seal.Handles.Tab (tabIndexToChar, TabKind (..))
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
 import Seal.Session.Store
   ( SessionRuntime (..), defaultSessionSelection
   , newSession, resolveDefaultAgent, saveSessionMeta )
@@ -209,7 +211,13 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
   let agentLine = case smAgent active0 of
         Nothing -> ""
         Just aid -> "  agent: " <> agentDefIdText aid
-  ccSend caps ("session: " <> smProvider active0 <> " / " <> smModel active0 <> agentLine)
+      -- Appended AFTER the agent line, per the pinned order (T-STR-9): an
+      -- agent-free session still ends with the machine.
+      machineLine = case smMachine active0 of
+        Nothing -> ""
+        Just nm -> "  machine: " <> machineNameText nm
+  ccSend caps ("session: " <> smProvider active0 <> " / " <> smModel active0
+                 <> agentLine <> machineLine)
   let skillBackend     = bSkills backends
       agentDefBackend   = bAgentDefs backends
     -- The /bg runner: mint a fresh persisted session from the config
@@ -420,7 +428,9 @@ runCliTui paths rt repoReg agentReg pr sr registry chain backends tabsH autonomy
                   active <- readIORef (srActive sr)
                   tl <- snapshotTabs th
                   case lookupByRef tl (BoundSession (smId active)) of
-                    Just t  -> ccSend caps (renderTab t)
+                    Just t  -> do
+                      mM <- machineOfSession paths (smId active)
+                      ccSend caps (renderTab mM t)
                     Nothing -> ccSend caps "no current tab"
                 Right (Seal.Routing.Route.NewSession _args) -> do
                   -- /new is registered as a CommandSpec in the registry
@@ -451,7 +461,9 @@ handleTabCommand paths caps tabsH mint = \case
     tl <- snapshotTabs tabsH
     if tabCount tl == 0
       then ccSend caps "no tabs"
-      else mapM_ (ccSend caps . renderTab) (tlTabs tl)
+      else mapM_ (\t -> do
+                    mM <- machineOfSessionRef paths t
+                    ccSend caps (renderTab mM t)) (tlTabs tl)
   TabNewCmd _mKind -> do
     meta <- mint
     r <- insertTabH tabsH (BoundSession (smId meta)) KindProvider Nothing
@@ -481,10 +493,42 @@ handleTabCommand paths caps tabsH mint = \case
       Left e  -> ccSend caps ("rename failed: " <> e)
       Right _ -> ccSend caps ("tab " <> T.singleton (tabIndexToChar idx) <> " renamed to " <> name)
 -- | Render one tab as a single line: @<index>  <kind>  [label]@.
-renderTab :: Tab -> Text
-renderTab t =
+-- | Render one tab line: @\<index\>  \<Kind\>  \<label\>  \<machine\>@.
+--
+-- __The machine comes from the caller, not from 'Tab'.__ A 'Tab' is bound to a
+-- session id; resolving that to a machine needs the session's @session.json@,
+-- which is IO and belongs at the call site. Passing @Maybe MachineName@ keeps
+-- this function pure and total, and 'Nothing' is a real state (a legacy session
+-- with no recorded machine) that must render as "no machine column" rather than
+-- as either a blank column or a fabricated name.
+renderTab :: Maybe MachineName -> Tab -> Text
+renderTab mMachine t =
   T.singleton (tabIndexToChar (tIndex t)) <> "  " <> T.pack (show (tKind t))
     <> maybe "" ("  " <>) (tLabel t)
+    <> maybe "" (("  " <>) . machineNameText) mMachine
+
+-- | The machine a session was recorded on, read from its @session.json@.
+--
+-- 'Nothing' for a legacy session that recorded no machine AND for one whose id
+-- has no @session.json@ (a tab bound to a session that was deleted on disk).
+-- Both render as "no machine column", which is honest: the tab line should not
+-- assert a machine the session never recorded.
+--
+-- Fail-soft rather than propagating: this feeds a display line, and a read
+-- error must not take down @\/tab list@.
+machineOfSession :: SealPaths -> SessionId -> IO (Maybe MachineName)
+machineOfSession paths sid = do
+  eMeta <- try (readSessionMeta paths sid) :: IO (Either IOException (Maybe SessionMeta))
+  pure $ case eMeta of
+    Left _        -> Nothing
+    Right Nothing -> Nothing
+    Right (Just m) -> smMachine m
+
+-- | 'machineOfSession' for a 'Tab', whose session id lives in its ref.
+machineOfSessionRef :: SealPaths -> Tab -> IO (Maybe MachineName)
+machineOfSessionRef paths t = case tRef t of
+  BoundHarness _ -> pure Nothing
+  BoundSession sid -> machineOfSession paths sid
 
 -- | Resolve the untrusted-execution 'UntrustedIO' capability handle from the
 -- 'SecurityConfig' and the local workspace root.

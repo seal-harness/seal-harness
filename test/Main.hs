@@ -116,6 +116,8 @@ import qualified Seal.Config.MachinesSpec
 import qualified Seal.Tools.Exec.MachineSpec
 import qualified Seal.ISA.Ops.MachineSpec
 import qualified Seal.ISA.Ops.MachineSchemaSpec
+import qualified Seal.ISA.Ops.MachinePromptSpec
+import qualified Seal.Gateway.MachineDisplaySpec
 import qualified Seal.ISA.DispatchMachineSpec
 import qualified Seal.Config.SecuritySpec
 import qualified Seal.Config.SecurityAccessControlSpec
@@ -358,6 +360,8 @@ specs = do
   Seal.Tools.Exec.MachineSpec.spec
   Seal.ISA.Ops.MachineSpec.spec
   Seal.ISA.Ops.MachineSchemaSpec.spec
+  Seal.ISA.Ops.MachinePromptSpec.spec
+  Seal.Gateway.MachineDisplaySpec.spec
   Seal.ISA.DispatchMachineSpec.spec
   Seal.Config.MigrateSpec.spec
   Seal.Config.MachinesSpec.spec

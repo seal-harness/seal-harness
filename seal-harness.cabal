@@ -666,6 +666,8 @@ test-suite tests
          Seal.Tools.Exec.SelfKeyGuardSpec
          Seal.Session.MachineRoutingSpec
          Seal.ISA.Ops.MachineSchemaSpec
+         Seal.ISA.Ops.MachinePromptSpec
+         Seal.Gateway.MachineDisplaySpec
          Seal.Tools.Exec.RemoteSpec
           Seal.Tools.ArgsSpec
           Seal.Tools.Exec.CapabilityScopingFailSpec

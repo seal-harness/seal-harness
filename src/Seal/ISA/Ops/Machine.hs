@@ -29,6 +29,7 @@ module Seal.ISA.Ops.Machine
   , renderSelectableNames
   , machinePropertySchema
   , execErrorToMachineError
+  , buildMachinePrompt
   ) where
 
 import Data.Aeson
@@ -189,3 +190,61 @@ execErrorToMachineError name = \case
   ExecLocalNotPermittedForUntrusted -> MachineNotPermitted name
   ExecNotImplemented             -> MachineUnreachable name UrBootstrapFailed
   ExecNotImplementedReason _     -> MachineUnreachable name UrBootstrapFailed
+
+-- ---------------------------------------------------------------------------
+-- The TUI session-start picker (T-STR-8)
+-- ---------------------------------------------------------------------------
+
+-- | Render the session-start machine picker.
+--
+-- The frozen layout, with the §0.2 amendments applied — no platform labels
+-- (@machines.toml@ defines no @os@ field), and the annotation column carries
+-- only @(this machine)@ or @(default)@:
+--
+-- @
+--   execution machine [default: linux-builder]:
+--     1. local          (this machine)
+--     2. linux-builder  (default)
+--     3. mac-mini
+--   > _
+-- @
+--
+-- __Takes @[Selectable]@, not @[MachineName]@.__ @local@ is not a constructible
+-- 'MachineName' ('mkMachineName' refuses the reserved name), so a name list
+-- could not express it; and the @local@ row must be SUPPRESSED entirely when
+-- @allow_localhost = false@, which is a property of the selectable set. The same
+-- type is what @GET \/api\/machines@ returns, so the TUI and the web picker
+-- cannot disagree about whether @local@ is offered.
+--
+-- Numbering is positional over the rows actually rendered, so suppressing
+-- @local@ renumbers rather than leaving a gap.
+--
+-- The annotation column is padded to a fixed width so the parentheses align; an
+-- UNANNOTATED row carries no trailing whitespace at all — invisible padding
+-- would make exact-output assertions and terminal wrapping disagree.
+buildMachinePrompt :: [Selectable] -> Maybe MachineName -> Text
+buildMachinePrompt selectable mDefault = T.unlines (header : rows <> ["> "])
+  where
+    header = case mDefault of
+      Just d  -> "execution machine [default: " <> machineNameText d <> "]:"
+      Nothing -> "execution machine:"
+
+    rows =
+      [ "  " <> T.pack (show i) <> ". "
+          <> case annotation sel of
+               ""    -> name   -- no trailing padding on an unannotated row
+               ann   -> pad name <> ann
+      | (i, sel) <- zip [(1 :: Int) ..] selectable
+      , let name = selectableNameText sel
+      ]
+
+    -- Pad the name so the annotation starts at a fixed column. Widest name in
+    -- the set plus two spaces, so no annotation ever touches a name.
+    widest = maximum (0 : map (T.length . selectableNameText) selectable)
+    pad name = name <> T.replicate (widest - T.length name + 2) " "
+
+    annotation sel = case sel of
+      SelLocal              -> "(this machine)"
+      SelMachine nm
+        | Just nm == mDefault -> "(default)"
+        | otherwise           -> ""
