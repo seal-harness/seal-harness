@@ -1,5 +1,9 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+
+-- 'Use fewer imports' is suppressed: the split import is a @#if@ so the
+-- hardened build does not carry a symbol whose only user compiled out.
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
 module Seal.Gateway.SendSpec (spec) where
@@ -27,6 +31,9 @@ import Data.Text qualified as T
 import Data.Time (UTCTime (..), fromGregorian)
 import Network.HTTP.Client (defaultManagerSettings, newManager)
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
+#if defined(REMOTE_ONLY_UNTRUSTED)
+import System.Directory (doesDirectoryExist)
+#endif
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
@@ -1112,6 +1119,8 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           let zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
               meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing Nothing Nothing sampleTime sampleTime
           saveSessionMeta paths meta
+#if !defined(REMOTE_ONLY_UNTRUSTED)
+        -- Compiled out under the hardened flag: its only caller is gated.
         seedRepoAgentsMd :: SealPaths -> SessionId -> T.Text -> IO ()
         seedRepoAgentsMd paths sid marker = do
           -- Seed the session workdir (the same path mkSessionExec uses in
@@ -1122,8 +1131,24 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           createDirectoryIfMissing True repoDir
           writeFile (repoDir </> "agents.md")
             ("---\nkind: agents\n---\n" <> T.unpack marker <> "\n")
+#endif
 
     it "a session bound to the user default (zoe) uses the repo's agents.md after a clone" $ do
+#if defined(REMOTE_ONLY_UNTRUSTED)
+      -- The default build proves the repo's agents.md wins after a clone into
+      -- a LOCAL workdir. This build has no local untrusted executor, so the
+      -- assertion that matters here is the inverse: nothing created that
+      -- workdir, and the session stays on the user default.
+      withSystemTempDirectory "auto-bind-int" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        seedZoe paths
+        let sid = mkSid "20260817-151158-281"
+        seedSessionWithZoe paths sid
+        -- Nothing seeded the workdir, and nothing may create one.
+        doesDirectoryExist (sessionWorkdir paths sid) `shouldReturn` False
+#else
       withSystemTempDirectory "auto-bind-int" $ \tmp -> do
         let paths = SealPaths
               { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
@@ -1145,6 +1170,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           Just sys -> do
             sys `shouldSatisfy` T.isInfixOf "REPO_PROJECT_MARKER"
             sys `shouldNotSatisfy` T.isInfixOf "ZOE_SYSTEM_PROMPT_MARKER"
+#endif
 
     it "a session with no repo in its workdir stays on the user default (zoe)" $ do
       withSystemTempDirectory "auto-bind-norepo" $ \tmp -> do

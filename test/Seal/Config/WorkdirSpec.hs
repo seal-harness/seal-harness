@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Config.WorkdirSpec (spec) where
 
@@ -19,7 +20,7 @@ import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Session.Workdir
   ( WorkdirError (..), ensureSessionWorkdir, cleanupSessionWorkdir
   , remoteSessionWorkdirPath, ensureRemoteSessionWorkdir
-  , mkSessionUntrustedIO, mkSessionExec, seUIOEnv, seWorkdirFs
+  , mkSessionExec, mkSessionUntrustedIO, seUIOEnv, seWorkdirFs
   , seWorkspaceRoot )
 import Data.Text.IO qualified as TIO
 import Seal.SourceControl.Clone (stubCloneDeps)
@@ -28,8 +29,9 @@ import Seal.Tools.Exec.Remote (mkFakeRemoteRunner, mkFakeRemoteRunnerRecording)
 import Seal.Tools.Exec.Types
   ( SshConfig (..), ExecError (..), mkSshHost, mkSshUser, mkRemotePath )
 import Seal.Tools.Exec.UIO.Internal (uieUntrustedIO)
+-- Whole-module import (repo convention): the two CPP branches below each use a
+-- different subset, and an explicit list would be unused in one of them.
 import Seal.Tools.Exec.UntrustedIO
-  ( UntrustedIO (..), mkRemoteUntrustedIOStub )
 import Seal.Tools.Exec.WorkdirFs (WorkdirFs (..), WorkdirFsErr (..))
 
 spec :: Spec
@@ -167,6 +169,33 @@ spec = describe "Seal.Session.Workdir" $ do
   describe "mkSessionExec" $ do
 
     it "(a) local mode → local WorkdirFs + local seUIOEnv + local seWorkspaceRoot" $
+#if defined(REMOTE_ONLY_UNTRUSTED)
+      -- Inverted assertion under the hardened flag. The default build proves
+      -- a local session gets a real local handle; this build must prove the
+      -- opposite, because @allow_localhost = true@ is exactly the state the
+      -- flag refuses. Asserting the fail-closed shape here rather than
+      -- skipping keeps the property tested in the configuration where it
+      -- matters (done-when 15) and keeps 'mkSessionExec' used.
+      withSystemTempDirectory "seal-wd-exec" $ \tmp -> do
+        let paths  = mkPaths tmp
+            sid    = mkSystemSessionId "exec-local-001"
+        createDirectoryIfMissing True (spCache paths)
+        exec <- mkSessionExec paths defaultSecurityConfig sid stubCloneDeps
+                   (mkFakeRemoteRunner (Right "")) Nothing
+        -- No local workdir was created, and the root is the fail-closed one.
+        -- The root is the sentinel, and the handle is a stub: those are the
+        -- two things the flag guarantees. (A directory may still exist under
+        -- cache/workdirs — the path is computed before the executor is
+        -- selected, and asserting otherwise would pin an unrelated detail.)
+        unWorkspaceRoot (seWorkspaceRoot exec)
+          `shouldBe` "/nonexistent-workdir-fail-closed"
+        -- The handle is the fail-closed stub, so a read fails rather than
+        -- reaching the local FS.
+        let markerRp = either (error "fixture") id (mkRemotePath "marker.txt")
+            uio = uieUntrustedIO (seUIOEnv exec)
+        res <- uioReadFile uio markerRp 65536
+        res `shouldSatisfy` not . isRight
+#else
       withSystemTempDirectory "seal-wd-exec" $ \tmp -> do
         let paths  = mkPaths tmp
             sid    = mkSystemSessionId "exec-local-001"
@@ -191,6 +220,7 @@ spec = describe "Seal.Session.Workdir" $ do
         let uio = uieUntrustedIO (seUIOEnv exec)
         res <- uioReadFile uio markerRp 65536
         res `shouldSatisfy` isRight
+#endif
 
     it "(b) remote mode + configured → both remote-shaped, share scWorkspace, one runner" $
       withSystemTempDirectory "seal-wd-remote" $ \tmp -> do
@@ -273,6 +303,35 @@ spec = describe "Seal.Session.Workdir" $ do
         unWorkspaceRoot (seWorkspaceRoot exec) `shouldBe` "/nonexistent-workdir-fail-closed"
 
     it "(e) mkSessionUntrustedIO ≡ uieUntrustedIO . seUIOEnv <$> mkSessionExec (back-compat)" $
+#if defined(REMOTE_ONLY_UNTRUSTED)
+      -- The equivalence still holds; what changes is that both sides are the
+      -- fail-closed stub in this configuration. Asserting equality of the two
+      -- construction paths is the actual claim, and it is configuration-
+      -- independent — so it stays live rather than being skipped.
+      withSystemTempDirectory "seal-wd-exec-bc" $ \tmp -> do
+        let paths  = mkPaths tmp
+            sid    = mkSystemSessionId "exec-bc-001"
+        createDirectoryIfMissing True (spCache paths)
+        uio1 <- mkSessionUntrustedIO paths defaultSecurityConfig sid
+        exec <- mkSessionExec paths defaultSecurityConfig sid stubCloneDeps
+                   (mkFakeRemoteRunner (Right "")) Nothing
+        let uio2 = uieUntrustedIO (seUIOEnv exec)
+            rp   = either (error "fixture") id (mkRemotePath "marker.txt")
+        -- Both are the stub: both fail the read, identically.
+        (e1, e2) <- (,) <$> uioReadFile uio1 rp 65536
+                         <*> uioReadFile uio2 rp 65536
+        e1 `shouldSatisfy` not . isRight
+        e2 `shouldSatisfy` not . isRight
+        e1 `shouldBe` e2
+        -- Both sides fail with the SAME error, which is the equivalence being
+        -- asserted. Comparing against 'mkRemoteUntrustedIOStub' directly would
+        -- be wrong: 'mkSessionExec' fail-closes with a REASON (why local
+        -- execution is unavailable), which is more informative than the bare
+        -- stub and is what a caller sees.
+        e1 `shouldSatisfy` \case
+          Left (UeExec (ExecNotImplementedReason _)) -> True
+          _                                          -> False
+#else
       withSystemTempDirectory "seal-wd-exec-bc" $ \tmp -> do
         let paths  = mkPaths tmp
             sid    = mkSystemSessionId "exec-bc-001"
@@ -294,6 +353,7 @@ spec = describe "Seal.Session.Workdir" $ do
         -- And the stub would NOT read it (proves they are not the stub).
         rStub <- uioReadFile mkRemoteUntrustedIOStub markerRp 65536
         rStub `shouldSatisfy` \case Left _ -> True; Right _ -> False
+#endif
 
 -- ---------------------------------------------------------------------------
 -- Fixtures

@@ -79,7 +79,7 @@ import Seal.Logging.Global (globalLogIO)
 import Seal.Security.Crypto (sha256Hash)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Tools.Args (mkShellCommand)
-import Seal.Tools.Exec.Local (readBounded, withManagedProcess)
+import Seal.Tools.Exec.Proc (readBounded, withManagedProcess)
 import Seal.Tools.Exec.Remote (RemoteRunner (..), runRemoteShell)
 import Seal.Tools.Exec.Types
   ( ExecError (..), RemotePath, SshConfig (..), getRemotePath, getSshHost

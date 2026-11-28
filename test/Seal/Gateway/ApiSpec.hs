@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
@@ -6081,6 +6082,10 @@ spec = describe "Seal.Gateway.API" $ do
     -- one def. @mDefault@ sets the configured default_agent (Nothing = none).
     -- Returns an Application ready to query. The temp dir lives for the
     -- test's duration (manual cleanup at start).
+    --
+    -- Compiled out under the hardened flag, where the tests that use it are
+    -- gated (they need a local workdir this build has no executor for).
+#if !defined(REMOTE_ONLY_UNTRUSTED)
     let mkSessionAgentsApp :: Maybe T.Text -> IO (Application, T.Text)
         mkSessionAgentsApp mDefault = do
           -- Use a fixed temp dir under /tmp (cleaned at start; OS cleans /tmp).
@@ -6150,8 +6155,16 @@ spec = describe "Seal.Gateway.API" $ do
     , adMkSessionExec = Nothing
                 }
           pure (apiApp deps, sidTxt)
+#endif
 
     it "returns 200 + the unioned agent list (workdir ⊕ user) for a known session with .agents/" $ do
+#if defined(REMOTE_ONLY_UNTRUSTED)
+      -- This fixture seeds a LOCAL session workdir and expects repo agent defs
+      -- discovered from it. The hardened artifact has no local untrusted
+      -- executor, so the session's exec is fail-closed and no workdir exists.
+      -- The remote-workdir variant below is the one that applies there.
+      pendingWith "-f remote-only-untrusted has no local workdir"
+#else
       (app, sid) <- mkSessionAgentsApp Nothing
       (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sid, "agents"])
       status `shouldBe` 200
@@ -6162,8 +6175,12 @@ spec = describe "Seal.Gateway.API" $ do
           -- Workdir defs: my-repo--agents-md, my-repo--foo-agent. User def: user-agent.
           names `shouldContain` ["my-repo--agents-md", "my-repo--foo-agent", "user-agent"]
         _ -> expectationFailure "expected a JSON array"
+#endif
 
     it "marks agents-md as default when no user default_agent is configured" $ do
+#if defined(REMOTE_ONLY_UNTRUSTED)
+      pendingWith "-f remote-only-untrusted has no local workdir"
+#else
       (app, sid) <- mkSessionAgentsApp Nothing
       (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sid, "agents"])
       status `shouldBe` 200
@@ -6177,8 +6194,12 @@ spec = describe "Seal.Gateway.API" $ do
           -- Exactly one entry is marked default: my-repo--agents-md.
           filter snd defaults `shouldBe` [("my-repo--agents-md", True)]
         _ -> expectationFailure "expected a JSON array"
+#endif
 
     it "repo agents.md wins over a configured user default_agent (repo > user precedence)" $ do
+#if defined(REMOTE_ONLY_UNTRUSTED)
+      pendingWith "-f remote-only-untrusted has no local workdir"
+#else
       (app, sid) <- mkSessionAgentsApp (Just "user-agent")
       (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sid, "agents"])
       status `shouldBe` 200
@@ -6194,6 +6215,7 @@ spec = describe "Seal.Gateway.API" $ do
           filter snd defaults `shouldBe` [("my-repo--agents-md", True)]
           defaults `shouldNotSatisfy` (("user-agent", True) `elem`)
         _ -> expectationFailure "expected a JSON array"
+#endif
 
     it "returns 404 for an unknown session id" $ do
       app <- apiApp <$> mkDepsFor fakePaths

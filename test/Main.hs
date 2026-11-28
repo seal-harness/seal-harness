@@ -53,6 +53,7 @@ import qualified Seal.Tools.Exec.TypesSpec
 import qualified Seal.Tools.Exec.UntrustedSpec
 import qualified Seal.Tools.Exec.UntrustedIORemoteSpec
 import qualified Seal.Tools.Exec.LocalSpec
+import qualified Seal.Tools.Exec.HardenedBuildSpec
 import qualified Seal.Tools.Exec.LogRedactionSpec
 import qualified Seal.Tools.Exec.RemoteSpec
 import qualified Seal.Tools.Exec.FileExplorerSpec
@@ -291,6 +292,7 @@ specs = do
   Seal.Tools.Exec.UntrustedSpec.spec
   Seal.Tools.Exec.UntrustedIORemoteSpec.spec
   Seal.Tools.Exec.LocalSpec.spec
+  Seal.Tools.Exec.HardenedBuildSpec.spec
   Seal.Tools.Exec.LogRedactionSpec.spec
   Seal.Tools.Exec.RemoteSpec.spec
   Seal.Tools.ArgsSpec.spec

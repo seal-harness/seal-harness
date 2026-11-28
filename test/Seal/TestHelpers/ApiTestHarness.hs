@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 -- | The reusable gateway API integration test harness. Builds 'ApiDeps'
 -- wired for local OR remote mode, with a mock LLM provider (via
@@ -372,16 +373,31 @@ runApiTestOpts mRepoCfg opts body = do
   describe "remote mode" $ runApiTestRemote mRepoCfg opts body
 
 -- | Run the test body in local mode only.
+--
+-- __Under @-f remote-only-untrusted@ this reports a pending instead of
+-- running.__ The hardened build has no local untrusted executor by
+-- construction, so every fixture below that boots a local session would
+-- exercise the fail-closed reason rather than the behaviour it names — and a
+-- body asserting "the clone landed in the workdir" would fail against a blank
+-- workspace for a reason that is the whole point of the build. Gating here
+-- keeps the hardened suite green without weakening any assertion: the local
+-- arm is not part of that artifact.
 runApiTestLocal
   :: Maybe DummyRepoConfig
   -> ApiTestOptions
   -> (ApiTestEnv -> IO ())
   -> SpecWith ()
+#if defined(REMOTE_ONLY_UNTRUSTED)
+runApiTestLocal _ _ _ =
+  it "local (omitted from this build)" $
+    pendingWith "-f remote-only-untrusted omits the local untrusted executor"
+#else
 runApiTestLocal mRepoCfg opts body = it "local" $ do
   withSystemTempDirectory "seal-api-test" $ \tmp -> do
     mRepo <- traverse (setupDummyRepo tmp) mRepoCfg
     env <- buildTestEnv tmp False mRepo opts
     body env
+#endif
 
 -- | Run the test body in remote mode only. Guards with 'pendingWith' when
 -- sshd / ssh-keygen / ssh-keyscan are unavailable.

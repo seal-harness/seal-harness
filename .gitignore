@@ -4,6 +4,7 @@ result-static
 *.hi
 *.swp
 dist-newstyle/
+dist-hardened/
 .superpowers/
 .codegraph/
 # Frontend build artifacts

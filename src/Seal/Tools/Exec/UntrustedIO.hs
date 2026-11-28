@@ -76,7 +76,7 @@ import Seal.Tools.Args
   ( BinArg, BinName, SearchPattern, ShellCommand
   , mkShellCommand, textBinArg, textBinName, textSearchPattern, textShellCommand
   )
-import Seal.Tools.Exec.Local
+import Seal.Tools.Exec.Proc
   ( readBounded, withManagedProcess )
 import Seal.Tools.Exec.Remote
   ( RemoteRunner (..), runRemoteShell

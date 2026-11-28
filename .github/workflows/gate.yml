@@ -102,6 +102,20 @@ jobs:
       - name: Run Haskell tests with coverage
         run: nix develop --command cabal test --enable-coverage
 
+      # ───────────────────────────────────────────────────────────────────
+      # The hardened build (done-when 15: `make check` passes INCLUDING
+      # `-f remote-only-untrusted`). That flag removes the local untrusted
+      # executor from the artifact, and a module that merely *imported* it —
+      # for a process helper, not for local execution — made the whole
+      # library fail to link. Nothing caught it, because the default build is
+      # the only configuration CI built. This step is the catch.
+      # ───────────────────────────────────────────────────────────────────
+      - name: Hardened build — build and test with -f remote-only-untrusted
+        run: nix develop --command cabal build all -f remote-only-untrusted --builddir=dist-hardened
+
+      - name: Hardened build — test suite
+        run: nix develop --command cabal test -f remote-only-untrusted --builddir=dist-hardened
+
       - name: Run frontend tests
         run: nix develop --command bash -c 'cd frontend && npm ci --prefer-offline && npm test'
 

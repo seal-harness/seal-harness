@@ -338,6 +338,7 @@ library
         Seal.Logging.Global
         Seal.Audit.Log
         Seal.Audit.Predicate
+        Seal.Tools.Exec.Proc
     -- The local untrusted executor is omitted under -f remote-only-untrusted
     -- (the hardened build: untrusted execution can only run remotely).
     if !flag(remote-only-untrusted)
@@ -425,6 +426,10 @@ test-suite tests
     type: exitcode-stdio-1.0
     main-is: Main.hs
     ghc-options: -threaded -rtsopts
+    -- The hardened build omits Seal.Tools.Exec.Local, so the specs that drive
+    -- the local executor compile out with it (see LocalSpec).
+    if flag(remote-only-untrusted)
+        cpp-options: -DREMOTE_ONLY_UNTRUSTED
     build-depends:
         base
       , seal-harness
@@ -654,6 +659,7 @@ test-suite tests
          Seal.Web.UrlSafetySpec
          Seal.Config.WorkdirSpec
          Seal.Tools.Exec.LocalSpec
+         Seal.Tools.Exec.HardenedBuildSpec
          Seal.Tools.Exec.RemoteSpec
           Seal.Tools.ArgsSpec
           Seal.Tools.Exec.CapabilityScopingFailSpec
