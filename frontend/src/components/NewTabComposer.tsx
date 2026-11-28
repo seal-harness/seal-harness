@@ -221,6 +221,31 @@ export function NewTabComposer({
             </Row>
           )}
 
+          {/* Execution machine. Hidden at ≤1 selectable machine: with one
+              there is nothing to choose, and a single-item dropdown is
+              noise. `''` means "no choice", which the hook sends as an
+              absent field so the server applies the configured default. */}
+          {spec.showMachinePicker && (
+            <Row label="Execution Machine" htmlFor="provider-machine">
+              <select
+                id="provider-machine"
+                data-testid="machine-picker"
+                value={spec.machine ?? ''}
+                onChange={(e) => spec.setMachine(e.target.value === '' ? null : e.target.value)}
+                style={inputStyle}
+              >
+                <option value="">
+                  {spec.defaultMachine
+                    ? `default (${spec.defaultMachine})`
+                    : 'default'}
+                </option>
+                {spec.machines.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+            </Row>
+          )}
+
           {branchFrom && (
             <Row label="Branch From" htmlFor="provider-branch-from">
               <input

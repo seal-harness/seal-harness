@@ -8,15 +8,24 @@ import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 
+import Data.Map.Strict qualified as Map
 import Seal.Config.File (RuntimeConfig (..), loadRuntimeConfig)
+import Seal.Config.Machines
+  ( MachineFileConfig (..), MachinesConfig (..), loadMachinesConfig )
 import Seal.Config.Migrate (migrateSecurityConfig)
-import Seal.Config.Paths (SealPaths (..), configFilePath, securityFilePath)
+import Seal.Config.Paths
+  ( SealPaths (..), configFilePath, machinesFilePath, securityFilePath )
 import Seal.Config.Security
   ( SecurityConfig (..), UntrustedExecFileConfig (..), loadSecurityConfig )
 import Seal.Gateway.Config (PartialGatewayConfig (..))
 
+-- | Helper: check if a Maybe UntrustedExecFileConfig is Just.
+isJustUexec :: Maybe UntrustedExecFileConfig -> Bool
+isJustUexec = \case Just _ -> True; Nothing -> False
+
 spec :: Spec
 spec = describe "Seal.Config.Migrate" $ do
+  specExecutionMachines
 
   let makePaths tmp = SealPaths
         { spHome   = tmp
@@ -129,13 +138,12 @@ spec = describe "Seal.Config.Migrate" $ do
         createDirectoryIfMissing True (tmp </> "config")
         TIO.writeFile cfgPath $ T.unlines
           [ "[untrusted_execution]"
-          , "mode = \"local\""
+          , "allow_localhost = false"
           ]
         migrateSecurityConfig paths
         Right sec <- loadSecurityConfig secPath
-        case scUntrustedExec sec of
-          Just uefc -> uefcMode uefc `shouldBe` "local"
-          Nothing -> expectationFailure "expected untrusted_execution to be migrated"
+        -- The migrated flag is preserved, not re-derived from a mode string.
+        fmap uefcAllowLocalhost (scUntrustedExec sec) `shouldBe` Just False
 
   describe "[gateway] moves like the other boot-only sections" $ do
     it "moves the table into a new security.toml and strips it from config.toml" $
@@ -309,6 +317,191 @@ spec = describe "Seal.Config.Migrate" $ do
         TIO.readFile secPath `shouldReturn` "vault_recipient = \"age1keep\"\n"
         TIO.readFile cfgPath `shouldReturn` "[gateway]\nport = \"8443\"\n"
 
--- | Helper: check if a Maybe UntrustedExecFileConfig is Just.
-isJustUexec :: Maybe UntrustedExecFileConfig -> Bool
-isJustUexec = \case Just _ -> True; Nothing -> False
+-- ---------------------------------------------------------------------------
+-- WU-8: migrateExecutionMachines
+--
+-- The execution-machine migration, run from 'migrateSecurityConfig' so it needs
+-- no separate boot call. Every row of design §4, plus the failure row.
+-- ---------------------------------------------------------------------------
+
+specExecutionMachines :: Spec
+specExecutionMachines = describe "execution-machine migration (WU-8)" $ do
+
+  let mkPaths tmp = SealPaths
+        { spHome   = tmp
+        , spConfig = tmp </> "config"
+        , spState  = tmp </> "state"
+        , spKeys   = tmp </> "keys"
+        , spCache  = tmp </> "cache"
+        }
+
+  -- The legacy remote block, as an operator's security.toml would carry it.
+  let legacyRemoteBlock =
+        [ "[untrusted_execution]"
+        , "mode = \"remote\""
+        , "[untrusted_execution.remote]"
+        , "host = \"builder.example.com\""
+        , "user = \"seal\""
+        , "port = 2222"
+        , "identity = \"/home/seal/.ssh/id_ed25519\""
+        , "known_hosts = \"/home/seal/.ssh/known_hosts\""
+        , "workspace = \"/srv/seal/workspace\""
+        ]
+
+  -- T-MIG-1 + the pinning clause: the remote table becomes a machine named
+  -- "default", is named as the default, and the flag turns local execution off.
+  it "mode=remote + a complete remote block becomes machine \"default\" with allow_localhost = false" $
+    withSystemTempDirectory "seal-mig-em" $ \tmp -> do
+      let paths = mkPaths tmp
+          secPath = securityFilePath paths
+      createDirectoryIfMissing True (tmp </> "config")
+      TIO.writeFile secPath (T.unlines legacyRemoteBlock)
+      migrateSecurityConfig paths
+
+      Right mc <- loadMachinesConfig paths
+      Map.keys (mcMachines mc) `shouldBe` ["default"]
+      mcDefault mc `shouldBe` Just "default"
+      case Map.lookup "default" (mcMachines mc) of
+        Nothing -> expectationFailure "the migrated machine is missing"
+        Just m -> do
+          mfcHost m `shouldBe` Just "builder.example.com"
+          mfcUser m `shouldBe` Just "seal"
+          mfcPort m `shouldBe` Just 2222
+          mfcIdentity m `shouldBe` Just "/home/seal/.ssh/id_ed25519"
+          mfcWorkspace m `shouldBe` Just "/srv/seal/workspace"
+
+      Right sec <- loadSecurityConfig secPath
+      fmap uefcAllowLocalhost (scUntrustedExec sec) `shouldBe` Just False
+
+  -- "Drops known_hosts": the pin file is harness-owned now, so carrying the
+  -- operator's path across would be a field nothing reads.
+  it "drops the operator's known_hosts path rather than migrating it" $
+    withSystemTempDirectory "seal-mig-em" $ \tmp -> do
+      let paths = mkPaths tmp
+      createDirectoryIfMissing True (tmp </> "config")
+      TIO.writeFile (securityFilePath paths) (T.unlines legacyRemoteBlock)
+      migrateSecurityConfig paths
+      Right mc <- loadMachinesConfig paths
+      (mfcIdentity =<< Map.lookup "default" (mcMachines mc))
+        `shouldBe` Just "/home/seal/.ssh/id_ed25519"
+      -- and the migrated machines.toml must not mention it at all
+      raw <- TIO.readFile (machinesFilePath paths)
+      raw `shouldSatisfy` (not . T.isInfixOf "known_hosts")
+
+  -- DW-2: the old block is gone, not retained for rollback convenience.
+  it "removes the old [untrusted_execution] block on the migration boot" $
+    withSystemTempDirectory "seal-mig-em" $ \tmp -> do
+      let paths = mkPaths tmp
+          secPath = securityFilePath paths
+      createDirectoryIfMissing True (tmp </> "config")
+      TIO.writeFile secPath (T.unlines legacyRemoteBlock)
+      migrateSecurityConfig paths
+      raw <- TIO.readFile secPath
+      raw `shouldSatisfy` (not . T.isInfixOf "[untrusted_execution.remote]")
+      raw `shouldSatisfy` (not . T.isInfixOf "mode")
+
+  -- The incomplete-block row: the flag is set, but NO machine is written. A
+  -- half-populated machine would resolve to nothing useful, and writing it
+  -- would make `default` point at something unusable.
+  it "mode=remote with an incomplete block sets the flag and writes no machine" $
+    withSystemTempDirectory "seal-mig-em" $ \tmp -> do
+      let paths = mkPaths tmp
+          secPath = securityFilePath paths
+      createDirectoryIfMissing True (tmp </> "config")
+      TIO.writeFile secPath $ T.unlines
+        [ "[untrusted_execution]"
+        , "mode = \"remote\""
+        , ""
+        , "[untrusted_execution.remote]"
+        , "host = \"builder.example.com\""
+        ]
+      migrateSecurityConfig paths
+      Right sec <- loadSecurityConfig secPath
+      fmap uefcAllowLocalhost (scUntrustedExec sec) `shouldBe` Just False
+      -- No machine written: the file may not exist at all, or be empty.
+      eMc <- loadMachinesConfig paths
+      case eMc of
+        Right mc -> mcMachines mc `shouldBe` Map.empty
+        Left _   -> pure ()
+
+  -- Row 4.
+  it "mode=local becomes allow_localhost = true" $
+    withSystemTempDirectory "seal-mig-em" $ \tmp -> do
+      let paths = mkPaths tmp
+          secPath = securityFilePath paths
+      createDirectoryIfMissing True (tmp </> "config")
+      TIO.writeFile secPath $ T.unlines
+        [ "[untrusted_execution]"
+        , "mode = \"local\""
+        ]
+      migrateSecurityConfig paths
+      Right sec <- loadSecurityConfig secPath
+      fmap uefcAllowLocalhost (scUntrustedExec sec) `shouldBe` Just True
+
+  -- Row 5: an existing machines.toml wins. Only the strip happens, so an
+  -- operator who already wrote machines by hand keeps them.
+  it "an existing machines.toml wins; only the old block is stripped" $
+    withSystemTempDirectory "seal-mig-em" $ \tmp -> do
+      let paths = mkPaths tmp
+          secPath = securityFilePath paths
+      createDirectoryIfMissing True (tmp </> "config")
+      TIO.writeFile (machinesFilePath paths) $ T.unlines
+        [ "default = \"mine\""
+        , "[machines.mine]"
+        , "host = \"mine.example.com\""
+        , "user = \"me\""
+        , "workspace = \"/srv/mine\""
+        ]
+      TIO.writeFile secPath (T.unlines legacyRemoteBlock)
+      migrateSecurityConfig paths
+      Right mc <- loadMachinesConfig paths
+      Map.keys (mcMachines mc) `shouldBe` ["mine"]
+      mcDefault mc `shouldBe` Just "mine"
+      -- and security.toml still records that local execution is off
+      Right sec <- loadSecurityConfig secPath
+      fmap uefcAllowLocalhost (scUntrustedExec sec) `shouldBe` Just False
+
+  it "is idempotent: a second run changes nothing" $
+    withSystemTempDirectory "seal-mig-em" $ \tmp -> do
+      let paths = mkPaths tmp
+          secPath = securityFilePath paths
+          machPath = machinesFilePath paths
+      createDirectoryIfMissing True (tmp </> "config")
+      TIO.writeFile secPath (T.unlines legacyRemoteBlock)
+      migrateSecurityConfig paths
+      sec1 <- TIO.readFile secPath
+      mach1 <- TIO.readFile machPath
+      migrateSecurityConfig paths
+      sec2 <- TIO.readFile secPath
+      mach2 <- TIO.readFile machPath
+      sec2 `shouldBe` sec1
+      mach2 `shouldBe` mach1
+
+  -- T-MIG-5: a failed write must not leave the install permissive. The flag is
+  -- set first and the machine written second, so a failure after the flag write
+  -- leaves "allow_localhost = false, no machine" — which refuses to run anything
+  -- rather than silently running locally.
+  it "a failed machines.toml write does not downgrade the install" $
+    withSystemTempDirectory "seal-mig-em" $ \tmp -> do
+      let paths = mkPaths tmp
+          secPath = securityFilePath paths
+      createDirectoryIfMissing True (tmp </> "config")
+      TIO.writeFile secPath (T.unlines legacyRemoteBlock)
+      -- Make machines.toml unwritable by putting a DIRECTORY where the file goes.
+      createDirectoryIfMissing True (machinesFilePath paths </> "blocker")
+      migrateSecurityConfig paths
+      Right sec <- loadSecurityConfig secPath
+      fmap uefcAllowLocalhost (scUntrustedExec sec) `shouldBe` Just False
+
+  -- The absent-section row: no [untrusted_execution] at all ⇒ the flag is left
+  -- absent, which resolves to True. That is today's behaviour and must not be
+  -- written out (an explicit `true` would look like a decision the operator made).
+  it "no [untrusted_execution] section leaves allow_localhost absent" $
+    withSystemTempDirectory "seal-mig-em" $ \tmp -> do
+      let paths = mkPaths tmp
+          secPath = securityFilePath paths
+      createDirectoryIfMissing True (tmp </> "config")
+      TIO.writeFile secPath "vault_recipient = \"age1abc\"\n"
+      migrateSecurityConfig paths
+      Right sec <- loadSecurityConfig secPath
+      scUntrustedExec sec `shouldBe` Nothing

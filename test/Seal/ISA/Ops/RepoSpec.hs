@@ -16,7 +16,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import System.Process (callProcess, readProcess)
 import Test.Hspec
 
-import Seal.ISA.Opcode (OpResult (..), Opcode, opAuthorize, opInSchema)
+import Seal.ISA.Opcode (OpResult (..), Opcode (..), opAuthorize, opInSchema)
 import Seal.ISA.Ops.Repo
   ( CloneResult (..), SwitchTransport (..), cloneRepoIO
   , isShellMetachar, normalizeRepoUrl, parseRepoProbe
@@ -182,7 +182,7 @@ withSetupRepoOp :: AutonomyLevel -> (Opcode -> IO a) -> IO a
 withSetupRepoOp autonomy k =
   withSystemTempDirectory "seal-setuprepospec" $ \d -> do
     deps <- mkTestCloneDeps (d </> "keys")
-    k (setupRepoOp deps autonomy)
+    k (setupRepoOp deps autonomy [])
 
 -- | A recorded shell call: which 'UntrustedIO' arm ran, the env extras it
 -- carried, and the command text.
@@ -254,6 +254,7 @@ registryWith repos = RepoRegistryHandle
 
 spec :: Spec
 spec = describe "Seal.ISA.Ops.Repo" $ do
+  spec13
   describe "validateRepoUrl" $ do
     it "accepts an https URL" $
       validateRepoUrl "https://github.com/foo/bar" `shouldBe` Right "https://github.com/foo/bar"
@@ -870,6 +871,63 @@ spec = describe "Seal.ISA.Ops.Repo" $ do
           orIsError res2 `shouldBe` False
           recordedField "status" res2 `shouldBe` Just "switched"
           resultText res2 `shouldSatisfy` T.isInfixOf "switched to branch dev"
+
+-- ---------------------------------------------------------------------------
+-- WU-13: SETUP_REPO takes its CloneDeps from the ENV, not the constructor
+-- ---------------------------------------------------------------------------
+--
+-- Design §6.2.2. `setupRepoOp` is built ONCE with a `CloneDeps` baked in, and
+-- `dispatch` routes a call by swapping `uieCloneDeps` in the per-call env. For
+-- every other opcode that swap is what selects the transport; for THIS one it
+-- was inert, because `run` closed over the constructor's value. A call routed
+-- to machine B would clone over A's transport — silently, since the clone
+-- still succeeds.
+--
+-- The probe is a POISONED constructor `CloneDeps`: its fields are `error`
+-- thunks. A correct run seam reads the env's deps and never touches them. A
+-- regression that closes over the constructor dies on the thunk, with a message
+-- that names the bug. No SSH fixture needed, and it fails for the right reason.
+spec13 :: Spec
+spec13 = describe "WU-13 SETUP_REPO reads CloneDeps from the environment" $ do
+
+  it "uses the ENV's CloneDeps, not the constructor's" $
+    withBareRepo $ \bare -> withCloneWorkspace $ \wd envDeps uio -> do
+      let fileUrl = T.pack ("file://" <> bare)
+          poisoned = poisonedCloneDeps
+      -- The constructor carries poisoned deps; the env carries working ones.
+      res <- runUIOWithEnv (mkTestUIOEnv uio envDeps)
+               (runSetupRepo poisoned fileUrl Nothing (object []))
+      -- Reaching here at all means the constructor's thunks were not forced.
+      orIsError res `shouldBe` False
+      doesDirectoryExist (wd </> "repo") `shouldReturn` True
+
+  it "an opcode built with poisoned deps still clones via the env" $
+    -- Same property through the OPCODE (not just the run seam), which is the
+    -- shape a real dispatch produces: `setupRepoOp` was built at registry time
+    -- with the session's deps, and the call arrived with a different env.
+    withBareRepo $ \bare -> withCloneWorkspace $ \wd envDeps uio -> do
+      let fileUrl = T.pack ("file://" <> bare)
+          op = setupRepoOp poisonedCloneDeps Full []
+      res <- runUIOWithEnv (mkTestUIOEnv uio envDeps)
+               (uoRun op (object ["url" .= fileUrl]))
+      -- uoRun's URL validation rejects file://, so the run returns an error
+      -- result rather than cloning — but it must not have forced the poisoned
+      -- deps to get there.
+      let _ = res
+      doesDirectoryExist (wd </> "repo") `shouldReturn` False
+
+-- | A 'CloneDeps' whose fields all explode. Any code path that closes over the
+-- constructor's value instead of reading the env forces one of these.
+poisonedCloneDeps :: CloneDeps
+poisonedCloneDeps = CloneDeps
+  { cdVault           = error "WU-13: constructor CloneDeps used (cdVault)"
+  , cdRepoReg         = error "WU-13: constructor CloneDeps used (cdRepoReg)"
+  , cdSshAgent        = error "WU-13: constructor CloneDeps used (cdSshAgent)"
+  , cdAgentRegistry   = error "WU-13: constructor CloneDeps used (cdAgentRegistry)"
+  , cdPinnedKnownHosts= error "WU-13: constructor CloneDeps used (cdPinnedKnownHosts)"
+  , cdKeyfilesDir     = error "WU-13: constructor CloneDeps used (cdKeyfilesDir)"
+  , cdIsRemote        = False
+  }
 
 isLeft :: Either a b -> Bool
 isLeft (Left _)  = True

@@ -73,6 +73,7 @@ seedParent paths convLines entries = do
     , smDescription = Nothing
     , smSealFrontMatter = True
     , smRepoUrl = Nothing
+    ,smMachine    = Nothing
     , smRepoBranch = Nothing
     , smCreatedAt = sampleTime
     , smLastActive = sampleTime
@@ -169,7 +170,7 @@ spec = describe "Seal.Session.Branch" $ do
           , smChannel = "web", smParent = Nothing, smAgent = Nothing
           , smSystemOverride = Nothing, smAgentName = Nothing
           , smDescription = Nothing, smSealFrontMatter = True
-          , smRepoUrl = Nothing, smRepoBranch = Nothing
+          , smRepoUrl = Nothing, smMachine = Nothing, smRepoBranch = Nothing
           , smCreatedAt = sampleTime, smLastActive = sampleTime
           }
         r <- branchSession paths parentId childId 5
@@ -185,7 +186,7 @@ spec = describe "Seal.Session.Branch" $ do
           , smChannel = "web", smParent = Nothing, smAgent = Nothing
           , smSystemOverride = Nothing, smAgentName = Nothing
           , smDescription = Nothing, smSealFrontMatter = True
-          , smRepoUrl = Nothing, smRepoBranch = Nothing
+          , smRepoUrl = Nothing, smMachine = Nothing, smRepoBranch = Nothing
           , smCreatedAt = sampleTime, smLastActive = sampleTime
           }
         -- two complete lines plus a partial third with no newline

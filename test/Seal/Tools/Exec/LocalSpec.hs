@@ -1,6 +1,10 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Tools.Exec.LocalSpec (spec) where
 
+import Test.Hspec
+
+#if !defined(REMOTE_ONLY_UNTRUSTED)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, cancel, waitCatch)
 import Data.Either (isRight)
@@ -8,7 +12,6 @@ import Data.Text qualified as T
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import System.Directory (doesFileExist, removeFile)
 import System.IO.Temp (withSystemTempDirectory)
-import Test.Hspec
 
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Tools.Args
@@ -16,7 +19,18 @@ import Seal.Tools.Args
 import Seal.Tools.Exec.Local (mkLocalExecHandle)
 import Seal.Tools.Exec.Types (ExecError (..), LocalExecHandle (..))
 import Seal.Tools.Exec.UntrustedIO (UntrustedIO (..), mkLocalUntrustedIO)
+#endif
 
+#if defined(REMOTE_ONLY_UNTRUSTED)
+-- The hardened build omits 'Seal.Tools.Exec.Local' from exposed-modules, so
+-- there is no local executor to drive. The specs below assert real subprocess
+-- behaviour and cannot be made vacuous, so they compile out and this suite
+-- reports the omission instead of silently passing nothing.
+spec :: Spec
+spec = describe "Seal.Tools.Exec.Local (omitted from this build)" $
+  it "-f remote-only-untrusted omits the local executor" $
+    pendingWith "local executor absent from the hardened build"
+#else
 spec :: Spec
 spec = describe "Seal.Tools.Exec.Local" $ do
   let wsRoot = WorkspaceRoot "."
@@ -241,3 +255,5 @@ threadDelay' = threadDelay
 when' :: Bool -> IO () -> IO ()
 when' True a = a
 when' False _ = pure ()
+
+#endif

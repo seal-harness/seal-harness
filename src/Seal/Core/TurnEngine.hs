@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 -- | The unified turn engine — the single implementation of the ISA registry
 -- builder, the child registry builder, the system-prompt resolver, and the
 -- turn body ('runSessionTurn').
@@ -34,6 +35,7 @@ module Seal.Core.TurnEngine
 import Control.Exception (SomeException, bracket, catch, throwIO)
 import Control.Monad (unless, void, when)
 import Data.Aeson (Value (..), toJSON)
+import Data.Aeson qualified as Aeson
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Set (member, fromList)
@@ -72,8 +74,11 @@ import Seal.Config.Paths
    sessionDir,
    sessionLogPath, sessionRequestsPath, sessionResponsesPath, sessionWorkdir)
 import qualified Katip as K2 (Severity (..), ls)
+import Seal.Config.Machines
+  ( MachineTarget (..), Selectable (..), machineNameText
+  , resolveRegistryForSecurity )
 import Seal.Config.Security
-  ( SecurityConfig, loadSecurityConfig, untrustedExecConfigFromSecurity )
+  ( SecurityConfig, loadSecurityConfig )
 import Seal.Logging.Global (globalLogIO)
 import Seal.Core.Backends (Backends (..))
 import Seal.Core.MessageSource (MessageSource)
@@ -96,7 +101,7 @@ import Seal.Harness.Id (newHarnessId, harnessIdToText)
 import Seal.Harness.Registry (HarnessRegistry)
 import Seal.Harness.Tmux (TmuxRunner, mkTmuxIdent)
 import Seal.ISA.Dispatch
-  (DispatchError (..), dispatch, recordSetupRepoResult,
+  (DispatchError (..), dispatchOn, recordSetupRepoResult,
    recordSkillLoadResult)
 import Seal.ISA.Ops.Agent
   ( AgentStartGate (..), AgentStartWiring (..), AgentWorkerBuilder
@@ -126,7 +131,8 @@ import Seal.Transcript.TurnFailure
   , renderForModel, renderForUser )
 import Seal.Logging.Logger (SealLogger)
 import Seal.Providers.Class
-  (ContentBlock (..), Message (..), Role (..), SomeProvider, ToolChoice (..))
+  (ContentBlock (..), Message (..), pattern Message, Role (..), SomeProvider
+  , ToolChoice (..))
 import Seal.Transcript.Entries
   ( EntryKind (..), EntryRecord (..), EnvelopeDelta (..) )
 import Seal.Transcript.ConvIndex (convLineCount, ensureIndex, readConvLines)
@@ -161,7 +167,8 @@ import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
 import Seal.Tools.Exec.HostKeyAdoption (HostKeyAdoption)
 import Seal.Tools.Exec.Remote (RemoteRunner, mkRealRemoteRunner)
-import Seal.Tools.Exec.Untrusted (UntrustedExecConfig (..), UntrustedExecMode (..))
+import Seal.Tools.Exec.Machine (resolveRegistryTarget, rtSelectable, rtSession)
+import Seal.Tools.Exec.UIO.Internal (UIOEnv (..))
 import Seal.Tools.Exec.WorkdirFs
   ( WorkdirFs (..), snapIsDirectoryAt, snapTopDirs )
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
@@ -271,6 +278,7 @@ buildSessionRegistry
   -> Clone.CloneDeps
   -> Backends
   -> WorkspaceRoot
+  -> [Selectable]
   -> SessionId
   -> Int
   -> Policy.AutonomyLevel
@@ -283,7 +291,7 @@ buildSessionRegistry
   -> ChannelCaps
   -> Bool
   -> ISA.Registry
-buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling autonomy webCfg
+buildSessionRegistry rt paths cloneDeps backends wsRoot selectable sid operatorCeiling autonomy webCfg
                      startWiring handoffDeps harnessReg tmuxRunner httpManager caps onDemand =
   reg
   where
@@ -314,14 +322,14 @@ buildSessionRegistry rt paths cloneDeps backends wsRoot sid operatorCeiling auto
       , agentStopOp (bRuntime backends)
       , agentInterruptOp (bRuntime backends)
      , agentManageOp startWiring handoffDeps
-      , searchFilesOp wsRoot securityPolicy operatorCeiling
-      , fileReadOp wsRoot operatorCeiling
-      , fileWriteOp wsRoot operatorCeiling
-      , filePatchOp wsRoot
-      , shellExecOp wsRoot securityPolicy
-      , setupRepoOp cloneDeps autonomy
-      , binExecOp wsRoot securityPolicy binAllowList
-      , processManageOp wsRoot securityPolicy
+      , searchFilesOp wsRoot securityPolicy operatorCeiling selectable
+      , fileReadOp wsRoot operatorCeiling selectable
+      , fileWriteOp wsRoot operatorCeiling selectable
+      , filePatchOp wsRoot selectable
+      , shellExecOp wsRoot securityPolicy selectable
+      , setupRepoOp cloneDeps autonomy selectable
+      , binExecOp wsRoot securityPolicy binAllowList selectable
+      , processManageOp wsRoot securityPolicy selectable
      , browserManageOp securityPolicy
       , webFetchOp webFetchCfg
       , webSearchOp webSearchCfg
@@ -691,30 +699,41 @@ metaCacheEnvFor
   :: TurnDeps -> SealPaths -> Either Text SecurityConfig
   -> IO (Maybe MetaCacheEnv)
 metaCacheEnvFor td paths eSecCfg = do
-  let mEnv = case (tdIsRemote td, eSecCfg) of
-        (True, Right secCfg) ->
-          case untrustedExecConfigFromSecurity secCfg of
-            Just (UntrustedExecConfig UemRemote (Just sshCfg)) -> Just MetaCacheEnv
-              { mceRunner       = fromMaybe mkRealRemoteRunner (tdRemoteRunner td)
-              , mceSshCfg       = sshCfg
-              , mceCacheRoot    = agentMetaCacheDir paths
-              , mceRunTransfer  = rsyncTransferIO sshCfg
-              }
-            _ -> Nothing
-        _ -> Nothing
+  eReg <- case eSecCfg of
+    Left _   -> pure (Left "security config load failed")
+    Right sc -> resolveRegistryForSecurity paths sc
+  let mEnv = case (tdIsRemote td, eReg) of
+        (True, Right reg) -> remoteEnvOf reg
+        _                 -> Nothing
       reason = case mEnv of
         Just _  -> "Just (snapshot routing active)"
-        Nothing -> case (tdIsRemote td, eSecCfg) of
+        Nothing -> case (tdIsRemote td, eReg) of
           (False, _) -> "Nothing (local mode)"
-          (_, Left err) ->
-            "Nothing (security config load failed: " ++ T.unpack err ++ ")"
-          (_, Right secCfg) ->
-            case untrustedExecConfigFromSecurity secCfg of
-              Just uec | uecMode uec == UemRemote ->
-                "Nothing (mode=remote but ssh config missing/incomplete)"
-              _ -> "Nothing (mode is not remote)"
+          (_, Left err) -> "Nothing (" ++ T.unpack err ++ ")"
+          (_, Right reg) -> case resolveRegistryTarget reg Nothing of
+            Left _ -> "Nothing (the session's execution machine is unavailable)"
+            Right (_, MtLocal) ->
+              "Nothing (the session's execution machine is local, so the crawl "
+                ++ "has no SSH round trips to amortize)"
+            Right (name, MtSsh _) ->
+              "Nothing (" ++ T.unpack (machineNameText name)
+                ++ " is remote but the snapshot env could not be built)"
   globalLogIO K2.DebugS (K2.ls (T.pack ("[agent-meta] env=" <> reason)))
   pure mEnv
+  where
+    -- The cache needs a *remote* machine's coordinates and its transport.
+    -- Before this feature a single security.toml block supplied both; now the
+    -- session's machine in machines.toml does. 'MtLocal' has no coordinates
+    -- and needs none — a local crawl has no round trips to amortize, which is
+    -- why this arm stays 'Nothing'.
+    remoteEnvOf reg = case resolveRegistryTarget reg Nothing of
+      Right (_, MtSsh sshCfg) -> Just MetaCacheEnv
+        { mceRunner      = fromMaybe mkRealRemoteRunner (tdRemoteRunner td)
+        , mceSshCfg      = sshCfg
+        , mceCacheRoot   = agentMetaCacheDir paths
+        , mceRunTransfer = rsyncTransferIO sshCfg
+        }
+      _ -> Nothing
 
 runTurnBody
   :: TurnDeps -> TurnAdapter -> SessionMeta -> Maybe MessageSource -> Text
@@ -728,7 +747,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
   let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
   cloneDeps <- mkCloneDepsTurn td
   exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
-                 (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
+                 (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt (smMachine meta))
                  eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
   let wfs    = seWorkdirFs exec
       wsRoot = seWorkspaceRoot exec
@@ -786,7 +805,7 @@ runTurnBody td adapter meta mSrc t sid paths prov model stopFanoutDoneRef tHandl
       -- keeps the web frontend's status indicator correct while the turn
       -- is waiting for human input (not stuck on "thinking").
       askAwareCaps = wrapCapsForAskStatus (tdBroker td) sid (taCaps adapter)
-      isaReg = buildSessionRegistry (tdVault td) paths cloneDeps sessionBackends wsRoot sid operatorCeiling
+      isaReg = buildSessionRegistry (tdVault td) paths cloneDeps sessionBackends wsRoot (rtSelectable (uieMachines uioEnv)) sid operatorCeiling
                  (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring handoffDeps
                  (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) askAwareCaps onDemand
   itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
@@ -1201,8 +1220,11 @@ sessionSkillBackend td sid = do
   let paths = tdPaths td
   eSecCfg <- loadSecurityConfig (securityFilePath paths)
   cloneDeps <- mkCloneDepsTurn td
+  -- The session's recorded machine, so the scan runs against the machine the
+  -- session is actually on rather than the current default.
+  mMeta <- loadSessionMeta paths sid
   exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
-                 (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
+                 (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt (mMeta >>= smMachine))
                  eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
   let wfs = seWorkdirFs exec
       wsRoot = seWorkspaceRoot exec
@@ -1239,7 +1261,7 @@ callDispatcher td caps sid channelLabel callOpName val = do
     let operatorCeiling = either (const defaultRetrievalMaxScanBytes) retrievalMaxScanBytes eCfg
     cloneDeps <- mkCloneDepsTurn td
     exec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec cloneDeps))
-                   (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt)
+                   (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) paths sc sid cloneDeps runner mAdopt (mMeta >>= smMachine))
                    eSecCfg sid cloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
     let wfs = seWorkdirFs exec
         wsRoot = seWorkspaceRoot exec
@@ -1259,19 +1281,29 @@ callDispatcher td caps sid channelLabel callOpName val = do
           { ahdWorker = buildWorker td sessionBackends sid [sid] appEnv eCfg operatorCeiling channelLabel 0 True
           , ahdEnsureTab = Just (ensureTabForSession (tdTabsHandle td) KindAi)
           }
-        isaReg = buildSessionRegistry (tdVault td) (tdPaths td) cloneDeps sessionBackends wsRoot sid operatorCeiling
+        isaReg = buildSessionRegistry (tdVault td) (tdPaths td) cloneDeps sessionBackends wsRoot (rtSelectable (uieMachines uioEnv)) sid operatorCeiling
                    (tdAutonomy td) (either (const Nothing) rcWeb eCfg) startWiring handoffDeps
                    (tdHarnessReg td) (tdTmuxRunner td) (tdHttpManager td) caps onDemand
     itwSetSecretOps tHandle (ISA.secretOpNames isaReg)
     callAbortFlag <- lookupOrCreateAbortFlag (tdAbortReg td) sid
-    res <- runApp appEnv (dispatch isaReg tHandle localBackend uioEnv (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
+    (res, mRanOn) <- runApp appEnv (dispatchOn isaReg tHandle localBackend uioEnv (either (const defaultToolTimeoutConfig) toolTimeoutConfig eCfg) callAbortFlag callOpName val)
     case res of
       Right r -> do
         let opNm = case callOpName of OpName n -> n
         if opNm == "SETUP_REPO"
           then do
             recordSetupRepoResult tHandle callOpName val r (Just channelLabel)
-            unless (orIsError r) $ do
+            -- The post-clone hooks act on the SESSION's workdir: they
+            -- invalidate its discovery scan, re-scan it, and re-bind the
+            -- repo's agents.md from the defs found there. If the clone ran on
+            -- ANOTHER machine, none of that applies — that machine's workdir
+            -- changed, and this session's did not. Running them anyway would
+            -- drop a warm cache for no reason and re-bind from defs on the
+            -- wrong filesystem (design §6.6).
+            let ranOnSessionMachine = case mRanOn of
+                  Nothing -> True   -- no machine reported: behave as before
+                  Just nm -> nm == rtSession (uieMachines uioEnv)
+            unless (orIsError r || not ranOnSessionMachine) $ do
               -- The clone changed the workdir's structure: drop the cached
               -- discovery scan, re-scan fresh, and bind from the fresh defs.
               -- Persist the cloned repo URL *and* the branch (or tag) to
@@ -1326,12 +1358,53 @@ callDispatcher td caps sid channelLabel callOpName val = do
                 let model = maybe (ModelId "") (ModelId . smModel) mMetaAfterBind
                 recordPreamble tHandle model mSystem isaReg
             broadcastAgentDefsChanged (tdBroker td)
+            -- Tell the model where its relative paths now resolve. A clone on
+            -- another machine puts the checkout on THAT machine's filesystem; a
+            -- follow-up FILE_READ of a relative path uses the SESSION's machine,
+            -- so the file will not be there. Saying so is the difference between
+            -- a model that adapts (names `machine` again) and one that thrashes.
+            -- Silent when the clone was local to the session, where the default
+            -- already does the right thing.
+            unless ranOnSessionMachine $
+              appendModelNote tHandle $
+                "Note: that clone ran on execution machine \""
+                  <> maybe "" machineNameText mRanOn <> "\". Follow-up relative "
+                  <> "paths resolve on this session's machine (\""
+                  <> machineNameText (rtSession (uieMachines uioEnv))
+                  <> "\"), where the checkout is NOT present. Name machine = "
+                  <> "\"" <> maybe "" machineNameText mRanOn
+                  <> "\" again on any call that needs those files."
           else recordSkillLoadResult tHandle callOpName val r (Just channelLabel)
         case mMeta of
           Just meta -> broadcastNewEntries (tdBroker td) paths sid (smModel meta) (smCreatedAt meta)
           Nothing   -> pure ()
       Left _  -> pure ()
     pure res
+
+-- | Record a harness note the model will see on its next turn.
+--
+-- An Assistant message with no tool call: the loop's next request includes the
+-- conversation, so this reaches the model exactly once and is visible in the
+-- transcript as a plain line. Used for the cross-machine SETUP_REPO divergence
+-- note — the model must learn that its clone landed elsewhere, and a note in
+-- the conversation is the only channel that is both model-visible and durable.
+appendModelNote :: IndexedTranscriptHandle -> Text -> IO ()
+appendModelNote tHandle note = do
+  now <- getCurrentTime
+  let entry = EntryRecord
+        { erId = ""
+        , erTimestamp = now
+        , erKind = EKHarness
+        , erConvLen = 1
+        , erEnvelope = Nothing
+        , erUsage = Nothing
+        , erStop = Nothing
+        , erDurationMs = Nothing
+        , erHarness = Nothing
+        , erCorrelation = Nothing
+        , erMeta = Map.fromList [("note", Aeson.String "machine-divergence")]
+        }
+  itwRecordAndAck tHandle (IndexedTranscriptWrite [Message Assistant [CbText note]] entry)
 
 -- | Build the 'AgentStartWiring' for a unified turn (design §5.3 — replaces
 -- @webStartWiring@, @channelStartWiring@, @cliStartWiring@). The
@@ -1435,8 +1508,13 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
         let execSid = case mAnchor of
               Just _  -> parentSid
               Nothing -> childSid
+        -- The exec being reused (or built) belongs to `execSid`, so it is that
+        -- session's recorded machine that must be honoured: anchoring to the
+        -- parent means running where the parent runs, and a fresh child inherits
+        -- the parent's choice because it starts life in the parent's world.
+        execMeta <- loadSessionMeta (tdPaths td) execSid
         seUIOEnv <$> either (\_ _ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
-                            (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) (tdPaths td) sc execSid childCloneDeps runner mAdopt)
+                            (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) (tdPaths td) sc execSid childCloneDeps runner mAdopt (execMeta >>= smMachine))
                             eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
     , dwdParentWorkdir = Just (sessionWorkdir (tdPaths td) parentSid)
     , dwdAutonomy = tdAutonomy td
@@ -1491,6 +1569,7 @@ buildWorker td sessionBackends parentSid parentLineage appEnv eCfg operatorCeili
       , smDescription = Nothing
       , smSealFrontMatter = True
       , smRepoUrl = Nothing
+      ,smMachine    = Nothing
       , smRepoBranch = Nothing
       , smCreatedAt = tnow, smLastActive = tnow }
 
@@ -1513,9 +1592,12 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
   childCloneDeps <- mkCloneDepsTurn td
   eSecCfg <- loadSecurityConfig (securityFilePath (tdPaths td))
   childExec <- either (\_ _ _ _ _ -> pure (failClosedSessionExec childCloneDeps))
-                      (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner mAdopt)
+                      (\sc _sid _cd runner mAdopt -> cachedSessionExec (tdExecCache td) (tdPaths td) sc childSid childCloneDeps runner mAdopt Nothing)
                       eSecCfg childSid childCloneDeps (fromMaybe mkRealRemoteRunner (tdRemoteRunner td)) (tdHostKeyAdoption td)
   let childWsRoot = seWorkspaceRoot childExec
+      -- The child's own selectable set: its schema must name the machines
+      -- THAT session can reach, not the parent's.
+      selectable = rtSelectable (uieMachines (seUIOEnv childExec))
       childWebCfg = either (const Nothing) rcWeb eCfg
       (_, _, _, orchEnabled) =
         resolveDelegationConfig (fromFileConfig (either (const Nothing) rcDelegation eCfg))
@@ -1537,14 +1619,14 @@ buildChildRegistryAdapter lineage td sessionBackends eCfg operatorCeiling adapte
         , skillDeleteOp (bSkills sessionBackends)
         , agentDefReadOp (bAgentDefs sessionBackends)
         , agentDefListOp (bAgentDefs sessionBackends)
-        , searchFilesOp childWsRoot securityPolicy operatorCeiling
-        , fileReadOp childWsRoot operatorCeiling
-        , fileWriteOp childWsRoot operatorCeiling
-        , filePatchOp childWsRoot
-        , shellExecOp childWsRoot securityPolicy
-        , setupRepoOp childCloneDeps (tdAutonomy td)
-        , binExecOp childWsRoot securityPolicy Nothing
-        , processManageOp childWsRoot securityPolicy
+        , searchFilesOp childWsRoot securityPolicy operatorCeiling selectable
+        , fileReadOp childWsRoot operatorCeiling selectable
+        , fileWriteOp childWsRoot operatorCeiling selectable
+        , filePatchOp childWsRoot selectable
+        , shellExecOp childWsRoot securityPolicy selectable
+        , setupRepoOp childCloneDeps (tdAutonomy td) selectable
+        , binExecOp childWsRoot securityPolicy Nothing selectable
+        , processManageOp childWsRoot securityPolicy selectable
         , webFetchOp childWebFetchCfg
         , webSearchOp childWebSearchCfg
        , sessionListOp (tdPaths td)

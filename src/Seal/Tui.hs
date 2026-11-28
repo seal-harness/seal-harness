@@ -26,6 +26,7 @@ import Seal.Providers.OllamaReadinessProbe
   ( mkOllamaProbes, defaultProbesConfig, oprReadiness )
 import Seal.Config.Migrate (migrateSecurityConfig)
 import Seal.Config.Templates (ensureConfigTemplates)
+import Seal.Config.Machines (resolveRegistryForSecurity)
 import Seal.Config.Security (SecurityConfig (..), defaultSecurityConfig, loadSecurityConfig)
 import Seal.Config.Paths
   ( SealPaths (..)
@@ -158,7 +159,7 @@ runTui autonomy logger = do
   -- Every launch starts a fresh session (resume is a follow-on milestone).
   -- The default agent (if set in config) is bound here: its id persists in
   -- smAgent and its non-empty provider/model override the config defaults.
-  sessionMeta <- initSession paths cfg (bAgentDefs backends)
+  sessionMeta <- initSession paths cfg (bAgentDefs backends) Nothing
   activeRef   <- newIORef sessionMeta
   let sr = SessionRuntime
              { srPaths      = paths
@@ -198,6 +199,8 @@ runTui autonomy logger = do
             pure oldSid
         , ndSetupRepo = Nothing
         , ndRepoReg = Just repoReg
+        , ndMachines =
+            resolveRegistryForSecurity paths secCfg
         }
   let coreDeps = CoreCommandDeps
         { ccdVault       = rt

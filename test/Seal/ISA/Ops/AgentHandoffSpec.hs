@@ -280,6 +280,7 @@ callerMetaWithRepo mRepo = SessionMeta
   , smDescription = Nothing
   , smSealFrontMatter = True
   , smRepoUrl = mRepo
+  ,smMachine    = Nothing
   , smRepoBranch = Nothing
   , smCreatedAt = t
   , smLastActive = t

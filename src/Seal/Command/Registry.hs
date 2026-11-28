@@ -32,6 +32,7 @@ import Data.Either (fromRight)
 import Seal.Config.File (RuntimeConfig, defaultRuntimeConfig, loadRuntimeConfig)
 import Data.Text (Text)
 import Seal.Session.Meta (SessionMeta)
+import Seal.Config.Machines (MachineName)
 import Seal.Session.Store (SessionRuntime, initSessionMeta)
 import Seal.SourceControl.Registry (RepoRegistryHandle)
 import Seal.Tabs (TabsHandle)
@@ -117,7 +118,7 @@ coreCommandSpecs d =
   , modelCommandSpec (ccdProvider d) (ccdSession d) (ccdModelWriter d)
   , agentCommandSpec (ccdAgentDefs d) (ccdCfgPath d)
   , tabCommandSpec (ccdPaths d) (ccdTabs d) (ccdTabCloseNotifier d)
-      (mintTabSession (ccdPaths d) (loadRuntimeConfig (ccdCfgPath d)) (ccdAgentDefs d))
+      (mintTabSession (ccdPaths d) (loadRuntimeConfig (ccdCfgPath d)) (ccdAgentDefs d) Nothing)
   , stopCommandSpec (ccdAbortReg d) (ccdRunRecords d) (ccdSession d) (ccdStopWriter d)
   , terseGrammarSpec
   ]
@@ -132,7 +133,9 @@ coreCommandSpecs d =
 -- Provider/model come from the runtime config's defaults (via
 -- 'initSessionMeta'); a config that fails to load falls back to
 -- 'defaultRuntimeConfig', matching every other config read in the harness.
-mintTabSession :: SealPaths -> IO (Either Text RuntimeConfig) -> AgentDefBackend -> IO SessionMeta
-mintTabSession paths loadCfg backend = do
+mintTabSession
+  :: SealPaths -> IO (Either Text RuntimeConfig) -> AgentDefBackend
+  -> Maybe MachineName -> IO SessionMeta
+mintTabSession paths loadCfg backend mMachine = do
   eCfg <- loadCfg
-  initSessionMeta paths (fromRight defaultRuntimeConfig eCfg) backend
+  initSessionMeta paths (fromRight defaultRuntimeConfig eCfg) backend mMachine

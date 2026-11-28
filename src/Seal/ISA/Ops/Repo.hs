@@ -74,6 +74,8 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 
+import Seal.Config.Machines (Selectable)
+import Seal.ISA.Ops.Machine (machinePropertySchema)
 import Seal.Core.Types (OpName (..))
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
@@ -87,6 +89,7 @@ import Seal.Tools.Args
   ( BranchName, branchNameText, mkBranchName, mkShellCommand, ShellCommand )
 import Seal.Tools.Exec.UIO
   ( UIO, renderUntrustedErr, uioLiftIO, uioUntrustedIO )
+import Seal.Tools.Exec.UIOGit (uioCdCloneDeps)
 import Seal.Tools.Exec.UntrustedIO (UntrustedIO)
 import Seal.Tools.Exec.UntrustedIO qualified as UIORec
   (UntrustedIO (uioShellExec, uioShellExecEnv, uioShellExecGitEnv))
@@ -104,11 +107,11 @@ import Seal.Tools.Exec.Types (RemotePath, mkRemotePath)
 -- one — and the delegation worker (which has no workspace root in scope but
 -- does have the child's 'UIOEnv') can build this op for a handoff session's
 -- pre-turn checkout.
-setupRepoOp :: CloneDeps -> AutonomyLevel -> Opcode
-setupRepoOp deps autonomy = UntrustedOpcode
+setupRepoOp :: CloneDeps -> AutonomyLevel -> [Selectable] -> Opcode
+setupRepoOp deps autonomy selectable = UntrustedOpcode
   { uoName = OpName "SETUP_REPO"
   , uoDesc = "Clone a remote repository into the session workspace (shallow, idempotent; an optional branch or tag is checked out). Discover any skills it ships via the available-skills catalog on the next turn."
-  , uoInSchema = setupRepoSchema
+  , uoInSchema = setupRepoSchema selectable
   , uoOutSchema = object []
   , uoAuthorize = \v ->
       case parseSetupRepoInput v of
@@ -123,8 +126,8 @@ setupRepoOp deps autonomy = UntrustedOpcode
            Right (url, mBranch) -> runSetupRepo deps url mBranch recorded
   }
 
-setupRepoSchema :: Value
-setupRepoSchema =
+setupRepoSchema :: [Selectable] -> Value
+setupRepoSchema selectable =
   object
     [ "type" .= ("object" :: Text)
     , "properties" .= object
@@ -136,6 +139,7 @@ setupRepoSchema =
             [ "type" .= ("string" :: Text)
             , "description" .= ("The branch or tag to check out. Omit to use the remote's default branch." :: Text)
             ]
+        , "machine" .= machinePropertySchema selectable
         ]
     , "required" .= (["url"] :: [Text])
     ]
@@ -531,8 +535,23 @@ renderCloneResult url mBranch res = case res of
 -- path; wraps 'cloneRepoIO' with the audit 'orRecorded' payload). A
 -- 'CloneSwitched' is a NON-error result (the clone is usable on the
 -- requested branch — the turn engine's post-repo hooks must still run).
+--
+-- __The fallback argument is a default, not the source.__ 'setupRepoOp' is
+-- constructed once with the session's 'CloneDeps' baked in, and the dispatcher
+-- routes a call to another machine by swapping @uieCloneDeps@ in the per-call
+-- environment. For every other opcode that swap is what selects the transport;
+-- for this one, closing over the constructor's value made it inert — a clone
+-- routed to machine B ran over A's transport, silently, because the clone
+-- still succeeded. 'CloneDeps' is transport-bound (@cdIsRemote@,
+-- @cdPinnedKnownHosts@), so it has to follow the call. Design §6.2.2.
+--
+-- __The parameter is now vestigial.__ 'uioCdCloneDeps' always yields a value
+-- ('UIOEnv' cannot lack one), so the env is the only source. It is kept rather
+-- than removed because ~40 call sites pass it and 'setupRepoOp''s signature
+-- would otherwise change for no behavioural reason; a later unit can drop it.
 runSetupRepo :: CloneDeps -> Text -> Maybe BranchName -> Value -> UIO OpResult
-runSetupRepo deps url mBranch recorded = do
+runSetupRepo _fallbackDeps url mBranch recorded = do
+  deps <- uioCdCloneDeps
   uio <- uioUntrustedIO
   res <- uioLiftIO (cloneRepoIO deps uio url mBranch)
   let (target, status, isErr) = case res of

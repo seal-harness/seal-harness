@@ -57,6 +57,7 @@ import Seal.Config.Paths
   , sessionMetaPath, sessionsRoot )
 import Seal.Core.Types (ModelId (..), SessionId, mkSessionId)
 import Seal.Providers.Registry (resolveDefaultModelForName)
+import Seal.Config.Machines (MachineName)
 import Seal.Session.Meta (SessionMeta (..))
 import Seal.Store.Markdown (decodeDoc, fmLookup)
 import Seal.Tools.Exec.WorkdirFs (WorkdirFs)
@@ -83,8 +84,18 @@ formatSessionId t =
 -- without writing anything to disk. Used by channels that want an
 -- in-memory active session without polluting the sessions list — the
 -- session is only persisted when the user actually sends a message.
-newSessionMeta :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> IO SessionMeta
-newSessionMeta _paths provider model channel mAgent = do
+-- | Create a fresh 'SessionMeta'.
+--
+-- @mMachine@ is the execution machine chosen at session start, recorded here so
+-- a resumed session keeps running where its work already is (design §5.1). It is
+-- 'Nothing' when the caller has no opinion — in which case @machines.toml@'s
+-- default decides at call time, and a session started on a machine whose config
+-- later changes is not silently moved: 'Seal.Session.Machine.machineForSession'
+-- reports the machine as gone instead.
+newSessionMeta
+  :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> Maybe MachineName
+  -> IO SessionMeta
+newSessionMeta _paths provider model channel mAgent mMachine = do
   now <- getCurrentTime
   sid <- case mkSessionId (formatSessionId now) of
     Right s -> pure s
@@ -96,13 +107,16 @@ newSessionMeta _paths provider model channel mAgent = do
     , smDescription = Nothing
     , smSealFrontMatter = True
     , smRepoUrl = Nothing
+    , smMachine = mMachine
     , smRepoBranch = Nothing
     , smCreatedAt = now, smLastActive = now }
 
 -- | Create a fresh session directory + session.json for the given selection.
-newSession :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> IO SessionMeta
-newSession paths provider model channel mAgent = do
-  meta <- newSessionMeta paths provider model channel mAgent
+newSession
+  :: SealPaths -> Text -> Text -> Text -> Maybe AgentDefId -> Maybe MachineName
+  -> IO SessionMeta
+newSession paths provider model channel mAgent mMachine = do
+  meta <- newSessionMeta paths provider model channel mAgent mMachine
   saveSessionMeta paths meta
   pure meta
 
@@ -277,26 +291,30 @@ resolveDefaultAgent backend cfg =
 -- If @default_agent@ is set and the def exists, its id is persisted in
 -- 'smAgent' and its non-empty provider/model override the config defaults
 -- (PureClaw @resolveOverride@ precedence: frontmatter > config > default).
-initSession :: SealPaths -> RuntimeConfig -> AgentDefBackend -> IO SessionMeta
-initSession paths cfg backend = do
+initSession
+  :: SealPaths -> RuntimeConfig -> AgentDefBackend -> Maybe MachineName
+  -> IO SessionMeta
+initSession paths cfg backend mMachine = do
   (mAgent, mProv, mModel) <- resolveDefaultAgent backend cfg
   let (cfgProv, cfgModel) = defaultSessionSelection cfg
       provider = fromMaybe cfgProv mProv
       model    = fromMaybe cfgModel mModel
-  newSession paths provider model "cli" mAgent
+  newSession paths provider model "cli" mAgent mMachine
 
 -- | Build an in-memory 'SessionMeta' from the config defaults, on the @web@
 -- channel, WITHOUT persisting to disk. The web gateway uses this so the
 -- active-session ref has a valid meta (provider/model fallbacks) without
 -- polluting the sessions list. The session is persisted only when the user
 -- actually sends the first message (which writes the transcript).
-initSessionMeta :: SealPaths -> RuntimeConfig -> AgentDefBackend -> IO SessionMeta
-initSessionMeta paths cfg backend = do
+initSessionMeta
+  :: SealPaths -> RuntimeConfig -> AgentDefBackend -> Maybe MachineName
+  -> IO SessionMeta
+initSessionMeta paths cfg backend mMachine = do
   (mAgent, mProv, mModel) <- resolveDefaultAgent backend cfg
   let (cfgProv, cfgModel) = defaultSessionSelection cfg
       provider = fromMaybe cfgProv mProv
       model    = fromMaybe cfgModel mModel
-  newSessionMeta paths provider model "web" mAgent
+  newSessionMeta paths provider model "web" mAgent mMachine
 
 -- | Update the bound agent for an existing session. Loads the current
 -- 'SessionMeta' from disk, replaces 'smAgent' (Nothing when the supplied id
@@ -428,6 +446,7 @@ updateSessionRepo paths sid mUrl mBranch = do
         Nothing  -> pure False
         Just meta -> do
           let next = meta { smRepoUrl = normalized mUrl
+                          ,smMachine    = Nothing
                           , smRepoBranch = normalized mBranch }
           saveSessionMeta paths next
           pure True

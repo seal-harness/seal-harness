@@ -13,6 +13,8 @@ import Data.Aeson.Types (parseMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 
+import Seal.Config.Machines (Selectable)
+import Seal.ISA.Ops.Machine (machinePropertySchema)
 import Seal.Core.Types (OpName (..))
 import Seal.ISA.Opcode
 import Seal.Providers.Class (ToolResultPart (..))
@@ -21,11 +23,11 @@ import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
 import Seal.Tools.Exec.UIO (renderUntrustedErr, uioProcessKill, uioProcessList)
 
 -- | PROCESS_MANAGE opcode. Input: @{ action: "list" | "kill", pid?: Int }@.
-processManageOp :: WorkspaceRoot -> SecurityPolicy -> Opcode
-processManageOp _wsRoot policy = UntrustedOpcode
+processManageOp :: WorkspaceRoot -> SecurityPolicy -> [Selectable] -> Opcode
+processManageOp _wsRoot policy selectable = UntrustedOpcode
   { uoName = OpName "PROCESS_MANAGE"
   , uoDesc = "List or kill processes on the untrusted plane (bounded output, validated PID)."
-  , uoInSchema = processManageSchema
+  , uoInSchema = processManageSchema selectable
   , uoOutSchema = object []
   , uoAuthorize = \v ->
       case actionField v of
@@ -64,8 +66,8 @@ processManageOp _wsRoot policy = UntrustedOpcode
       Deny -> Left "PROCESS_MANAGE denied by autonomy policy"
       _   -> Right ()
 
-processManageSchema :: Value
-processManageSchema =
+processManageSchema :: [Selectable] -> Value
+processManageSchema selectable =
   object
     [ "type" .= ("object" :: Text)
     , "properties" .= object
@@ -77,6 +79,7 @@ processManageSchema =
             [ "type" .= ("integer" :: Text)
             , "description" .= ("Required for kill; positive integer." :: Text)
             ]
+        , "machine" .= machinePropertySchema selectable
         ]
     , "required" .= (["action"] :: [Text])
     ]

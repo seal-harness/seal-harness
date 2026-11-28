@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
@@ -20,6 +21,7 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (fromJust, fromMaybe, isJust, listToMaybe, mapMaybe)
 import Data.Set qualified as Set
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
 import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime(..), fromGregorian)
 import Data.Vector qualified as V
@@ -52,6 +54,7 @@ import Seal.Config.File (RuntimeConfig (..), ProviderConfig (..), defaultRuntime
 import Seal.Config.Paths
   ( SealPaths (..), sessionConversationPath, sessionDir, sessionMetaPath
   , sessionWorkdir, sshAgentsDir )
+import Seal.Config.Machines (mkMachineName)
 import Seal.Config.Security (defaultSecurityConfig)
 import Seal.Core.AllowList (AllowList (..))
 import Seal.Core.Types
@@ -168,7 +171,7 @@ stubHandle = ChannelHandle
 fakeMeta :: SessionMeta
 fakeMeta =
   let sid = case mkSessionId "test" of Right s -> s; Left _ -> error "sid"
-  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+  in SessionMeta sid "ollama" "llama3" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
 
 -- | Look up a string-keyed field in an Aeson object, for test assertions.
 lookupK :: T.Text -> KeyMap.KeyMap A.Value -> Maybe A.Value
@@ -893,7 +896,7 @@ spec = describe "Seal.Gateway.API" $ do
   describe "POST /api/sessions/:id/new (WU-6)" $ do
     it "honours provider/model/channel overrides (D2)" $
       withRebindNewEnv defaultRuntimeConfig (\_ -> pure ()) $ \deps paths -> do
-        oldMeta <- newSession paths "old-prov" "old-model" "web" Nothing
+        oldMeta <- newSession paths "old-prov" "old-model" "web" Nothing Nothing
         -- Bind a tab so the real rebind path is exercised (not the
         -- no-tab path).
         _ <- insertTabH (adTabsHandle deps) (BoundSession (smId oldMeta)) KindProvider Nothing
@@ -923,7 +926,7 @@ spec = describe "Seal.Gateway.API" $ do
         let oldAgent = case mkAgentDefId "old-agent" of
               Right x -> x
               Left _  -> error "old agent id"
-        oldMeta <- newSession paths "anthropic" "claude-sonnet-4" "web" (Just oldAgent)
+        oldMeta <- newSession paths "anthropic" "claude-sonnet-4" "web" (Just oldAgent) Nothing
         _ <- insertTabH (adTabsHandle deps) (BoundSession (smId oldMeta)) KindProvider Nothing
         threadDelay 5000
         req <- testPost ["api", "sessions", sessionIdText (smId oldMeta), "new"]
@@ -943,7 +946,7 @@ spec = describe "Seal.Gateway.API" $ do
 
     it "returns tab_index null + rebound false when no tab is bound" $
       withRebindNewEnv defaultRuntimeConfig (\_ -> pure ()) $ \deps paths -> do
-        oldMeta <- newSession paths "anthropic" "m" "web" Nothing
+        oldMeta <- newSession paths "anthropic" "m" "web" Nothing Nothing
         threadDelay 5000
         req <- testPost ["api", "sessions", sessionIdText (smId oldMeta), "new"]
           (A.encode (A.object []))
@@ -1078,6 +1081,46 @@ spec = describe "Seal.Gateway.API" $ do
             [ "name" .= ("beta" :: T.Text)
             , "synopsis" .= ("Beta synopsis" :: T.Text) ]
         ]
+
+  -- ── WU-10: GET /api/machines — the web new-tab picker's data source.
+  describe "GET /api/machines (WU-10)" $ do
+    it "returns 200 with a selectable list, the default, and unusable entries" $ do
+      app <- mkApp
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "machines"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> do
+          -- The shape the picker reads. A fresh install has `local` selectable
+          -- and no default, so the lists are present and well-typed rather
+          -- than absent — an absent key would make the UI code branch.
+          o `shouldSatisfy` KeyMap.member (Key.fromText "selectable")
+          o `shouldSatisfy` KeyMap.member (Key.fromText "default")
+          o `shouldSatisfy` KeyMap.member (Key.fromText "unusable")
+        other -> expectationFailure ("expected an object, got " <> show other)
+
+    it "lists `local` when allow_localhost is on (the default)" $ do
+      app <- mkApp
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "machines"])
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) ->
+          case KeyMap.lookup (Key.fromText "selectable") o of
+            Just (A.Array xs) ->
+              [ t | A.String t <- V.toList xs ] `shouldContain` ["local"]
+            other -> expectationFailure ("expected an array, got " <> show other)
+        other -> expectationFailure ("expected an object, got " <> show other)
+
+    it "never returns a host, user, path or key — negative" $ do
+      -- The requirements forbid a client being handed coordinates. Rendered
+      -- JSON is the right level to assert at: a field added later that carries
+      -- a host fails here even if nobody thought to update a typed decoder.
+      app <- mkApp
+      (_, body) <- runAppBody app (testRequest methodGet ["api", "machines"])
+      let rendered = TE.decodeUtf8 (BL.toStrict body)
+      rendered `shouldNotSatisfy` T.isInfixOf "host"
+      rendered `shouldNotSatisfy` T.isInfixOf "user"
+      rendered `shouldNotSatisfy` T.isInfixOf "/srv/"
+      rendered `shouldNotSatisfy` T.isInfixOf "identity"
+      rendered `shouldNotSatisfy` T.isInfixOf "SHA256"
 
   it "GET /api/harnesses returns 200" $ do
     app <- mkApp
@@ -1224,7 +1267,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1254,7 +1297,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1285,7 +1328,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1308,7 +1351,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1348,7 +1391,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1371,7 +1414,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1403,7 +1446,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1895,7 +1938,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1930,7 +1973,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = (SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = (SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0))
                   { smDescription = Just "old name" }
@@ -1958,7 +2001,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -1975,7 +2018,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2055,7 +2098,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2086,7 +2129,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2111,7 +2154,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2137,7 +2180,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2176,7 +2219,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2194,7 +2237,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2219,7 +2262,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2237,7 +2280,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2270,7 +2313,7 @@ spec = describe "Seal.Gateway.API" $ do
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
       let aid = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "aid"
-          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just aid) (Just "one-off") Nothing Nothing True Nothing Nothing
+          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just aid) (Just "one-off") Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2297,7 +2340,7 @@ spec = describe "Seal.Gateway.API" $ do
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
       let aid = case mkAgentDefId "dev" of Right x -> x; Left _ -> error "aid"
-          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just aid) Nothing Nothing Nothing True Nothing Nothing
+          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing (Just aid) Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2322,7 +2365,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing (Just "one-off") Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing (Just "one-off") Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2350,7 +2393,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2374,7 +2417,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2404,7 +2447,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2422,7 +2465,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2445,7 +2488,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
           fileContent = "---\nid: my-uploaded-agent\n---\nYou are a helpful agent."
@@ -2472,7 +2515,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
           fileContent = "You are a helpful agent with no frontmatter."
@@ -2497,7 +2540,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing (Just "my-uploaded-agent") Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing (Just "my-uploaded-agent") Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2520,7 +2563,7 @@ spec = describe "Seal.Gateway.API" $ do
           sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
           sdir = sessionDir paths sid
       createDirectoryIfMissing True sdir
-      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+      let meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                   (UTCTime (fromGregorian 2026 7 1) 0)
                   (UTCTime (fromGregorian 2026 7 1) 0)
       saveSessionMeta paths meta
@@ -2532,6 +2575,50 @@ spec = describe "Seal.Gateway.API" $ do
         Just (A.Object o) -> case lookupK "path" o of
           Just (A.String p) ->
             p `shouldBe` T.pack (cacheDir </> "workdirs" </> T.unpack sidTxt)
+          other -> expectationFailure ("expected path string, got: " <> show other)
+        _ -> expectationFailure ("expected JSON object, got: " <> show body)
+
+  -- WU-6b: the reported workdir must be the one on the machine the session is
+  -- RECORDED on, not the one on the current default. A resumed session reports
+  -- where its work actually is.
+  it "GET /api/sessions/:id/workdir follows the session's recorded machine" $
+    withSystemTempDirectory "seal-api-machine" $ \stateDir -> do
+      let cacheDir = stateDir </> "cache"
+          homeDir = stateDir </> "home"
+          paths = fakePaths { spHome = homeDir, spState = stateDir, spCache = cacheDir }
+          sidTxt = "20260701-120000-098"
+          sid = case mkSessionId sidTxt of Right s -> s; Left _ -> error "sid"
+          sdir = sessionDir paths sid
+      createDirectoryIfMissing True sdir
+      -- machines.toml: "default" is the default, but this session is recorded on
+      -- "builder", whose workspace differs.
+      createDirectoryIfMissing True homeDir
+      TIO.writeFile (homeDir </> "machines.toml") $ T.unlines
+        [ "default = \"default\""
+        , "[machines.default]"
+        , "host = \"a.example.com\""
+        , "user = \"seal\""
+        , "workspace = \"/srv/default-ws\""
+        , "[machines.builder]"
+        , "host = \"b.example.com\""
+        , "user = \"seal\""
+        , "workspace = \"/srv/builder-ws\""
+        ]
+      let builder = case mkMachineName "builder" of
+            Right n -> n; Left e -> error ("machine fixture: " <> T.unpack e)
+          meta = SessionMeta sid "anthropic" "claude-sonnet-4" "web" Nothing Nothing Nothing Nothing Nothing True Nothing (Just builder) Nothing
+                   (UTCTime (fromGregorian 2026 7 1) 0)
+                   (UTCTime (fromGregorian 2026 7 1) 0)
+      saveSessionMeta paths meta
+      deps <- mkDepsFor paths
+      let app = apiApp deps
+      (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sidTxt, "workdir"])
+      status `shouldBe` 200
+      case A.decode body :: Maybe A.Value of
+        Just (A.Object o) -> case lookupK "path" o of
+          Just (A.String p) ->
+            -- The recorded machine's workspace, NOT the default's.
+            p `shouldBe` T.pack ("/srv/builder-ws/workdirs/" <> T.unpack sidTxt)
           other -> expectationFailure ("expected path string, got: " <> show other)
         _ -> expectationFailure ("expected JSON object, got: " <> show body)
 
@@ -6035,6 +6122,10 @@ spec = describe "Seal.Gateway.API" $ do
     -- one def. @mDefault@ sets the configured default_agent (Nothing = none).
     -- Returns an Application ready to query. The temp dir lives for the
     -- test's duration (manual cleanup at start).
+    --
+    -- Compiled out under the hardened flag, where the tests that use it are
+    -- gated (they need a local workdir this build has no executor for).
+#if !defined(REMOTE_ONLY_UNTRUSTED)
     let mkSessionAgentsApp :: Maybe T.Text -> IO (Application, T.Text)
         mkSessionAgentsApp mDefault = do
           -- Use a fixed temp dir under /tmp (cleaned at start; OS cleans /tmp).
@@ -6104,8 +6195,16 @@ spec = describe "Seal.Gateway.API" $ do
     , adMkSessionExec = Nothing
                 }
           pure (apiApp deps, sidTxt)
+#endif
 
     it "returns 200 + the unioned agent list (workdir ⊕ user) for a known session with .agents/" $ do
+#if defined(REMOTE_ONLY_UNTRUSTED)
+      -- This fixture seeds a LOCAL session workdir and expects repo agent defs
+      -- discovered from it. The hardened artifact has no local untrusted
+      -- executor, so the session's exec is fail-closed and no workdir exists.
+      -- The remote-workdir variant below is the one that applies there.
+      pendingWith "-f remote-only-untrusted has no local workdir"
+#else
       (app, sid) <- mkSessionAgentsApp Nothing
       (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sid, "agents"])
       status `shouldBe` 200
@@ -6116,8 +6215,12 @@ spec = describe "Seal.Gateway.API" $ do
           -- Workdir defs: my-repo--agents-md, my-repo--foo-agent. User def: user-agent.
           names `shouldContain` ["my-repo--agents-md", "my-repo--foo-agent", "user-agent"]
         _ -> expectationFailure "expected a JSON array"
+#endif
 
     it "marks agents-md as default when no user default_agent is configured" $ do
+#if defined(REMOTE_ONLY_UNTRUSTED)
+      pendingWith "-f remote-only-untrusted has no local workdir"
+#else
       (app, sid) <- mkSessionAgentsApp Nothing
       (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sid, "agents"])
       status `shouldBe` 200
@@ -6131,8 +6234,12 @@ spec = describe "Seal.Gateway.API" $ do
           -- Exactly one entry is marked default: my-repo--agents-md.
           filter snd defaults `shouldBe` [("my-repo--agents-md", True)]
         _ -> expectationFailure "expected a JSON array"
+#endif
 
     it "repo agents.md wins over a configured user default_agent (repo > user precedence)" $ do
+#if defined(REMOTE_ONLY_UNTRUSTED)
+      pendingWith "-f remote-only-untrusted has no local workdir"
+#else
       (app, sid) <- mkSessionAgentsApp (Just "user-agent")
       (status, body) <- runAppBody app (testRequest methodGet ["api", "sessions", sid, "agents"])
       status `shouldBe` 200
@@ -6148,6 +6255,7 @@ spec = describe "Seal.Gateway.API" $ do
           filter snd defaults `shouldBe` [("my-repo--agents-md", True)]
           defaults `shouldNotSatisfy` (("user-agent", True) `elem`)
         _ -> expectationFailure "expected a JSON array"
+#endif
 
     it "returns 404 for an unknown session id" $ do
       app <- apiApp <$> mkDepsFor fakePaths

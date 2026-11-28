@@ -22,6 +22,8 @@ module Seal.Config.Paths
   , sessionDir
   , sessionMetaPath
   , sessionArchivedMarkerPath
+  , machinesFilePath
+  , execKnownHostsPath
   , sessionTranscriptPath
   , sessionConversationPath
   , sessionConversationIndexPath
@@ -140,6 +142,28 @@ securityFilePath paths = spHome paths </> "security.toml"
 -- written only by 'Seal.Config.Credentials'. No opcode may read or write it —
 -- it is agent-immutable security state, like everything else in
 -- @~\/.seal\/@.
+
+-- | Absolute path to the execution-machine registry:
+-- @\<home\>\/machines.toml@.
+--
+-- A sibling of @security.toml@ (NOT under @config\/@) for the same reason: the
+-- git-versioned @config\/@ tree must not be able to resurrect a stale machine
+-- list. Created @0600@ and written only by boot seeding, migration and the
+-- human-driven @seal machine@ command. No opcode may read or write it.
+machinesFilePath :: SealPaths -> FilePath
+machinesFilePath paths = spHome paths </> "machines.toml"
+
+-- | The single harness-owned SSH host-key pin file, shared by every execution
+-- machine: @\<home\>\/exec-known-hosts@.
+--
+-- One file rather than one per machine. @ssh@ keys @known_hosts@ entries by
+-- hostname (or @[host]:port@) and, with @StrictHostKeyChecking=yes@, consults
+-- only the matching entry — so per-host isolation is enforced by ssh, not by
+-- splitting files. Deriving the path here (rather than letting an operator
+-- supply it) also removes a shell-interpolation surface: no config value can
+-- point the pin file at a workspace path.
+execKnownHostsPath :: SealPaths -> FilePath
+execKnownHostsPath paths = spHome paths </> "exec-known-hosts"
 credentialsFilePath :: SealPaths -> FilePath
 credentialsFilePath paths = spHome paths </> "credentials.toml"
 

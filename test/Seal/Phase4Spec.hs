@@ -29,9 +29,9 @@ import Seal.Tools.Exec.Abort (AbortFlag, newAbortFlag)
 import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Tools.Exec.UntrustedIO
   ( UntrustedIO (..), mkRemoteUntrustedIOStub )
-import Seal.Tools.Exec.Types (TerminalBackend (..))
+import Seal.Tools.Exec.Types (ExecBackend (..), TerminalBackend (..))
 import Seal.Tools.Exec.Untrusted
-  ( UntrustedExecConfig (..), UntrustedExecMode (..), selectExecBackend
+  ( UntrustedExecConfig (..), selectExecBackend
   , mkUntrustedExecBackend, enforceRemoteOnly )
 import Seal.Types.App
 import Seal.Types.Config
@@ -64,8 +64,8 @@ spec = describe "Seal.Phase4Spec (capstone)" $ do
     seen <- newIORef []
     let uio  = fakeUio seen "ok\n"
         wsRoot = WorkspaceRoot "/ws"
-        shellOp = shellExecOp wsRoot (SecurityPolicy AllowAll Full)
-        fileWriteOp' = fileWriteOp wsRoot 65536
+        shellOp = shellExecOp wsRoot (SecurityPolicy AllowAll Full) []
+        fileWriteOp' = fileWriteOp wsRoot 65536 []
         reg = mkRegistry [shellOp, fileWriteOp']
     (h, _readState) <- fakeIndexedTranscript
     -- Dispatch SHELL_EXEC (Untrusted: ACK-before-execute)
@@ -87,22 +87,29 @@ spec = describe "Seal.Phase4Spec (capstone)" $ do
     -- The executor was actually called
     readIORef seen `shouldNotReturn` []
 
-  it "mode=remote with no remote configured: selectExecBackend never yields EbLocal" $ do
-    let cfg = UntrustedExecConfig UemRemote Nothing
-    selectExecBackend cfg TbLocal `shouldSatisfy` \case
-      Left _  -> True   -- mode=remote + TbLocal -> Left (no local fallback)
-      Right _ -> True   -- selectExecBackend still uses ExecBackend internally
+  -- Was vacuous: both arms of the old `case` returned True, so it passed even
+  -- if a local handle came back. Now it asserts the one thing it claimed.
+  it "allow_localhost = false: selectExecBackend never yields EbLocal" $ do
+    let cfg = UntrustedExecConfig False
+    case selectExecBackend cfg TbLocal of
+      Left _            -> pure ()
+      Right (EbLocal _) -> expectationFailure
+        "allow_localhost = false yielded a local executor"
+      Right _           -> expectationFailure "expected Left for MtLocal"
 
   it "UntrustedExecBackend is only constructible from Ssh (never Local)" $ do
     case mkUntrustedExecBackend TbLocal of
       Left _ -> pure ()
       Right _ -> expectationFailure "mkUntrustedExecBackend accepted Local"
 
-  it "enforceRemoteOnly rejects mode=local (Cabal flag startup check)" $ do
-    let cfg = UntrustedExecConfig UemLocal Nothing
+  it "enforceRemoteOnly rejects allow_localhost = true (Cabal flag startup check)" $ do
+    let cfg = UntrustedExecConfig True
     case enforceRemoteOnly cfg of
       Left _ -> pure ()
-      Right _ -> expectationFailure "enforceRemoteOnly accepted mode=local"
+      Right _ -> expectationFailure "enforceRemoteOnly accepted allow_localhost = true"
+
+  it "enforceRemoteOnly accepts allow_localhost = false" $ do
+    enforceRemoteOnly (UntrustedExecConfig False) `shouldBe` Right ()
 
 rightOf :: Either a b -> Maybe b
 rightOf (Right b) = Just b

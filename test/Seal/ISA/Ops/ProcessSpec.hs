@@ -52,7 +52,7 @@ spec = describe "Seal.ISA.Ops.Process" $ do
     it "list action runs a shell command and returns bounded output" $ do
       seen <- newIORef []
       let uio = fakeUio seen "PID  CMD\n  1  init\n 42  myproc\n"
-          op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full)
+          op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full) []
       r <- runTestApp (runOp uio Nothing op (object ["action" .= ("list" :: String)]))
       orIsError r `shouldBe` False
       orParts r `shouldSatisfy` \case [TrpText t] -> "myproc" `T.isInfixOf` t; _ -> False
@@ -61,33 +61,33 @@ spec = describe "Seal.ISA.Ops.Process" $ do
     it "kill action with a valid PID runs the kill command" $ do
       seen <- newIORef []
       let uio = fakeUio seen ""
-          op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full)
+          op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full) []
       r <- runTestApp (runOp uio Nothing op (object ["action" .= ("kill" :: String), "pid" .= (123 :: Int)]))
       orIsError r `shouldBe` False
       readIORef seen `shouldReturn` ["kill 123"]
 
     it "kill action rejects a negative PID" $ do
-      let op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full)
+      let op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full) []
       uoAuthorize op (object ["action" .= ("kill" :: String), "pid" .= (-1 :: Int)])
         `shouldBe` Left "PROCESS_MANAGE: pid must be a positive integer"
 
     it "kill action rejects a missing PID" $ do
-      let op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full)
+      let op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full) []
       uoAuthorize op (object ["action" .= ("kill" :: String)])
         `shouldBe` Left "PROCESS_MANAGE: kill requires {pid:positive integer}"
 
     it "missing action field -> error" $ do
-      let op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full)
+      let op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full) []
       uoAuthorize op (object []) `shouldBe` Left "PROCESS_MANAGE requires {action:string}"
 
     it "unknown action -> error" $ do
-      let op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full)
+      let op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full) []
       uoAuthorize op (object ["action" .= ("frobnicate" :: String)])
         `shouldBe` Left "PROCESS_MANAGE: unknown action \"frobnicate\""
 
     it "orRecorded captures the action + pid (secret-free)" $ do
       seen <- newIORef []
       let uio = fakeUio seen ""
-          op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full)
+          op = processManageOp (WorkspaceRoot "/ws") (SecurityPolicy (AllowOnly mempty) Full) []
       r <- runTestApp (runOp uio Nothing op (object ["action" .= ("kill" :: String), "pid" .= (42 :: Int)]))
       orRecorded r `shouldBe` object ["action" .= ("kill" :: String), "pid" .= (42 :: Int)]

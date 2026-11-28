@@ -38,10 +38,14 @@ module Seal.Tools.Exec.HostKeyAdoption
   , HostKeyInfo (..)
   , extractFirstKeyLine
   , buildAdoptionPrompt
+  , HostKeyPaths (..)
+  , defaultHostKeyPaths
+  , isSelfHostKey
   ) where
 
 import Control.Exception (IOException, try)
 import Data.ByteString (ByteString)
+import Data.Maybe (mapMaybe)
 import Data.ByteString qualified as BS
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -56,6 +60,7 @@ import System.Process
   , withCreateProcess
   )
 
+import Seal.Config.Machines (MachineName, machineNameText)
 import Seal.Logging.Global (globalLogIO)
 import Seal.Tools.Exec.Types
   ( SshConfig (..)
@@ -70,15 +75,21 @@ import Katip qualified as K (ls)
 -- it to the pinned @known_hosts@ file. The constructor is NOT exported;
 -- use 'mkHostKeyAdoption' (production) or 'mkHostKeyAdoptionStub' (tests).
 newtype HostKeyAdoption = HostKeyAdoption
-  { hkaAdopt :: SshConfig -> IO (Either Text ())
+  { hkaAdopt :: MachineName -> SshConfig -> IO (Either Text ())
     -- ^ Probe the host, ask the human, append the key on approval.
+    -- The machine name is an argument, not a field of 'SshConfig': §2.2
+    -- keeps 'MtSsh' name-free (the map key is the name), so the only place
+    -- it can reach the prompt is here.
     -- Returns @Right ()@ on success (key adopted), @Left msg@ on
     -- rejection or failure.
   }
-
 -- | Information about a host key discovered by @ssh-keyscan@.
 data HostKeyInfo = HostKeyInfo
-  { hkiHost    :: Text
+  { hkiMachine :: !(Maybe MachineName)
+    -- ^ Which configured machine this key belongs to. 'Maybe' because the
+    -- probe can run outside a machine context (a bare @ssh-keyscan@); the
+    -- adoption path always supplies it, and the prompt names it.
+  , hkiHost    :: Text
     -- ^ The host (user@host form for display)
   , hkiKeyType :: Text
     -- ^ e.g. @ssh-ed25519@
@@ -107,7 +118,7 @@ mkHostKeyAdoption confirm =
 mkHostKeyAdoptionStub :: HostKeyAdoption
 mkHostKeyAdoptionStub =
   HostKeyAdoption
-    { hkaAdopt = \_ -> pure (Left "host-key adoption not available")
+    { hkaAdopt = \_ _ -> pure (Left "host-key adoption not available")
     }
 
 -- | Like 'mkHostKeyAdoption' but with an injected probe function (tests).
@@ -121,12 +132,15 @@ mkHostKeyAdoptionWithProbe
   -> HostKeyAdoption
 mkHostKeyAdoptionWithProbe probe confirm =
   HostKeyAdoption
-    { hkaAdopt = \cfg -> do
+    { hkaAdopt = \name cfg -> do
         eInfo <- probe cfg
         case eInfo of
           Left err -> pure (Left err)
-          Right info -> do
-            let prompt = buildAdoptionPrompt info
+          Right info0 -> do
+            -- The probe cannot know the machine name (§2.2: `MtSsh` is
+            -- name-free), so it is stamped on here, from the caller.
+            let info = info0 { hkiMachine = Just name }
+                prompt = buildAdoptionPrompt info
             approved <- confirm prompt
             if approved
               then appendKeyToKnownHosts (scKnownHosts cfg) (hkiKeyLine info)
@@ -135,12 +149,13 @@ mkHostKeyAdoptionWithProbe probe confirm =
 
 -- | The full adoption flow: probe → display → confirm → append.
 -- Used by 'mkHostKeyAdoption'; exported for direct testing.
-adoptHostKeyIO :: (Text -> IO Bool) -> SshConfig -> IO (Either Text ())
-adoptHostKeyIO confirm cfg = do
+adoptHostKeyIO :: (Text -> IO Bool) -> MachineName -> SshConfig -> IO (Either Text ())
+adoptHostKeyIO confirm name cfg = do
   eInfo <- probeHostKey cfg
   case eInfo of
     Left err -> pure (Left err)
-    Right info -> do
+    Right info0 -> do
+      let info = info0 { hkiMachine = Just name }
       let prompt = buildAdoptionPrompt info
       globalLogIO InfoS (K.ls ("Host-key adoption prompt: " <> prompt))
       approved <- confirm prompt
@@ -175,7 +190,8 @@ probeHostKey cfg = do
           case eFp of
             Left err -> pure (Left err)
             Right fp -> pure (Right HostKeyInfo
-              { hkiHost = getSshUser (scUser cfg) <> "@" <> T.pack host
+              { hkiMachine = Nothing
+              , hkiHost = getSshUser (scUser cfg) <> "@" <> T.pack host
               , hkiKeyType = keyType
               , hkiKeyLine = keyLine
               , hkiFingerprint = fp
@@ -213,13 +229,29 @@ computeFingerprint keyLine = do
       pure (Left ("ssh-keygen exited " <> T.pack (show n) <> ": " <> stderr))
 
 -- | Build the human-facing adoption prompt.
+--
+-- __The copy is frozen__ (T-STR-7): four lines, a two-space indent on the
+-- detail rows, and @key:  @ padded so the two values align. Asserted as exact
+-- equality, so the padding is part of the string — not formatting to be
+-- tidied.
+--
+-- The machine name is the first line's subject rather than the host: a human
+-- confirming twice in one install must be able to tell WHICH machine they are
+-- trusting. Two machines can share a host string (a load balancer, a rebuilt
+-- box reusing a DNS name), and a prompt keyed on the host alone makes those
+-- indistinguishable at exactly the moment the answer matters.
 buildAdoptionPrompt :: HostKeyInfo -> Text
-buildAdoptionPrompt info =
-  "The remote execution host " <> hkiHost info
-  <> " is not in the known_hosts file.\n"
-  <> "Key type: " <> hkiKeyType info <> "\n"
-  <> "Fingerprint: " <> hkiFingerprint info <> "\n"
-  <> "Adopt this host key? [y/N]"
+buildAdoptionPrompt info = T.unlines
+  [ "machine \"" <> subject <> "\" is not yet known."
+  , "  host: " <> hkiHost info
+  , "  key:  " <> hkiKeyType info <> " " <> hkiFingerprint info
+  , "Trust this key? [y/N]"
+  ]
+  where
+    -- The machine name when known; the host otherwise, so a probe outside a
+    -- machine context still produces a usable prompt. Quoted either way, which
+    -- is what the frozen copy does.
+    subject = maybe (hkiHost info) machineNameText (hkiMachine info)
 
 -- | Append a key line to the @known_hosts@ file. Creates the file if it
 -- does not exist (the parent directory must already exist). Avoids
@@ -282,3 +314,82 @@ readProcessWithStdin argv stdinBytes = do
     errTxt <- maybe (pure "") TIO.hGetContents mErr
     ec <- waitForProcess ph
     pure (ec, outTxt, errTxt)
+
+-- ---------------------------------------------------------------------------
+-- Self-key guard (§3.2 layer 3)
+-- ---------------------------------------------------------------------------
+
+-- | Where the harness machine's own sshd host keys live.
+--
+-- A VALUE, not a constant, so the guard is testable against a fixture. Design
+-- §3.2 records why this matters: revision 1 hardcoded @~\/.ssh@, where sshd does
+-- not keep its host keys, so the check silently never fired — a security guard
+-- that reads the wrong file is worse than no guard, because it reports success.
+newtype HostKeyPaths = HostKeyPaths
+  { hkpSystemKeys :: [FilePath]
+    -- ^ Public key files, @/etc/ssh/ssh_host_*_key.pub@ by default.
+  }
+  deriving stock (Eq, Show)
+
+-- | The production paths. Globbed lazily by 'isSelfHostKey' rather than
+-- enumerated, so a machine with only RSA keys still gets checked.
+defaultHostKeyPaths :: HostKeyPaths
+defaultHostKeyPaths = HostKeyPaths
+  [ "/etc/ssh/ssh_host_ed25519_key.pub"
+  , "/etc/ssh/ssh_host_ecdsa_key.pub"
+  , "/etc/ssh/ssh_host_rsa_key.pub"
+  ]
+
+-- | Does this presented key match any of the harness machine's own host keys?
+--
+-- __Compares key MATERIAL, not lines.__ The two sources spell a host key
+-- differently: @ssh-keyscan@ yields @\<host\> \<type\> \<blob\>@ while
+-- @/etc/ssh/*.pub@ yields @\<type\> \<blob\> [comment]@. Comparing whole lines
+-- would therefore never match, and the guard would be silently inert. The blob
+-- (the base64 field) is the identity.
+--
+-- Unreadable key files are SKIPPED, not fatal (design §3.2 layer 3): a distro
+-- that keeps its keys elsewhere degrades from two defences to one rather than
+-- refusing every connection.
+--
+-- Only the FIRST key line of a multi-line input is used — @ssh-keyscan@ may
+-- return several key types, and the caller is expected to check the one it will
+-- actually pin.
+isSelfHostKey :: HostKeyPaths -> Text -> IO Bool
+isSelfHostKey paths presented = do
+  let mBlob = keyBlob presented
+  case mBlob of
+    Nothing   -> pure False
+    Just blob -> do
+      ownBlobs <- concat <$> mapM blobsIn (hkpSystemKeys paths)
+      pure (blob `elem` ownBlobs)
+  where
+    blobsIn path = do
+      eExists <- try (doesFileExist path) :: IO (Either IOException Bool)
+      case eExists of
+        Left _        -> pure []   -- unreadable ⇒ skipped (§3.2 layer 3)
+        Right False   -> pure []
+        Right True    -> do
+          eContent <- try (TIO.readFile path) :: IO (Either IOException Text)
+          case eContent of
+            Left _   -> pure []
+            Right t  -> pure (mapMaybe keyBlob (T.lines t))
+
+-- | The key blob (third whitespace field) of a host-key line, whichever of the
+-- two spellings it uses.
+--
+-- @ssh-keyscan@: @host type blob@ → the blob is field 3.
+-- @/etc/ssh/*.pub@: @type blob comment…@ → the blob is field 2.
+--
+-- Distinguished by whether the first field looks like a host: the two shapes
+-- differ in that a key TYPE always starts with @ssh-@, @ecdsa-@ or @sk-@.
+keyBlob :: Text -> Maybe Text
+keyBlob line =
+  case T.words (T.strip line) of
+    (a : _b : c : _) | looksLikeHost a      -> Just c
+    (a : b : _)      | looksLikeKeyType a   -> Just b
+    _               -> Nothing
+  where
+    looksLikeHost t = not (looksLikeKeyType t)
+    looksLikeKeyType t = any (`T.isPrefixOf` t)
+      ["ssh-", "ecdsa-", "sk-", "rsa-"]

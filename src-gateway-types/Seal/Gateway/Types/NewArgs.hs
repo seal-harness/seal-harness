@@ -32,6 +32,11 @@ data NewArgs = NewArgs
   , naBranch   :: Maybe Text
     -- ^ The branch or tag to check out when @-r@ clones a repo. 'Nothing'
     -- means the remote's default branch.
+  , naMachine  :: Maybe Text
+    -- ^ The execution machine to run this session on (@-x@\/@--machine@).
+    -- 'Text', not 'MachineName': parsing happens before the registry is known,
+    -- and an unknown name must fail at @/new@ time with the valid choices
+    -- listed, which needs the raw text to echo.
   } deriving stock (Eq, Show)
 
 -- | The empty 'NewArgs' — no overrides, use all config defaults.
@@ -41,6 +46,7 @@ emptyNewArgs = NewArgs
   , naModel    = Nothing
   , naRepo     = Nothing
   , naBranch   = Nothing
+  , naMachine  = Nothing
   }
 
 -- | Parse the raw argument text from the routing layer into 'NewArgs'.
@@ -59,6 +65,7 @@ parseNewArgs raw =
       | flag `elem` ["-m", "--model"]    = go rest acc { naModel    = Just val }
       | flag `elem` ["-r", "--repo"]     = go rest acc { naRepo     = Just val }
       | flag `elem` ["-b", "--branch"]   = go rest acc { naBranch   = Just val }
+      | flag `elem` ["-x", "--machine"]  = go rest acc { naMachine  = Just val }
       | otherwise                        = go (val : rest) acc
     go (_flag : rest) acc = go rest acc
 

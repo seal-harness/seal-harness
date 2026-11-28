@@ -147,7 +147,7 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
     it "non-completion with no summary is CerMaxIterations (preserved residual)" $ do
       resolveExitReason Nothing False Nothing `shouldBe` CerMaxIterations
     it "fanoutDone with no summary is still CerCompleted (fanout is the completion signal)" $ do
-      resolveExitReason Nothing True Nothing `shouldBe` CerCompleted
+      resolveExitReason Nothing True Nothing`shouldBe` CerCompleted
     it "a fanoutDone text that happens to contain an abort marker is STILL CerCompleted (crash reason absent — real answers win)" $ do
       resolveExitReason (Just "I did the work, then typed (stopped) as part of my answer") True Nothing
         `shouldBe` CerCompleted
@@ -316,6 +316,7 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
               , smDescription = Nothing
               , smSealFrontMatter = True
               , smRepoUrl = Nothing
+              ,smMachine    = Nothing
               , smRepoBranch = Nothing
               , smCreatedAt = now, smLastActive = now }
         saveSessionMeta paths parentMeta
@@ -457,7 +458,7 @@ spec = describe "Seal.Agent.Runtime.Delegation.Worker" $ do
 
   describe "handoffRepoRegistry" $ do
     it "always contains SETUP_REPO (a def allow-list cannot drop it)" $
-      case lookupOp (handoffRepoRegistry stubCloneDeps Full) (OpName "SETUP_REPO") of
+      case lookupOp (handoffRepoRegistry stubCloneDeps Full []) (OpName "SETUP_REPO") of
         Just _  -> pure ()
         Nothing -> expectationFailure "SETUP_REPO missing from the handoff repo registry"
 
@@ -662,6 +663,7 @@ sampleMetaWithRepo mRepo = SessionMeta
   , smDescription = Nothing
   , smSealFrontMatter = True
   , smRepoUrl = mRepo
+  ,smMachine    = Nothing
   , smRepoBranch = Nothing
   , smCreatedAt = t
   , smLastActive = t

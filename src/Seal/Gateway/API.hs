@@ -79,13 +79,16 @@ import Seal.Config.Paths
   ( SealPaths (..), repoKeysDir, securityFilePath, sessionMetaPath, sessionWorkdir
   , workdirsRoot )
 import Seal.Config.Security
-  ( SecurityConfig, untrustedExecConfigFromSecurity )
+  ( SecurityConfig )
 import Seal.Session.AgentMetaCache
   ( MetaCacheEnv (..), agentMetaCacheDir, rsyncTransferIO )
-import Seal.Tools.Exec.Untrusted
-  ( UntrustedExecConfig (..), UntrustedExecMode (..) )
+
+import Seal.Config.Machines
+  ( MachineName, MachineRegistry (..), MachineTarget (..), localMachineName
+  , machineNameText, mkMachineName, resolveRegistryForSecurity )
 import Seal.Session.ExecCache (cachedSessionExec, cachedWorkdirScan)
-import Seal.Session.Workdir (mkSessionExec, remoteSessionWorkdirPath, SessionExec (..))
+import Seal.Session.Workdir
+  ( mkSessionExecFor, remoteSessionWorkdirPath, SessionExec (..) )
 import Seal.SourceControl.Clone (CloneDeps (..))
 import qualified Seal.SourceControl.Clone as Clone
 import Seal.Security.Path (lexicalCollapse, blockedSegment)
@@ -93,6 +96,7 @@ import Seal.Tools.Exec.FileExplorer
 import Seal.SourceControl.AgentRegistry (AgentRegistryHandle)
 import Seal.SourceControl.GithubKeys (pinnedGithubKnownHosts)
 import Seal.Tools.Exec.Abort (SessionAbortRegistry, setSessionAbort)
+import Seal.Tools.Exec.Machine (resolveRegistryTarget)
 import Seal.Tools.Exec.Remote (mkRealRemoteRunner)
 import Seal.Tools.Ssh.Agent (mkRealSshAgentHandle)
 import Seal.Session.Lock (sessionTurnInFlight)
@@ -139,7 +143,8 @@ import Seal.Providers.OllamaReadiness
   ( OllamaReadiness (..), readinessWire )
 import Seal.Security.Adoption
   (AdoptError (..), ConsentChannel, authorizeAdoption)
-import Seal.Session.Meta (SessionMeta (..))
+import Seal.Session.Machine (machineForSession, renderMachineConfigError)
+import Seal.Session.Meta (SessionMeta (..), readSessionMeta)
 import Seal.SourceControl.Repo
   ( RepoCredential (..), RepoId, SourceRepo (..), hostAllowed, mkRepoId
   , parseCredentialKind, parseRepoHost, parseVcsKind, repoCredentialKindText
@@ -323,6 +328,13 @@ dispatchApi deps req respond =
     -- menu to report.
     (m', ["api", "commands"]) | m' == methodGet ->
       respond =<< handleCommands deps
+    -- GET /api/machines -> the execution machines the web new-tab picker
+    -- offers. NAMES AND REASONS ONLY: the requirements forbid the model (and,
+    -- for the picker's purposes, any client) from being handed a host, user,
+    -- address, key or path. 'handleMachines' is what enforces that, and the
+    -- negative assertion in 'ApiSpec' pins it.
+    (m', ["api", "machines"]) | m' == methodGet ->
+      respond =<< handleMachines deps
     (m', ["api", "tabs"]) | m' == methodGet -> do
       tl <- snapshotTabs (adTabsHandle deps)
       let tabsJson = map tabToJson (tlTabs tl)
@@ -1202,23 +1214,35 @@ parseSetupRepoBody body =
       Just (A.String b) | not (T.null (T.strip b)) -> Just b
       _ -> Nothing
 
--- | Agent-metadata cache env for API-driven scans. Remote mode only —
--- in local mode the workdir is local and the legacy crawl costs nothing.
--- Prefers the SendDeps runner seam so remote-mode integration tests stay
--- hermetic; production passes Nothing there and gets the real runner.
-metaCacheEnvForApi :: ApiDeps -> Maybe MetaCacheEnv
+-- | Agent-metadata cache env for API-driven scans, or 'Nothing' when there is
+-- no remote machine to cache against.
+--
+-- __IO now, because the coordinates moved.__ Before this feature the single
+-- remote came straight out of the already-loaded 'SecurityConfig'. Now every
+-- machine lives in @machines.toml@, so answering "what are the session
+-- machine's coordinates" means reading that file — and the machine registry is
+-- boot-only config, which is why it is re-read here rather than snapshotted on
+-- 'ApiDeps' (an operator who adds a machine should not have to restart).
+--
+-- In local mode the workdir IS local, so the per-file crawl has no SSH round
+-- trips to amortize and there is deliberately no cache: 'Nothing'.
+metaCacheEnvForApi :: ApiDeps -> IO (Maybe MetaCacheEnv)
 metaCacheEnvForApi deps = case adSend deps of
-  Just sendDeps | sdIsRemote sendDeps ->
-    case untrustedExecConfigFromSecurity (adSecurityConfig deps) of
-      Just (UntrustedExecConfig UemRemote (Just sshCfg)) ->
-        Just MetaCacheEnv
-          { mceRunner    = fromMaybe mkRealRemoteRunner (sdRemoteRunner sendDeps)
-          , mceSshCfg    = sshCfg
-          , mceCacheRoot = agentMetaCacheDir (adPaths deps)
+  Just sendDeps | sdIsRemote sendDeps -> do
+    eReg <- resolveRegistryForSecurity paths (adSecurityConfig deps)
+    pure $ case eReg of
+      Left _ -> Nothing
+      Right reg -> case resolveRegistryTarget reg Nothing of
+        Right (_, MtSsh sshCfg) -> Just MetaCacheEnv
+          { mceRunner      = fromMaybe mkRealRemoteRunner (sdRemoteRunner sendDeps)
+          , mceSshCfg      = sshCfg
+          , mceCacheRoot   = agentMetaCacheDir paths
           , mceRunTransfer = rsyncTransferIO sshCfg
           }
-      _ -> Nothing
-  _ -> Nothing
+        _ -> Nothing
+  _ -> pure Nothing
+  where
+    paths = adPaths deps
 
 -- | Build the @POST /api/sessions/:id/setup-repo@ response from the
 -- 'Either' returned by 'Seal.Gateway.Send.handleSetupRepo': 400 carrying
@@ -1299,6 +1323,7 @@ handleTabNew deps v =
           mAgent = parseAgentField v
           mBranchFrom = parseBranchFrom v
           mBranchLen  = parseBranchConvLen v
+          mMachine    = parseMachineField v
       case (mBranchFrom, mBranchLen) of
         -- A client that sends branch_from IS branching. Silently handing
         -- it an empty session is the exact bug this feature fixes, so a
@@ -1308,13 +1333,13 @@ handleTabNew deps v =
           pure (errJson status400
                  "branch_from requires branch_conv_len (the conversation \
                  \length to inherit from the parent session)")
-        (Nothing, _) -> plainProviderSession deps paths provider model mAgent
+        (Nothing, _) -> plainProviderSession deps paths provider model mAgent mMachine
         (Just parentSid, Just n) -> do
           parentExists <- doesFileExist (sessionMetaPath paths parentSid)
           if not parentExists
             then pure (errJson status404 "session not found")
             else do
-              meta <- newSessionMeta paths provider model "web" mAgent
+              meta <- newSessionMeta paths provider model "web" mAgent mMachine
               let sid = smId meta
               eSeed <- branchSession paths parentSid sid n
               case eSeed of
@@ -1357,9 +1382,10 @@ handleTabNew deps v =
 -- stay readable. Mints, inserts the tab, then persists — the original
 -- ordering, unchanged.
 plainProviderSession
-  :: ApiDeps -> SealPaths -> Text -> Text -> Maybe AgentDefId -> IO Response
-plainProviderSession deps paths provider model mAgent = do
-  meta <- newSessionMeta paths provider model "web" mAgent
+  :: ApiDeps -> SealPaths -> Text -> Text -> Maybe AgentDefId
+  -> Maybe MachineName -> IO Response
+plainProviderSession deps paths provider model mAgent mMachine = do
+  meta <- newSessionMeta paths provider model "web" mAgent mMachine
   let sid = smId meta
   res <- insertTabH (adTabsHandle deps) (BoundSession sid) KindProvider Nothing
   case res of
@@ -1376,6 +1402,28 @@ parseBranchFrom v = case v of
     Just (A.String t) -> either (const Nothing) Just (mkSessionId (T.strip t))
     _                 -> Nothing
   _ -> Nothing
+
+-- | Read the optional @machine@ field from a new-tab body.
+--
+-- Parsed as raw text and handed to 'mkMachineName' by the store; a name that
+-- does not validate is stored as-is and then rejected by the resolver on the
+-- first turn, which is the same treatment an unknown name gets from the model.
+-- The picker only ever offers names from @GET \/api\/machines@, so an invalid
+-- value here means a hand-written request.
+parseMachineField :: Value -> Maybe MachineName
+parseMachineField v =
+  case parseMaybe (withObject "body" (.:? "machine")) v
+         :: Maybe (Maybe Text) of
+    Just (Just raw) | not (T.null (T.strip raw)) -> toName (T.strip raw)
+    _                                           -> Nothing
+  where
+    toName t
+      -- `local` is reserved: 'mkMachineName' refuses it by design, so it comes
+      -- from the registry's own constant rather than a parse.
+      | t == "local" = Just localMachineName
+      | otherwise = case mkMachineName t of
+          Right nm -> Just nm
+          Left _   -> Nothing
 
 -- | Parse the optional @branch_conv_len@ field: a non-negative
 -- conversation length. Absent, non-numeric, or negative ⇒ 'Nothing'.
@@ -1454,7 +1502,7 @@ handleSessionNew deps v = do
         Just t  -> eitherToMaybe (mkAgentDefId t)
         Nothing -> mDefAgent
       channel = if lookupBodyBool "headless" then "bg" else fromMaybe "web" (lookupBodyStr "channel")
-  meta <- newSession paths provider model channel mAgent
+  meta <- newSession paths provider model channel mAgent Nothing
   triggerBroadcast deps
   pure (jsonOk (object [ "session_id" .= sessionIdText (smId meta) ]))
   where
@@ -1511,7 +1559,7 @@ handleSessionRebindNew deps sidTxt body =
               let provider = fromMaybe (smProvider oldMeta) (bodyStr "provider" body)
                   model    = fromMaybe (smModel oldMeta) (bodyStr "model" body)
                   channel  = fromMaybe "web" (bodyStr "channel" body)
-              meta <- newSession paths provider model channel mDefAgent
+              meta <- newSession paths provider model channel mDefAgent Nothing
               let newSid = smId meta
                   newSidTxt = sessionIdText newSid
               snap <- snapshotTabs (adTabsHandle deps)
@@ -1570,6 +1618,52 @@ handleCommands deps = case adSend deps of
         [ "name" .= n
         , "synopsis" .= csSynopsis spec
         ]
+
+-- | Handle @GET \/api\/machines@ — what the web new-tab picker offers.
+--
+-- __Names and reasons only.__ The response carries each selectable machine's
+-- NAME and the configured default; for a configured-but-unusable machine it
+-- carries the name plus a reason string. It never carries a host, user, path,
+-- key or fingerprint: the requirements forbid it, and a browser has no use for
+-- them. This is the same split as the model-facing renderer — the reason text
+-- comes from 'renderMachineConfigError', which is the OPERATOR-facing renderer,
+-- so a host is not present there either; only the condition.
+--
+-- A malformed @machines.toml@ yields an empty machine list rather than a 500.
+-- The picker's job is to show what may be chosen; if nothing can be resolved,
+-- showing nothing (and letting the first tool call explain why) is better than
+-- a request that fails in a way the UI cannot render.
+handleMachines :: ApiDeps -> IO Response
+handleMachines deps = do
+  eReg <- resolveRegistryForSecurity (srPaths (adSessionRuntime deps))
+                                     (adSecurityConfig deps)
+  case eReg of
+    Left _ -> pure (jsonLBS status200 (A.encode emptyPayload))
+    Right reg -> pure (jsonLBS status200 (A.encode (payload reg)))
+  where
+    emptyPayload = object
+      [ "selectable" .= ([] :: [Text])
+      , "default"    .= (Nothing :: Maybe Text)
+      , "unusable"   .= ([] :: [Value]) ]
+
+    payload reg = object
+      [ "selectable" .= map machineNameText (Map.keys (regMachines reg))
+      , "default"    .= fmap machineNameText (regDefault reg)
+      , "unusable"   .= [ object
+                            [ "name"   .= machineNameText nm
+                            , "reason" .= reasonFor nm r ]
+                        | (nm, r) <- Map.toList (regRejected reg) ]
+      ]
+
+    -- 'renderMachineConfigError' prefixes "machines.toml: machine \"x\" is
+    -- unusable: ". The name is already a field here, so the prefix is stripped
+    -- to keep the UI from repeating it.
+    reasonFor nm r =
+      let full = renderMachineConfigError nm r
+          marker = "is unusable: "
+      in case T.breakOn marker full of
+           (_, rest) | not (T.null rest) -> T.strip (T.drop (T.length marker) rest)
+           _                             -> full
 
 -- | Handle PUT /api/sessions/:id/archived. Sets or clears the archive flag
 -- via 'updateSessionArchived'. Returns 200 {ok:true} on success, 404 when
@@ -1642,6 +1736,11 @@ handleSessionAgents deps sid = do
       -- instance the turn engine uses) so the remote mkdir -p bootstrap and
       -- the workdir discovery scan each run once per session, not once per
       -- frontend fetch. The adMkSessionExec seam (tests) bypasses the cache.
+      -- This session's recorded machine, so the exec (and therefore the
+      -- discovery scan) follows the machine the session is on rather than the
+      -- current default.
+      mSessionMeta <- readSessionMeta paths sid
+      let mMachine = mSessionMeta >>= smMachine
       (exec, mCache) <- case adMkSessionExec deps of
         Just mk -> do
           e <- mk sid
@@ -1649,14 +1748,14 @@ handleSessionAgents deps sid = do
         Nothing -> case adSend deps of
           Just sendDeps -> do
             cloneDeps <- cloneDepsForApiDeps deps
-            e <- cachedSessionExec (sdExecCache sendDeps) paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner (sdHostKeyAdoption sendDeps)
+            e <- cachedSessionExec (sdExecCache sendDeps) paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner (sdHostKeyAdoption sendDeps) mMachine
             pure (e, Just (sdExecCache sendDeps))
           Nothing -> do
             cloneDeps <- cloneDepsForApiDeps deps
-            e <- mkSessionExec paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner Nothing
+            e <- mkSessionExecFor paths (adSecurityConfig deps) sid cloneDeps mkRealRemoteRunner Nothing mMachine
             pure (e, Nothing)
+      metaEnv <- metaCacheEnvForApi deps
       let wfs = seWorkdirFs exec
-          metaEnv = metaCacheEnvForApi deps
       workdirBackend <- case mCache of
         Just cache -> do
           -- One shared scan; serve the union from a static backend.
@@ -1707,21 +1806,22 @@ handleSessionWorkdir deps sid = do
   if not exists
     then pure (errJson status404 "session not found")
     else do
-      let wdPath = case untrustedExecConfigFromSecurity (adSecurityConfig deps) of
-            Nothing ->
-              -- Local mode: the workdir is on the same machine as the
-              -- gateway, so the absolute path is directly usable.
-              T.pack (sessionWorkdir paths sid)
-            Just uec -> case uecRemote uec of
-              Just sshCfg ->
-                -- Remote mode with a configured SSH workspace: the
-                -- workdir is on the remote machine.
-                remoteSessionWorkdirPath sshCfg sid
-              Nothing ->
-                -- Remote mode without a complete remote block
-                -- (fail-closed at the executor level): fall back to the
-                -- local path shape so the frontend has something to show.
-                T.pack (sessionWorkdir paths sid)
+      -- The workdir lives on the session's execution machine, and "the
+      -- session's" is its /recorded/ machine ('smMachine') — not the current
+      -- default, which may have moved since. A resumed session therefore reports
+      -- the path where its work actually is. 'machineForSession' is the same
+      -- resolver the turn engine uses, so the two cannot disagree about where a
+      -- session runs.
+      mSessionMeta <- readSessionMeta paths sid
+      eReg <- resolveRegistryForSecurity paths (adSecurityConfig deps)
+      let wdPath = case (mSessionMeta, eReg) of
+            (Just meta, Right reg) -> case machineForSession reg meta of
+              Right (_, MtSsh sshCfg) -> remoteSessionWorkdirPath sshCfg sid
+              _ -> T.pack (sessionWorkdir paths sid)
+            -- An unresolvable machine falls back to the local path shape, so the
+            -- frontend always has something to show. 'handleSessionAgents' is
+            -- where an unusable machine surfaces as an error.
+            _ -> T.pack (sessionWorkdir paths sid)
       pure (jsonLBS status200 (A.encode (object ["path" .= wdPath])))
 
 -- | Parse the @archived@ boolean field from a PUT /api/sessions/:id/archived

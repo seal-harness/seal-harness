@@ -18,7 +18,9 @@ import Data.Aeson.Types (parseMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 
+import Seal.Config.Machines (Selectable)
 import Seal.Core.Types (OpName (..))
+import Seal.ISA.Ops.Machine (machinePropertySchema)
 import Seal.ISA.Opcode
 import Seal.Security.Policy (SecurityPolicy (..), AutonomyLevel (..))
 import Seal.Security.Path (WorkspaceRoot (..))
@@ -44,11 +46,11 @@ dangerousGhAuthCmds =
 -- 'ShellCommand'. Run: via 'uioShellExec' (Local or Remote SSH, backend-
 -- selected at wiring time). 'orRecorded': the command + cwd (secret-free
 -- metadata).
-shellExecOp :: WorkspaceRoot -> SecurityPolicy -> Opcode
-shellExecOp _wsRoot policy = UntrustedOpcode
+shellExecOp :: WorkspaceRoot -> SecurityPolicy -> [Selectable] -> Opcode
+shellExecOp _wsRoot policy selectable = UntrustedOpcode
   { uoName = OpName "SHELL_EXEC"
   , uoDesc = "Run a shell command (validated, SafePath-confined, AuthorizedCommand-gated)."
-  , uoInSchema = shellExecSchema
+  , uoInSchema = shellExecSchema selectable
   , uoOutSchema = object []
   , uoAuthorize = \v ->
       case commandField v of
@@ -81,8 +83,8 @@ shellExecOp _wsRoot policy = UntrustedOpcode
                 Right out -> OpResult [TrpText out] False recorded
   }
 
-shellExecSchema :: Value
-shellExecSchema =
+shellExecSchema :: [Selectable] -> Value
+shellExecSchema selectable =
   object
     [ "type" .= ("object" :: Text)
     , "properties" .= object
@@ -98,6 +100,7 @@ shellExecSchema =
             [ "type" .= ("integer" :: Text)
             , "description" .= ("Per-call timeout in seconds; if the tool doesn't finish in this time, it's killed. Default 120, max 600. For long builds, redirect to a file (e.g. 'build 2>&1 | tee build.log') and FILE_READ the log with pagination." :: Text)
             ]
+        , "machine" .= machinePropertySchema selectable
         ]
     , "required" .= (["command"] :: [Text])
     ]

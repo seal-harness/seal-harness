@@ -20,6 +20,7 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
     autoSummary: null,
     firstMessageSnippet: null,
     channel: null,
+    machine: 'local',
     channelUserId: null,
     lastUserMessageAt: null,
     ...overrides,
@@ -59,6 +60,7 @@ describe('ActiveTabs', () => {
         tabAgent={() => null}
         tabProvider={() => ''}
         tabChannel={() => null}
+        tabMachine={() => null}
         fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={() => {}}
         onNewTab={() => {}}
@@ -85,6 +87,7 @@ describe('ActiveTabs', () => {
         tabAgent={() => null}
         tabProvider={() => ''}
         tabChannel={() => null}
+        tabMachine={() => null}
         fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={() => {}}
         onNewTab={() => {}}
@@ -110,6 +113,7 @@ describe('ActiveTabs', () => {
         tabAgent={() => null}
         tabProvider={() => ''}
         tabChannel={() => null}
+        tabMachine={() => null}
         fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={() => {}}
         onNewTab={onNewTab}
@@ -136,6 +140,7 @@ describe('ActiveTabs', () => {
         tabAgent={() => null}
         tabProvider={() => ''}
         tabChannel={() => null}
+        tabMachine={() => null}
         fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={onSelectTab}
         onNewTab={() => {}}
@@ -257,6 +262,7 @@ describe('RunningHarnesses', () => {
         tabAgent={() => null}
         tabProvider={() => ''}
         tabChannel={() => null}
+        tabMachine={() => null}
         fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
@@ -280,6 +286,7 @@ describe('RunningHarnesses', () => {
         tabAgent={() => null}
         tabProvider={() => ''}
         tabChannel={() => null}
+        tabMachine={() => null}
         fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
@@ -304,6 +311,7 @@ describe('RunningHarnesses', () => {
         tabAgent={() => null}
         tabProvider={() => ''}
         tabChannel={() => null}
+        tabMachine={() => null}
         fields={DEFAULT_TAB_LINE_FIELDS}
         onSelectTab={() => {}}
         onCloseTab={() => {}}
@@ -624,6 +632,7 @@ describe('Sidebar — tab second-line info (repo · provider · model · agent)'
       runtime: 'session:anthropic',
       repoUrl: 'https://github.com/seal-harness/seal-harness.git',
       channel: 'web',
+      machine: 'local',
       agent: 'zoe',
     })]
     render(
@@ -681,10 +690,14 @@ describe('Sidebar — tab second-line info (repo · provider · model · agent)'
       />,
     )
     const label = screen.getByTestId('tab-status-label-0')
-    // Default config is provider · repo · channel — the Ollama badge is an
-    // icon (no text), and there is no repo or channel data, so the text
-    // content is empty (renderConfigurableLine has only the icon to show).
-    expect(label.textContent).toBe('')
+    // Default config is provider · repo · channel · machine. The Ollama badge
+    // is an icon (no text) and there is no repo or channel, so the ONLY text is
+    // the machine — which is always present, because the server never reports
+    // null for it (a legacy session resolves to `local`). This test used to
+    // assert an EMPTY line; `machine` being on by default is a deliberate
+    // consequence of the feature, so the assertion records the new truth rather
+    // than being deleted.
+    expect(label.textContent).toBe('·local')
   })
 
   it('does not show agent or model under the default config (no repo, no channel)', () => {
@@ -770,6 +783,7 @@ describe('Sidebar — configurable tab second-line fields', () => {
       model: 'claude-sonnet-4-20250514',
       runtime: 'session:anthropic',
       channel: 'signal',
+      machine: 'local',
     })]
     render(
       <Sidebar
@@ -1023,6 +1037,7 @@ describe('Sidebar — session second-line configurable fields', () => {
       model: 'claude-sonnet-4-20250514',
       runtime: 'session:anthropic',
       channel: 'signal',
+      machine: 'local',
       repoUrl: 'https://github.com/seal-harness/seal-harness.git',
     })]
     render(

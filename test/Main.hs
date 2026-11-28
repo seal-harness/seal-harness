@@ -39,6 +39,8 @@ import qualified Seal.Gateway.TranscriptSpec
 import qualified Seal.Util.StrictIOSpec
 import qualified Seal.AppMainSpec
 import qualified Seal.Session.BranchSpec
+import qualified Seal.Session.MachineSpec
+import qualified Seal.Session.MachineRoutingSpec
 import qualified Seal.Session.MetaSpec
 import qualified Seal.Session.AgentMetaCacheSpec
 import qualified Seal.Session.ExecCacheSpec
@@ -52,6 +54,9 @@ import qualified Seal.Tools.Exec.TypesSpec
 import qualified Seal.Tools.Exec.UntrustedSpec
 import qualified Seal.Tools.Exec.UntrustedIORemoteSpec
 import qualified Seal.Tools.Exec.LocalSpec
+import qualified Seal.Tools.Exec.HardenedBuildSpec
+import qualified Seal.Tools.Exec.ExecErrorMappingSpec
+import qualified Seal.Tools.Exec.SelfKeyGuardSpec
 import qualified Seal.Tools.Exec.LogRedactionSpec
 import qualified Seal.Tools.Exec.RemoteSpec
 import qualified Seal.Tools.Exec.FileExplorerSpec
@@ -97,6 +102,7 @@ import qualified Seal.Command.SkillSpec
 import qualified Seal.Command.RepoSpec
 import qualified Seal.Command.AgentSpec
 import qualified Seal.Command.BackgroundSpec
+import qualified Seal.Command.MachineSpec
 import qualified Seal.Command.CallSpec
 import qualified Seal.Command.ChannelSpec
 import qualified Seal.Command.SpecSpec
@@ -106,6 +112,13 @@ import qualified Seal.Config.BootPlanSpec
 import qualified Seal.Config.CredentialsSpec
 import qualified Seal.Config.FileSpec
 import qualified Seal.Config.MigrateSpec
+import qualified Seal.Config.MachinesSpec
+import qualified Seal.Tools.Exec.MachineSpec
+import qualified Seal.ISA.Ops.MachineSpec
+import qualified Seal.ISA.Ops.MachineSchemaSpec
+import qualified Seal.ISA.Ops.MachinePromptSpec
+import qualified Seal.Gateway.MachineDisplaySpec
+import qualified Seal.ISA.DispatchMachineSpec
 import qualified Seal.Config.SecuritySpec
 import qualified Seal.Config.SecurityAccessControlSpec
 import qualified Seal.Config.SecurityScopingFailSpec
@@ -275,6 +288,8 @@ specs = do
   Seal.Util.StrictIOSpec.spec
   Seal.AppMainSpec.spec
   Seal.Session.BranchSpec.spec
+  Seal.Session.MachineSpec.spec
+  Seal.Session.MachineRoutingSpec.spec
   Seal.Session.MetaSpec.spec
   Seal.Session.AgentMetaCacheSpec.spec
   Seal.Session.ExecCacheSpec.spec
@@ -288,6 +303,9 @@ specs = do
   Seal.Tools.Exec.UntrustedSpec.spec
   Seal.Tools.Exec.UntrustedIORemoteSpec.spec
   Seal.Tools.Exec.LocalSpec.spec
+  Seal.Tools.Exec.HardenedBuildSpec.spec
+  Seal.Tools.Exec.ExecErrorMappingSpec.spec
+  Seal.Tools.Exec.SelfKeyGuardSpec.spec
   Seal.Tools.Exec.LogRedactionSpec.spec
   Seal.Tools.Exec.RemoteSpec.spec
   Seal.Tools.ArgsSpec.spec
@@ -333,6 +351,7 @@ specs = do
   Seal.Command.RepoSpec.spec
   Seal.Command.AgentSpec.spec
   Seal.Command.BackgroundSpec.spec
+  Seal.Command.MachineSpec.spec
   Seal.Command.CallSpec.spec
   Seal.Command.ChannelSpec.spec
   Seal.Command.SpecSpec.spec
@@ -341,7 +360,14 @@ specs = do
   Seal.Config.BootPlanSpec.spec
   Seal.Config.CredentialsSpec.spec
   Seal.Config.FileSpec.spec
+  Seal.Tools.Exec.MachineSpec.spec
+  Seal.ISA.Ops.MachineSpec.spec
+  Seal.ISA.Ops.MachineSchemaSpec.spec
+  Seal.ISA.Ops.MachinePromptSpec.spec
+  Seal.Gateway.MachineDisplaySpec.spec
+  Seal.ISA.DispatchMachineSpec.spec
   Seal.Config.MigrateSpec.spec
+  Seal.Config.MachinesSpec.spec
   Seal.Config.SecuritySpec.spec
   Seal.Config.SecurityAccessControlSpec.spec
   Seal.Config.SecurityScopingFailSpec.spec

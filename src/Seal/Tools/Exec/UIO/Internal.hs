@@ -1,5 +1,5 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 -- | The restricted monad for untrusted opcode execution. Carries an
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 -- 'UntrustedIO' handle (+ the Git 'CloneDeps' surface) internally; the only
 -- IO an opcode can perform is the lifted 'UntrustedIO'/'CloneDeps' surface.
 -- NO 'MonadIO' — a bare 'liftIO'\/'IO' action in an opcode body typed
@@ -26,6 +26,7 @@ module Seal.Tools.Exec.UIO.Internal
   , mkUIOStub
   , runUIOWithEnv
   , mkTestUIOEnv
+  , mkTestUIOEnvWith
   , uioRead
   , uioWrite
   , uioPatch
@@ -52,9 +53,13 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT, ask, asks, runReaderT)
 import Data.ByteString (ByteString)
 import Data.Text (Text)
+import Data.Text qualified as T
 
+import Seal.Config.Machines (MachineName, mkMachineName)
 import Seal.Security.Path (WorkspaceRoot)
 import Seal.SourceControl.Clone (CloneDeps)
+import Seal.Tools.Exec.Machine
+  ( MachineRouting, mkStaticRouting )
 import Seal.Text.LineFile (LineWindow)
 import Seal.Tools.Args (BinArg, BinName, SearchPattern, ShellCommand)
 import Seal.Tools.Exec.Remote (RemoteRunner)
@@ -89,6 +94,11 @@ newtype UIO a = UIO { unUIO :: ReaderT UIOEnv IO a }
 data UIOEnv = UIOEnv
   { uieUntrustedIO :: !UntrustedIO
   , uieCloneDeps   :: !CloneDeps
+  , uieMachines    :: !MachineRouting
+    -- ^ The per-call routing table. 'dispatch' resolves the target machine
+    -- from the input and builds a per-call copy of this env with
+    -- 'uieUntrustedIO' and 'uieCloneDeps' swapped (design §6.2) — so no
+    -- @uio*@ signature changes and no opcode needs to know a machine.
   }
 
 -- | Run a 'UIO' action with a pre-built 'UIOEnv'. Exported to the
@@ -105,7 +115,29 @@ runUIOWithEnv env (UIO action) = runReaderT action env
 -- wrapper (W-A3) + tests (Git specs seed a stub 'CloneDeps' into the
 -- 'UIOEnv' via this helper).
 mkTestUIOEnv :: UntrustedIO -> CloneDeps -> UIOEnv
-mkTestUIOEnv = UIOEnv
+mkTestUIOEnv uio deps = mkTestUIOEnvWith uio deps (singletonRoutingFor uio deps)
+
+-- | A routing table with exactly one machine — the session machine — wrapping
+-- the supplied handle. Kept total and IO-free so the ~90 existing
+-- 'mkTestUIOEnv' call sites keep compiling and behaving unchanged; a call
+-- naming any /other/ machine simply fails with 'MachineUnknown', which is the
+-- correct behaviour for an env that was built without one.
+singletonRoutingFor :: UntrustedIO -> CloneDeps -> MachineRouting
+singletonRoutingFor uio deps =
+  mkStaticRouting testSessionName [(testSessionName, uio, deps)]
+
+-- | The singleton session machine's name. Not @local@: @local@ is reserved and
+-- must not be constructible via 'mkMachineName'.
+testSessionName :: MachineName
+testSessionName =
+  either (\e -> error ("Seal.Tools.Exec.UIO.Internal: " <> T.unpack e)) id
+    (mkMachineName (T.pack "default"))
+
+-- | Build a 'UIOEnv' from an explicit routing table. The multi-machine seam:
+-- tests needing two or more machines build routing with 'mkMachineRouting' +
+-- 'seedRouting' and pass it here, so a call naming another machine resolves.
+mkTestUIOEnvWith :: UntrustedIO -> CloneDeps -> MachineRouting -> UIOEnv
+mkTestUIOEnvWith = UIOEnv
 
 -- ---------------------------------------------------------------------------
 -- Smart constructors (the only way to obtain a 'UIO' execution context)
@@ -117,7 +149,7 @@ mkTestUIOEnv = UIOEnv
 mkLocalUIO :: WorkspaceRoot -> CloneDeps -> UIO a -> IO a
 mkLocalUIO wsRoot cloneDeps action =
   let uio = mkLocalUntrustedIO wsRoot
-      env = UIOEnv uio cloneDeps
+      env = UIOEnv uio cloneDeps (singletonRoutingFor uio cloneDeps)
   in runUIOWithEnv env action
 
 -- | @mode=remote@: the workdir is a remote workspace path; 'UntrustedIO'
@@ -127,14 +159,14 @@ mkRemoteUIO :: SshConfig -> RemoteRunner -> WorkspaceRoot -> CloneDeps
             -> UIO a -> IO a
 mkRemoteUIO sshCfg runner _wsRoot cloneDeps action =
   let uio = mkRemoteUntrustedIO sshCfg runner
-      env = UIOEnv uio cloneDeps
+      env = UIOEnv uio cloneDeps (singletonRoutingFor uio cloneDeps)
   in runUIOWithEnv env action
 
 -- | Fail-closed: every operation returns 'Left'\/stub. For misconfigured
 -- or unreachable remotes; mirrors 'mkRemoteUntrustedIOStub'.
 mkUIOStub :: CloneDeps -> UIO a -> IO a
 mkUIOStub cloneDeps action =
-  let env = UIOEnv mkRemoteUntrustedIOStub cloneDeps
+  let env = UIOEnv mkRemoteUntrustedIOStub cloneDeps (singletonRoutingFor mkRemoteUntrustedIOStub cloneDeps)
   in runUIOWithEnv env action
 
 -- ---------------------------------------------------------------------------

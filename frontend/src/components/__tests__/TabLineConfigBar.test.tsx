@@ -161,7 +161,7 @@ describe('TabLineConfigBar — grouped layout', () => {
   it('does not show a divider when all fields are enabled', () => {
     render(
       <TabLineConfigBar
-        fields={['provider', 'model', 'repo', 'channel', 'agent']}
+        fields={['provider', 'model', 'repo', 'channel', 'agent', 'machine']}
         onFieldsChange={() => {}}
       />,
     )
@@ -178,7 +178,7 @@ describe('TabLineConfigBar — grouped layout', () => {
       <TabLineConfigBar fields={['provider']} onFieldsChange={() => {}} />,
     )
     fireEvent.click(screen.getByTestId('tab-line-config-button'))
-    // Only one enabled field → disabled group has 4 items but the divider
+    // Only one enabled field → disabled group has 5 items but the divider
     // should still appear since both groups are non-empty.
     const popover = screen.getByTestId('tab-line-config-popover')
     const divider = popover.querySelector('div[style*="border-top"]')

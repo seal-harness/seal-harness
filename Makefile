@@ -11,7 +11,7 @@ NIX := nix develop --command
 ARGS ?=
 
 .DEFAULT_GOAL := help
-.PHONY: help build test lint check run tui ghci clean shell frontend-install frontend-test dist package static
+.PHONY: help build test lint check run tui ghci clean shell frontend-install frontend-test hardened dist package static
 
 help: ## List the available targets
 	@echo "seal-harness — make targets:"
@@ -43,6 +43,18 @@ run: ## Run the seal executable; pass flags via ARGS="..." (e.g. make run ARGS="
 
 frontend-test: ## Run the frontend unit tests (vitest)
 	@cd frontend && npm test
+
+# The hardened build: no local untrusted executor in the artifact, and
+# allow_localhost = true is refused at boot. Done-when 15 says `make check`
+# passes INCLUDING this configuration, so it is a gate step rather than a
+# follow-on project. The order matters — a build that links is the
+# precondition for a test that runs.
+#
+# Uses its own builddir: GHC's recompilation checker would otherwise
+# invalidate every module each time the flag alternates.
+hardened: ## Build and test with -f remote-only-untrusted (the hardened gate)
+	$(NIX) cabal build all -f remote-only-untrusted --builddir=dist-hardened
+	$(NIX) cabal test     -f remote-only-untrusted --builddir=dist-hardened
 
 frontend-install: ## Install frontend npm dependencies if missing
 	@cd frontend && [ -d node_modules ] || npm install

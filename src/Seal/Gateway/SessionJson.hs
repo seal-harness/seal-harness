@@ -18,6 +18,7 @@ import Data.Aeson (Value, object, (.=))
 import Data.Text (Text)
 
 import Seal.Agent.Def.Types (agentDefIdText)
+import Seal.Config.Machines (machineNameText)
 import Seal.Config.Paths (SealPaths)
 import Seal.Core.Types (sessionIdText)
 import Seal.Gateway.Transcript
@@ -80,7 +81,15 @@ sessionWire (BoundHarness _)   = Nothing
 -- backwards-compat with old session.json files that predate smAgentName.
 sessionInfoJson :: Maybe Text -> Maybe Text -> Maybe Int -> SessionMeta -> Value
 sessionInfoJson mSnippet mLastUserMessageAt mTokensUsed m = object
-  [ "id" .= sessionIdText (smId m)
+  -- The machine is NEVER null on upgrade (design §5.6): a legacy session that
+  -- recorded none still reports the machine it RESOLVES to, so the sidebar has
+  -- something to show for every session rather than a blank column for old
+  -- ones. 'smMachine' is the raw record; the resolved name needs the registry,
+  -- which this pure projection does not have — so the recorded name, and
+  -- "local" as the documented fallback for a session that recorded nothing
+  -- (the implicit machine a pre-feature install resolves to).
+  [ "machine" .= maybe "local" machineNameText (smMachine m)
+  , "id" .= sessionIdText (smId m)
   , "agent" .= ( smAgentName m <|> (agentDefIdText <$> smAgent m) )
   , "runtime" .= ("session:" <> smProvider m)
   , "model" .= smModel m

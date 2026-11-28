@@ -73,7 +73,9 @@ import Seal.Session.Store (saveChildSessionMeta, saveSessionMeta)
 import Seal.SourceControl.Clone (CloneDeps)
 import Seal.Tools.Args (branchNameText, mkBranchName)
 import Seal.Tools.Exec.Abort (AbortFlag)
-import Seal.Tools.Exec.UIO.Internal (UIOEnv, runUIOWithEnv)
+import Seal.Config.Machines (Selectable)
+import Seal.Tools.Exec.Machine (rtSelectable)
+import Seal.Tools.Exec.UIO.Internal (UIOEnv (..), runUIOWithEnv)
 import Seal.Tools.Exec.UIOGit (uioCdCloneDeps)
 import Seal.Tools.Timeout (ToolTimeoutConfig)
 import Seal.Types.App (App, runApp)
@@ -346,7 +348,8 @@ mkDelegateWorker deps agentDef childSid task _hooks = do
             cloneDeps <- runUIOWithEnv childUioEnv uioCdCloneDeps
             runApp (dwdAppEnv deps) $
               dispatchHandoffRepo childTHandle
-                (handoffRepoRegistry cloneDeps (dwdAutonomy deps))
+                (handoffRepoRegistry cloneDeps (dwdAutonomy deps)
+                   (rtSelectable (uieMachines childUioEnv)))
                 childUioEnv (dwdToolTimeout deps) childAbortFlag
                 repo (Just (dwdChannel deps))
         -- Capture the final answer via 'aeOnStop': the loop's
@@ -456,6 +459,7 @@ writeChildMeta deps childSid = do
     , smDescription = Nothing
     , smSealFrontMatter = True
     , smRepoUrl = Nothing
+    ,smMachine    = Nothing
     , smRepoBranch = Nothing
     , smCreatedAt = now
     , smLastActive = now
@@ -515,8 +519,12 @@ handoffRepo explicitUrl explicitBranch mParent = case nonBlank explicitUrl of
 -- list 'SETUP_REPO' would silently skip the checkout. Only that allow-list
 -- is bypassed — no blocklist control is skipped ('SETUP_REPO' is not in
 -- 'delegationBlocklist').
-handoffRepoRegistry :: CloneDeps -> AutonomyLevel -> Registry
-handoffRepoRegistry cloneDeps autonomy = mkRegistry [setupRepoOp cloneDeps autonomy]
+--
+-- The selectable set comes from the child's own 'UIOEnv', not a default: the
+-- schema the model sees must name the machines that session can actually reach.
+handoffRepoRegistry :: CloneDeps -> AutonomyLevel -> [Selectable] -> Registry
+handoffRepoRegistry cloneDeps autonomy selectable =
+  mkRegistry [setupRepoOp cloneDeps autonomy selectable]
 
 -- | Dispatch 'SETUP_REPO' into the handoff session's transcript and record
 -- its result for the user (the clone / no-op / conflict / failure text),
@@ -580,6 +588,7 @@ writeHandoffMeta deps childSid agentDef taskRepo = do
     , smDescription = Nothing
     , smSealFrontMatter = True
     , smRepoUrl = rsUrl <$> repo
+    ,smMachine    = Nothing
     , smRepoBranch = repo >>= rsBranch
     , smCreatedAt = now
     , smLastActive = now

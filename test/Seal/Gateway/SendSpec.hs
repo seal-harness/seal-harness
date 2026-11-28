@@ -1,5 +1,9 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+
+-- 'Use fewer imports' is suppressed: the split import is a @#if@ so the
+-- hardened build does not carry a symbol whose only user compiled out.
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
 module Seal.Gateway.SendSpec (spec, turnFailureSpec) where
@@ -27,6 +31,9 @@ import Data.Text qualified as T
 import Data.Time (UTCTime (..), fromGregorian)
 import Network.HTTP.Client (defaultManagerSettings, newManager)
 import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
+#if defined(REMOTE_ONLY_UNTRUSTED)
+import System.Directory (doesDirectoryExist)
+#endif
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
@@ -109,6 +116,7 @@ stubMint = pure SessionMeta
   , smDescription = Nothing
   , smSealFrontMatter = True
   , smRepoUrl = Nothing
+  ,smMachine    = Nothing
   , smRepoBranch = Nothing
   , smCreatedAt = UTCTime (fromGregorian 2026 1 1) 0
   , smLastActive = UTCTime (fromGregorian 2026 1 1) 0
@@ -271,7 +279,7 @@ mkSendDepsWith paths resolveStub = do
   testLocks <- newSessionLocks
   testAbortReg <- newSessionAbortRegistry
   testRepeatReg <- newSessionRepeatRegistry
-  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing sampleTime sampleTime
+  let activeMeta = SessionMeta (mkSid "active") "ollama" "llama3.2" "cli" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing sampleTime sampleTime
   activeRef <- newIORef activeMeta
   let sr = SessionRuntime { srPaths = paths, srConfigPath = configRoot </> "config.toml", srActive = activeRef }
   -- A real ProviderRuntime whose config path is nonexistent (loadRuntimeConfig
@@ -329,7 +337,7 @@ seedSessionChannel :: SealPaths -> Text -> SessionId -> IO ()
 seedSessionChannel paths channel sid = do
   let sdir = sessionDir paths sid
   createDirectoryIfMissing True sdir
-  let meta = SessionMeta sid "ollama" "llama3.2" channel Nothing Nothing Nothing Nothing Nothing True Nothing Nothing sampleTime sampleTime
+  let meta = SessionMeta sid "ollama" "llama3.2" channel Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing sampleTime sampleTime
   saveSessionMeta paths meta
 
 -- | Seed a session.json on disk for the given sid (channel @web@).
@@ -386,7 +394,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         tabsH <- newTabsHandle
         let sid = mkSid "20261108-130001-skip"
             meta = SessionMeta sid "ollama" "llama3.2" "web"
-                     Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+                     Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                      sampleTime sampleTime
             sendDeps = baseDeps { sdTabsHandle = tabsH }
         seedSession paths sid
@@ -448,7 +456,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let sendDeps = baseDeps { sdTabsHandle = tabsH }
             sid = mkSid "20261108-120000-meta"
             meta = SessionMeta sid "ollama" "llama3.2" "web"
-                     Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
+                     Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing
                      sampleTime sampleTime
         seedSession paths sid
         er <- plainTurn sendDeps meta (Just (sendSampleSource (Just "12345"))) "hello"
@@ -1110,8 +1118,10 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           let sdir = sessionDir paths sid
           createDirectoryIfMissing True sdir
           let zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
-              meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing Nothing sampleTime sampleTime
+              meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing Nothing Nothing sampleTime sampleTime
           saveSessionMeta paths meta
+#if !defined(REMOTE_ONLY_UNTRUSTED)
+        -- Compiled out under the hardened flag: its only caller is gated.
         seedRepoAgentsMd :: SealPaths -> SessionId -> T.Text -> IO ()
         seedRepoAgentsMd paths sid marker = do
           -- Seed the session workdir (the same path mkSessionExec uses in
@@ -1122,8 +1132,24 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           createDirectoryIfMissing True repoDir
           writeFile (repoDir </> "agents.md")
             ("---\nkind: agents\n---\n" <> T.unpack marker <> "\n")
+#endif
 
     it "a session bound to the user default (zoe) uses the repo's agents.md after a clone" $ do
+#if defined(REMOTE_ONLY_UNTRUSTED)
+      -- The default build proves the repo's agents.md wins after a clone into
+      -- a LOCAL workdir. This build has no local untrusted executor, so the
+      -- assertion that matters here is the inverse: nothing created that
+      -- workdir, and the session stays on the user default.
+      withSystemTempDirectory "auto-bind-int" $ \tmp -> do
+        let paths = SealPaths
+              { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
+              , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
+        seedZoe paths
+        let sid = mkSid "20260817-151158-281"
+        seedSessionWithZoe paths sid
+        -- Nothing seeded the workdir, and nothing may create one.
+        doesDirectoryExist (sessionWorkdir paths sid) `shouldReturn` False
+#else
       withSystemTempDirectory "auto-bind-int" $ \tmp -> do
         let paths = SealPaths
               { spHome = tmp, spState = tmp </> "state", spConfig = tmp </> "config"
@@ -1145,6 +1171,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
           Just sys -> do
             sys `shouldSatisfy` T.isInfixOf "REPO_PROJECT_MARKER"
             sys `shouldNotSatisfy` T.isInfixOf "ZOE_SYSTEM_PROMPT_MARKER"
+#endif
 
     it "a session with no repo in its workdir stays on the user default (zoe)" $ do
       withSystemTempDirectory "auto-bind-norepo" $ \tmp -> do
@@ -1198,7 +1225,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sdir = sessionDir paths sid
             zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
             -- The front matter is OFF for this session.
-            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing False Nothing Nothing sampleTime sampleTime
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing False Nothing Nothing Nothing sampleTime sampleTime
         createDirectoryIfMissing True sdir
         saveSessionMeta paths meta
         outcome <- handleSend sendDeps sid Nothing "tell me about yourself"
@@ -1237,7 +1264,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
             sdir = sessionDir paths sid
             zoe = case mkAgentDefId' "zoe" of Right a -> a; Left _ -> error "bad zoe id"
             -- The front matter is ON (the default).
-            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing Nothing sampleTime sampleTime
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing (Just zoe) Nothing (Just "zoe") Nothing True Nothing Nothing Nothing sampleTime sampleTime
         createDirectoryIfMissing True sdir
         saveSessionMeta paths meta
         outcome <- handleSend sendDeps sid Nothing "tell me about yourself"
@@ -1918,7 +1945,7 @@ spec = describe "Seal.Gateway.Send auto-tab" $ do
         let td = (mkWebTurnDeps deps)
               { tdOnTurnEnd = Just (\_ ->
                   sessionTurnInFlight (sdLocks deps) sid >>= writeIORef hookRef . Just) }
-            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing sampleTime sampleTime
+            meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing sampleTime sampleTime
         done <- newEmptyMVar
         _ <- forkIO (void (runSessionTurn td (testTurnAdapter td) meta Nothing "hello") >> putMVar done ())
         seen <- waitFor 5000000 (readIORef recorded) (not . null)
@@ -2138,8 +2165,25 @@ tfPaths tmp = SealPaths
   , spKeys = tmp </> "keys", spCache = tmp </> "cache" }
 
 tfMeta :: SessionId -> SessionMeta
-tfMeta sid = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing
-  Nothing Nothing True Nothing Nothing sampleTime sampleTime
+-- Named construction, not positional: 15 fields with three adjacent
+-- `Maybe`s is exactly where a merge silently drops one.
+tfMeta sid = SessionMeta
+  { smId = sid
+  , smProvider = "ollama"
+  , smModel = "llama3.2"
+  , smChannel = "web"
+  , smParent = Nothing
+  , smAgent = Nothing
+  , smSystemOverride = Nothing
+  , smAgentName = Nothing
+  , smDescription = Nothing
+  , smSealFrontMatter = True
+  , smRepoUrl = Nothing
+  , smMachine = Nothing
+  , smRepoBranch = Nothing
+  , smCreatedAt = sampleTime
+  , smLastActive = sampleTime
+  }
 
 -- | Drive one turn whose provider throws, and hand back the entries written.
 tfRunFailingTurn :: FilePath -> SessionId -> IO [EntryRecord]
@@ -2235,7 +2279,7 @@ runWithRecordedHook deps sid = do
   let td = (mkWebTurnDeps deps)
         { tdOnTurnEnd = Just (\_ ->
             sessionTurnInFlight (sdLocks deps) sid >>= writeIORef hookRef . Just) }
-      meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing sampleTime sampleTime
+      meta = SessionMeta sid "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing Nothing sampleTime sampleTime
   outcome <- runSessionTurn td (testTurnAdapter td) meta Nothing "hello"
   pure (outcome, hookRef)
 

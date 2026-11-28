@@ -55,10 +55,10 @@ import Seal.Tools.Timeout (defaultToolTimeoutConfig)
 import Seal.Config.Migrate
   ( configHasLegacySecurityFields, migrateSecurityConfig )
 import Seal.Config.Paths
-  ( SealPaths (..), configFilePath, securityFilePath )
+  ( SealPaths (..), configFilePath, machinesFilePath, securityFilePath )
 import Seal.Config.Security
   ( AccessControlFileConfig (..), SecurityConfig (..)
-  , UntrustedExecFileConfig (..), UntrustedExecRemoteFileConfig (..)
+  , UntrustedExecFileConfig (..)
   , decodeSecurityConfig, gatewayConfigFromSecurity, scUntrustedExec
   , scVaultKeyType, scVaultUnlock, securityConfigCodec, tomlKeyPaths )
 import Seal.Config.Templates
@@ -153,14 +153,13 @@ spec = describe "Seal.Config.Templates" $ do
       -- the two tests above while leaving no block to copy.
       forM_ ["# [providers.<label>]", "# [signal]", "# [telegram]", "# [workdir]"]
         $ \header -> (header `T.isInfixOf` configTomlTemplate) `shouldBe` True
-      forM_ [ "# [untrusted_execution]", "# [untrusted_execution.remote]"
-            , "# [access_control]" ]
+      forM_ [ "# [untrusted_execution]", "# [access_control]" ]
         $ \header -> (header `T.isInfixOf` securityTomlTemplate) `shouldBe` True
-      -- The remote block's six keys must be inside the block, not just anywhere.
-      let remoteBlock = snd (T.breakOn "# [untrusted_execution.remote]"
-                                    securityTomlTemplate)
-      forM_ ["host", "user", "port", "identity", "known_hosts", "workspace"]
-        $ \key -> (key `T.isInfixOf` remoteBlock) `shouldBe` True
+      -- The [untrusted_execution] block's key must be inside the block, not just
+      -- mentioned anywhere. It carries exactly one setting now, and the SSH
+      -- coordinates it used to hold are a machines.toml concern.
+      let execBlock = snd (T.breakOn "# [untrusted_execution]" securityTomlTemplate)
+      ("allow_localhost" `T.isInfixOf` execBlock) `shouldBe` True
 
   describe "written values resolve like absent keys" $ do
     it "keeps the loopback gateway default" $
@@ -234,7 +233,7 @@ spec = describe "Seal.Config.Templates" $ do
       withSealHome $ \paths -> do
         (created, warnings) <- ensureConfigTemplates paths
         warnings `shouldBe` []
-        created `shouldBe` [configFilePath paths, securityFilePath paths]
+        created `shouldBe` [configFilePath paths, securityFilePath paths, machinesFilePath paths]
         TIO.readFile (configFilePath paths) `shouldReturn` configTomlTemplate
         TIO.readFile (securityFilePath paths) `shouldReturn` securityTomlTemplate
         (createdAgain, warningsAgain) <- ensureConfigTemplates paths
@@ -254,7 +253,7 @@ spec = describe "Seal.Config.Templates" $ do
         let mine = "# my own config\nmax_turns = 5\n"
         TIO.writeFile (configFilePath paths) mine
         (created, _) <- ensureConfigTemplates paths
-        created `shouldBe` [securityFilePath paths]
+        created `shouldBe` [securityFilePath paths, machinesFilePath paths]
         TIO.readFile (configFilePath paths) `shouldReturn` mine
 
     it "reports a failure instead of throwing, and still writes the other file" $
@@ -264,7 +263,7 @@ spec = describe "Seal.Config.Templates" $ do
         TIO.writeFile (spConfig paths) "not a directory"
         (created, warnings) <- ensureConfigTemplates paths
         length warnings `shouldBe` 1
-        created `shouldBe` [securityFilePath paths]
+        created `shouldBe` [securityFilePath paths, machinesFilePath paths]
         doesFileExist (configFilePath paths) `shouldReturn` False
 
     it "defers to the security migration while config.toml is pre-split" $
@@ -275,7 +274,9 @@ spec = describe "Seal.Config.Templates" $ do
         createDirectoryIfMissing True (spConfig paths)
         TIO.writeFile (configFilePath paths) "vault_unlock = \"startup\"\n"
         (created, warnings) <- ensureConfigTemplates paths
-        created `shouldBe` []
+        -- machines.toml is unrelated to the security migration, so it is
+        -- still seeded; only security.toml defers.
+        created `shouldBe` [machinesFilePath paths]
         warnings `shouldBe` []
         doesFileExist (securityFilePath paths) `shouldReturn` False
 
@@ -372,9 +373,7 @@ sampleSecurityConfig = SecurityConfig
   , scVaultIdentity  = Just "/identity.txt"
   , scVaultUnlock    = Just "startup"
   , scVaultKeyType   = Just "x25519"
-  , scUntrustedExec  = Just (UntrustedExecFileConfig "remote" (Just
-      (UntrustedExecRemoteFileConfig (Just "builder.example.com") (Just "seal")
-        (Just 22) (Just "/id_ed25519") (Just "/known_hosts") (Just "/workspace"))))
+  , scUntrustedExec  = Just (UntrustedExecFileConfig False)
   , scAccessControl  = Just (AccessControlFileConfig (Just "passkey")
                                (Just "https://seal.example.com")
                                (Just "seal.example.com"))

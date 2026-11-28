@@ -283,7 +283,7 @@ deployKeyRepo =
 ----------------------------------------------------------------------
 
 testOp :: Opcode
-testOp = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing
+testOp = binExecOp (WorkspaceRoot "/ws") (SecurityPolicy AllowAll Full) Nothing []
 
 ghPrCreateInput :: Value
 ghPrCreateInput = object

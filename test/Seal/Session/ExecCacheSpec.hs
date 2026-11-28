@@ -5,18 +5,20 @@ import Data.IORef
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
 import Data.Time (UTCTime (..), addUTCTime)
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (secondsToDiffTime)
-import System.FilePath ((</>))
+import System.Directory (createDirectoryIfMissing)
+import System.IO.Temp (withSystemTempDirectory)
+import System.FilePath ((</>), takeDirectory)
 import Test.Hspec
 
 import Seal.Agent.Def.Types (AgentDef (..), agentDefIdText)
-import Seal.Config.Paths (SealPaths (..))
+import Seal.Config.Machines (MachineName, mkMachineName)
+import Seal.Config.Paths (SealPaths (..), machinesFilePath)
 import Seal.Config.Security
-  ( SecurityConfig (..), UntrustedExecFileConfig (..)
-  , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig
-  )
+  ( SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig )
 import Seal.Core.Types (SessionId, mkSystemSessionId, sessionIdText)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Session.ExecCache
@@ -40,64 +42,124 @@ spec = describe "Seal.Session.ExecCache" $ do
 
   describe "cachedSessionExec" $ do
 
-    it "builds once: a second call issues no additional SSH calls" $ do
+    it "builds once: a second call issues no additional SSH calls" $
+      withSystemTempDirectory "seal-exec-cache-build-once" $ \tmp -> do
       calls <- newIORef []
       cache <- newSessionExecCacheWith (pure fakeNow)
       deps <- stubCloneDeps
-      let paths = tmpPaths "/tmp/seal-exec-cache-build-once"
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
+      let paths = tmpPaths tmp
+      writeMachinesToml paths "/srv/agent-workspace"
+      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing Nothing
       n1 <- length <$> readIORef calls
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
+      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing Nothing
       n2 <- length <$> readIORef calls
       -- The first build runs the remote mkdir -p bootstrap; the cached hit
       -- must not run anything.
       (n1, n2) `shouldBe` (1 :: Int, 1 :: Int)
 
-    it "rebuilds when the security config fingerprint changes" $ do
+    it "rebuilds when the security config fingerprint changes" $
+      withSystemTempDirectory "seal-exec-cache-fingerprint" $ \tmp -> do
       calls <- newIORef []
       cache <- newSessionExecCacheWith (pure fakeNow)
       deps <- stubCloneDeps
-      let paths = tmpPaths "/tmp/seal-exec-cache-fingerprint"
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
+      let paths = tmpPaths tmp
+      writeMachinesToml paths "/srv/agent-workspace"
+      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing Nothing
       n1 <- length <$> readIORef calls
-      _ <- cachedSessionExec cache paths otherRemoteSecCfg sidA deps (recordingRunner calls) Nothing
+      -- A machines.toml edit must rebuild: the fingerprint covers the resolved
+      -- registry, not just the security flag.
+      writeMachinesToml paths "/srv/other-workspace"
+      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing Nothing
       n2 <- length <$> readIORef calls
       (n1, n2) `shouldBe` (1 :: Int, 2 :: Int)
 
-    it "invalidateExec forces a rebuild on the next call" $ do
+    it "invalidateExec forces a rebuild on the next call" $
+      withSystemTempDirectory "seal-exec-cache-invalidate" $ \tmp -> do
       calls <- newIORef []
       cache <- newSessionExecCacheWith (pure fakeNow)
       deps <- stubCloneDeps
-      let paths = tmpPaths "/tmp/seal-exec-cache-invalidate"
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
+      let paths = tmpPaths tmp
+      writeMachinesToml paths "/srv/agent-workspace"
+      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing Nothing
       invalidateExec cache sidA
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
+      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing Nothing
       n <- length <$> readIORef calls
       n `shouldBe` (2 :: Int)
 
-    it "caches per session (different sids do not collide)" $ do
+    it "caches per session (different sids do not collide)" $
+      withSystemTempDirectory "seal-exec-cache-persid" $ \tmp -> do
       calls <- newIORef []
       cache <- newSessionExecCacheWith (pure fakeNow)
       deps <- stubCloneDeps
-      let paths = tmpPaths "/tmp/seal-exec-cache-persid"
-      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
-      _ <- cachedSessionExec cache paths remoteSecCfg sidB deps (recordingRunner calls) Nothing
+      let paths = tmpPaths tmp
+      writeMachinesToml paths "/srv/agent-workspace"
+      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing Nothing
+      _ <- cachedSessionExec cache paths remoteSecCfg sidB deps (recordingRunner calls) Nothing Nothing
       n <- length <$> readIORef calls
       n `shouldBe` (2 :: Int)
 
-    it "does not poison the cache with a fail-closed exec" $ do
+    it "does not poison the cache with a fail-closed exec" $
+      withSystemTempDirectory "seal-exec-cache-failclosed" $ \tmp -> do
       calls <- newIORef []
       cache <- newSessionExecCacheWith (pure fakeNow)
       deps <- stubCloneDeps
-      let paths = tmpPaths "/tmp/seal-exec-cache-failclosed"
-          -- mode=remote with NO remote block → fail-closed at build time.
+      let paths = tmpPaths tmp
+          -- No machines.toml AND local execution off: nothing to run on, so
+          -- the build fail-closes rather than silently running locally.
           brokenCfg = defaultSecurityConfig
-            { scUntrustedExec = Just (UntrustedExecFileConfig "remote" Nothing) }
-      e1 <- cachedSessionExec cache paths brokenCfg sidA deps (recordingRunner calls) Nothing
+            { scUntrustedExec = Just (UntrustedExecFileConfig False) }
+      e1 <- cachedSessionExec cache paths brokenCfg sidA deps (recordingRunner calls) Nothing Nothing
       execRoot e1 `shouldBe` "/nonexistent-workdir-fail-closed"
-      -- The failed build was NOT cached; a later VALID config builds fresh.
-      e2 <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing
+      -- The failed build was NOT cached; once a machine exists the same session
+      -- builds fresh rather than staying poisoned.
+      writeMachinesToml paths "/srv/agent-workspace"
+      e2 <- cachedSessionExec cache paths remoteSecCfg sidA deps (recordingRunner calls) Nothing Nothing
       execRoot e2 `shouldBe` "/srv/agent-workspace/workdirs/" <> sessionIdText sidA
+
+    -- WU-9: the session's recorded machine must decide which exec is built.
+    -- Without this, `smMachine` is a field nothing reads — the exact
+    -- "looked done and wasn't" failure the handoff warns about.
+    it "builds the exec for the session's RECORDED machine, not the default" $
+      withSystemTempDirectory "seal-exec-cache-recorded" $ \tmp -> do
+      calls <- newIORef []
+      cache <- newSessionExecCacheWith (pure fakeNow)
+      deps <- stubCloneDeps
+      let paths = tmpPaths tmp
+      -- machines.toml names "default" as the default, and "other" as a second
+      -- machine with a different workspace.
+      writeMachinesTomlWithDefault paths "default"
+      appendFile (machinesFilePath paths) (unlines
+        [ "[machines.other]"
+        , "host = \"other.internal\""
+        , "user = \"agent\""
+        , "workspace = \"/srv/other-workspace\""
+        ])
+      e <- cachedSessionExec cache paths remoteSecCfg sidA deps
+             (recordingRunner calls) Nothing (Just (machineName "other"))
+      execRoot e `shouldBe` "/srv/other-workspace/workdirs/" <> sessionIdText sidA
+
+    it "rebuilds when the session's machine changes" $
+      withSystemTempDirectory "seal-exec-cache-machine-change" $ \tmp -> do
+      calls <- newIORef []
+      cache <- newSessionExecCacheWith (pure fakeNow)
+      deps <- stubCloneDeps
+      let paths = tmpPaths tmp
+      writeMachinesTomlWithDefault paths "default"
+      appendFile (machinesFilePath paths) (unlines
+        [ "[machines.other]"
+        , "host = \"other.internal\""
+        , "user = \"agent\""
+        , "workspace = \"/srv/other-workspace\""
+        ])
+      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps
+             (recordingRunner calls) Nothing (Just (machineName "default"))
+      n1 <- length <$> readIORef calls
+      -- Same session, same config, different recorded machine: the cache must
+      -- not hand back the previous machine's handles.
+      _ <- cachedSessionExec cache paths remoteSecCfg sidA deps
+             (recordingRunner calls) Nothing (Just (machineName "other"))
+      n2 <- length <$> readIORef calls
+      (n1, n2) `shouldBe` (1 :: Int, 2 :: Int)
 
   --------------------------------------------------------------------------
   -- cachedWorkdirScan (fetch-or-scan agent defs + skills per session)
@@ -165,24 +227,49 @@ fakeNow = UTCTime (fromGregorian 2026 8 22) (secondsToDiffTime (12 * 3600))
 wsRoot :: WorkspaceRoot
 wsRoot = WorkspaceRoot "/srv/agent-workspace"
 
-remoteBlock :: UntrustedExecRemoteFileConfig
-remoteBlock = UntrustedExecRemoteFileConfig
-  { uerfcHost       = Just "exec.internal"
-  , uerfcUser       = Just "agent"
-  , uerfcPort       = Nothing
-  , uerfcIdentity   = Nothing
-  , uerfcKnownHosts = Just "/home/agent/.seal/exec-known-hosts"
-  , uerfcWorkspace  = Just "/srv/agent-workspace"
-  }
-
+-- | The @security.toml@ half: local execution is off, so the resolver must
+-- take the machine from @machines.toml@.
 remoteSecCfg :: SecurityConfig
 remoteSecCfg = defaultSecurityConfig
-  { scUntrustedExec = Just (UntrustedExecFileConfig "remote" (Just remoteBlock)) }
+  { scUntrustedExec = Just (UntrustedExecFileConfig False) }
 
-otherRemoteSecCfg :: SecurityConfig
-otherRemoteSecCfg = defaultSecurityConfig
-  { scUntrustedExec = Just (UntrustedExecFileConfig "remote" (Just remoteBlock
-      { uerfcWorkspace = Just "/srv/other-workspace" })) }
+-- | Write a @machines.toml@ naming one machine, with the given workspace.
+--
+-- The exec cache's fingerprint covers this file, so the fixtures have to write
+-- it: before this feature the coordinates lived in @security.toml@ and the two
+-- configs below differed; now they differ here.
+-- | A 'MachineName' for a fixture. `local` is reserved and cannot pass through
+-- 'mkMachineName', so fixtures name ordinary machines.
+machineName :: Text -> MachineName
+machineName t = case mkMachineName t of
+  Right n  -> n
+  Left why -> error ("ExecCacheSpec.machineName: " <> T.unpack why)
+
+-- | Write a @machines.toml@ naming one machine called @default@, and one called
+-- @other@, so a test can distinguish "the default" from "the recorded machine".
+writeMachinesTomlWithDefault :: SealPaths -> Text -> IO ()
+writeMachinesTomlWithDefault paths defaultName = do
+  let path = machinesFilePath paths
+  createDirectoryIfMissing True (takeDirectory path)
+  TIO.writeFile path (T.unlines
+    [ "default = \"" <> defaultName <> "\""
+    , "[machines.default]"
+    , "host = \"exec.internal\""
+    , "user = \"agent\""
+    , "workspace = \"/srv/agent-workspace\""
+    ])
+
+writeMachinesToml :: SealPaths -> Text -> IO ()
+writeMachinesToml paths workspace = do
+  let path = machinesFilePath paths
+  createDirectoryIfMissing True (takeDirectory path)
+  TIO.writeFile path (T.unlines
+    [ "default = \"builder\""
+    , "[machines.builder]"
+    , "host = \"exec.internal\""
+    , "user = \"agent\""
+    , "workspace = \"" <> workspace <> "\""
+    ])
 
 -- | A 'RemoteRunner' that records every invocation's argv and always
 -- returns empty stdout (enough for the mkdir -p workdir bootstrap).

@@ -1,11 +1,13 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Seal.Tools.Exec.UntrustedSpec (spec) where
 
-import Data.Either (isLeft, isRight)
+import Data.Either (isRight)
 import Test.Hspec
 import Test.Hspec.QuickCheck (prop)
 import Test.QuickCheck (Arbitrary (..), Gen, elements, forAll)
 
+import Seal.Config.Security
+  ( defaultSecurityConfig, untrustedExecConfigFromSecurity )
 import Seal.Tools.Exec.Types
 import Seal.Tools.Exec.Untrusted
 
@@ -34,83 +36,90 @@ spec = describe "Seal.Tools.Exec.Untrusted" $ do
 
   describe "selectUntrustedBackend" $ do
 
-    it "mode=remote + TbSsh configured -> Right (the Ssh backend)" $ do
-      let cfg = UntrustedExecConfig UemRemote (Just sshCfg)
-      selectUntrustedBackend cfg (TbSsh sshCfg) `shouldSatisfy` isRight
+    it "yields the Ssh backend for a TbSsh, whatever allow_localhost says" $ do
+      selectUntrustedBackend (UntrustedExecConfig True)  (TbSsh sshCfg)
+        `shouldSatisfy` isRight
+      selectUntrustedBackend (UntrustedExecConfig False) (TbSsh sshCfg)
+        `shouldSatisfy` isRight
 
-    it "mode=remote + no remote configured -> Left ExecRemoteRequired" $ do
-      let cfg = UntrustedExecConfig UemRemote Nothing
-      selectUntrustedBackend cfg (TbSsh sshCfg) `shouldBe` Left ExecRemoteRequired
+    it "never yields Local, even when allow_localhost is true" $ do
+      -- This is the remote-only selector. `allow_localhost` decides whether
+      -- `local` is *offered*, which is resolution's job; it never turns this
+      -- function into one that hands out a local handle.
+      selectUntrustedBackend (UntrustedExecConfig True) TbLocal
+        `shouldBe` Left ExecLocalNotPermittedForUntrusted
 
-    it "mode=remote + TbLocal -> Left ExecLocalNotPermittedForUntrusted (never Local)" $ do
-      let cfg = UntrustedExecConfig UemRemote (Just sshCfg)
-      selectUntrustedBackend cfg TbLocal `shouldBe` Left ExecLocalNotPermittedForUntrusted
-
-    it "mode=local + anything -> Left ExecLocalNotPermittedForUntrusted (never yields Local)" $ do
-      let cfg = UntrustedExecConfig UemLocal (Just sshCfg)
-      selectUntrustedBackend cfg TbLocal `shouldBe` Left ExecLocalNotPermittedForUntrusted
-
-    prop "mode=remote never yields a Local-capable backend (always Ssh-or-Left)" $
+    prop "only TbSsh yields Right; all other backends yield Left" $
       forAll genBackend $ \b ->
-        let cfg = UntrustedExecConfig UemRemote (Just sshCfg)
+        let cfg = UntrustedExecConfig True
         in case selectUntrustedBackend cfg b of
              Right _ -> case b of TbSsh _ -> True; _ -> False
-             Left _  -> True
+             Left _  -> case b of TbSsh _ -> False; _ -> True
 
-    prop "mode=local never yields Right (always Left, never Local)" $
-      forAll genBackend $ \b ->
-        let cfg = UntrustedExecConfig UemLocal (Just sshCfg)
-        in selectUntrustedBackend cfg b `shouldSatisfy` isLeft
+  -- Design 8 step 2, the corrected truth table. The two properties below are
+  -- the whole point of it: `allow_localhost` gates MtLocal and ONLY MtLocal.
+  -- Revision 1 gated remote machines on the same flag and so refused every
+  -- machine under the default configuration; these assertions fail against
+  -- that table.
+  describe "selectExecBackend (the corrected truth table)" $ do
 
-  describe "selectExecBackend" $ do
+    it "MtLocal + allow_localhost = true -> EbLocal" $
+      selectExecBackend (UntrustedExecConfig True) TbLocal
+        `shouldSatisfy` isRight
 
-    it "mode=local + TbLocal -> Right (EbLocal ...)" $ do
-      let cfg = UntrustedExecConfig UemLocal Nothing
-      selectExecBackend cfg TbLocal `shouldSatisfy` isRight
+    it "MtLocal + allow_localhost = false -> Left (never EbLocal)" $
+      selectExecBackend (UntrustedExecConfig False) TbLocal
+        `shouldBe` Left ExecLocalNotPermittedForUntrusted
 
-    it "mode=remote + TbSsh configured -> Right (EbRemote ...)" $ do
-      let cfg = UntrustedExecConfig UemRemote (Just sshCfg)
-      selectExecBackend cfg (TbSsh sshCfg) `shouldSatisfy` isRight
-
-    it "mode=remote + TbLocal -> Left (no local fallback)" $ do
-      let cfg = UntrustedExecConfig UemRemote (Just sshCfg)
-      selectExecBackend cfg TbLocal `shouldBe` Left ExecLocalNotPermittedForUntrusted
-
-    it "mode=remote + no remote configured + TbSsh -> Left ExecRemoteRequired" $ do
-      let cfg = UntrustedExecConfig UemRemote Nothing
-      selectExecBackend cfg (TbSsh sshCfg) `shouldBe` Left ExecRemoteRequired
-
-    prop "mode=remote never yields EbLocal (no local fallback)" $
-      forAll genBackend $ \b ->
-        let cfg = UntrustedExecConfig UemRemote (Just sshCfg)
-        in case selectExecBackend cfg b of
-             Right (EbLocal _) -> False
-             _                 -> True
-
-  describe "fail-closed integration (spec §7 row 1+2)" $ do
-
-    it "mode=remote, no remote configured + TbLocal -> Left ExecLocalNotPermittedForUntrusted (no local fallback)" $ do
-      let cfg = UntrustedExecConfig UemRemote Nothing
-      selectExecBackend cfg TbLocal `shouldBe` Left ExecLocalNotPermittedForUntrusted
-
-    it "mode=remote, no remote configured + TbSsh -> Left ExecRemoteRequired (fail-closed at call time)" $ do
-      let cfg = UntrustedExecConfig UemRemote Nothing
-      selectExecBackend cfg (TbSsh sshCfg) `shouldBe` Left ExecRemoteRequired
-
-    it "mode=remote, remote configured + TbSsh -> Right (EbRemote sshCfg)" $ do
-      let cfg = UntrustedExecConfig UemRemote (Just sshCfg)
-      case selectExecBackend cfg (TbSsh sshCfg) of
+    it "MtSsh is selectable under the default (allow_localhost = true)" $
+      case selectExecBackend (UntrustedExecConfig True) (TbSsh sshCfg) of
         Right (EbRemote s) -> scHost s `shouldBe` scHost sshCfg
-        _ -> expectationFailure "expected Right (EbRemote ...)"
+        other -> expectationFailure
+          ("expected Right (EbRemote ...) under allow_localhost = true, got "
+            <> show other)
+
+    it "MtSsh is selectable with allow_localhost = false too" $
+      case selectExecBackend (UntrustedExecConfig False) (TbSsh sshCfg) of
+        Right (EbRemote s) -> scHost s `shouldBe` scHost sshCfg
+        other -> expectationFailure
+          ("expected Right (EbRemote ...) under allow_localhost = false, got "
+            <> show other)
+
+    prop "prop_mtLocalFalseIsNeverEbLocal: MtLocal under a false flag never runs locally" $
+      let cfg = UntrustedExecConfig False
+      in case selectExecBackend cfg TbLocal of
+           Right (EbLocal _) -> False
+           _                 -> True
+
+    prop "prop_mtSshIsNeverEbLocal: a remote machine never becomes a local handle" $
+      forAll (elements [True, False]) $ \allow ->
+        case selectExecBackend (UntrustedExecConfig allow) (TbSsh sshCfg) of
+          Right (EbLocal _) -> False
+          _                 -> True
+
+    prop "the flag changes exactly one cell of the table" $
+      forAll genBackend $ \b ->
+        let withFlag = selectExecBackend (UntrustedExecConfig True) b
+            noFlag   = selectExecBackend (UntrustedExecConfig False) b
+        in case b of
+             TbLocal -> withFlag /= noFlag
+             _       -> withFlag == noFlag
 
   describe "enforceRemoteOnly (Cabal flag startup check)" $ do
 
-    it "mode=remote -> Right ()" $ do
-      let cfg = UntrustedExecConfig UemRemote (Just sshCfg)
-      enforceRemoteOnly cfg `shouldBe` Right ()
+    it "allow_localhost = false -> Right ()" $
+      enforceRemoteOnly (UntrustedExecConfig False) `shouldBe` Right ()
 
-    it "mode=local -> Left (startup error)" $ do
-      let cfg = UntrustedExecConfig UemLocal Nothing
+    it "allow_localhost = true -> Left (startup error)" $
+      enforceRemoteOnly (UntrustedExecConfig True) `shouldSatisfy` \case
+        Left _ -> True
+        Right _ -> False
+
+    it "rejects the default, which is allow_localhost = true" $ do
+      -- The state the check exists to reject: no [untrusted_execution] section
+      -- at all. It used to resolve to `Nothing`, which the check could not see
+      -- through, so a hardened build started and then failed every local call.
+      let cfg = untrustedExecConfigFromSecurity defaultSecurityConfig
       enforceRemoteOnly cfg `shouldSatisfy` \case
         Left _ -> True
         Right _ -> False

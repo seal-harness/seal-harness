@@ -52,6 +52,11 @@ export interface SessionInfo {
   /** Communications channel name of the session origin (e.g. "signal",
    *  "telegram", "cli"), or null when no source was recorded. */
   channel: string | null
+  /** The execution machine this session runs on. Always present: a session
+   *  that recorded none reports the machine it resolves to (`local` on a
+   *  pre-feature install), never null — so the sidebar never has a blank
+   *  column and consumers never branch. */
+  machine: string
   /** Channel user id of the session origin, or null when the channel
    *  carries no user id (e.g. `seal tui` → the `cli` channel). */
   channelUserId: string | null

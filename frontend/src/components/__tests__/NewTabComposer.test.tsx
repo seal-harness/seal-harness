@@ -62,6 +62,11 @@ function makeSpec(overrides: Partial<NewTabSpec> = {}): NewTabSpec {
     discoveryError: false,
     scanDiscoverable: vi.fn(async () => {}),
     validationError: null,
+    machines: [],
+    defaultMachine: null,
+    machine: null,
+    setMachine: vi.fn(),
+    showMachinePicker: false,
     buildBody: vi.fn(() => ({ kind: 'provider', provider: 'anthropic', model: 'claude-sonnet-4' })),
     persistOnSubmit: vi.fn(),
   }
@@ -87,6 +92,49 @@ describe('NewTabComposer — provider kind', () => {
     // The agent field was removed from the new-tab composer (the agent is
     // chosen later on the SessionSetup screen).
     expect(screen.queryByLabelText('Agent')).toBeNull()
+  })
+
+  // ── WU-10/WU-11: the execution-machine picker (done-when 8).
+  describe('execution machine picker', () => {
+
+    it('is hidden when only one machine is selectable', () => {
+      // "shown only when more than one machine is selectable" — with one there
+      // is nothing to choose, and a single-item dropdown is noise.
+      render(<NewTabComposer
+        spec={makeSpec({ machines: ['local'], showMachinePicker: false })}
+        onSubmit={() => {}} onCancel={() => {}} />)
+      expect(screen.queryByTestId('machine-picker')).toBeNull()
+    })
+
+    it('is shown when two or more machines are selectable', () => {
+      render(<NewTabComposer
+        spec={makeSpec({
+          machines: ['local', 'mac-mini'],
+          showMachinePicker: true,
+          defaultMachine: 'mac-mini',
+        })}
+        onSubmit={() => {}} onCancel={() => {}} />)
+      expect(screen.getByTestId('machine-picker')).toBeTruthy()
+    })
+
+    it('preselects "default" rather than the default machine name', () => {
+      // Pre-selecting the DEFAULT NAME would pin every session at birth: an
+      // operator who later changes `default` would find new sessions still
+      // starting on the old one. The empty option means "no choice", which the
+      // hook omits from the request body.
+      render(<NewTabComposer
+        spec={makeSpec({
+          machines: ['local', 'mac-mini'],
+          showMachinePicker: true,
+          defaultMachine: 'mac-mini',
+          machine: null,
+        })}
+        onSubmit={() => {}} onCancel={() => {}} />)
+      const picker = screen.getByTestId('machine-picker') as HTMLSelectElement
+      expect(picker.value).toBe('')
+      expect(picker.options[0]!.textContent).toContain('mac-mini')
+    })
+
   })
 
   // Test 42, the second ProviderSelect consumer. This is the other live render

@@ -17,11 +17,13 @@ module Seal.Session.Meta
 
 import Data.Aeson
   ( FromJSON (..), ToJSON (..), object, withObject, (.:), (.:?), (.!=), (.=) )
+import Data.Aeson.Types (Parser)
 import Data.Text (Text)
 import Data.Time (UTCTime)
 import System.Directory (doesFileExist)
 
 import Seal.Agent.Def.Types (AgentDefId (..))
+import Seal.Config.Machines (MachineName, machineNameText, mkMachineName)
 import Seal.Config.Paths (SealPaths, sessionMetaPath)
 import Seal.Core.Types (SessionId)
 import Seal.Util.StrictIO (decodeFileStrict)
@@ -81,6 +83,13 @@ data SessionMeta = SessionMeta
     -- @SETUP_REPO@ (either agent-invoked or the web setup-repo endpoint).
     -- 'Nothing' when no repo has been cloned. Persisted to @session.json@
     -- so the sidebar can show the repo name without scanning the workdir.
+  , smMachine :: Maybe MachineName
+    -- ^ The execution machine this session runs on. 'Nothing' for a session
+    -- created before this field existed, and for one that never chose — both
+    -- resolve through @machines.toml@'s default at call time, which is why the
+    -- decode is tolerant. Recorded so a resumed session keeps running where its
+    -- work already is: a session whose machine has been deleted fails rather than
+    -- silently moving (design §5.1).
   , smRepoBranch :: Maybe Text
     -- ^ The branch or tag requested for 'smRepoUrl' through @SETUP_REPO@'s
     -- optional @branch@ argument. 'Nothing' means the remote's default
@@ -105,6 +114,7 @@ instance ToJSON SessionMeta where
     , "description" .= smDescription m
     , "seal_front_matter" .= smSealFrontMatter m
     , "repo_url"    .= smRepoUrl m
+    , "machine"     .= (machineNameText <$> smMachine m)
     , "repo_branch" .= smRepoBranch m
     , "created_at"  .= smCreatedAt m
     , "last_active" .= smLastActive m
@@ -123,6 +133,10 @@ instance FromJSON SessionMeta where
     <*> o .:? "description"
     <*> o .:? "seal_front_matter" .!= True
     <*> o .:? "repo_url"
+    -- Tolerant: pre-existing sessions have no machine, and unknown keys are
+    -- ignored in both directions, so this is a pure addition to the format.
+    <*> fmap (>>= either (const Nothing) Just . mkMachineName)
+              (o .:? "machine" :: Parser (Maybe Text))
     <*> o .:? "repo_branch"
     <*> o .:  "created_at"
     <*> o .:  "last_active"

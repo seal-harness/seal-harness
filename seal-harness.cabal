@@ -186,6 +186,7 @@ library
         Seal.Command.Tab
         Seal.Command.Agent
         Seal.Command.Background
+        Seal.Command.Machine
         Seal.Command.AccessControl
         Seal.Command.Call
         Seal.Command.New
@@ -196,6 +197,9 @@ library
         Seal.Config.Credentials
         Seal.Config.File
         Seal.Config.Migrate
+        Seal.Config.Machines
+        Seal.Tools.Exec.Machine
+        Seal.ISA.Ops.Machine
         Seal.Config.Paths
         Seal.Config.Security
         Seal.Config.Templates
@@ -205,6 +209,7 @@ library
         Seal.Session.AgentMetaCache
         Seal.Session.ExecCache
         Seal.Session.Branch
+        Seal.Session.Machine
         Seal.Session.Meta
         Seal.Session.Store
         Seal.Session.Workdir
@@ -337,6 +342,7 @@ library
         Seal.Logging.Global
         Seal.Audit.Log
         Seal.Audit.Predicate
+        Seal.Tools.Exec.Proc
     -- The local untrusted executor is omitted under -f remote-only-untrusted
     -- (the hardened build: untrusted execution can only run remotely).
     if !flag(remote-only-untrusted)
@@ -424,6 +430,10 @@ test-suite tests
     type: exitcode-stdio-1.0
     main-is: Main.hs
     ghc-options: -threaded -rtsopts
+    -- The hardened build omits Seal.Tools.Exec.Local, so the specs that drive
+    -- the local executor compile out with it (see LocalSpec).
+    if flag(remote-only-untrusted)
+        cpp-options: -DREMOTE_ONLY_UNTRUSTED
     build-depends:
         base
       , seal-harness
@@ -598,6 +608,7 @@ test-suite tests
         Seal.Command.RepoSpec
         Seal.Command.AgentSpec
         Seal.Command.BackgroundSpec
+        Seal.Command.MachineSpec
         Seal.Command.CallSpec
         Seal.Command.AccessControlSpec
         Seal.Command.ChannelSpec
@@ -608,10 +619,14 @@ test-suite tests
         Seal.Config.CredentialsSpec
         Seal.Config.FileSpec
         Seal.Config.MigrateSpec
+        Seal.Config.MachinesSpec
         Seal.Config.SecurityAccessControlSpec
        Seal.Config.SecuritySpec
          Seal.Config.SecurityScopingFailSpec
          Seal.CapabilityScopingWorkdirFsFailSpec
+        Seal.Tools.Exec.MachineSpec
+        Seal.ISA.Ops.MachineSpec
+        Seal.ISA.DispatchMachineSpec
         Seal.Config.PathsSpec
         Seal.Config.TemplatesSpec
         Seal.ConfigSpec
@@ -632,6 +647,7 @@ test-suite tests
         Seal.Session.AgentMetaCacheSpec
         Seal.Session.ExecCacheSpec
         Seal.Session.BranchSpec
+        Seal.Session.MachineSpec
         Seal.Session.MetaSpec
         Seal.Session.StoreSpec
         Seal.Session.LogSpec
@@ -650,6 +666,13 @@ test-suite tests
          Seal.Web.UrlSafetySpec
          Seal.Config.WorkdirSpec
          Seal.Tools.Exec.LocalSpec
+         Seal.Tools.Exec.HardenedBuildSpec
+         Seal.Tools.Exec.ExecErrorMappingSpec
+         Seal.Tools.Exec.SelfKeyGuardSpec
+         Seal.Session.MachineRoutingSpec
+         Seal.ISA.Ops.MachineSchemaSpec
+         Seal.ISA.Ops.MachinePromptSpec
+         Seal.Gateway.MachineDisplaySpec
          Seal.Tools.Exec.RemoteSpec
           Seal.Tools.ArgsSpec
           Seal.Tools.Exec.CapabilityScopingFailSpec

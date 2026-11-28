@@ -64,7 +64,7 @@ import System.Process
   )
 
 import Seal.Tools.Args (ShellCommand, textShellCommand)
-import Seal.Tools.Exec.Local (readBounded, readBoundedBytes, withManagedProcess)
+import Seal.Tools.Exec.Proc (readBounded, readBoundedBytes, withManagedProcess)
 import Seal.Tools.Exec.Types
 import Seal.Logging.Global (globalLogIO)
 

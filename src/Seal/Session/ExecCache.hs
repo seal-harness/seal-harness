@@ -44,13 +44,14 @@ import Data.Time (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
 import Seal.Agent.Def.Types (AgentDef)
 import Seal.Agent.Def.Workdir (listWorkdirAgentDefsSnap)
 import Seal.Config.Paths (SealPaths)
-import Seal.Config.Security (SecurityConfig, untrustedExecConfigFromSecurity)
+import Seal.Config.Machines
+  ( MachineName, MachineRegistry (..), resolveRegistryForSecurity )
+import Seal.Config.Security (SecurityConfig)
 import Seal.Core.Types (SessionId)
 import Seal.Security.Path (WorkspaceRoot (..))
 import Seal.Session.AgentMetaCache (MetaCacheEnv, buildRoutingWorkdirFs)
 import Seal.Session.Workdir
-  ( SessionExec (..), isFailClosedSessionExec, mkSessionExec
-  )
+  ( SessionExec (..), isFailClosedSessionExec, mkSessionExecFor )
 import Seal.Skills.Backend (listWorkdirSkillsSnap)
 import Seal.Skills.Types (Skill)
 import Seal.SourceControl.Clone (CloneDeps)
@@ -92,25 +93,44 @@ newSessionExecCacheWith :: IO UTCTime -> IO SessionExecCache
 newSessionExecCacheWith now =
   SessionExecCache <$> newIORef Map.empty <*> newIORef Map.empty <*> pure now
 
--- | A stable fingerprint of the part of the security config that determines
--- session-exec behavior (mode local/remote + SSH coordinates). 'Show'-based:
--- the config types are small, pure records with 'Eq'/'Show' pinned for tests.
-execFingerprint :: SecurityConfig -> Text
-execFingerprint = T.pack . show . untrustedExecConfigFromSecurity
+-- | A stable fingerprint of everything that determines a session exec.
+--
+-- __It covers both config files now, and it has to.__ Before this feature the
+-- exec was a pure function of @security.toml@, so fingerprinting that file was
+-- complete. The coordinates moved to @machines.toml@, so fingerprinting only the
+-- flag would leave an operator who adds or edits a machine looking at a stale
+-- cached exec until they restarted. The registry *is* the resolved set, so
+-- fingerprinting it is also exactly the design's rule: any @machines.toml@ edit
+-- rebuilds.
+--
+-- IO because reading @machines.toml@ is IO. A malformed file fingerprints as its
+-- error text, so fixing the file also invalidates the cache.
+execFingerprint :: SealPaths -> SecurityConfig -> Maybe MachineName -> IO Text
+execFingerprint paths secCfg mMachine = do
+  eReg <- resolveRegistryForSecurity paths secCfg
+  pure $ T.pack $ case eReg of
+    Left err  -> "unresolvable: " <> T.unpack err
+    Right reg -> show (regMachines reg, regRejected reg, regDefault reg, mMachine)
 
 -- | Fetch-or-build the session's 'SessionExec'. Successes are memoized by
 -- 'SessionId'; rebuilt on a fingerprint mismatch or explicit
 -- 'invalidateExec'. Fail-closed builds are never stored.
+--
+-- @mMachine@ is the session's recorded machine ('smMachine'), and it is part of
+-- the fingerprint: a session resumed on a different machine must build a fresh
+-- exec even when @machines.toml@ has not changed. Without that, the cache would
+-- hand back the previous machine's handles.
 cachedSessionExec
   :: SessionExecCache -> SealPaths -> SecurityConfig -> SessionId
-  -> CloneDeps -> RemoteRunner -> Maybe HostKeyAdoption -> IO SessionExec
-cachedSessionExec cache paths secCfg sid cloneDeps runner mAdoption = do
+  -> CloneDeps -> RemoteRunner -> Maybe HostKeyAdoption
+  -> Maybe MachineName -> IO SessionExec
+cachedSessionExec cache paths secCfg sid cloneDeps runner mAdoption mMachine = do
   execs <- readIORef (sceExecs cache)
-  let fp = execFingerprint secCfg
+  fp <- execFingerprint paths secCfg mMachine
   case Map.lookup sid execs of
     Just ce | ceFingerprint ce == fp -> pure (ceExec ce)
     _ -> do
-      exec <- mkSessionExec paths secCfg sid cloneDeps runner mAdoption
+      exec <- mkSessionExecFor paths secCfg sid cloneDeps runner mAdoption mMachine
       if isFailClosedSessionExec exec
         then pure exec   -- never cache failures: a later retry must succeed
         else do

@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 -- | The reusable gateway API integration test harness. Builds 'ApiDeps'
 -- wired for local OR remote mode, with a mock LLM provider (via
@@ -62,8 +63,10 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, mapMaybe, maybeToList)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
 import Data.Text.Encoding qualified as TE
 import Data.Time (UTCTime (..), fromGregorian)
+import Network.Info (NetworkInterface (..), getNetworkInterfaces, ipv4)
 import Network.HTTP.Client (defaultManagerSettings, newManager)
 import Network.HTTP.Types (methodGet, methodPost, statusCode)
 import Network.Wai
@@ -74,7 +77,7 @@ import System.Directory
   ( createDirectoryIfMissing, doesFileExist, findExecutable
   , getHomeDirectory, getTemporaryDirectory )
 import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
+import System.FilePath ((</>), takeDirectory)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Process (readCreateProcessWithExitCode, proc, CreateProcess (..))
 import Test.Hspec
@@ -85,10 +88,10 @@ import Seal.Command.Provider (ProviderRuntime (..))
 import Seal.Command.Spec (mkRegistry)
 import Seal.Command.Tab (noTabCloseNotifier)
 import Seal.Config.File (updateRuntimeConfig, DelegationFileConfig (..), rcDelegation)
-import Seal.Config.Paths (SealPaths (..), securityFilePath, sshAgentsDir)
+import Seal.Config.Paths
+  ( SealPaths (..), machinesFilePath, securityFilePath, sshAgentsDir )
 import Seal.Config.Security
-  ( SecurityConfig (..), UntrustedExecFileConfig (..)
-  , UntrustedExecRemoteFileConfig (..), defaultSecurityConfig
+  ( SecurityConfig (..), UntrustedExecFileConfig (..), defaultSecurityConfig
   , WriteMode (PreserveCredentials), saveSecurityConfig )
 import Seal.Core.Types (ModelId (..), mkSessionId)
 import Seal.Gateway.API (ApiDeps (..), apiApp)
@@ -124,7 +127,6 @@ import Seal.ISA.RepeatDetect (newSessionRepeatRegistry)
 import Seal.Tools.Exec.Remote (RemoteRunner (..))
 import Seal.Tools.Exec.Types (ExecError (..))
 import Seal.Tools.Exec.FileExplorer (mkFailClosedFileExplorer)
-import Seal.Tools.Exec.Untrusted (UntrustedExecMode (..))
 import Seal.Tabs (newTabsHandle)
 import Seal.Web.UiState (newUiStateHandle)
 import Seal.Memory.Embedding (nullEmbeddingBackend)
@@ -164,7 +166,8 @@ data ApiTestEnv = ApiTestEnv
   { ateApp         :: Application
   , ateDeps        :: ApiDeps
   , atePaths       :: SealPaths
-  , ateMode        :: UntrustedExecMode
+  , ateIsRemote    :: Bool
+    -- ^ Whether this fixture runs every untrusted call on a separate machine
     -- ^ Which untrusted executor wiring this environment uses. The test
     -- body must NOT branch on this for assertions — both modes must assert
     -- the same contract. It exists so fixtures can observe the executor's
@@ -179,10 +182,14 @@ data ApiTestEnv = ApiTestEnv
     -- the contract itself is asserted via the shared gh-env marker file.
   }
 
--- | Human-readable label for a mode (diagnostics output only).
-uemLabel :: UntrustedExecMode -> Text
-uemLabel UemLocal  = "local"
-uemLabel UemRemote = "remote"
+-- | Human-readable label for a fixture's execution plane (diagnostics only).
+--
+-- The two configurations this harness exercises are "every untrusted call runs
+-- on this machine" and "every untrusted call runs on a separate one". Since
+-- @allow_localhost@ is the only thing that decides between them, the label
+-- derives from the same 'Bool' the rest of the harness branches on.
+uemLabel :: Bool -> Text
+uemLabel isRemote = if isRemote then "remote" else "local"
 
 -- | The PAT token seeded into the fake vault for @CredPat@ dummy repos.
 -- Tests assert this exact value reaches the composed untrusted command's
@@ -295,10 +302,22 @@ setupDummyRepo tmp cfg = do
   pubKey <- readFileStrict pubKeyPath
   appendFile authorizedKeysPath (pubKey <> "\n")
 
-  -- Scan localhost's host key.
+  -- Scan the host key of the address the harness will actually dial. The
+  -- machine list names a non-loopback address (see 'nonLoopbackSelfAddress'),
+  -- so scanning @localhost@ would file the key under a name nothing dials and
+  -- the connection would be refused as an unknown host.
+  -- The key must be filed under the name the MACHINE LIST dials, or the
+  -- connection is refused as unknown. That name is a non-loopback one (see
+  -- 'selfHostName'); the repo URL below keeps its original shape because it is
+  -- a credential-resolution input, not a transport address.
+  scanHost <- selfHostName
   (scanEc, scanOut, _) <- readCreateProcessWithExitCode
-    (proc "ssh-keyscan" ["-t", "ed25519", "localhost"]) ""
-  let knownHostsPath = keyfilesDir </> "known_hosts"
+    (proc "ssh-keyscan" ["-t", "ed25519", scanHost]) ""
+  -- Host keys are pinned in the harness-owned file now, not per repo: the
+  -- machine's scKnownHosts is 'execKnownHostsPath', filled at the single
+  -- construction site. Writing the scanned key here is what makes the first
+  -- connection find it already pinned (no TOFU prompt in a test).
+  let knownHostsPath = tmp </> "exec-known-hosts"
   case scanEc of
     ExitFailure _ -> writeFile knownHostsPath ""  -- empty known_hosts; test body will pendingWith
     ExitSuccess -> writeFile knownHostsPath scanOut
@@ -354,16 +373,31 @@ runApiTestOpts mRepoCfg opts body = do
   describe "remote mode" $ runApiTestRemote mRepoCfg opts body
 
 -- | Run the test body in local mode only.
+--
+-- __Under @-f remote-only-untrusted@ this reports a pending instead of
+-- running.__ The hardened build has no local untrusted executor by
+-- construction, so every fixture below that boots a local session would
+-- exercise the fail-closed reason rather than the behaviour it names — and a
+-- body asserting "the clone landed in the workdir" would fail against a blank
+-- workspace for a reason that is the whole point of the build. Gating here
+-- keeps the hardened suite green without weakening any assertion: the local
+-- arm is not part of that artifact.
 runApiTestLocal
   :: Maybe DummyRepoConfig
   -> ApiTestOptions
   -> (ApiTestEnv -> IO ())
   -> SpecWith ()
+#if defined(REMOTE_ONLY_UNTRUSTED)
+runApiTestLocal _ _ _ =
+  it "local (omitted from this build)" $
+    pendingWith "-f remote-only-untrusted omits the local untrusted executor"
+#else
 runApiTestLocal mRepoCfg opts body = it "local" $ do
   withSystemTempDirectory "seal-api-test" $ \tmp -> do
     mRepo <- traverse (setupDummyRepo tmp) mRepoCfg
-    env <- buildTestEnv tmp UemLocal mRepo opts
+    env <- buildTestEnv tmp False mRepo opts
     body env
+#endif
 
 -- | Run the test body in remote mode only. Guards with 'pendingWith' when
 -- sshd / ssh-keygen / ssh-keyscan are unavailable.
@@ -375,7 +409,7 @@ runApiTestRemote
 runApiTestRemote mRepoCfg opts body = it "remote" $ do
   let runBody = withSystemTempDirectory "seal-api-test" $ \tmp -> do
           mRepo <- traverse (setupDummyRepo tmp) mRepoCfg
-          env <- buildTestEnv tmp UemRemote mRepo opts
+          env <- buildTestEnv tmp True mRepo opts
           body env
   keygenExe <- findExecutable "ssh-keygen"
   case keygenExe of
@@ -410,9 +444,9 @@ runApiTestRemote mRepoCfg opts body = it "remote" $ do
 -- ---------------------------------------------------------------------------
 
 buildTestEnv
-  :: FilePath -> UntrustedExecMode -> Maybe DummyRepo -> ApiTestOptions
+  :: FilePath -> Bool -> Maybe DummyRepo -> ApiTestOptions
   -> IO ApiTestEnv
-buildTestEnv tmp mode mRepo opts = do
+buildTestEnv tmp isRemoteMode mRepo opts = do
   let stateRoot  = tmp </> "state"
       configRoot = tmp </> "config"
       sessionRoot = stateRoot </> "sessions"
@@ -461,9 +495,17 @@ buildTestEnv tmp mode mRepo opts = do
   vaultRt <- makeFakeVaultRuntime (maybeToList mVaultSeed)
 
   -- Session runtime.
-  let meta0 = SessionMeta
-        (case mkSessionId "test" of Right s -> s; Left _ -> error "sid") "ollama" "llama3.2" "web" Nothing Nothing Nothing Nothing Nothing True Nothing Nothing
-        (UTCTime (fromGregorian 2026 1 1) 0) (UTCTime (fromGregorian 2026 1 1) 0)
+  -- Named construction: this had drifted far enough that a positional literal
+  -- silently bound a timestamp to the wrong field as soon as one was inserted.
+  let testTime = UTCTime (fromGregorian 2026 1 1) 0
+      meta0 = SessionMeta
+        { smId = case mkSessionId "test" of Right s -> s; Left _ -> error "sid"
+        , smProvider = "ollama", smModel = "llama3.2", smChannel = "web"
+        , smParent = Nothing, smAgent = Nothing, smSystemOverride = Nothing
+        , smAgentName = Nothing, smDescription = Nothing, smSealFrontMatter = True
+        , smRepoUrl = Nothing, smMachine = Nothing, smRepoBranch = Nothing
+        , smCreatedAt = testTime, smLastActive = testTime
+        }
   activeRef <- newIORef meta0
   let sr = SessionRuntime
         { srPaths = paths, srConfigPath = configRoot </> "config.toml"
@@ -490,15 +532,22 @@ buildTestEnv tmp mode mRepo opts = do
         }
   agentRegH <- mkAgentRegistryHandle (sshAgentsDir paths)
 
-  -- Security config: remote mode needs untrusted_execution.remote.
-  -- Write it to security.toml so runTurnBody picks it up (the turn
-  -- engine loads SecurityConfig from disk, not from ApiDeps).
-  currentUser <- if mode == UemRemote then whoami else pure ""
+  -- Security config: remote mode means allow_localhost = false. Write it to
+  -- security.toml so runTurnBody picks it up (the turn engine loads
+  -- SecurityConfig from disk, not from ApiDeps).
+  --
+  -- The SSH coordinates do NOT go here any more: they are a named machine in
+  -- machines.toml, which 'writeRemoteMachinesToml' writes below. That is what
+  -- the feature under test is for — one file for the policy, one for the hosts.
+  currentUser <- if isRemoteMode then whoami else pure ""
   let mKeyfilePath = mRepo >>= drKeyfilePath
-      secCfg = if mode == UemRemote
-        then buildRemoteSecurityConfig tmp currentUser mKeyfilePath
+      secCfg = if isRemoteMode
+        then buildRemoteSecurityConfig
         else defaultSecurityConfig
   _ <- saveSecurityConfig (securityFilePath paths) secCfg PreserveCredentials
+  when isRemoteMode $ do
+    host <- T.pack <$> selfHostName
+    writeRemoteMachinesToml paths tmp currentUser host mKeyfilePath
 
   logger <- testSealLogger
   execCache <- newSessionExecCache
@@ -508,7 +557,7 @@ buildTestEnv tmp mode mRepo opts = do
   -- gh command of the composed remote string. Both fixtures append what
   -- the gh invocation actually saw to the same marker file, so the test
   -- body asserts one contract with no mode branching.
-  mCaptureRef <- if mode == UemRemote && atoFakeRemoteRunner opts
+  mCaptureRef <- if isRemoteMode && atoFakeRemoteRunner opts
     then Just <$> newIORef []
     else pure Nothing
   mRunner <- case mCaptureRef of
@@ -539,7 +588,7 @@ buildTestEnv tmp mode mRepo opts = do
         , sdRepeatReg = testRepeatReg
         , sdTabsHandle = tabsH
         , sdLogger = logger
-        , sdIsRemote = mode == UemRemote
+        , sdIsRemote = isRemoteMode
         , sdExecCache = execCache
         , sdRemoteRunner = mRunner
         , sdHostKeyAdoption = Nothing
@@ -591,7 +640,7 @@ buildTestEnv tmp mode mRepo opts = do
     { ateApp = app
     , ateDeps = deps
     , atePaths = paths
-    , ateMode = mode
+    , ateIsRemote = isRemoteMode
     , ateProviderRef = providerRef
     , ateDummyRepo = mRepo
     , ateCapturedSshArgv = mCaptureRef
@@ -755,25 +804,82 @@ ghMarkerLines url effEnv = T.unpack (T.concat
   , "GIT_TERMINAL_PROMPT='" <> fromMaybe "" (lookup "GIT_TERMINAL_PROMPT" effEnv) <> "'\n"
   ])
 
--- | Build a SecurityConfig for remote mode (SSH to localhost).
--- The identity (private key) must be set so sshExecArgv passes @-i <key>@.
--- Without it, SSH falls back to default keys (~/.ssh/id_*) and the agent,
--- neither of which has the test key.
-buildRemoteSecurityConfig :: FilePath -> String -> Maybe FilePath -> SecurityConfig
-buildRemoteSecurityConfig tmp user mKeyfilePath =
+-- | The @security.toml@ half of the remote fixture: local execution is off, so
+-- the resolver must take the session machine from @machines.toml@.
+buildRemoteSecurityConfig :: SecurityConfig
+buildRemoteSecurityConfig =
   defaultSecurityConfig
-    { scUntrustedExec = Just UntrustedExecFileConfig
-        { uefcMode = "remote"
-        , uefcRemote = Just UntrustedExecRemoteFileConfig
-            { uerfcHost = Just "localhost"
-            , uerfcUser = Just (T.pack user)
-            , uerfcPort = Nothing
-            , uerfcIdentity = mKeyfilePath
-            , uerfcKnownHosts = Just (tmp </> "state" </> "repos" </> "keys" </> "known_hosts")
-            , uerfcWorkspace = Just (T.pack (tmp </> "cache" </> "remote-workspace"))
-            }
-        }
-    }
+    { scUntrustedExec = Just (UntrustedExecFileConfig False) }
+
+-- | The @machines.toml@ half of the remote fixture: one machine named
+-- @default@, whose coordinates point at the local sshd the fixture starts.
+--
+-- @host@ must NOT be a loopback form. Resolution's loopback guard refuses a
+-- machine whose host is @localhost@, @127.0.0.0/8@, @::1@ and the unspecified
+-- addresses (that is DW-5), so a fixture describing a separate machine cannot
+-- spell one of those — the fixture would then be exercising a configuration the
+-- product rejects, and every remote test would fail-closed for the wrong
+-- reason. @exec.internal@ is a name that resolves nowhere: the fake runner
+-- never dials, it only records the argv, so the name is free to be honest.
+--
+-- The identity (private key) must be set so @sshExecArgv@ passes @-i <key>@.
+-- Without it SSH falls back to the default keys and the agent, neither of which
+-- has the test key.
+writeRemoteMachinesToml
+  :: SealPaths -> FilePath -> String -> Text -> Maybe FilePath -> IO ()
+writeRemoteMachinesToml paths tmp user host mKeyfilePath = do
+  let path = machinesFilePath paths
+  createDirectoryIfMissing True (takeDirectory path)
+  TIO.writeFile path $ T.unlines $
+    [ "default = \"default\""
+    , "[machines.default]"
+    , "host = \"" <> host <> "\""
+    , "user = \"" <> T.pack user <> "\""
+    ]
+    <> maybe [] (\k -> [ "identity = \"" <> T.pack k <> "\"" ]) mKeyfilePath
+    <> [ "workspace = \"" <> T.pack (tmp </> "cache" </> "remote-workspace") <> "\"" ]
+
+-- | A name for this machine that the loopback guard does not refuse.
+--
+-- This fixture runs a real @sshd@ on the test host, so the harness must dial
+-- something that reaches it. @localhost@ and @127.0.0.0/8@ are exactly what the
+-- guard rejects — a machine claiming to be the harness machine would defeat the
+-- two-plane split — so dialling them would make every remote test fail-closed
+-- for a reason unrelated to what it asserts.
+--
+-- The machine's own hostname is the honest answer: it is not a loopback form, it
+-- really is this host, and in practice it resolves back to it. It is *not*
+-- verified here. If it does not resolve, @sshd@ is unreachable and the existing
+-- @SSH to localhost not working@ guard turns the test into a pending rather than
+-- a false failure — which is why this is a hostname and not an address: the repo
+-- URL built from it goes through credential resolution, and an IP literal there
+-- is refused ("only github.com is supported") before any SSH happens.
+-- | A dialable address for this machine that the loopback guard does not
+-- refuse.
+--
+-- This fixture runs a real @sshd@ on the test host, so the harness's machine
+-- list must name something that reaches it. @localhost@ and @127.0.0.0/8@ are
+-- exactly what the guard rejects — a machine claiming to be the harness machine
+-- would defeat the two-plane split — so naming them would make every remote test
+-- fail-closed for a reason unrelated to what it asserts.
+--
+-- A non-loopback address of a local interface is the honest answer: it really is
+-- this host, it really is dialable, and it is not a loopback form. That the
+-- machine *is* this host is a separate question, and the design answers it with
+-- the connect-time host-key comparison (WU-15), not with the host string — so a
+-- LAN address here is a legitimate configured machine, not a loophole.
+--
+-- Note this is only the /transport/ address. The repo URL keeps its
+-- @localhost@ shape: it is a credential-resolution input, and that layer
+-- accepts only @github.com@.
+selfHostName :: IO String
+selfHostName = do
+  addrs <- map (show . ipv4) <$> getNetworkInterfaces
+  case filter (not . isLoopbackish) addrs of
+    (a : _) -> pure a
+    []      -> pure "localhost"
+  where
+    isLoopbackish a = take 4 a == "127." || a == "0.0.0.0" || a == "::"
 
 -- ---------------------------------------------------------------------------
 -- Test helpers

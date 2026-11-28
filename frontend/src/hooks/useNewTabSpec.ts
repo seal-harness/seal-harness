@@ -65,6 +65,22 @@ export interface NewTabSpec {
   repoBranch: string
   setRepoBranch: (v: string) => void
 
+  // Execution machine
+  /** Selectable machine names from GET /api/machines, in the server's order. */
+  machines: string[]
+  /** The configured default machine, or null when none is set. */
+  defaultMachine: string | null
+  /** The chosen machine, or null to leave it to the configured default.
+   *  Null is the honest state for "the user did not choose": recording the
+   *  default eagerly would pin the session, so a later change of `default`
+   *  would stop moving it. */
+  machine: string | null
+  setMachine: (v: string | null) => void
+  /** Whether the picker is shown at all. Hidden at ≤1 selectable machine, per
+   *  the requirement: with one machine there is nothing to choose, and a
+   *  single-item dropdown is noise. */
+  showMachinePicker: boolean
+
   // Harness
   flavour: HarnessFlavour
   setFlavour: (v: HarnessFlavour) => void
@@ -139,6 +155,33 @@ export function useNewTabSpec(
   // `pendingRestoreModel` holds the restored model id so the fetch effect
   // prefers it over the default; it's cleared once consumed.
   const pendingRestoreModel = useRef<string | null>(null)
+
+  // ── Execution machines ────────────────────────────────────────────────
+  // Fetched from GET /api/machines. The endpoint returns names and reasons
+  // only, so there is nothing to redact here.
+  const [machines, setMachines] = useState<string[]>([])
+  const [defaultMachine, setDefaultMachine] = useState<string | null>(null)
+  const [machine, setMachine] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    fetch('/api/machines')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((body: { selectable?: string[]; default?: string | null } | null) => {
+        if (cancelled || !body) return
+        setMachines(Array.isArray(body.selectable) ? body.selectable : [])
+        setDefaultMachine(typeof body.default === 'string' ? body.default : null)
+      })
+      // A failure leaves the picker hidden (0 machines), which is the safe
+      // degradation: the session still starts on the configured default,
+      // decided server-side.
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
+
+  // Shown only when there is something to choose. The requirement is explicit:
+  // the picker appears when more than one machine is selectable.
+  const showMachinePicker = machines.length > 1
 
   // Harness
   const [flavour, setFlavour] = useState<HarnessFlavour>('claude-code')
@@ -311,7 +354,14 @@ export function useNewTabSpec(
 
   const buildBody = useCallback((): CreateTabBody => {
     if (kind === 'provider') {
-      return { kind: 'provider', provider, model: model.trim() }
+      return {
+        kind: 'provider',
+        provider,
+        model: model.trim(),
+        // Omitted when null: the server then applies the configured default
+        // at call time, so a session that never chose keeps following it.
+        ...(machine ? { machine } : {}),
+      }
     }
     if (kind === 'harness') {
       // Seal's T10 takes a flat `kind: 'harness'` + harness_id. The harness
@@ -326,7 +376,7 @@ export function useNewTabSpec(
     // adoptWindow directly with the session/window/windowIndex). Return a
     // sentinel the caller will not send.
     return { kind: 'attach', harness_id: attachSession }
-  }, [kind, provider, model, flavour, customBinary, attachSession])
+  }, [kind, provider, model, machine, flavour, customBinary, attachSession])
 
   // Persist the current form selection + record the custom model (if any).
   // Best-effort; failures are swallowed (the UI still works within the
@@ -374,6 +424,7 @@ export function useNewTabSpec(
     customModels,
     repo, setRepo,
     repoBranch, setRepoBranch,
+    machines, defaultMachine, machine, setMachine, showMachinePicker,
     // Merge registered repo URLs with persisted history (deduped,
     // registered repos first so they're at the top of the dropdown).
     repoOptions: [

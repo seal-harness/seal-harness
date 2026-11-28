@@ -35,23 +35,27 @@ function mockLocalStorage() {
 // ── Constants ──────────────────────────────────────────────────────────
 
 describe('tabLineConfig constants', () => {
-  it('exports labels for all five fields', () => {
+  it('exports labels for all six fields', () => {
     expect(Object.keys(TAB_LINE_FIELD_LABELS).sort()).toEqual(
-      ['agent', 'channel', 'model', 'provider', 'repo'],
+      ['agent', 'channel', 'machine', 'model', 'provider', 'repo'],
     )
   })
 
-  it('ALL_TAB_LINE_FIELDS lists all five canonical fields', () => {
-    expect(ALL_TAB_LINE_FIELDS).toHaveLength(5)
+  it('ALL_TAB_LINE_FIELDS lists all six canonical fields', () => {
+    expect(ALL_TAB_LINE_FIELDS).toHaveLength(6)
     expect(ALL_TAB_LINE_FIELDS).toContain('provider')
     expect(ALL_TAB_LINE_FIELDS).toContain('model')
     expect(ALL_TAB_LINE_FIELDS).toContain('repo')
     expect(ALL_TAB_LINE_FIELDS).toContain('channel')
     expect(ALL_TAB_LINE_FIELDS).toContain('agent')
+    expect(ALL_TAB_LINE_FIELDS).toContain('machine')
   })
 
-  it('DEFAULT_TAB_LINE_FIELDS is provider → repo → channel', () => {
-    expect(DEFAULT_TAB_LINE_FIELDS).toEqual(['provider', 'repo', 'channel'])
+  it('DEFAULT_TAB_LINE_FIELDS is provider → repo → channel → machine', () => {
+    // `machine` is ON BY DEFAULT, not hidden behind the config popover: the
+    // whole point of the feature is showing where a session's untrusted work
+    // runs, and the sidebar renders only the configured fields.
+    expect(DEFAULT_TAB_LINE_FIELDS).toEqual(['provider', 'repo', 'channel', 'machine'])
   })
 })
 

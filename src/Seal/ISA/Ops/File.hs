@@ -27,6 +27,8 @@ import Data.Text.Encoding qualified as TE
 import Data.Text.Read qualified as TR (decimal)
 
 import Seal.Core.Paging (defaultPageParams)
+import Seal.Config.Machines (Selectable)
+import Seal.ISA.Ops.Machine (machinePropertySchema)
 import Seal.Core.Types
 import Seal.ISA.Opcode
 import Seal.Providers.Class
@@ -39,8 +41,8 @@ import Seal.Tools.Exec.UIO
 -- @limit@, and @max_scan_bytes@. (A shared single-string schema helper cannot
 -- express optional fields, so a small local builder is preferred over
 -- prematurely sharing one here.)
-fileReadSchema :: Value
-fileReadSchema =
+fileReadSchema :: [Selectable] -> Value
+fileReadSchema selectable =
   object
     [ "type" .= ("object" :: Text)
     , "properties" .= object
@@ -71,6 +73,7 @@ fileReadSchema =
                  \down. A smaller value narrows the scan window but never widens \
                  \the memory bound." :: Text)
             ]
+        , "machine" .= machinePropertySchema selectable
         ]
     , "required" .= (["path"] :: [Text])
     ]
@@ -138,11 +141,11 @@ scanBytesField v = case intField "max_scan_bytes" v of
 -- 'orRecorded' captures the requested path / offset / limit / resolved
 -- max_scan_bytes (secret-free metadata); file contents flow only to 'orParts'
 -- (model-visible).
-fileReadOp :: WorkspaceRoot -> Int -> Opcode
-fileReadOp _root operatorCeiling = UntrustedOpcode
+fileReadOp :: WorkspaceRoot -> Int -> [Selectable] -> Opcode
+fileReadOp _root operatorCeiling selectable = UntrustedOpcode
   { uoName = OpName "FILE_READ"
   , uoDesc = "Read a UTF-8 text file from the workspace or by absolute path."
-  , uoInSchema = fileReadSchema
+  , uoInSchema = fileReadSchema selectable
   , uoOutSchema = object []
   , uoAuthorize =
       maybe (Left "FILE_READ requires {path:string}") (const (Right ())) . pathField
@@ -232,11 +235,11 @@ clampScanBytes operatorCeiling mReq =
 -- @mode@ field is @\"write\"@ (default, truncate + create) or @\"append\"@.
 -- 'orRecorded' captures the path + mode + byte count (NOT the content —
 -- content may be large; the transcript records metadata only).
-fileWriteOp :: WorkspaceRoot -> Int -> Opcode
-fileWriteOp _root operatorWriteCeiling = UntrustedOpcode
+fileWriteOp :: WorkspaceRoot -> Int -> [Selectable] -> Opcode
+fileWriteOp _root operatorWriteCeiling selectable = UntrustedOpcode
   { uoName = OpName "FILE_WRITE"
   , uoDesc = "Write or append to a file (workspace-relative or absolute path, bounded)."
-  , uoInSchema = fileWriteSchema
+  , uoInSchema = fileWriteSchema selectable
   , uoOutSchema = object []
   , uoAuthorize =
       maybe (Left "FILE_WRITE requires {path:string, content:string}") (const (Right ()))
@@ -280,8 +283,8 @@ fileWriteOp _root operatorWriteCeiling = UntrustedOpcode
                   recorded
   }
 
-fileWriteSchema :: Value
-fileWriteSchema =
+fileWriteSchema :: [Selectable] -> Value
+fileWriteSchema selectable =
   object
     [ "type" .= ("object" :: Text)
     , "properties" .= object
@@ -297,6 +300,7 @@ fileWriteSchema =
             [ "type" .= ("string" :: Text)
             , "description" .= ("\"write\" (default, truncate+create) or \"append\"." :: Text)
             ]
+        , "machine" .= machinePropertySchema selectable
         ]
     , "required" .= (["path", "content"] :: [Text])
     ]
@@ -319,8 +323,8 @@ modeField v = case parseMaybe (withObject "in" (.:? "mode")) v :: Maybe (Maybe T
 -- atomic temp+rename write lands the result). 'orRecorded' captures the
 -- path + patch line count + applied flag (NOT the patch body — it may be
 -- large; the transcript records metadata only).
-filePatchOp :: WorkspaceRoot -> Opcode
-filePatchOp _root = UntrustedOpcode
+filePatchOp :: WorkspaceRoot -> [Selectable] -> Opcode
+filePatchOp _root selectable = UntrustedOpcode
   { uoName = OpName "FILE_PATCH"
   , uoDesc = "Apply a unified diff to a file (workspace-relative or absolute, atomic write). \
              \Input fields are {path: string, patch: string} — the patch field is named \
@@ -328,7 +332,7 @@ filePatchOp _root = UntrustedOpcode
              \would emit; both the long hunk header form (@@@ -1,2 +1,2 @@@) and the \
              \short form (@@@ -1 +1 @@@, length 1 implied) are accepted. No shell is \
              \invoked — the diff is parsed and applied in-process."
-  , uoInSchema = filePatchSchema
+  , uoInSchema = filePatchSchema selectable
   , uoOutSchema = object []
   , uoAuthorize = \v ->
       case (pathField v, patchField v) of
@@ -361,8 +365,8 @@ filePatchOp _root = UntrustedOpcode
                   OpResult [TrpText ("patched " <> T.pack rel)] False recorded
   }
 
-filePatchSchema :: Value
-filePatchSchema =
+filePatchSchema :: [Selectable] -> Value
+filePatchSchema selectable =
   object
     [ "type" .= ("object" :: Text)
     , "properties" .= object
@@ -376,6 +380,7 @@ filePatchSchema =
                                 \Standard @git diff@ output; both @@ -1,2 +1,2 @@ and \
                                 \@@ -1 +1 @@ hunk headers are accepted. Applied in-process, no shell." :: Text)
             ]
+        , "machine" .= machinePropertySchema selectable
         ]
     , "required" .= (["path", "patch"] :: [Text])
     ]
